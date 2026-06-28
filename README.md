@@ -7,7 +7,10 @@ models, querysets, relations and migrations for PostgreSQL and SQLite.**
 [![PyPI](https://img.shields.io/pypi/v/yara-orm.svg)](https://pypi.org/project/yara-orm/)
 [![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-blue.svg)](https://github.com/vsdudakov/yara-orm)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#development)
+[![Docs](https://img.shields.io/badge/docs-vsdudakov.github.io%2Fyara--orm-blue.svg)](https://vsdudakov.github.io/yara-orm/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE.md)
+
+📖 **Documentation: [vsdudakov.github.io/yara-orm](https://vsdudakov.github.io/yara-orm/)**
 
 Yara ORM is a high-performance **async ORM for Python** that pairs the ergonomics
 of a Django/Tortoise-style API — models, querysets, relations, aggregation and

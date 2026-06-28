@@ -1,4 +1,4 @@
-.PHONY: build test example clean dev lint format
+.PHONY: build test example clean dev lint format docs docs-serve docs-install
 
 VENV ?= .venv313
 PY := $(VENV)/bin/python
@@ -46,6 +46,19 @@ bench-sqlite:
 	.venv312/bin/pip install -q -U aiosqlite
 	BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
 
+# --- Documentation (MkDocs Material) -----------------------------------------
+# Install the docs extra from pyproject.toml ([project.optional-dependencies]).
+docs-install:
+	$(VENV)/bin/pip install -U "mkdocs-material[imaging]>=9.5"
+
+# Build the static site into ./site (social cards enabled, like CI).
+docs:
+	CI=true $(PY) -m mkdocs build --strict
+
+# Live-preview at http://127.0.0.1:8000 (social cards off for speed).
+docs-serve:
+	$(PY) -m mkdocs serve
+
 clean:
 	cargo clean
-	rm -rf target build *.egg-info
+	rm -rf target build *.egg-info site .cache

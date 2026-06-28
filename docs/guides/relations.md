@@ -1,0 +1,299 @@
+---
+title: Relations
+description: Model ForeignKey, OneToOne and ManyToMany relations and prefetch related rows in an async Python ORM, avoiding N+1 queries with batched eager loading.
+---
+
+# Relations
+
+Relations connect your models to one another. `yara_orm` gives you a foreign key
+for one-to-many links, a one-to-one for exclusive pairs, and a many-to-many
+realised through a join table. Forward and reverse access is fully async, and
+the `prefetch_related` helper batches related rows so you can traverse relations
+in an async Python ORM without falling into the N+1 query trap.
+
+All relation fields are declared with the `fields` module, and the `Prefetch`
+helper is imported straight from the package:
+
+```python
+from yara_orm import Model, Prefetch, fields
+```
+
+The examples below use these canonical models:
+
+```python
+from yara_orm import Model, fields
+
+
+class Author(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=120)
+
+
+class Book(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=200)
+    author = fields.ForeignKeyField("Author", related_name="books")
+    tags = fields.ManyToManyField("Tag", related_name="books")
+
+
+class Tag(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50, unique=True)
+```
+
+## Foreign keys
+
+```python
+fields.ForeignKeyField(
+    reference,
+    related_name=None,
+    on_delete=OnDelete.CASCADE,
+    source_field=None,
+)
+```
+
+- `reference` — the target model, given as a name (`"Author"`) or a dotted path
+  (`"app.Author"`).
+- `related_name` — the name of the reverse accessor installed on the target
+  model (here, `Author.books`).
+- `on_delete` — the referential action applied when the referenced row is
+  deleted (see [`OnDelete`](#on-delete-actions)).
+- `source_field` — the target field that is referenced; defaults to the target's
+  primary key.
+
+Although you declare the field under the relation name (`author`), the metaclass
+synthesises a concrete `<name>_id` backing column. For `Book.author` that is the
+`author_id` column, which actually stores the foreign key value.
+
+### Forward access
+
+Accessing the relation on an instance returns an awaitable descriptor that
+resolves to the related instance, or `None` when the foreign key is unset:
+
+```python
+book = await Book.get(id=1)
+author = await book.author          # -> Author instance, or None
+```
+
+Assign a related instance directly when creating or updating a row. You may pass
+the model instance itself:
+
+```python
+author = await Author.create(name="Ada")
+book = await Book.create(title="Foundations", author=author)
+```
+
+Assigning an instance sets the `author_id` backing column to the instance's
+primary key, and caches the instance so a subsequent `await book.author` returns
+it without a query.
+
+### Reverse manager
+
+The `related_name` installs a manager on the target model. It is awaitable (to a
+list), async-iterable, and chainable:
+
+```python
+author = await Author.get(id=1)
+
+books = await author.books                 # -> list[Book]
+
+async for book in author.books:            # async iteration
+    print(book.title)
+
+# Chainable queryset methods:
+await author.books.all()                   # all related books
+await author.books.filter(title="Foundations")
+await author.books.order_by("-id")
+await author.books.filter(rating__gte=5).count()
+
+# Create a related row already bound to this author:
+new_book = await author.books.create(title="Second Foundation")
+```
+
+`.all()`, `.filter(...)` and `.order_by(...)` each return a full queryset scoped
+to the parent, so you can chain further (`.count()`, `.order_by(...)`, and so on)
+before awaiting. `.create(**kwargs)` sets the foreign key for you.
+
+### On-delete actions
+
+`OnDelete` enumerates the referential actions emitted in the DDL:
+
+| Value | `ON DELETE` clause |
+| --- | --- |
+| `OnDelete.CASCADE` | `CASCADE` (the default) |
+| `OnDelete.RESTRICT` | `RESTRICT` |
+| `OnDelete.SET_NULL` | `SET NULL` |
+| `OnDelete.SET_DEFAULT` | `SET DEFAULT` |
+| `OnDelete.NO_ACTION` | `NO ACTION` |
+
+```python
+from yara_orm import fields
+from yara_orm.fields import OnDelete
+
+
+class Book(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=200)
+    author = fields.ForeignKeyField(
+        "Author",
+        related_name="books",
+        on_delete=OnDelete.SET_NULL,
+        null=True,
+    )
+```
+
+## One-to-one
+
+`OneToOneField(reference, ...)` is a foreign key that enforces uniqueness, so the
+reverse side yields a single instance instead of a list. It accepts the same
+arguments as `ForeignKeyField` and defaults `unique=True`.
+
+```python
+class Profile(Model):
+    id = fields.IntField(pk=True)
+    bio = fields.TextField()
+    author = fields.OneToOneField("Author", related_name="profile")
+```
+
+The forward side awaits to one instance, and the reverse accessor
+(`related_name`) also awaits to a single instance (or `None`):
+
+```python
+author = await Author.create(name="Ada")
+await Profile.create(bio="Pioneer of computing", author=author)
+
+profile = await author.profile          # -> single Profile, or None
+back = await profile.author             # -> the Author
+```
+
+## Many-to-many
+
+```python
+fields.ManyToManyField(
+    reference,
+    related_name=None,
+    through=None,
+    forward_key=None,
+    backward_key=None,
+)
+```
+
+A many-to-many field adds **no column** to the owning table. Instead a
+through/join table is auto-created to hold the pairings:
+
+- `through` — the join table name; synthesised as `<owner>_<target>` when
+  omitted.
+- `forward_key` — the join-table column referencing the target model; defaults
+  to `<target>_id`.
+- `backward_key` — the join-table column referencing the owning model; defaults
+  to `<owner>_id`.
+
+The relation exposes a manager that is awaitable (to a list), async-iterable, and
+mutable:
+
+```python
+book = await Book.create(title="Foundations", author=author)
+sci = await Tag.create(name="sci-fi")
+classic = await Tag.create(name="classic")
+
+await book.tags.add(sci, classic)       # link rows in the join table
+tags = await book.tags                   # -> list[Tag]
+
+async for tag in book.tags:              # async iteration
+    print(tag.name)
+
+await book.tags.remove(classic)          # unlink specific rows
+await book.tags.clear()                  # unlink everything
+
+# Querying methods mirror the reverse manager:
+await book.tags.all()
+await book.tags.filter(name="sci-fi")
+await book.tags.order_by("name")
+```
+
+`add()` and `remove()` accept model instances or raw primary key values. `add()`
+inserts join rows idempotently (`ON CONFLICT DO NOTHING`), and `clear()` removes
+all pairings for this instance. The reverse side (`Tag.books`) works the same
+way.
+
+## Recursive (self-referential) relations
+
+A foreign key can point at its own model to build a hierarchy. Pass the model's
+own name as the reference and make the column nullable for root rows:
+
+```python
+class Employee(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=120)
+    manager = fields.ForeignKeyField("Employee", related_name="reports", null=True)
+```
+
+The forward `manager` awaits to the parent (or `None` at the top), and the
+reverse `reports` manager lists the direct children:
+
+```python
+boss = await Employee.create(name="Boss")
+worker = await Employee.create(name="Worker", manager=boss)
+
+assert (await worker.manager).id == boss.id
+reports = await boss.reports            # -> list[Employee]
+```
+
+## Avoiding N+1 with prefetch
+
+Traversing a relation per row issues one query per instance — the classic N+1
+problem. `prefetch_related` solves it by loading every related row for a batch in
+a single query per relation, populating each instance's prefetch cache so later
+relation access returns without touching the database.
+
+```python
+authors = await Author.all().prefetch_related("books")
+for author in authors:
+    for book in await author.books:     # served from cache, no query
+        print(author.name, book.title)
+```
+
+To prefetch onto a single instance you already have, use `fetch_related`, which
+accepts one or more relation names:
+
+```python
+book = await Book.get(id=1)
+await book.fetch_related("author", "tags")
+
+author = await book.author              # cached
+tags = await book.tags                  # cached
+```
+
+Both work across forward foreign keys, one-to-one relations, reverse managers,
+and many-to-many relations.
+
+!!! tip "Reach for `prefetch_related` to kill N+1"
+    Whenever you loop over a list of rows and touch a relation on each one,
+    prefetch it. `Author.all().prefetch_related("books")` runs two queries total
+    — one for the authors, one for every author's books — instead of one extra
+    query per author. The related rows are cached on each instance, so awaiting
+    the relation inside the loop is free.
+
+### Customising a prefetch with `Prefetch`
+
+For finer control, pass a `Prefetch(relation, queryset=...)` object to filter or
+order the related rows that get loaded:
+
+```python
+from yara_orm import Prefetch
+
+authors = await Author.all().prefetch_related(
+    Prefetch("books", queryset=Book.filter(rating__gte=4))
+)
+
+for author in authors:
+    top_books = await author.books      # only books with rating >= 4
+```
+
+The supplied queryset constrains the lookup, while the batching guarantee still
+holds: one query loads the filtered related rows for the whole batch.
+
+## See also
+
+- [Querying](querying.md)
+- [Models & fields](models-and-fields.md)
