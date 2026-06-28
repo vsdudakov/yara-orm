@@ -17,8 +17,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu = manylinux x86_64, macos-latest = arm64, macos-13 = x86_64.
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+        # ubuntu = manylinux x86_64, macos-latest = arm64 (Apple Silicon).
+        # macos-13 (Intel x86_64) dropped — scarce runners; Intel-Mac users
+        # build from the sdist. Re-add "macos-13" here to ship x86_64 wheels.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
