@@ -1,6 +1,6 @@
 # Benchmarks
 
-`bench.py` runs identical workloads against **this library (`orm`)**,
+`bench.py` runs identical workloads against **this library (`yara-orm`)**,
 **Tortoise ORM** (async, asyncpg), **SQLAlchemy 2.0** (async ORM, asyncpg) and
 **Pony ORM** (sync, psycopg2) on the same PostgreSQL instance, each ORM in its
 own table.
@@ -8,7 +8,7 @@ own table.
 ## Running
 
 Pony's query decompiler does **not** support Python 3.13+, so the full 4-way
-run needs Python ≤ 3.12. `orm`, Tortoise and SQLAlchemy run on any supported
+run needs Python ≤ 3.12. `yara-orm`, Tortoise and SQLAlchemy run on any supported
 version (Pony is simply reported as `-`).
 
 ```bash
@@ -42,7 +42,7 @@ BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
   cold-start noise.
 * `get_by_pk` issues the same random pk sequence to every ORM.
 * Caveats — this is *throughput-oriented*, not a micro-benchmark:
-  * sync (Pony) vs async (Tortoise, `orm`) have different concurrency models;
+  * sync (Pony) vs async (Tortoise, `yara-orm`) have different concurrency models;
   * Pony opens a transaction per `get` (its design) and has no SQL-level bulk
     `UPDATE`, so its update path mutates objects in a loop;
   * SQLAlchemy `get_by_pk` uses a fresh session per lookup (no identity-map
@@ -54,17 +54,17 @@ BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
 PostgreSQL 18, Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower is
 better).
 
-| operation       | orm  | tortoise | sqlalchemy |  pony |
-|-----------------|-----:|---------:|-----------:|------:|
-| bulk_insert     | 11.5 |     23.1 |       67.5 | 208.4 |
-| single_insert   | 32.8 |     80.4 |      153.3 |  59.1 |
-| fetch_all       |  3.5 |     16.0 |       12.2 |  30.4 |
-| count           |  0.4 |      0.5 |        1.2 |   0.5 |
-| filter          |  2.2 |      8.5 |       20.5 |  15.4 |
-| get_by_pk       | 63.2 |    194.4 |      292.8 |  82.7 |
-| update          |  3.3 |      3.4 |        4.1 | 117.8 |
+| operation       | yara-orm | tortoise | sqlalchemy |  pony |
+|-----------------|---------:|---------:|-----------:|------:|
+| bulk_insert     |     11.5 |     23.1 |       67.5 | 208.4 |
+| single_insert   |     32.8 |     80.4 |      153.3 |  59.1 |
+| fetch_all       |      3.5 |     16.0 |       12.2 |  30.4 |
+| count           |      0.4 |      0.5 |        1.2 |   0.5 |
+| filter          |      2.2 |      8.5 |       20.5 |  15.4 |
+| get_by_pk       |     63.2 |    194.4 |      292.8 |  82.7 |
+| update          |      3.3 |      3.4 |        4.1 | 117.8 |
 
-Speedup vs `orm` (competitor_time / orm_time; >1 means `orm` faster):
+Speedup vs `yara-orm` (competitor_time / yara_orm_time; >1 means `yara-orm` faster):
 
 | operation     | tortoise | sqlalchemy |  pony |
 |---------------|---------:|-----------:|------:|
@@ -76,7 +76,7 @@ Speedup vs `orm` (competitor_time / orm_time; >1 means `orm` faster):
 | get_by_pk     |    3.1×  |      4.6×  |  1.3× |
 | update        |    1.0×  |      1.3×  | 35.7× |
 
-`orm` is fastest on every operation in this configuration. `get_by_pk` and
+`yara-orm` is fastest on every operation in this configuration. `get_by_pk` and
 `single_insert` are latency-bound (one sequential round-trip per call) and sit
 near the raw client⇄PostgreSQL round-trip floor.
 
@@ -84,17 +84,17 @@ near the raw client⇄PostgreSQL round-trip floor.
 
 `BENCH_BACKEND=sqlite`, Python 3.12, N=5000, median of 5 (ms, lower is better):
 
-| operation     | orm | tortoise | sqlalchemy |  pony |
-|---------------|----:|---------:|-----------:|------:|
-| bulk_insert   | 7.5 |     13.2 |      607.7 |  47.2 |
-| single_insert | 35.1|     27.6 |      235.2 | 117.2 |
-| fetch_all     | 4.9 |     38.2 |       11.0 |  48.7 |
-| count         | 0.1 |      0.3 |        0.6 |   0.2 |
-| filter        | 2.6 |     19.5 |       17.6 |  24.9 |
-| get_by_pk     | 54.1|     79.2 |      329.3 |  30.1 |
-| update        | 0.5 |      0.5 |        1.8 |  41.5 |
+| operation     | yara-orm | tortoise | sqlalchemy |  pony |
+|---------------|---------:|---------:|-----------:|------:|
+| bulk_insert   |      7.5 |     13.2 |      607.7 |  47.2 |
+| single_insert |     35.1 |     27.6 |      235.2 | 117.2 |
+| fetch_all     |      4.9 |     38.2 |       11.0 |  48.7 |
+| count         |      0.1 |      0.3 |        0.6 |   0.2 |
+| filter        |      2.6 |     19.5 |       17.6 |  24.9 |
+| get_by_pk     |     54.1 |     79.2 |      329.3 |  30.1 |
+| update        |      0.5 |      0.5 |        1.8 |  41.5 |
 
-`orm` wins the throughput-bound operations decisively (bulk 1.8×/81×/6.3×,
+`yara-orm` wins the throughput-bound operations decisively (bulk 1.8×/81×/6.3×,
 fetch_all 7.8×/2.2×/9.9×, filter 7.5×/6.8×/9.6× vs Tortoise/SQLAlchemy/Pony).
 It trails on the two **latency-bound** ops: in-process Pony beats us on
 `get_by_pk` (0.6×) and Tortoise edges `single_insert` (0.8×) — because our
@@ -103,7 +103,7 @@ blocking thread **per call**, which costs a few µs that an in-process driver
 avoids on sequential point queries. Real workloads rarely fire thousands of
 sequential point reads, and everything throughput-shaped is far ahead.
 
-## Why `orm` is fast here
+## Why `yara-orm` is fast here
 
 * **Rust hot path** — parameter binding and row decoding happen in compiled
   code; the async bridge (PyO3 + tokio) keeps the event loop free.
