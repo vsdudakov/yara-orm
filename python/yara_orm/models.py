@@ -205,9 +205,7 @@ class ModelMeta(type):
             descending = spec.startswith("-")
             fname = spec[1:] if descending else spec
             if fname != "pk" and fname not in fields:
-                raise FieldError(
-                    f"Meta.ordering refers to unknown field {fname!r} on {name}"
-                )
+                raise FieldError(f"Meta.ordering refers to unknown field {fname!r} on {name}")
             ordering.append((fname, descending))
 
         relations = {}
