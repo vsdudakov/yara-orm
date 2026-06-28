@@ -1,0 +1,76 @@
+name: Benchmark
+
+# Runs the 4-way ORM benchmark (yara-orm vs Tortoise / SQLAlchemy / Pony) on
+# PostgreSQL and SQLite. Manual or weekly; results land in the job summary and
+# as an artifact. Python 3.12 because Pony's decompiler doesn't support 3.13+.
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "Bulk rows (BENCH_N)"
+        default: "5000"
+      repeat:
+        description: "Runs per ORM, median (BENCH_REPEAT)"
+        default: "5"
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orm_bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ORM_TEST_DB: postgres://postgres:postgres@localhost:5432/orm_bench
+      BENCH_N: ${{ github.event.inputs.n || '5000' }}
+      BENCH_REPEAT: ${{ github.event.inputs.repeat || '5' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ORMs and drivers
+        run: |
+          python -m pip install -U pip maturin
+          pip install tortoise-orm "sqlalchemy[asyncio]" asyncpg aiosqlite pony psycopg2-binary
+      - name: Build the Rust engine
+        run: maturin develop --release
+      - name: PostgreSQL benchmark
+        run: |
+          {
+            echo "## PostgreSQL"
+            echo '```'
+            python benchmarks/bench.py
+            echo '```'
+          } | tee bench_postgres.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: SQLite benchmark
+        env:
+          BENCH_BACKEND: sqlite
+        run: |
+          {
+            echo "## SQLite"
+            echo '```'
+            python benchmarks/bench.py
+            echo '```'
+          } | tee bench_sqlite.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench_*.txt

@@ -1,0 +1,243 @@
+//! The `Engine` object exposed to Python: a thin async facade over a `Backend`.
+
+use std::sync::Arc;
+
+use pyo3::prelude::*;
+use pyo3::exceptions::PyRuntimeError;
+use pyo3_async_runtimes::tokio::future_into_py;
+use tokio::sync::Mutex;
+
+use crate::backend::{self, Backend, TxConn};
+use crate::error::to_pyerr;
+use crate::value::{PyRow, Value};
+
+#[pyclass]
+pub struct Engine {
+    backend: Arc<dyn Backend>,
+}
+
+#[pymethods]
+impl Engine {
+    /// Dialect identifier used by the Python layer to render SQL.
+    #[getter]
+    fn dialect(&self) -> &'static str {
+        self.backend.dialect()
+    }
+
+    /// Execute a non-returning statement; resolves to the affected row count.
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            backend.execute(&sql, &params).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Run a query; resolves to a list of dict rows.
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_all<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            let rows = backend.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
+            Ok(rows.into_iter().map(PyRow).collect::<Vec<_>>())
+        })
+    }
+
+    /// Run a query; resolves to a list of positional value lists (no column
+    /// names). The fast path the model layer uses for SELECTs.
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_rows<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            backend
+                .fetch_all_values(&sql, &params)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Run a query; resolves to the first positional value list or `None`.
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_row<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            let rows = backend
+                .fetch_all_values(&sql, &params)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(rows.into_iter().next())
+        })
+    }
+
+    /// Execute the same statement once per row set, pipelined on one
+    /// connection; resolves to a list with the first returned row of each
+    /// execution (the fast path for bulk inserts with RETURNING).
+    fn execute_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        rows: Vec<Vec<Value>>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            let out = backend.execute_many(&sql, &rows).await.map_err(to_pyerr)?;
+            Ok(out.into_iter().map(PyRow).collect::<Vec<_>>())
+        })
+    }
+
+    /// Run a query; resolves to the first row dict or `None`.
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_one<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            let rows = backend.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
+            Ok(rows.into_iter().next().map(PyRow))
+        })
+    }
+
+    /// Close the underlying connection pool.
+    fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            backend.close().await;
+            Ok(())
+        })
+    }
+
+    /// Begin a transaction; resolves to a `Transaction` bound to one connection.
+    fn begin<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        future_into_py(py, async move {
+            let tx = backend.begin_tx().await.map_err(to_pyerr)?;
+            Ok(Transaction {
+                inner: Arc::new(Mutex::new(Some(tx))),
+            })
+        })
+    }
+}
+
+#[pyclass]
+pub struct Transaction {
+    inner: Arc<Mutex<Option<Box<dyn TxConn>>>>,
+}
+
+fn tx_finished() -> PyErr {
+    PyRuntimeError::new_err("transaction already committed or rolled back")
+}
+
+#[pymethods]
+impl Transaction {
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn execute<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            tx.execute(&sql, &params).await.map_err(to_pyerr)
+        })
+    }
+
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_rows<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            tx.fetch_all_values(&sql, &params).await.map_err(to_pyerr)
+        })
+    }
+
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_row<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            let rows = tx.fetch_all_values(&sql, &params).await.map_err(to_pyerr)?;
+            Ok(rows.into_iter().next())
+        })
+    }
+
+    #[pyo3(signature = (sql, params=Vec::new()))]
+    fn fetch_all<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            let rows = tx.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
+            Ok(rows.into_iter().map(PyRow).collect::<Vec<_>>())
+        })
+    }
+
+    fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let tx = inner.lock().await.take().ok_or_else(tx_finished)?;
+            tx.commit().await.map_err(to_pyerr)
+        })
+    }
+
+    fn rollback<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let tx = inner.lock().await.take().ok_or_else(tx_finished)?;
+            tx.rollback().await.map_err(to_pyerr)
+        })
+    }
+}
+
+/// Connect to a database and resolve to an [`Engine`].
+#[pyfunction]
+pub fn connect(py: Python<'_>, url: String) -> PyResult<Bound<'_, PyAny>> {
+    future_into_py(py, async move {
+        let backend = backend::connect(&url).await.map_err(to_pyerr)?;
+        Ok(Engine {
+            backend: Arc::from(backend),
+        })
+    })
+}
