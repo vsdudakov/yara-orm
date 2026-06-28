@@ -3,19 +3,48 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-# Distribution name on PyPI is "yara-orm"; the import package stays `orm`.
+# Distribution name on PyPI is "yara-orm"; the import package is `yara_orm`.
 name = "yara-orm"
 version = "0.1.0"
-description = "An async Python ORM with a Tortoise-style interface and a Rust execution engine"
+description = "Fast async Python ORM with a Rust engine — Tortoise-style models, querysets, relations and migrations for PostgreSQL and SQLite"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "yara-orm contributors" }]
-urls = { Homepage = "https://github.com/vsdudakov/yara-orm", Repository = "https://github.com/vsdudakov/yara-orm" }
+keywords = [
+    "orm",
+    "async",
+    "asyncio",
+    "database",
+    "postgresql",
+    "postgres",
+    "sqlite",
+    "rust",
+    "pyo3",
+    "tortoise",
+    "sqlalchemy",
+    "query-builder",
+    "migrations",
+    "async-orm",
+    "high-performance",
+]
+urls = { Homepage = "https://github.com/vsdudakov/yara-orm", Repository = "https://github.com/vsdudakov/yara-orm", Documentation = "https://github.com/vsdudakov/yara-orm#readme", Issues = "https://github.com/vsdudakov/yara-orm/issues" }
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
+    "Framework :: AsyncIO",
     "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,7 @@
 # Yara ORM
 
-**A fast, async Python ORM with a [Tortoise](https://tortoise.github.io/)-style API and a Rust execution engine.**
+**A fast, async Python ORM with a Rust engine — [Tortoise](https://tortoise.github.io/)-style
+models, querysets, relations and migrations for PostgreSQL and SQLite.**
 
 [![CI](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml/badge.svg)](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/yara-orm.svg)](https://pypi.org/project/yara-orm/)
@@ -8,11 +9,13 @@
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#development)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE.md)
 
-Yara ORM gives you the ergonomics of an async Django/Tortoise-style ORM — models,
-querysets, relations, migrations — while the hot path (connection pooling,
-parameter binding, row decoding) runs in compiled Rust. It is **2–9× faster**
-than popular pure-Python ORMs on common operations, ships with **PostgreSQL and
-SQLite** backends, and is **100% test-covered**.
+Yara ORM is a high-performance **async ORM for Python** that pairs the ergonomics
+of a Django/Tortoise-style API — models, querysets, relations, aggregation and
+migrations — with a hot path (connection pooling, parameter binding, row decoding)
+written in compiled **Rust** (PyO3 + tokio). It is a drop-in-feel **alternative to
+Tortoise ORM and async SQLAlchemy**: **2–9× faster** than popular pure-Python ORMs
+on common operations, with first-class **PostgreSQL** and **SQLite** backends, full
+type hints, and **100% test coverage**.
 
 ```python
 from yara_orm import Model, YaraOrm, fields
