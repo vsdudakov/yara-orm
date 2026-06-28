@@ -1,21 +1,39 @@
 //! PostgreSQL backend built on tokio-postgres + deadpool connection pooling.
 
 use async_trait::async_trait;
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod};
 use tokio_postgres::types::ToSql;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, Statement};
 
+use crate::backend::pool::extract_pool_params;
 use crate::backend::{Backend, TxConn};
 use crate::error::EngineError;
 use crate::value::{decode_pg_row, decode_pg_row_values, Row, Value};
 
+/// Default pool size when the URL does not specify `max_size`.
+const DEFAULT_MAX_SIZE: usize = 16;
+
 pub struct PgBackend {
     pool: Pool,
+    /// When false (URL `statement_cache_size=0`), prepared statements are not
+    /// cached per connection — required behind a transaction-pooling proxy
+    /// such as PgBouncer, which would otherwise see stale prepared statements.
+    cache_statements: bool,
+}
+
+/// Prepare `sql`, honouring the backend's statement-cache setting.
+async fn prepare(client: &Object, sql: &str, cache: bool) -> Result<Statement, EngineError> {
+    Ok(if cache {
+        client.prepare_cached(sql).await?
+    } else {
+        client.prepare(sql).await?
+    })
 }
 
 impl PgBackend {
     pub async fn connect(url: &str) -> Result<Self, EngineError> {
-        let pg_config: tokio_postgres::Config = url
+        let (clean_url, params) = extract_pool_params(url)?;
+        let pg_config: tokio_postgres::Config = clean_url
             .parse()
             .map_err(|e: tokio_postgres::Error| EngineError::Config(e.to_string()))?;
 
@@ -23,22 +41,42 @@ impl PgBackend {
             recycling_method: RecyclingMethod::Fast,
         };
         let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
+        let max_size = params.max_size.unwrap_or(DEFAULT_MAX_SIZE);
         let pool = Pool::builder(mgr)
-            .max_size(16)
+            .max_size(max_size)
             .build()
             .map_err(|e| EngineError::Config(e.to_string()))?;
 
-        // Fail fast if the database is unreachable / credentials are wrong.
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
-        client
+        // Pre-warm connections: always at least one (so we fail fast on an
+        // unreachable database / bad credentials), and up to `min_size` so the
+        // first real queries don't each pay connection latency. The pool keeps
+        // no hard minimum, so this is a best-effort prime of idle connections.
+        let warm = params.min_size.unwrap_or(0).max(1).min(max_size);
+        let mut held = Vec::with_capacity(warm);
+        for _ in 0..warm {
+            held.push(
+                pool.get()
+                    .await
+                    .map_err(|e| EngineError::Connection(e.to_string()))?,
+            );
+        }
+        held[0]
             .simple_query("SELECT 1")
             .await
             .map_err(|e| EngineError::Connection(e.to_string()))?;
+        drop(held); // return the warmed connections to the pool as idle
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            cache_statements: params.cache_statements,
+        })
+    }
+
+    async fn get(&self) -> Result<Object, EngineError> {
+        self.pool
+            .get()
+            .await
+            .map_err(|e| EngineError::Connection(e.to_string()))
     }
 }
 
@@ -49,26 +87,16 @@ fn as_sql_params(params: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
 #[async_trait]
 impl Backend for PgBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
-        // Cache the prepared statement on the connection so repeated calls with
-        // the same SQL skip the parse/plan round-trip.
-        let stmt = client.prepare_cached(sql).await?;
+        let client = self.get().await?;
+        let stmt = prepare(&client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let affected = client.execute(&stmt, &bound).await?;
         Ok(affected)
     }
 
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
-        let stmt = client.prepare_cached(sql).await?;
+        let client = self.get().await?;
+        let stmt = prepare(&client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
         Ok(rows.iter().map(decode_pg_row).collect())
@@ -79,12 +107,8 @@ impl Backend for PgBackend {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>, EngineError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
-        let stmt = client.prepare_cached(sql).await?;
+        let client = self.get().await?;
+        let stmt = prepare(&client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
         Ok(rows.iter().map(decode_pg_row_values).collect())
@@ -95,12 +119,8 @@ impl Backend for PgBackend {
         sql: &str,
         rows: &[Vec<Value>],
     ) -> Result<Vec<Row>, EngineError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
-        let stmt = client.prepare_cached(sql).await?;
+        let client = self.get().await?;
+        let stmt = prepare(&client, sql, self.cache_statements).await?;
 
         // Bind every row up front so the borrows live across the pipelined await.
         let bounds: Vec<Vec<&(dyn ToSql + Sync)>> = rows.iter().map(|r| as_sql_params(r)).collect();
@@ -126,31 +146,31 @@ impl Backend for PgBackend {
     }
 
     async fn begin_tx(&self) -> Result<Box<dyn TxConn>, EngineError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
+        let client = self.get().await?;
         client.batch_execute("BEGIN").await?;
-        Ok(Box::new(PgTx { client }))
+        Ok(Box::new(PgTx {
+            client,
+            cache_statements: self.cache_statements,
+        }))
     }
 }
 
 /// A pinned-connection PostgreSQL transaction.
 struct PgTx {
-    client: deadpool_postgres::Object,
+    client: Object,
+    cache_statements: bool,
 }
 
 #[async_trait]
 impl TxConn for PgTx {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
-        let stmt = self.client.prepare_cached(sql).await?;
+        let stmt = prepare(&self.client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         Ok(self.client.execute(&stmt, &bound).await?)
     }
 
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
-        let stmt = self.client.prepare_cached(sql).await?;
+        let stmt = prepare(&self.client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client.query(&stmt, &bound).await?;
         Ok(rows.iter().map(decode_pg_row).collect())
@@ -161,7 +181,7 @@ impl TxConn for PgTx {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>, EngineError> {
-        let stmt = self.client.prepare_cached(sql).await?;
+        let stmt = prepare(&self.client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client.query(&stmt, &bound).await?;
         Ok(rows.iter().map(decode_pg_row_values).collect())

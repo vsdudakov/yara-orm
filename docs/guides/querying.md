@@ -130,6 +130,8 @@ Pass field names to `.order_by()`. Prefix a name with `-` for descending order; 
 await Book.all().order_by("-rating", "title")   # highest rating first, then A→Z by title
 ```
 
+A model can declare a default ordering via [`Meta.ordering`](models-and-fields.md#default-ordering), applied to any query that does not call `.order_by()` itself; an explicit `.order_by()` always overrides it.
+
 ## Pagination
 
 Use `.limit(n)` and `.offset(n)` to page through results (typically alongside `.order_by()` for stable paging):

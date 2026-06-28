@@ -37,3 +37,11 @@ updates:
       rust:
         patterns:
           - "*"
+    ignore:
+      # rusqlite must resolve to the SAME version as deadpool-sqlite's own
+      # rusqlite dependency (types flow between them via `Object::interact`).
+      # deadpool-sqlite 0.13 (latest) pins rusqlite to ^0.38, so bumps to 0.39+
+      # are un-mergeable until a newer deadpool-sqlite ships. Lift this once
+      # deadpool-sqlite supports a newer rusqlite, and bump both together.
+      - dependency-name: "rusqlite"
+        versions: [">=0.39"]
