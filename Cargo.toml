@@ -26,7 +26,7 @@ chrono = "0.4"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 rust_decimal = { version = "1.42", features = ["db-tokio-postgres"] }
 deadpool-sqlite = "0.13.0"
-rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 
 [profile.release]
 opt-level = 3
