@@ -1,0 +1,81 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+# Distribution name on PyPI is "yara-orm"; the import package stays `orm`.
+name = "yara-orm"
+version = "0.1.0"
+description = "An async Python ORM with a Tortoise-style interface and a Rust execution engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "yara-orm contributors" }]
+urls = { Homepage = "https://github.com/vsdudakov/yara-orm", Repository = "https://github.com/vsdudakov/yara-orm" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "ty>=0.0.1a1",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "yara_orm._engine"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["python"]
+extend-exclude = ["migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4"]
+# B008: FastAPI-style defaults n/a here; keep call-in-default for argparse/Path ok.
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests/benchmarks define ORM models at module scope after imports and keep a
+# few intentionally-unused locals for clarity.
+"tests/*" = ["E402"]
+"benchmarks/*" = ["E402", "F841"]
+"examples/*" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["yara_orm"]
+
+[tool.ty.environment]
+root = ["./python"]
+python-version = "3.9"
+
+[tool.coverage.run]
+source = ["yara_orm"]
+branch = true
+omit = ["*/_engine.pyi"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+    "if __name__ == .__main__.:",
+    "pragma: no cover",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "off"
