@@ -1,0 +1,39 @@
+# Keep dependencies up to date across the three ecosystems in this repo.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # GitHub Actions used by the CI / release / benchmark workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Python dependencies (declared in pyproject.toml).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    groups:
+      python:
+        patterns:
+          - "*"
+
+  # Rust crates for the native engine (Cargo.toml at the repo root).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    groups:
+      rust:
+        patterns:
+          - "*"
