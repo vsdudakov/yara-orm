@@ -45,6 +45,8 @@ class MetaInfo:
         relations: dict[str, RelationInfo] | None = None,
         m2m: dict[str, M2MInfo] | None = None,
         description: str | None = None,
+        abstract: bool = False,
+        ordering: list[tuple[str, bool]] | None = None,
     ) -> None:
         """Store resolved table metadata and precompute the row-decode plan.
 
@@ -55,10 +57,16 @@ class MetaInfo:
             relations: Forward relation metadata keyed by relation name.
             m2m: Many-to-many relation metadata keyed by relation name.
             description: Optional human-readable table description.
+            abstract: Whether the model is an abstract base (no table of its
+                own; only contributes fields to concrete subclasses).
+            ordering: Default ordering as ``(field_name, descending)`` tuples,
+                applied to queries that set no explicit ``order_by``.
 
         Returns:
             None
         """
+        self.abstract = abstract
+        self.ordering = ordering or []
         self.table = table
         self.fields = fields
         self.pk_field = pk_field
@@ -181,10 +189,26 @@ class ModelMeta(type):
             fields = {"id": pk_field, **fields}
 
         meta_cls = namespace.get("Meta")
+        # `abstract` is intentionally read from the class's own Meta only (not
+        # inherited): a concrete subclass of an abstract base is itself concrete
+        # unless it redeclares `abstract = True`, matching Tortoise ORM.
+        abstract = bool(getattr(meta_cls, "abstract", False))
         table = getattr(meta_cls, "table", None) or name.lower()
         description = getattr(meta_cls, "table_description", None) or getattr(
             meta_cls, "description", None
         )
+
+        # `ordering` is a list of field specs (``"name"`` / ``"-name"``) applied
+        # as the default ORDER BY when a query sets none of its own.
+        ordering: list[tuple[str, bool]] = []
+        for spec in getattr(meta_cls, "ordering", None) or ():
+            descending = spec.startswith("-")
+            fname = spec[1:] if descending else spec
+            if fname != "pk" and fname not in fields:
+                raise FieldError(
+                    f"Meta.ordering refers to unknown field {fname!r} on {name}"
+                )
+            ordering.append((fname, descending))
 
         relations = {}
         for rel_name, fk in fk_decls.items():
@@ -201,6 +225,8 @@ class ModelMeta(type):
             relations=relations,
             m2m=m2m,
             description=description,
+            abstract=abstract,
+            ordering=ordering,
         )
 
         # Install forward accessors and m2m managers as class descriptors.
@@ -211,7 +237,11 @@ class ModelMeta(type):
             m2m[rel_name] = info
             setattr(cls, rel_name, M2MDescriptor(info, pk_field.model_field_name))
 
-        registry.register(cls)
+        # Abstract bases contribute their fields to subclasses but have no table
+        # of their own, so they stay out of the registry (schema generation,
+        # migrations and relation resolution all iterate the registry).
+        if not abstract:
+            registry.register(cls)
         return cls
 
 

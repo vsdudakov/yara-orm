@@ -1,10 +1,11 @@
 """Coverage: model construction, persistence and bulk branches."""
 
 import datetime as dt
+import uuid
 
 import pytest
 
-from yara_orm import Model, fields
+from yara_orm import Model, fields, registry
 
 
 class CvMUser(Model):
@@ -31,6 +32,45 @@ class CvMRef(Model):
 
     class Meta:
         table = "cov_mref"
+
+
+class CvMTimestamped(Model):
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        abstract = True
+
+
+class CvMConcrete(CvMTimestamped):
+    name = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "cov_mconcrete"
+
+
+def test_abstract_base_is_not_registered():
+    """
+    GIVEN an abstract model and a concrete subclass of it
+    WHEN their classes are created
+    THEN only the concrete subclass is registered and gets a table
+    """
+    names = {m.__name__ for m in registry.all_models()}
+    assert "CvMTimestamped" not in names
+    assert "CvMConcrete" in names
+    assert CvMTimestamped._meta.abstract is True
+
+
+def test_abstract_is_not_inherited_and_fields_propagate():
+    """
+    GIVEN a concrete subclass of an abstract base
+    WHEN its metadata is inspected
+    THEN it is itself concrete and inherits the base's fields and UUID pk
+    """
+    assert CvMConcrete._meta.abstract is False
+    assert list(CvMConcrete._meta.fields) == ["id", "created_at", "name"]
+    assert CvMConcrete._meta.pk_field.model_field_name == "id"
+    assert isinstance(CvMConcrete(name="x").id, uuid.UUID)
 
 
 @pytest.mark.asyncio

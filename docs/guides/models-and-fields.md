@@ -60,6 +60,53 @@ class Author(Model):
 | `table`             | Custom table name. Defaults to the lowercase model class name.      |
 | `table_description` | Human-readable table comment. Aliased as `description`.             |
 | `description`       | Alternative spelling of `table_description` (used if the latter is unset). |
+| `abstract`          | Mark the model as an abstract base — no table of its own; see below. |
+| `ordering`          | Default `ORDER BY` for queries that set no explicit `order_by`; see below. |
+
+### Default ordering
+
+Set `ordering` to a list of field names to apply a default `ORDER BY` to every
+query on the model that does not call `order_by` itself. Prefix a name with `-`
+for descending order; `pk` is accepted as an alias for the primary key. Each name
+is validated against the model's fields at class-creation time.
+
+```python
+class Message(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "messages"
+        ordering = ["-created_at"]      # newest first by default
+
+await Message.all()                      # ORDER BY created_at DESC
+await Message.all().order_by("id")       # explicit order_by overrides the default
+```
+
+An explicit `order_by()` always takes precedence over `Meta.ordering`.
+
+### Abstract base models
+
+Set `abstract = True` to define a reusable base whose fields are inherited by
+subclasses but which has no table of its own. An abstract model is left out of
+the registry, so schema generation and migrations skip it. `abstract` is read
+from each class's own `Meta` only — it is **not** inherited, so a subclass is
+concrete unless it redeclares `abstract = True`.
+
+```python
+import uuid
+
+class TimestampedModel(Model):
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+class Article(TimestampedModel):     # concrete: gets an "article" table with
+    title = fields.CharField()       # id, created_at, updated_at and title
+```
 
 ## Field reference
 

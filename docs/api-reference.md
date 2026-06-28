@@ -56,7 +56,9 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | `fetch_related` | `await instance.fetch_related(*names)` | Populate relations on the instance. |
 | `pk` | `instance.pk` | Primary key value. |
 
-The inner `Meta` class supports `table` and `table_description` / `description`.
+The inner `Meta` class supports `table`, `table_description` / `description`,
+`abstract` (mark as a base model with no table; not inherited by subclasses), and
+`ordering` (default `ORDER BY` field list, e.g. `["-created_at"]`).
 
 ## fields
 

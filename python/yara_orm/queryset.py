@@ -487,11 +487,14 @@ class QuerySet:
 
         Returns:
             The ``ORDER BY`` clause, or an empty string when no ordering is set.
+            An explicit ``order_by`` takes precedence over the model's
+            ``Meta.ordering`` default.
         """
-        if not self._order:
+        order = self._order or self.model._meta.ordering
+        if not order:
             return ""
         parts = []
-        for name, descending in self._order:
+        for name, descending in order:
             if name in self._annotations:
                 ref = dialect.quote(name)
             else:
