@@ -50,8 +50,10 @@ jobs:
         run: |
           python -m pip install -U pip maturin
           pip install tortoise-orm "sqlalchemy[asyncio]" asyncpg aiosqlite pony psycopg2-binary
-      - name: Build the Rust engine
-        run: maturin develop --release
+      - name: Build and install the Rust engine
+        run: |
+          maturin build --release --out dist --interpreter python
+          pip install --no-index --find-links dist yara-orm
       - name: PostgreSQL benchmark
         run: |
           {

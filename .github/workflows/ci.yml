@@ -63,7 +63,9 @@ jobs:
         run: psql "$ORM_TEST_DB" -c 'CREATE DATABASE orm_test2;'
       - name: Install Python deps
         run: pip install maturin pytest pytest-asyncio pytest-cov
-      - name: Build the Rust engine into the environment
-        run: maturin develop --release
+      - name: Build and install the Rust engine
+        run: |
+          maturin build --release --out dist --interpreter python
+          pip install --no-index --find-links dist yara-orm
       - name: Run tests with 100% coverage gate
         run: pytest -q --cov=yara_orm --cov-branch --cov-report=term-missing
