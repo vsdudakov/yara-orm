@@ -388,7 +388,7 @@ class PostgresDialect(BaseDialect):
         "text": "TEXT",
         "bool": "BOOL",
         "float": "DOUBLE PRECISION",
-        "decimal": "DOUBLE PRECISION",
+        "decimal": "NUMERIC({max_digits}, {decimal_places})",
         "datetime": "TIMESTAMPTZ",
         "date": "DATE",
         "time": "TIME",
@@ -429,7 +429,10 @@ class SqliteDialect(BaseDialect):
         "text": "TEXT",
         "bool": "BOOLEAN",
         "float": "REAL",
-        "decimal": "DECIMAL",
+        # TEXT affinity (via VARCHAR) keeps decimals stored as the exact string
+        # we bind; NUMERIC affinity would coerce them to lossy REAL on insert.
+        # DecimalField.to_python reconstructs the Decimal on read.
+        "decimal": "VARCHAR({max_digits})",
         "datetime": "TIMESTAMP",
         "date": "DATE",
         "time": "TIME",

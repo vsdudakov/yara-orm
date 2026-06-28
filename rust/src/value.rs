@@ -6,7 +6,7 @@
 
 use std::error::Error;
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
@@ -60,8 +60,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
         }
         // datetime must be checked before date (datetime subclasses date).
         if ob.is_instance_of::<PyDateTime>() {
-            if let Ok(dt) = ob.extract::<DateTime<Utc>>() {
-                return Ok(Value::TimestampTz(dt));
+            // A tz-aware datetime with any offset extracts as FixedOffset; we
+            // normalise it to UTC. (Extracting straight to DateTime<Utc> only
+            // succeeds for UTC-tagged values, so a +05:00 datetime would
+            // otherwise fall through and be mis-handled as naive.)
+            if let Ok(dt) = ob.extract::<DateTime<FixedOffset>>() {
+                return Ok(Value::TimestampTz(dt.with_timezone(&Utc)));
             }
             return Ok(Value::Timestamp(ob.extract::<NaiveDateTime>()?));
         }
@@ -77,13 +81,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
         if ob.is_instance_of::<PyDict>() || ob.is_instance_of::<PyList>() {
             return Ok(Value::Json(py_to_json(ob)?));
         }
-        // uuid.UUID has no dedicated Python C-type; match on its qualified name.
+        // uuid.UUID and decimal.Decimal have no dedicated Python C-type; match
+        // on the qualified name. Decimal is bound as an exact NUMERIC value
+        // rather than going through f64, which would silently lose precision.
         if let Ok(qual) = ob.get_type().qualname() {
-            if qual.to_string() == "UUID" {
+            let qual = qual.to_string();
+            if qual == "UUID" {
                 let s = ob.str()?.to_string();
                 let parsed = uuid::Uuid::parse_str(&s)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
                 return Ok(Value::Uuid(parsed));
+            }
+            if qual == "Decimal" {
+                // Python's ``str(Decimal)`` may use scientific notation
+                // (e.g. ``1E-10``), which ``from_str_exact`` rejects — fall
+                // back to ``from_scientific`` so either form parses exactly.
+                let s = ob.str()?.to_string();
+                let parsed = rust_decimal::Decimal::from_str_exact(&s)
+                    .or_else(|_| rust_decimal::Decimal::from_scientific(&s))
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "invalid decimal {s:?}: {e}"
+                        ))
+                    })?;
+                return Ok(Value::Decimal(parsed));
             }
         }
         Err(pyo3::exceptions::PyTypeError::new_err(format!(
