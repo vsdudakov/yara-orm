@@ -36,6 +36,60 @@ if TYPE_CHECKING:
 MIGRATION_TABLE = "orm_migrations"
 _FILENAME_RE = re.compile(r"^(\d+)_.*\.py$")
 
+# Reprs longer than this are expanded one item per line in generated migrations.
+# Kept above the widest single column spec so leaf specs stay on one line while
+# the surrounding ``columns``/``fks`` mappings break out per column.
+_WRAP = 200
+
+
+def _fmt(value: Any, indent: int = 0) -> str:
+    """Render a value as Python source, expanding long dicts/lists per line.
+
+    Short values (and any scalar) render as their plain ``repr``; long dicts and
+    lists break onto one item per line, indented under ``indent`` spaces, so the
+    column maps in a generated migration read top-to-bottom instead of as one
+    unreadable line.
+
+    Args:
+        value: Value to render as Python source.
+        indent: Number of leading spaces for the closing bracket.
+
+    Returns:
+        The Python source for ``value``.
+    """
+    text = repr(value)
+    if len(text) <= _WRAP or not isinstance(value, (dict, list)):
+        return text
+    pad, inner = " " * indent, " " * (indent + 4)
+    if isinstance(value, dict):
+        body = ",\n".join(f"{inner}{k!r}: {_fmt(v, indent + 4)}" for k, v in value.items())
+        return f"{{\n{body},\n{pad}}}"
+    body = ",\n".join(f"{inner}{_fmt(item, indent + 4)}" for item in value)
+    return f"[\n{body},\n{pad}]"
+
+
+def _call(name: str, args: list[str]) -> str:
+    """Render a constructor call, wrapping to one argument per line when long.
+
+    A call whose single-line form fits within ``_WRAP`` (and whose arguments are
+    not themselves already wrapped) stays on one line; otherwise each argument
+    goes on its own line so the generated migration reads top-to-bottom. The
+    indentation assumes the call sits at four spaces inside an ``operations``
+    list, matching :meth:`Migrator._write_migration`.
+
+    Args:
+        name: Dotted name of the operation constructor (e.g. ``m.CreateTable``).
+        args: Pre-rendered positional/keyword argument source fragments.
+
+    Returns:
+        The constructor call source (no trailing indentation).
+    """
+    oneline = f"{name}({', '.join(args)})"
+    if len(oneline) <= _WRAP and "\n" not in oneline:
+        return oneline
+    body = ",\n".join(f"        {arg}" for arg in args)
+    return f"{name}(\n{body},\n    )"
+
 
 # ---------------------------------------------------------------------------
 # Operations
@@ -167,11 +221,16 @@ class CreateTable(Operation):
         Returns:
             The source code constructing this operation.
         """
-        extra = f", composite_pk={self.composite_pk!r}" if self.composite_pk else ""
-        return (
-            f"m.CreateTable({self.table!r}, columns={self.columns!r}, pk={self.pk!r}, "
-            f"fks={self.fks!r}, indexes={self.indexes!r}{extra})"
-        )
+        args = [
+            repr(self.table),
+            f"columns={_fmt(self.columns, 8)}",
+            f"pk={self.pk!r}",
+            f"fks={_fmt(self.fks, 8)}",
+            f"indexes={_fmt(self.indexes, 8)}",
+        ]
+        if self.composite_pk:
+            args.append(f"composite_pk={self.composite_pk!r}")
+        return _call("m.CreateTable", args)
 
 
 class DropTable(Operation):
@@ -229,7 +288,7 @@ class DropTable(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return f"m.DropTable({self.table!r}, spec={self.spec!r})"
+        return _call("m.DropTable", [repr(self.table), f"spec={_fmt(self.spec, 8)}"])
 
 
 class AddColumn(Operation):
@@ -296,7 +355,15 @@ class AddColumn(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return f"m.AddColumn({self.table!r}, {self.name!r}, spec={self.spec!r}, fk={self.fk!r})"
+        return _call(
+            "m.AddColumn",
+            [
+                repr(self.table),
+                repr(self.name),
+                f"spec={_fmt(self.spec, 8)}",
+                f"fk={_fmt(self.fk, 8)}",
+            ],
+        )
 
 
 class DropColumn(Operation):
@@ -362,7 +429,15 @@ class DropColumn(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return f"m.DropColumn({self.table!r}, {self.name!r}, spec={self.spec!r}, fk={self.fk!r})"
+        return _call(
+            "m.DropColumn",
+            [
+                repr(self.table),
+                repr(self.name),
+                f"spec={_fmt(self.spec, 8)}",
+                f"fk={_fmt(self.fk, 8)}",
+            ],
+        )
 
 
 class CreateIndex(Operation):
@@ -422,7 +497,7 @@ class CreateIndex(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return f"m.CreateIndex({self.table!r}, {self.column!r})"
+        return _call("m.CreateIndex", [repr(self.table), repr(self.column)])
 
 
 class DropIndex(Operation):
@@ -482,7 +557,7 @@ class DropIndex(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return f"m.DropIndex({self.table!r}, {self.column!r})"
+        return _call("m.DropIndex", [repr(self.table), repr(self.column)])
 
 
 class RunSQL(Operation):
@@ -531,7 +606,7 @@ class RunSQL(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return f"m.RunSQL({self.sql!r}, reverse_sql={self.reverse_sql!r})"
+        return _call("m.RunSQL", [_fmt(self.sql, 8), f"reverse_sql={_fmt(self.reverse_sql, 8)}"])
 
 
 class RunPython(Operation):

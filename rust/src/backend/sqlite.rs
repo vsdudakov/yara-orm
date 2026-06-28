@@ -19,6 +19,18 @@ fn map_interact<E: std::fmt::Display>(e: E) -> EngineError {
     EngineError::Query(format!("sqlite interact: {e}"))
 }
 
+/// Map a rusqlite error, promoting constraint violations (UNIQUE, FOREIGN KEY,
+/// NOT NULL, CHECK) to [`EngineError::Integrity`] so they reach Python as
+/// `IntegrityError` instead of a generic runtime error.
+fn map_sqlite(e: rusqlite::Error) -> EngineError {
+    if let rusqlite::Error::SqliteFailure(err, msg) = &e {
+        if err.code == rusqlite::ErrorCode::ConstraintViolation {
+            return EngineError::Integrity(msg.clone().unwrap_or_else(|| e.to_string()));
+        }
+    }
+    EngineError::Query(e.to_string())
+}
+
 /// Prepare `sql` (cached or not) and hand the statement to `f`. Caching is
 /// skipped when the URL carried `statement_cache_size=0`.
 fn with_stmt<T>(
@@ -60,7 +72,7 @@ fn sql_execute(
     with_stmt(conn, sql, cache, |stmt| {
         let n = stmt
             .execute(rusqlite::params_from_iter(bound))
-            .map_err(map_interact)?;
+            .map_err(map_sqlite)?;
         Ok(n as u64)
     })
 }
@@ -84,9 +96,9 @@ fn sql_fetch_rows(
         let meta = column_meta(stmt);
         let mut rows = stmt
             .query(rusqlite::params_from_iter(bound))
-            .map_err(map_interact)?;
+            .map_err(map_sqlite)?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(map_interact)? {
+        while let Some(row) = rows.next().map_err(map_sqlite)? {
             let mut values = Vec::with_capacity(meta.len());
             for (idx, (_, decl)) in meta.iter().enumerate() {
                 let vr = row.get_ref(idx).map_err(map_interact)?;
@@ -113,8 +125,8 @@ fn sql_execute_many(
                 row_params.iter().map(value_to_sqlite).collect();
             let mut qrows = stmt
                 .query(rusqlite::params_from_iter(bound))
-                .map_err(map_interact)?;
-            if let Some(row) = qrows.next().map_err(map_interact)? {
+                .map_err(map_sqlite)?;
+            if let Some(row) = qrows.next().map_err(map_sqlite)? {
                 let mut r = Vec::with_capacity(meta.len());
                 for (idx, (name, decl)) in meta.iter().enumerate() {
                     let vr = row.get_ref(idx).map_err(map_interact)?;

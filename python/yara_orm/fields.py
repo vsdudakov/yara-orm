@@ -229,15 +229,21 @@ class DecimalField(Field):
         self.type_params = {"max_digits": max_digits, "decimal_places": decimal_places}
 
     def to_db(self, value: Any) -> Any:
-        """Convert a value into a ``float`` for binding.
+        """Convert a value into a ``Decimal`` for binding.
+
+        The engine binds ``Decimal`` straight to a NUMERIC parameter, so values
+        are kept exact instead of being routed through ``float`` (which would
+        silently lose precision for large or high-scale decimals).
 
         Args:
             value: The Python value to convert.
 
         Returns:
-            The value as a ``float``, or ``None``.
+            The value as a ``Decimal``, or ``None``.
         """
-        return None if value is None else float(value)
+        if value is None:
+            return None
+        return value if isinstance(value, Decimal) else Decimal(str(value))
 
     def to_python(self, value: Any) -> Any:
         """Convert a database value into a ``Decimal``.
