@@ -12,3 +12,7 @@ __pycache__/
 .coverage
 htmlcov/
 Cargo.lock
+# MkDocs documentation build output / caches
+/site
+.cache/
+docs-requirements.txt

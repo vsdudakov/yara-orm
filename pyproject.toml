@@ -28,7 +28,7 @@ keywords = [
     "async-orm",
     "high-performance",
 ]
-urls = { Homepage = "https://github.com/vsdudakov/yara-orm", Repository = "https://github.com/vsdudakov/yara-orm", Documentation = "https://github.com/vsdudakov/yara-orm#readme", Issues = "https://github.com/vsdudakov/yara-orm/issues" }
+urls = { Homepage = "https://vsdudakov.github.io/yara-orm/", Repository = "https://github.com/vsdudakov/yara-orm", Documentation = "https://vsdudakov.github.io/yara-orm/", Issues = "https://github.com/vsdudakov/yara-orm/issues" }
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -56,6 +56,7 @@ dev = [
     "ruff>=0.6",
     "ty>=0.0.1a1",
 ]
+docs = ["mkdocs-material[imaging]>=9.5"]
 
 [tool.maturin]
 python-source = "python"
