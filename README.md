@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml/badge.svg)](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/yara-orm.svg)](https://pypi.org/project/yara-orm/)
-[![Python](https://img.shields.io/pypi/pyversions/yara-orm.svg)](https://pypi.org/project/yara-orm/)
+[![Python](https://img.shields.io/badge/python-3.9%E2%80%933.14-blue.svg)](https://github.com/vsdudakov/yara-orm)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#development)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE.md)
 

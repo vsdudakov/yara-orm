@@ -1,9 +1,9 @@
-"""Benchmark: this library (`orm`) vs Tortoise ORM vs Pony ORM on PostgreSQL.
+"""Benchmark: this library (`yara-orm`) vs Tortoise ORM vs Pony ORM on PostgreSQL.
 
 Identical workloads run against the same database, each ORM in its own table.
 Times are wall-clock for the warm path (drivers/prepared-statement caches are
 hit once before measuring). This is throughput-oriented and not a micro-
-benchmark: sync (Pony) vs async (Tortoise, orm) and differing feature sets mean
+benchmark: sync (Pony) vs async (Tortoise, yara-orm) and differing feature sets mean
 results are indicative, not absolute. Methodology is printed with the results.
 
 Usage:
@@ -428,7 +428,7 @@ def main():
     )
 
     results = {}
-    print("running: orm (ours) ...")
+    print("running: yara-orm (ours) ...")
     results["ours"] = _median_runs(run_ours, True)
     print("running: tortoise ...")
     try:
