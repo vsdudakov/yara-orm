@@ -73,16 +73,22 @@ src = ["python"]
 extend-exclude = ["migrations"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "C4"]
+# D = pydocstyle: every public symbol in the library carries a Google-style
+# docstring (enforced on `python/` only; relaxed for tests — see below).
+select = ["E", "F", "W", "I", "B", "UP", "C4", "D"]
 # B008: FastAPI-style defaults n/a here; keep call-in-default for argparse/Path ok.
 ignore = ["B008"]
 
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
 [tool.ruff.lint.per-file-ignores]
 # Tests/benchmarks define ORM models at module scope after imports and keep a
-# few intentionally-unused locals for clarity.
-"tests/*" = ["E402"]
-"benchmarks/*" = ["E402", "F841"]
-"examples/*" = ["E402"]
+# few intentionally-unused locals for clarity. Docstring rules (D) are relaxed
+# there: tests document behaviour with GIVEN/WHEN/THEN bodies, not pydocstyle.
+"tests/*" = ["E402", "D"]
+"benchmarks/*" = ["E402", "F841", "D"]
+"examples/*" = ["E402", "D"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["yara_orm"]

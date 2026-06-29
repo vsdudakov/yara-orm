@@ -127,6 +127,7 @@ default automatically; see [Primary keys](#primary-keys) below.
 | `DatetimeField`      | `auto_now=False`, `auto_now_add=False`                  | `datetime.datetime`             |
 | `DateField`          | —                                                       | `datetime.date`                 |
 | `TimeField`          | —                                                       | `datetime.time`                 |
+| `TimeDeltaField`     | —                                                       | `datetime.timedelta`            |
 | `UUIDField`          | `pk` defaults `default` to `uuid4`                      | `uuid.UUID`                     |
 | `JSONField`          | —                                                       | JSON-serialisable value         |
 | `IntEnumField`       | `enum_type`                                             | `IntEnum` member (as integer)   |
@@ -153,6 +154,7 @@ Every concrete field accepts the same column options:
 | `index`       | `False` | Create an index on the column.                                 |
 | `db_column`   | `None`  | Explicit column name (defaults to the attribute name).         |
 | `description` | `None`  | Column comment (emitted as a SQL `COMMENT`).                   |
+| `validators`  | `None`  | List of validators run against the value on `save()`.          |
 
 ```python
 import uuid
@@ -169,6 +171,29 @@ class Session(Model):
     A `default` that is callable is invoked per row at insert time, so
     `default=uuid.uuid4` produces a fresh value for each instance rather than one
     shared value.
+
+## Validators
+
+Attach validators to a field with `validators=[...]`. They run on `save()` and
+raise `ValidationError` for an invalid value (a `None` value on a nullable field
+is skipped). The validators live in `yara_orm.validators`:
+
+```python
+from yara_orm import fields
+from yara_orm.validators import MinValueValidator, MaxLengthValidator, RegexValidator
+
+
+class Account(Model):
+    handle = fields.CharField(max_length=30, validators=[RegexValidator(r"^[a-z0-9_]+$")])
+    age = fields.IntField(validators=[MinValueValidator(0)])
+    bio = fields.CharField(max_length=200, null=True, validators=[MaxLengthValidator(200)])
+```
+
+Available validators: `MinValueValidator`, `MaxValueValidator`, `MinLengthValidator`,
+`MaxLengthValidator`, `RegexValidator`, and the IP-address functions
+`validate_ipv4_address` / `validate_ipv6_address` / `validate_ipv46_address`.
+Write your own by subclassing `Validator` and implementing `__call__` to raise
+`ValidationError` on failure.
 
 ## Enum fields
 

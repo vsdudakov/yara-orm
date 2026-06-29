@@ -333,6 +333,39 @@ async def test_select_related_unknown_relation_raises(db):
 
 
 @pytest.mark.asyncio
+async def test_bulk_update_relation_field(db):
+    """
+    GIVEN events linked to tournaments
+    WHEN bulk_update writes the FK relation to a new tournament instance
+    THEN the foreign key is updated from the instance's primary key
+    """
+    a = await Tournament.create(name="A")
+    b = await Tournament.create(name="B")
+    e1 = await Event.create(name="e1", tournament=a)
+    e2 = await Event.create(name="e2", tournament=a)
+    e1.tournament = b
+    e2.tournament = b
+    assert await Event.bulk_update([e1, e2], ["tournament"]) == 2
+    assert {e.tournament_id for e in await Event.all()} == {b.id}
+
+
+@pytest.mark.asyncio
+async def test_select_related_combined_with_prefetch(db):
+    """
+    GIVEN events with a forward FK and a reverse/m2m relation
+    WHEN a query combines select_related and prefetch_related
+    THEN the joined FK and the prefetched relation are both populated
+    """
+    t = await Tournament.create(name="Cup")
+    e = await Event.create(name="Final", tournament=t)
+    team = await Team.create(name="Red")
+    await e.participants.add(team)
+    [event] = await Event.select_related("tournament").prefetch_related("participants")
+    assert event.tournament.name == "Cup"
+    assert [p.name for p in await event.participants] == ["Red"]
+
+
+@pytest.mark.asyncio
 async def test_reverse_manager_create_filter_order(db):
     """
     GIVEN an author with related books

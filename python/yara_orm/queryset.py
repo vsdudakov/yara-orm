@@ -18,7 +18,6 @@ from .functions import Function
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from .aggregations import Aggregate
     from .dialects import BaseDialect
     from .fields import Field
     from .models import Model

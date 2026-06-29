@@ -193,6 +193,9 @@ async def test_update_or_create(db):
     obj, created = await QsWidget.update_or_create(name="b", defaults={"qty": 8})
     assert created is False and obj.qty == 8
     assert (await QsWidget.get(name="b")).qty == 8  # persisted
+    # No defaults on an existing row: returns it unchanged without an update.
+    obj, created = await QsWidget.update_or_create(name="b")
+    assert created is False and obj.qty == 8
 
 
 @pytest.mark.asyncio
@@ -317,3 +320,17 @@ async def test_select_for_update(db):
     await QsWidget.create(name="lock", qty=1)
     rows = await QsWidget.filter(name="lock").select_for_update()
     assert len(rows) == 1
+
+
+def test_slicing_errors():
+    """
+    GIVEN a query set
+    WHEN it is indexed with a step, a negative bound, or a non-int/slice key
+    THEN the appropriate ValueError / TypeError is raised (no DB access)
+    """
+    with pytest.raises(ValueError):
+        QsWidget.all()[::2]
+    with pytest.raises(ValueError):
+        QsWidget.all()[-2:]
+    with pytest.raises(TypeError):
+        QsWidget.all()["x"]

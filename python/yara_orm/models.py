@@ -370,6 +370,7 @@ class Model(metaclass=ModelMeta):
         """
         cls = type(self)
         created = not self._in_db
+        self._run_validators()
         has_signals = signals._has_handlers(cls)
         executor = get_executor(cls, write=True)
         if has_signals:
@@ -378,6 +379,21 @@ class Model(metaclass=ModelMeta):
         if has_signals:
             await signals.emit_post_save(cls, self, created, executor, update_fields)
         return self
+
+    def _run_validators(self) -> None:
+        """Run each field's validators against this instance's current values.
+
+        Returns:
+            None
+        """
+        for field in self._meta.field_list:
+            if not field.validators:
+                continue
+            value = getattr(self, field.model_field_name, None)
+            if value is None:
+                continue
+            for validator in field.validators:
+                validator(value)
 
     async def _perform_save(self, executor: Any) -> None:
         """Run the INSERT or UPDATE statement that persists this instance.

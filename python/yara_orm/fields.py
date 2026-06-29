@@ -9,9 +9,13 @@ decision in the dialect layer.
 from __future__ import annotations
 
 import uuid as _uuid
+from datetime import timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .validators import Validator
 
 
 class Field:
@@ -38,6 +42,7 @@ class Field:
         index: bool = False,
         db_column: str | None = None,
         description: str | None = None,
+        validators: list[Validator] | None = None,
     ) -> None:
         """Initialize the field with its column options.
 
@@ -49,6 +54,7 @@ class Field:
             index: Whether to create an index on the column.
             db_column: Explicit column name; the metaclass fills it when blank.
             description: Human-readable comment emitted as a column COMMENT.
+            validators: Validators run against the value on ``save()``.
 
         Returns:
             None
@@ -58,6 +64,8 @@ class Field:
         self.default = default
         self.unique = unique
         self.index = index
+        #: Validators applied to the field's value before persisting.
+        self.validators: list[Validator] = list(validators) if validators else []
         #: Column name; the metaclass fills this in when left blank.
         self.db_column: str = db_column or ""
         #: Human-readable comment, emitted as a column COMMENT in DDL.
@@ -345,6 +353,41 @@ class TimeField(Field):
     field_kind = "time"
 
 
+class TimeDeltaField(Field):
+    """A duration column, stored as an integer number of microseconds."""
+
+    field_kind = "timedelta"
+    read_identity = False
+
+    def to_db(self, value: Any) -> Any:
+        """Convert a ``timedelta`` to its total microseconds for binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            The duration as an ``int`` of microseconds, or ``None``.
+        """
+        if value is None:
+            return None
+        if isinstance(value, timedelta):
+            return (value.days * 86400 + value.seconds) * 1_000_000 + value.microseconds
+        return int(value)
+
+    def to_python(self, value: Any) -> Any:
+        """Convert stored microseconds back into a ``timedelta``.
+
+        Args:
+            value: The value returned by the database engine.
+
+        Returns:
+            The duration as a ``timedelta``, or ``None``.
+        """
+        if value is None or isinstance(value, timedelta):
+            return value
+        return timedelta(microseconds=int(value))
+
+
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
@@ -610,6 +653,7 @@ __all__ = [
     "DatetimeField",
     "DateField",
     "TimeField",
+    "TimeDeltaField",
     "UUIDField",
     "JSONField",
     "IntEnumField",
