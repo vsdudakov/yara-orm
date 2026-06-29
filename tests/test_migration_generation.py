@@ -321,3 +321,174 @@ async def test_makemigrations_composite_index_executes_on_sqlite(sqlite_orm, tmp
     finally:
         E2EThing._meta.indexes = []
         _detach_field(E2EThing, "rank")
+
+
+@pytest.mark.asyncio
+async def test_partial_index_migration_roundtrip_on_sqlite(sqlite_orm, tmp_path):
+    """
+    GIVEN an applied table on SQLite
+    WHEN a partial Index is added then removed across migrations, each applied
+         and reverted
+    THEN every composite-index operation (add/remove, forward/backward, source
+         with the condition) round-trips and the catalogue ends up consistent
+    """
+    from yara_orm.connection import get_engine
+
+    mgr = MigrationManager(directory=str(tmp_path), app="e2ep", models=E2E_MODELS)
+    _attach_field(E2EThing, "score", fields.IntField(default=0))
+
+    async def index_names():
+        rows = await get_engine().fetch_rows(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='e2e_thing'"
+        )
+        return {r[0] for r in rows}
+
+    try:
+        mgr.make_migrations(name="initial")
+        await mgr.upgrade()
+
+        # Add a partial index -> AddCompositeIndex (forward + to_source w/ condition).
+        E2EThing._meta.indexes = [
+            Index(fields=["score"], name="idx_hi_score", condition="score > 10")
+        ]
+        add_file = mgr.make_migrations(name="add_partial")
+        assert "condition='score > 10'" in (tmp_path / add_file).read_text()
+        await mgr.upgrade()
+        assert "idx_hi_score" in await index_names()
+
+        # Revert the add (backward_sql -> drop), then re-apply.
+        await mgr.downgrade(steps=1)
+        assert "idx_hi_score" not in await index_names()
+        await mgr.upgrade()
+        assert "idx_hi_score" in await index_names()
+
+        # Remove it from the model -> RemoveCompositeIndex (forward drop).
+        E2EThing._meta.indexes = []
+        rm_file = mgr.make_migrations(name="drop_partial")
+        assert "RemoveCompositeIndex" in (tmp_path / rm_file).read_text()
+        await mgr.upgrade()
+        assert "idx_hi_score" not in await index_names()
+
+        # Revert the remove (backward_sql -> recreate the partial index).
+        await mgr.downgrade(steps=1)
+        assert "idx_hi_score" in await index_names()
+    finally:
+        E2EThing._meta.indexes = []
+        _detach_field(E2EThing, "score")
+
+
+# --- index over a relation name + multi-rename + Meta normalization forms -----
+class GenParent(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "gen_parent"
+
+
+class GenChild(Model):
+    id = fields.IntField(pk=True)
+    a = fields.CharField(max_length=10)
+    b = fields.CharField(max_length=10)
+    parent = fields.ForeignKeyField("GenParent", related_name="children")
+
+    class Meta:
+        table = "gen_child"
+
+
+def test_meta_index_over_relation_name():
+    """
+    GIVEN a Meta.indexes entry naming a foreign-key relation
+    WHEN the migration state is built
+    THEN the index resolves to the relation's backing column
+    """
+    before = model_state([GenParent, GenChild])
+    GenChild._meta.indexes = [Index(fields=["parent"], name="idx_child_parent")]
+    try:
+        ci = model_state([GenParent, GenChild])["tables"]["gen_child"]["composite_indexes"]
+        assert ci["idx_child_parent"]["columns"] == ["parent_id"]
+        assert _op_names(diff_states(before, model_state([GenParent, GenChild]))) == [
+            "AddCompositeIndexIfNotExists"
+        ]
+    finally:
+        GenChild._meta.indexes = []
+
+
+def test_simultaneous_column_renames_detected():
+    """
+    GIVEN two columns of identical type renamed at once
+    WHEN the diff runs
+    THEN both are detected as RenameField (greedy one-to-one pairing)
+    """
+    before = model_state([GenParent, GenChild])
+    _detach_field(GenChild, "a")
+    _detach_field(GenChild, "b")
+    _attach_field(GenChild, "x", fields.CharField(max_length=10))
+    _attach_field(GenChild, "y", fields.CharField(max_length=10))
+    try:
+        ops = diff_states(before, model_state([GenParent, GenChild]))
+        renamed = {(o.old, o.new) for o in ops if type(o).__name__ == "RenameField"}
+        assert renamed == {("a", "x"), ("b", "y")}
+    finally:
+        _detach_field(GenChild, "x")
+        _detach_field(GenChild, "y")
+        _attach_field(GenChild, "a", fields.CharField(max_length=10))
+        _attach_field(GenChild, "b", fields.CharField(max_length=10))
+
+
+def test_meta_indexes_normalization_forms():
+    """
+    GIVEN the accepted Meta.indexes shapes (bare Index, single string group)
+          and a multi-group unique_together
+    WHEN a model is defined with each
+    THEN they normalise to the expected index/constraint sets
+    """
+
+    class NormA(Model):
+        id = fields.IntField(pk=True)
+        a = fields.CharField(max_length=10)
+        b = fields.CharField(max_length=10)
+
+        class Meta:
+            table = "norm_a"
+            indexes = Index(fields=["a"], name="idx_norm_a")  # bare Index
+            unique_together = (("a", "b"), ("b",))  # several groups
+
+    class NormB(Model):
+        id = fields.IntField(pk=True)
+        a = fields.CharField(max_length=10)
+        b = fields.CharField(max_length=10)
+
+        class Meta:
+            table = "norm_b"
+            indexes = ("a", "b")  # single group of plain field names
+
+    assert [ix.fields for ix in NormA._meta.indexes] == [["a"]]
+    assert NormA._meta.unique_together == [("a", "b"), ("b",)]
+    assert [ix.fields for ix in NormB._meta.indexes] == [["a", "b"]]
+
+
+def test_unnamed_meta_constraint_is_not_diffed():
+    """
+    GIVEN an unnamed Meta.constraints entry
+    WHEN the migration state is built
+    THEN it is omitted (it cannot be dropped by name, so it is not diffed)
+    """
+    before = model_state([GenParent, GenChild])
+    GenChild._meta.constraints = [m.UniqueConstraint(fields=["a", "b"])]  # no name
+    try:
+        after = model_state([GenParent, GenChild])
+        assert after["tables"]["gen_child"]["constraints"] == []
+        assert diff_states(before, after) == []
+    finally:
+        GenChild._meta.constraints = []
+
+
+def test_remove_plain_composite_index_to_source_has_no_condition():
+    """
+    GIVEN a RemoveCompositeIndex for an index with no partial condition
+    WHEN it is rendered to migration source
+    THEN no ``condition=`` argument is emitted
+    """
+    src = m.RemoveCompositeIndex("t", "idx_t_a_b", ["a", "b"]).to_source()
+    assert "condition=" not in src
+    assert "idx_t_a_b" in src

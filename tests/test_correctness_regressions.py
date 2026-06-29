@@ -212,6 +212,11 @@ async def test_auto_now_is_aware_when_use_tz(sqlite_use_tz):
     row = await A4Stamped.create()
     assert row.created.tzinfo is not None
     assert row.updated.tzinfo is not None
+    # Saving again is an UPDATE: ``updated`` (auto_now) bumps, but ``created``
+    # (auto_now_add) is left untouched.
+    first_created = row.created
+    await row.save()
+    assert row.created == first_created
 
 
 # --- RandomHex width honours size on both backends ---------------------------
