@@ -1,3 +1,4 @@
+import contextlib
 import os
 import tempfile
 
@@ -36,7 +37,8 @@ async def _sqlite_session(generate: bool):
     finally:
         await YaraOrm.close()
         for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(path + suffix):
+            # Tolerate a sidecar vanishing between check and remove (see below).
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(path + suffix)
 
 
@@ -121,7 +123,9 @@ async def _setup_backend(backend: str, models: list):
         finally:
             await YaraOrm.close()
             for suffix in ("", "-wal", "-shm"):
-                if os.path.exists(path + suffix):
+                # The -wal/-shm sidecars may vanish between the check and the
+                # remove (SQLite checkpoint on close), so tolerate their absence.
+                with contextlib.suppress(FileNotFoundError):
                     os.remove(path + suffix)
     elif backend == "postgres":
         await YaraOrm.init(DB_URL)
