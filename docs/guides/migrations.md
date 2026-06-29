@@ -262,6 +262,43 @@ class Migration(m.Migration):
     ]
 ```
 
+### Renames and constraints
+
+`makemigrations` sees a rename as a drop plus an add (it has no way to know a
+column was renamed), so **renames are hand-written**:
+
+| Operation | Purpose |
+| --- | --- |
+| `RenameModel(old, new)` | Rename a table. |
+| `RenameField(table, old, new)` | Rename a column. |
+| `RenameIndex(table, column, old_name, new_name, unique=False)` | Rename an index (PostgreSQL in place; SQLite drops/recreates). |
+
+Constraints are likewise hand-written. Build a constraint with
+`UniqueConstraint(fields=[...], name=...)` or `CheckConstraint(check="...", name=...)`
+and manage it with `AddConstraint` / `RemoveConstraint` / `RenameConstraint`:
+
+```python
+from yara_orm import migrations as m
+
+
+class Migration(m.Migration):
+    dependencies = ["0001_initial"]
+    operations = [
+        m.RenameField("user", "name", "full_name"),
+        m.AddConstraint(
+            "user",
+            m.UniqueConstraint(fields=["full_name"], name="uq_user_full_name"),
+        ),
+    ]
+```
+
+!!! warning "Constraints need a name on SQLite-incompatible backends"
+    `AddConstraint` / `RemoveConstraint` / `RenameConstraint` use
+    `ALTER TABLE … CONSTRAINT`, which **PostgreSQL** supports in place. **SQLite**
+    has no such syntax, so these raise a clear `UnSupportedError` — rebuild the
+    table with `RunSQL` instead. Give every constraint a `name` so the operation
+    can be reversed on `downgrade`.
+
 ### Data migration with `--empty`
 
 Start from a blank migration:

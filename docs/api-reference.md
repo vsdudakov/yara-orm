@@ -157,10 +157,13 @@ Handlers are async. The `Signals` enum names the four lifecycle signals. See
 `migrations.MigrationManager(directory="migrations", app="models", models=None)` plus the
 `migrations.Migration` base class (carrying `operations`, `dependencies`, `atomic`) and the
 operation classes `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`, `AlterField`,
-`AddIndex`, `RemoveIndex`, `RunSQL`, `RunPython`. Generated migrations use the idempotent
-analogs (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,
-`AddUniqueIndexConcurrently` and `RemoveIndexConcurrently` are for hand-written
-non-atomic migrations. CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
+`AddIndex`, `RemoveIndex`, `RenameModel`, `RenameField`, `RenameIndex`, `AddConstraint`,
+`RemoveConstraint`, `RenameConstraint`, `RunSQL`, `RunPython` (constraints built with
+`UniqueConstraint` / `CheckConstraint`). Generated migrations use the idempotent analogs
+(`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,
+`AddUniqueIndexConcurrently` and `RemoveIndexConcurrently` are for hand-written non-atomic
+migrations. Constraint operations are PostgreSQL-only (SQLite raises `UnSupportedError`).
+CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
 
 ## Dialects
 

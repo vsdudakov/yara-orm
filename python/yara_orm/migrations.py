@@ -31,7 +31,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from . import registry
 from .connection import get_dialect, get_executor, in_transaction
@@ -291,6 +291,123 @@ def _new_tstate(fields: dict[str, Field], composite_pk: list[str] | None) -> dic
         "composite_pk": composite_pk,
         "indexes": _derived_indexes(fields),
     }
+
+
+def _rename_in_table(tstate: dict[str, Any], old: str, new: str) -> None:
+    """Rename a column within a table state (fields, indexes, composite pk).
+
+    Args:
+        tstate: The table state to mutate in place.
+        old: The current column name.
+        new: The new column name.
+
+    Returns:
+        None
+    """
+    tstate["fields"] = {(new if c == old else c): f for c, f in tstate["fields"].items()}
+    tstate["indexes"] = [new if c == old else c for c in tstate.get("indexes", [])]
+    if tstate.get("composite_pk"):
+        tstate["composite_pk"] = [new if c == old else c for c in tstate["composite_pk"]]
+
+
+# ---------------------------------------------------------------------------
+# Constraint definitions
+# ---------------------------------------------------------------------------
+class Constraint:
+    """Base class for a table constraint definition (unique or check)."""
+
+    def __init__(self, name: str | None = None) -> None:
+        """Store the optional constraint name.
+
+        Args:
+            name: The constraint name (required to reverse an ``AddConstraint``).
+
+        Returns:
+            None
+        """
+        self.name = name
+
+    def to_spec(self) -> dict[str, Any]:
+        """Render the constraint as a dialect spec mapping.
+
+        Returns:
+            The constraint specification mapping.
+        """
+        raise NotImplementedError
+
+    def to_source(self) -> str:
+        """Render the constraint as Python source for a migration file.
+
+        Returns:
+            The source code constructing this constraint.
+        """
+        raise NotImplementedError
+
+
+class UniqueConstraint(Constraint):
+    """A ``UNIQUE`` constraint over one or more columns."""
+
+    def __init__(self, *, fields: list[str], name: str | None = None) -> None:
+        """Store the constrained columns and optional name.
+
+        Args:
+            fields: The column names covered by the unique constraint.
+            name: The constraint name.
+
+        Returns:
+            None
+        """
+        super().__init__(name)
+        self.fields = list(fields)
+
+    def to_spec(self) -> dict[str, Any]:
+        """Render the unique constraint as a dialect spec mapping.
+
+        Returns:
+            The constraint specification mapping.
+        """
+        return {"kind": "unique", "name": self.name, "fields": list(self.fields)}
+
+    def to_source(self) -> str:
+        """Render the unique constraint as Python source.
+
+        Returns:
+            The source code constructing this constraint.
+        """
+        return f"m.UniqueConstraint(fields={self.fields!r}, name={self.name!r})"
+
+
+class CheckConstraint(Constraint):
+    """A ``CHECK`` constraint over a boolean SQL expression."""
+
+    def __init__(self, *, check: str, name: str | None = None) -> None:
+        """Store the check expression and optional name.
+
+        Args:
+            check: The SQL boolean expression the constraint enforces.
+            name: The constraint name.
+
+        Returns:
+            None
+        """
+        super().__init__(name)
+        self.check = check
+
+    def to_spec(self) -> dict[str, Any]:
+        """Render the check constraint as a dialect spec mapping.
+
+        Returns:
+            The constraint specification mapping.
+        """
+        return {"kind": "check", "name": self.name, "check": self.check}
+
+    def to_source(self) -> str:
+        """Render the check constraint as Python source.
+
+        Returns:
+            The source code constructing this constraint.
+        """
+        return f"m.CheckConstraint(check={self.check!r}, name={self.name!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1136,442 @@ class RemoveIndexConcurrently(RemoveIndex):
     """Drop the index ``CONCURRENTLY`` (PostgreSQL; requires ``atomic = False``)."""
 
     concurrently = True
+
+
+# -- rename operations (hand-written) ---------------------------------------
+class RenameModel(Operation):
+    """Rename a table."""
+
+    def __init__(self, old: str, new: str) -> None:
+        """Store the current and new table names.
+
+        Args:
+            old: The current table name.
+            new: The new table name.
+
+        Returns:
+            None
+        """
+        self.old = old
+        self.new = new
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the rename-table statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that rename the table.
+        """
+        return dialect.render_rename_table(self.old, self.new)
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the statements that rename the table back.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that restore the original table name.
+        """
+        return dialect.render_rename_table(self.new, self.old)
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Move the table entry under its new name.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        state["tables"][self.new] = state["tables"].pop(self.old)
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Move the table entry back under its original name.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        state["tables"][self.old] = state["tables"].pop(self.new)
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        return _call("m.RenameModel", [repr(self.old), repr(self.new)])
+
+
+class RenameField(Operation):
+    """Rename a column on a table."""
+
+    def __init__(self, table: str, old: str, new: str) -> None:
+        """Store the table and the column's current and new names.
+
+        Args:
+            table: The table owning the column.
+            old: The current column name.
+            new: The new column name.
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.old = old
+        self.new = new
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the rename-column statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that rename the column.
+        """
+        return dialect.render_rename_column(self.table, self.old, self.new)
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the statements that rename the column back.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that restore the original column name.
+        """
+        return dialect.render_rename_column(self.table, self.new, self.old)
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Rename the column in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        _rename_in_table(state["tables"][self.table], self.old, self.new)
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Restore the column's original name in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        _rename_in_table(state["tables"][self.table], self.new, self.old)
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        return _call("m.RenameField", [repr(self.table), repr(self.old), repr(self.new)])
+
+
+class RenameIndex(Operation):
+    """Rename an index (PostgreSQL in place; SQLite drops and recreates it)."""
+
+    def __init__(
+        self, table: str, column: str, old_name: str, new_name: str, unique: bool = False
+    ) -> None:
+        """Store the index's table, column and current/new names.
+
+        Args:
+            table: The table owning the index.
+            column: The indexed column (used to recreate on rebuild dialects).
+            old_name: The current index name.
+            new_name: The new index name.
+            unique: Whether the recreated index should be ``UNIQUE``.
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.column = column
+        self.old_name = old_name
+        self.new_name = new_name
+        self.unique = unique
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the rename-index statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that rename the index.
+        """
+        return dialect.render_rename_index(
+            self.table, self.column, self.old_name, self.new_name, unique=self.unique
+        )
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the statements that rename the index back.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that restore the original index name.
+        """
+        return dialect.render_rename_index(
+            self.table, self.column, self.new_name, self.old_name, unique=self.unique
+        )
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        args = [repr(self.table), repr(self.column), repr(self.old_name), repr(self.new_name)]
+        if self.unique:
+            args.append("unique=True")
+        return _call("m.RenameIndex", args)
+
+
+# -- constraint operations (hand-written; SQLite raises UnSupportedError) ----
+class AddConstraint(Operation):
+    """Add a unique or check constraint to a table."""
+
+    def __init__(self, table: str, constraint: Constraint) -> None:
+        """Store the table and the constraint to add.
+
+        Args:
+            table: The table to constrain.
+            constraint: The constraint definition (must be named to be
+                reversible).
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.constraint = constraint
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the add-constraint statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that add the constraint.
+        """
+        return dialect.render_add_constraint(self.table, self.constraint.to_spec())
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the drop-constraint statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that drop the constraint.
+        """
+        return dialect.render_drop_constraint(self.table, cast(str, self.constraint.name))
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Record the constraint in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        state["tables"][self.table].setdefault("constraints", []).append(self.constraint.to_spec())
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Remove the constraint from the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        cons = state["tables"][self.table].get("constraints", [])
+        state["tables"][self.table]["constraints"] = [
+            c for c in cons if c.get("name") != self.constraint.name
+        ]
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        return _call("m.AddConstraint", [repr(self.table), self.constraint.to_source()])
+
+
+class RemoveConstraint(Operation):
+    """Drop a constraint, keeping its definition so it can be reversed."""
+
+    def __init__(self, table: str, constraint: Constraint) -> None:
+        """Store the table and the constraint to drop.
+
+        Args:
+            table: The constrained table.
+            constraint: The constraint definition, used to recreate on reverse.
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.constraint = constraint
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the drop-constraint statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that drop the constraint.
+        """
+        return dialect.render_drop_constraint(self.table, cast(str, self.constraint.name))
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the statements that recreate the constraint.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that add the constraint back.
+        """
+        return dialect.render_add_constraint(self.table, self.constraint.to_spec())
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Remove the constraint from the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        cons = state["tables"][self.table].get("constraints", [])
+        state["tables"][self.table]["constraints"] = [
+            c for c in cons if c.get("name") != self.constraint.name
+        ]
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Restore the constraint in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        state["tables"][self.table].setdefault("constraints", []).append(self.constraint.to_spec())
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        return _call("m.RemoveConstraint", [repr(self.table), self.constraint.to_source()])
+
+
+class RenameConstraint(Operation):
+    """Rename a named constraint on a table."""
+
+    def __init__(self, table: str, old: str, new: str) -> None:
+        """Store the table and the constraint's current and new names.
+
+        Args:
+            table: The constrained table.
+            old: The current constraint name.
+            new: The new constraint name.
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.old = old
+        self.new = new
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the rename-constraint statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that rename the constraint.
+        """
+        return dialect.render_rename_constraint(self.table, self.old, self.new)
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the statements that rename the constraint back.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that restore the original constraint name.
+        """
+        return dialect.render_rename_constraint(self.table, self.new, self.old)
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Rename the constraint in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        for c in state["tables"][self.table].get("constraints", []):
+            if c.get("name") == self.old:
+                c["name"] = self.new
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Restore the constraint's original name in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        for c in state["tables"][self.table].get("constraints", []):
+            if c.get("name") == self.new:
+                c["name"] = self.old
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        return _call("m.RenameConstraint", [repr(self.table), repr(self.old), repr(self.new)])
 
 
 class RunSQL(Operation):
