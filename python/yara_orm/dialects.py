@@ -231,7 +231,7 @@ class BaseDialect:
         lines.append(f"PRIMARY KEY ({self.quote(meta.pk_field.db_column)})")
 
         for field in meta.fields.values():
-            if isinstance(field, ForeignKeyField):
+            if isinstance(field, ForeignKeyField) and field.db_constraint:
                 ref = get_model(field.reference)
                 col = self.quote(field.db_column)
                 ref_tbl = self.quote(ref._meta.table)
@@ -241,6 +241,8 @@ class BaseDialect:
                     f"ON DELETE {field.on_delete}"
                 )
         lines.extend(self._unique_together_lines(meta))
+        for constraint in meta.constraints:
+            lines.append(self._constraint_clause(constraint.to_spec()))
 
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)
@@ -969,7 +971,7 @@ class SqliteDialect(BaseDialect):
             lines.append(f"PRIMARY KEY ({self.quote(pk.db_column)})")
 
         for field in meta.fields.values():
-            if isinstance(field, ForeignKeyField):
+            if isinstance(field, ForeignKeyField) and field.db_constraint:
                 ref = get_model(field.reference)
                 col = self.quote(field.db_column)
                 ref_tbl = self.quote(ref._meta.table)
@@ -979,6 +981,8 @@ class SqliteDialect(BaseDialect):
                     f"ON DELETE {field.on_delete}"
                 )
         lines.extend(self._unique_together_lines(meta))
+        for constraint in meta.constraints:
+            lines.append(self._constraint_clause(constraint.to_spec()))
 
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)

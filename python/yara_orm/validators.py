@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .exceptions import ValidationError
@@ -164,6 +165,46 @@ class RegexValidator(Validator):
             raise ValidationError(f"{value!r} does not match {self.regex.pattern!r}")
 
 
+class NumericValidator(Validator):
+    """Reject values that are not numeric (a number or a numeric string)."""
+
+    def __call__(self, value: Any) -> None:
+        """Raise if ``value`` is not numeric.
+
+        Args:
+            value: The value to check.
+
+        Returns:
+            None
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
+            raise ValidationError(f"{value!r} is not numeric")
+        if isinstance(value, str):
+            try:
+                Decimal(value)
+            except InvalidOperation as exc:
+                raise ValidationError(f"{value!r} is not numeric") from exc
+
+
+class CommaSeparatedIntegerListValidator(Validator):
+    """Reject strings that are not a comma-separated list of integers."""
+
+    def __call__(self, value: Any) -> None:
+        """Raise if ``value`` is not a comma-separated list of integers.
+
+        Args:
+            value: The string to check (e.g. ``"1,2,3"``).
+
+        Returns:
+            None
+        """
+        parts = str(value).split(",")
+        for part in parts:
+            token = part.strip()
+            if not (token.lstrip("-").isdigit() and token not in ("", "-")):
+                raise ValidationError(f"{value!r} is not a comma-separated list of integers")
+
+
 def validate_ipv4_address(value: str) -> None:
     """Validate that ``value`` is an IPv4 address.
 
@@ -216,6 +257,8 @@ __all__ = [
     "MinLengthValidator",
     "MaxLengthValidator",
     "RegexValidator",
+    "NumericValidator",
+    "CommaSeparatedIntegerListValidator",
     "validate_ipv4_address",
     "validate_ipv6_address",
     "validate_ipv46_address",

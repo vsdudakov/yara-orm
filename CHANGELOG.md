@@ -8,6 +8,21 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Added
 
+- **Model-level query shortcuts.** `first()`, `last()`, `earliest()`,
+  `latest()`, `exists()`, `distinct()`, `select_for_update()`, `values()` and
+  `values_list()` are now classmethods on the model (previously query-set only),
+  so `await Book.first()` works without `Book.all()`.
+- **`Model.clone()`** — return an unsaved copy ready to insert as a new row
+  (optionally with an explicit `pk`).
+- **`Model.describe()`** — a structured description of the model's schema
+  (table, primary key, fields, relations and `Meta` options).
+- **`Meta.constraints`** — declare `UniqueConstraint` / `CheckConstraint` on the
+  model; `generate_schemas()` emits them in the `CREATE TABLE`.
+- **`ForeignKeyField(db_constraint=False)`** — keep the FK column without
+  emitting a database `FOREIGN KEY` constraint.
+- **`Random()`** function — `RANDOM()` for random ordering
+  (`annotate(r=Random()).order_by("r")`).
+- **`NumericValidator` and `CommaSeparatedIntegerListValidator`.**
 - **Relation-spanning filters.** `filter()` / `exclude()` now traverse
   relations with the `__` syntax — `Book.filter(author__name__icontains="ad")`,
   multi-level `Book.filter(author__country__name="UK")`, reverse FKs

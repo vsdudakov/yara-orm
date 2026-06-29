@@ -151,4 +151,23 @@ class Coalesce(Function):
         return f"COALESCE({resolve(self.field)}, {_literal(self.default)})"
 
 
-__all__ = ["Function", "Lower", "Upper", "Length", "Trim", "Concat", "Coalesce"]
+class Random(Function):
+    """A random value in ``[0, 1)`` via ``RANDOM()`` (PostgreSQL and SQLite).
+
+    Takes no column; useful for random ordering, e.g.
+    ``Model.annotate(r=Random()).order_by("r")``.
+    """
+
+    def render(self, resolve: ColumnResolver) -> str:
+        """Render ``RANDOM()``.
+
+        Args:
+            resolve: Column resolver (unused; the function takes no column).
+
+        Returns:
+            The SQL expression text.
+        """
+        return "RANDOM()"
+
+
+__all__ = ["Function", "Lower", "Upper", "Length", "Trim", "Concat", "Coalesce", "Random"]
