@@ -93,6 +93,10 @@ class MetaInfo:
             (f.model_field_name, None if f.read_identity else f.to_python) for f in self.field_list
         ]
         self._compiled_for: str | None = None
+        # Memoised partial-UPDATE statements for ``save(update_fields=...)``,
+        # keyed by ``(dialect, ordered db columns)``. A given column set always
+        # maps to the same SQL, so entries never need invalidating.
+        self._partial_update_cache: dict[tuple[str, tuple[str, ...]], str] = {}
 
     def get_field(self, name: str) -> Field:
         """Return the field for ``name``, treating ``"pk"`` as the primary key.
@@ -142,7 +146,54 @@ class MetaInfo:
             )
         else:
             self.insert_sql = f"INSERT INTO {q(self.table)} DEFAULT VALUES RETURNING {ret}"
+
+        # Single-instance UPDATE (all non-pk columns) and DELETE, both keyed by
+        # the primary key. These are static per (model, dialect) — exactly like
+        # the INSERT above — so ``save()`` on an existing row and ``delete()``
+        # bind params against a cached statement instead of rebuilding the SQL,
+        # quoting columns and generating placeholders on every call.
+        self.update_field_list = [f for f in self.field_list if f is not self.pk_field]
+        pk_col = q(self.pk_field.db_column)
+        if self.update_field_list:
+            assignments = ", ".join(
+                f"{q(f.db_column)} = {dialect.placeholder(i + 1)}"
+                for i, f in enumerate(self.update_field_list)
+            )
+            pk_hole = dialect.placeholder(len(self.update_field_list) + 1)
+            self.update_sql = f"UPDATE {q(self.table)} SET {assignments} WHERE {pk_col} = {pk_hole}"
+        else:
+            # A pk-only model has nothing to UPDATE; callers skip the statement.
+            self.update_sql = None
+        self.delete_sql = f"DELETE FROM {q(self.table)} WHERE {pk_col} = {dialect.placeholder(1)}"
         self._compiled_for = dialect.name
+
+    def partial_update_sql(self, dialect: BaseDialect, fields: list[Field]) -> str:
+        """Return a cached ``UPDATE`` statement writing only ``fields`` by pk.
+
+        Powers ``save(update_fields=...)``: the SET clause covers just the named
+        columns instead of every non-pk column. Memoised per column set.
+
+        Args:
+            dialect: The SQL dialect used to quote names and build placeholders.
+            fields: The non-pk fields to assign, in bind order.
+
+        Returns:
+            An ``UPDATE ... SET ... WHERE pk = ?`` statement string.
+        """
+        key = (dialect.name, tuple(f.db_column for f in fields))
+        sql = self._partial_update_cache.get(key)
+        if sql is None:
+            q = dialect.quote
+            assignments = ", ".join(
+                f"{q(f.db_column)} = {dialect.placeholder(i + 1)}" for i, f in enumerate(fields)
+            )
+            pk_hole = dialect.placeholder(len(fields) + 1)
+            sql = (
+                f"UPDATE {q(self.table)} SET {assignments} "
+                f"WHERE {q(self.pk_field.db_column)} = {pk_hole}"
+            )
+            self._partial_update_cache[key] = sql
+        return sql
 
 
 def _normalize_field_groups(value: Any) -> list[tuple[str, ...]]:
@@ -389,8 +440,14 @@ class Model(metaclass=ModelMeta):
         return f"<{type(self).__name__} pk={self.pk!r}>"
 
     # -- persistence ------------------------------------------------------
-    def _apply_auto_now(self) -> None:
+    def _apply_auto_now(self, only: set[str] | None = None) -> None:
         """Set ``auto_now``/``auto_now_add`` datetime fields to the current time.
+
+        Args:
+            only: When given, restrict updates to these field names. Used by
+                ``save(update_fields=...)`` so an ``auto_now`` column is bumped
+                only if it is among the fields being persisted (and the
+                in-memory value never diverges from the row on disk).
 
         Returns:
             None
@@ -401,14 +458,20 @@ class Model(metaclass=ModelMeta):
                 if field.auto_now or (field.auto_now_add and not self._in_db):
                     if field.auto_now_add and self._in_db:
                         continue
+                    if only is not None and name not in only:
+                        continue
                     setattr(self, name, now)
 
     async def save(self, update_fields: list[str] | None = None) -> Model:
         """Persist this instance, emitting pre/post-save signals if registered.
 
         Args:
-            update_fields: Optional list of field names passed through to the
-                save signals; provided for signal handlers' information.
+            update_fields: When updating an existing row, restrict the write to
+                these field names (relation names map to their FK column); an
+                empty list is a no-op and unknown names raise ``FieldError``.
+                ``auto_now`` columns are bumped only if named. Ignored when the
+                instance is being inserted (a new row needs all its columns).
+                The list is also forwarded to the save signals.
 
         Returns:
             This instance.
@@ -420,7 +483,7 @@ class Model(metaclass=ModelMeta):
         executor = get_executor(cls, write=True)
         if has_signals:
             await signals.emit_pre_save(cls, self, executor, update_fields)
-        await self._perform_save(executor)
+        await self._perform_save(executor, update_fields)
         if has_signals:
             await signals.emit_post_save(cls, self, created, executor, update_fields)
         return self
@@ -440,16 +503,21 @@ class Model(metaclass=ModelMeta):
             for validator in field.validators:
                 validator(value)
 
-    async def _perform_save(self, executor: Any) -> None:
+    async def _perform_save(self, executor: Any, update_fields: list[str] | None = None) -> None:
         """Run the INSERT or UPDATE statement that persists this instance.
 
         Args:
             executor: The write-capable database executor to run SQL against.
+            update_fields: Optional subset of fields to write on an UPDATE; see
+                :meth:`save`. Ignored for INSERTs.
 
         Returns:
             None
         """
-        self._apply_auto_now()
+        if self._in_db and update_fields is not None:
+            self._apply_auto_now(only=set(update_fields))
+        else:
+            self._apply_auto_now()
         dialect = get_dialect(type(self))
         meta = self._meta
         meta.compile(dialect)
@@ -491,22 +559,33 @@ class Model(metaclass=ModelMeta):
             row = await executor.fetch_row(sql, params)
             setattr(self, pk_field.model_field_name, pk_field.to_python(row[0]))
             self._in_db = True
-        else:
-            assignments = []
-            params = []
-            idx = 1
-            for name, field in meta.fields.items():
-                if field is pk_field:
+        elif update_fields is not None:
+            # Partial update: write only the named fields (relation names map to
+            # their FK column). The pk is the WHERE key, never an assignment.
+            resolved: list[Field] = []
+            seen: set[str] = set()
+            for name in update_fields:
+                if name in meta.relations:
+                    field = meta.get_field(meta.relations[name].source_attr)
+                else:
+                    field = meta.get_field(name)  # raises FieldError if unknown
+                if field is pk_field or field.db_column in seen:
                     continue
-                assignments.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
-                params.append(field.to_db(getattr(self, name, None)))
-                idx += 1
+                seen.add(field.db_column)
+                resolved.append(field)
+            if not resolved:
+                # Empty update_fields (or only the pk): nothing to persist.
+                return
+            params = [f.to_db(getattr(self, f.model_field_name, None)) for f in resolved]
             params.append(pk_field.to_db(self.pk))
-            sql = (
-                f"UPDATE {table} SET {', '.join(assignments)} "
-                f"WHERE {dialect.quote(pk_field.db_column)} = {dialect.placeholder(idx)}"
-            )
-            await executor.execute(sql, params)
+            await executor.execute(meta.partial_update_sql(dialect, resolved), params)
+        elif meta.update_sql is not None:
+            # Reuse the cached UPDATE statement; only the bound values change.
+            params = [
+                f.to_db(getattr(self, f.model_field_name, None)) for f in meta.update_field_list
+            ]
+            params.append(pk_field.to_db(self.pk))
+            await executor.execute(meta.update_sql, params)
 
     async def delete(self) -> None:
         """Delete this instance's row, emitting pre/post-delete signals.
@@ -521,11 +600,8 @@ class Model(metaclass=ModelMeta):
         has_signals = signals._has_handlers(cls)
         if has_signals:
             await signals.emit_pre_delete(cls, self, executor)
-        sql = (
-            f"DELETE FROM {dialect.quote(meta.table)} "
-            f"WHERE {dialect.quote(meta.pk_field.db_column)} = {dialect.placeholder(1)}"
-        )
-        await executor.execute(sql, [meta.pk_field.to_db(self.pk)])
+        meta.compile(dialect)
+        await executor.execute(meta.delete_sql, [meta.pk_field.to_db(self.pk)])
         self._in_db = False
         if has_signals:
             await signals.emit_post_delete(cls, self, executor)

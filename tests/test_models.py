@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from yara_orm import Model, fields, registry
+from yara_orm import FieldError, Model, fields, registry
 
 
 class CvMUser(Model):
@@ -124,6 +124,108 @@ async def test_auto_now_updates_on_save(db):
     u.name = "b"
     await u.save()
     assert (await CvMUser.get(id=u.id)).name == "b"
+
+
+@pytest.mark.asyncio
+async def test_save_update_fields_writes_only_named(db):
+    """
+    GIVEN a persisted row with several mutated columns
+    WHEN save(update_fields=["name"]) is called
+    THEN only the named column is written; the others keep their stored value
+    """
+    u = await CvMUser.create(name="a", alias="ax")
+    u.name = "b"
+    u.alias = "bx"  # mutated but NOT in update_fields
+    await u.save(update_fields=["name"])
+
+    reloaded = await CvMUser.get(id=u.id)
+    assert reloaded.name == "b"
+    assert reloaded.alias == "ax"  # the unnamed column was left untouched
+
+
+@pytest.mark.asyncio
+async def test_save_update_fields_restricts_auto_now(db):
+    """
+    GIVEN a model with an auto_now timestamp
+    WHEN save(update_fields=[...]) omits / includes that column
+    THEN the timestamp is bumped only when it is named
+    """
+    u = await CvMUser.create(name="a")
+    before = (await CvMUser.get(id=u.id)).touched
+
+    u.name = "b"
+    await u.save(update_fields=["name"])  # touched not named -> not bumped
+    assert (await CvMUser.get(id=u.id)).touched == before
+
+    await u.save(update_fields=["touched"])  # named -> bumped
+    assert (await CvMUser.get(id=u.id)).touched > before
+
+
+@pytest.mark.asyncio
+async def test_save_update_fields_empty_is_noop(db):
+    """
+    GIVEN a mutated in-memory instance
+    WHEN save(update_fields=[]) is called
+    THEN no UPDATE runs and the stored row is unchanged
+    """
+    u = await CvMUser.create(name="a")
+    u.name = "b"
+    await u.save(update_fields=[])
+    assert (await CvMUser.get(id=u.id)).name == "a"
+
+
+@pytest.mark.asyncio
+async def test_save_update_fields_unknown_raises(db):
+    """
+    GIVEN a persisted row
+    WHEN save(update_fields=[...]) names a field the model does not have
+    THEN a FieldError is raised
+    """
+    u = await CvMUser.create(name="a")
+    u.name = "b"
+    with pytest.raises(FieldError):
+        await u.save(update_fields=["nope"])
+
+
+@pytest.mark.asyncio
+async def test_save_update_fields_relation_maps_to_fk_column(db):
+    """
+    GIVEN a row with a foreign key
+    WHEN save(update_fields=["user"]) names the relation
+    THEN the relation's backing FK column is written
+    """
+    u1 = await CvMUser.create(name="u1")
+    u2 = await CvMUser.create(name="u2")
+    ref = await CvMRef.create(user=u1)
+
+    ref.user = u2
+    await ref.save(update_fields=["user"])
+    assert (await CvMRef.get(id=ref.id)).user_id == u2.id
+
+
+@pytest.mark.asyncio
+async def test_save_update_fields_skips_pk_and_duplicates(db):
+    """
+    GIVEN update_fields naming the primary key and a repeated field
+    WHEN save(update_fields=[...]) runs
+    THEN the pk and duplicate entries are skipped and the real column is written
+    """
+    u = await CvMUser.create(name="a")
+    u.name = "b"
+    await u.save(update_fields=["pk", "name", "name"])
+    assert (await CvMUser.get(id=u.id)).name == "b"
+
+
+@pytest.mark.asyncio
+async def test_save_pk_only_model_is_noop(db):
+    """
+    GIVEN a persisted model whose only column is its primary key
+    WHEN it is saved again with no update_fields
+    THEN there is nothing to UPDATE and the call is a no-op
+    """
+    row = await CvMOnlyPk.create()
+    await row.save()  # no non-pk columns -> no UPDATE statement
+    assert await CvMOnlyPk.filter(id=row.id).exists() is True
 
 
 @pytest.mark.asyncio
