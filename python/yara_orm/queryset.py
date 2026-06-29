@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import registry
 from .connection import get_dialect, get_executor
-from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
+from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned, UnSupportedError
 from .expressions import Expression
 from .functions import Function
 
@@ -37,22 +37,34 @@ _OPERATORS = {
     "istartswith": ("ILIKE", lambda v: f"{v}%"),
     "endswith": ("LIKE", lambda v: f"%{v}"),
     "iendswith": ("ILIKE", lambda v: f"%{v}"),
+    # Case-insensitive exact match: ILIKE with no wildcards in the bound value.
+    "iexact": ("ILIKE", lambda v: f"{v}"),
 }
+
+# Date/time part lookups, e.g. ``created_at__year=2024`` (rendered per dialect).
+_DATE_PARTS = frozenset({"year", "month", "day", "hour", "minute", "second"})
+# Regex lookups, e.g. ``name__regex=r"^A"`` (rendered per dialect operator).
+_REGEX_OPS = frozenset({"regex", "iregex"})
+# Lookups handled by dedicated branches rather than the ``_OPERATORS`` table.
+_SPECIAL_OPS = frozenset({"in", "not_in", "isnull", "range", "search"})
+# Every recognized trailing lookup suffix.
+_LOOKUPS = frozenset(_OPERATORS) | _DATE_PARTS | _REGEX_OPS | _SPECIAL_OPS
 
 
 def _split_lookup(key: str) -> tuple[str, str]:
     """Split a filter key into its field path and lookup operator.
 
     Args:
-        key: A filter key such as ``"age__gte"`` or ``"name"``.
+        key: A filter key such as ``"age__gte"`` or ``"author__name__icontains"``.
 
     Returns:
         A ``(field_path, operator)`` tuple; the operator defaults to
-        ``"exact"`` when the key carries no recognized lookup suffix.
+        ``"exact"`` when the key carries no recognized lookup suffix. The field
+        path may itself span relations (``"author__name"``).
     """
     if "__" in key:
         head, _, tail = key.rpartition("__")
-        if tail in _OPERATORS or tail in ("in", "isnull"):
+        if tail in _LOOKUPS:
             return head, tail
     return key, "exact"
 
@@ -157,6 +169,12 @@ class QuerySet:
         self._select_related: list[str] = []
         self._distinct: bool = False
         self._for_update: bool = False
+        self._for_update_nowait: bool = False
+        self._for_update_skip_locked: bool = False
+        self._for_update_of: tuple[str, ...] = ()
+        self._only: tuple[str, ...] | None = None
+        self._defer: frozenset[str] = frozenset()
+        self._using: str | None = None
 
     # -- cloning / chaining ----------------------------------------------
     def _clone(self) -> QuerySet:
@@ -178,6 +196,12 @@ class QuerySet:
         qs._select_related = list(self._select_related)
         qs._distinct = self._distinct
         qs._for_update = self._for_update
+        qs._for_update_nowait = self._for_update_nowait
+        qs._for_update_skip_locked = self._for_update_skip_locked
+        qs._for_update_of = self._for_update_of
+        qs._only = self._only
+        qs._defer = self._defer
+        qs._using = self._using
         return qs
 
     def filter(self, *args: Q, **kwargs: Any) -> QuerySet:
@@ -330,17 +354,88 @@ class QuerySet:
         qs._distinct = True
         return qs
 
-    def select_for_update(self) -> QuerySet:
+    def select_for_update(
+        self,
+        nowait: bool = False,
+        skip_locked: bool = False,
+        of: tuple[str, ...] = (),
+    ) -> QuerySet:
         """Return a new query set that locks matched rows (``FOR UPDATE``).
 
         The lock is emitted on backends that support it (PostgreSQL) and is a
         no-op on SQLite; it only takes effect inside a transaction.
+
+        Args:
+            nowait: Emit ``NOWAIT`` so a contended lock errors instead of waiting.
+            skip_locked: Emit ``SKIP LOCKED`` to skip already-locked rows
+                (ignored when ``nowait`` is set).
+            of: Table/relation names to lock (``FOR UPDATE OF ...``).
 
         Returns:
             A cloned ``QuerySet`` that locks the selected rows.
         """
         qs = self._clone()
         qs._for_update = True
+        qs._for_update_nowait = nowait
+        qs._for_update_skip_locked = skip_locked
+        qs._for_update_of = tuple(of)
+        return qs
+
+    def using_db(self, connection_name: str) -> QuerySet:
+        """Return a new query set that executes on a named connection.
+
+        Args:
+            connection_name: The registered connection to run statements on.
+                An active transaction still takes precedence.
+
+        Returns:
+            A cloned ``QuerySet`` bound to the named connection.
+        """
+        qs = self._clone()
+        qs._using = connection_name
+        return qs
+
+    def only(self, *fields: str) -> QuerySet:
+        """Return a new query set selecting only the named columns.
+
+        Instances come back partially populated; the primary key is always
+        included. Reading a field that was not selected raises ``FieldError``.
+
+        Args:
+            *fields: Field names to load.
+
+        Returns:
+            A cloned ``QuerySet`` restricted to the named columns.
+        """
+        meta = self.model._meta
+        for name in fields:
+            meta.get_field(name)
+        pk_name = meta.pk_field.model_field_name
+        names = tuple(dict.fromkeys((pk_name, *fields)))  # pk first, de-duplicated
+        qs = self._clone()
+        qs._only = names
+        qs._defer = frozenset()
+        return qs
+
+    def defer(self, *fields: str) -> QuerySet:
+        """Return a new query set that omits the named columns.
+
+        Instances come back without the deferred fields loaded; the primary key
+        is never deferred. Reading a deferred field raises ``FieldError``.
+
+        Args:
+            *fields: Field names to omit from the SELECT.
+
+        Returns:
+            A cloned ``QuerySet`` omitting the named columns.
+        """
+        meta = self.model._meta
+        for name in fields:
+            meta.get_field(name)
+        pk_name = meta.pk_field.model_field_name
+        qs = self._clone()
+        qs._defer = frozenset(f for f in fields if f != pk_name)
+        qs._only = None
         return qs
 
     def __getitem__(self, item: slice | int) -> QuerySet | Any:
@@ -418,6 +513,11 @@ class QuerySet:
         meta = self.model._meta
         base, op = _split_lookup(key)
 
+        # A multi-segment path (``author__name``) traverses one or more
+        # relations; compile it as a correlated membership subquery.
+        if "__" in base:
+            return self._compile_relation_lookup(base, op, value, dialect, idx)
+
         descriptor = getattr(self.model, base, None)
         if base in meta.m2m or isinstance(descriptor, M2MDescriptor):
             return self._compile_m2m_lookup(base, op, value, dialect, idx)
@@ -429,18 +529,60 @@ class QuerySet:
         else:
             field = meta.get_field(base)
         col = self._qualified(dialect, field)
+        return self._compile_field_op(col, field, op, value, dialect, idx)
 
+    def _compile_field_op(
+        self,
+        col: str,
+        field: Field,
+        op: str,
+        value: Any,
+        dialect: BaseDialect,
+        idx: int,
+    ) -> tuple[str, list[Any], int]:
+        """Compile a single ``column <op> value`` condition.
+
+        Args:
+            col: The already-qualified column reference.
+            field: The field backing the column (for value coercion).
+            op: The lookup operator (e.g. ``gte``, ``in``, ``year``, ``regex``).
+            value: The comparison value.
+            dialect: The SQL dialect providing quoting and placeholders.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, params, next_index)`` tuple.
+        """
         if op == "isnull":
             return (f"{col} IS NULL" if value else f"{col} IS NOT NULL"), [], idx
-        if op == "in":
+        if op in ("in", "not_in"):
+            membership = "NOT IN" if op == "not_in" else "IN"
             if not value:
-                return "1 = 0", [], idx
+                # ``x IN ()`` is always false; ``x NOT IN ()`` always true.
+                return ("1 = 1" if op == "not_in" else "1 = 0"), [], idx
             holes, params = [], []
             for item in value:
                 holes.append(dialect.placeholder(idx))
                 params.append(field.to_db(item.pk if _is_model(item) else item))
                 idx += 1
-            return f"{col} IN ({', '.join(holes)})", params, idx
+            return f"{col} {membership} ({', '.join(holes)})", params, idx
+        if op == "range":
+            lo, hi = value
+            p1, p2 = dialect.placeholder(idx), dialect.placeholder(idx + 1)
+            return f"{col} BETWEEN {p1} AND {p2}", [field.to_db(lo), field.to_db(hi)], idx + 2
+        if op in _DATE_PARTS:
+            return (
+                f"{dialect.date_part_sql(op, col)} = {dialect.placeholder(idx)}",
+                [value],
+                idx + 1,
+            )
+        if op in _REGEX_OPS:
+            regex_op = dialect.regex_ops.get(op)
+            if regex_op is None:
+                raise UnSupportedError(f"{dialect.name} does not support the __{op} lookup")
+            return f"{col} {regex_op} {dialect.placeholder(idx)}", [value], idx + 1
+        if op == "search":
+            return dialect.search_sql(col, dialect.placeholder(idx)), [value], idx + 1
 
         sql_op, pattern = _OPERATORS[op]
         if sql_op == "ILIKE":
@@ -448,6 +590,7 @@ class QuerySet:
             sql_op = dialect.ilike
         if isinstance(value, Expression):
             # Compare the column against another column expression (e.g. F).
+            meta = self.model._meta
             expr_params: list[Any] = []
             expr_sql, idx = value.resolve(
                 lambda n: self._qualified(dialect, meta.get_field(n)), dialect, expr_params, idx
@@ -457,6 +600,92 @@ class QuerySet:
         idx += 1
         bound = pattern(value) if pattern is not None else field.to_db(value)
         return f"{col} {sql_op} {placeholder}", [bound], idx
+
+    def _compile_relation_lookup(
+        self,
+        base: str,
+        op: str,
+        value: Any,
+        dialect: BaseDialect,
+        idx: int,
+    ) -> tuple[str, list[Any], int]:
+        """Compile a relation-spanning lookup (``rel__...__field``) to a subquery.
+
+        Resolves the leading relation segment, then compiles the remainder of
+        the path against the related model in a fresh queryset, embedding it as
+        an uncorrelated membership subquery. Nesting recurses, so paths of any
+        depth and self-relations work without join-induced row duplication.
+
+        Args:
+            base: The field path with at least one relation segment.
+            op: The trailing lookup operator applied to the final field.
+            value: The comparison value.
+            dialect: The SQL dialect providing quoting and placeholders.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, params, next_index)`` tuple holding the membership
+            condition SQL, its bound parameters and the updated index.
+        """
+        # Deferred: breaks the queryset <-> relations import cycle.
+        from .relations import M2MDescriptor, ReverseFKDescriptor, model_name
+
+        seg, _, rest = base.partition("__")
+        inner_key = rest if op == "exact" else f"{rest}__{op}"
+        meta = self.model._meta
+        q = dialect.quote
+        table = q(meta.table)
+        pk = q(meta.pk_field.db_column)
+
+        if seg in meta.relations:
+            # Forward FK: base.<fk> IN (SELECT target.pk FROM target WHERE inner)
+            info = meta.relations[seg]
+            target = info.resolve_target()
+            tmeta = target._meta
+            fk_col = f"{table}.{q(meta.get_field(info.source_attr).db_column)}"
+            inner, params, idx = QuerySet(target)._compile_lookup(inner_key, value, dialect, idx)
+            sub = (
+                f"SELECT {q(tmeta.table)}.{q(tmeta.pk_field.db_column)} "
+                f"FROM {q(tmeta.table)} WHERE {inner}"
+            )
+            return f"{fk_col} IN ({sub})", params, idx
+
+        descriptor = getattr(self.model, seg, None)
+        if isinstance(descriptor, ReverseFKDescriptor):
+            # Reverse FK: base.pk IN (SELECT child.<fk> FROM child WHERE inner)
+            source = registry.get_model(model_name(descriptor.source_reference))
+            smeta = source._meta
+            inner, params, idx = QuerySet(source)._compile_lookup(inner_key, value, dialect, idx)
+            sub = (
+                f"SELECT {q(smeta.table)}.{q(descriptor.source_attr)} "
+                f"FROM {q(smeta.table)} WHERE {inner}"
+            )
+            return f"{table}.{pk} IN ({sub})", params, idx
+
+        if isinstance(descriptor, M2MDescriptor):
+            # M2M: base.pk IN (SELECT through.near FROM through
+            #                  WHERE through.far IN (SELECT target.pk ... inner))
+            info = descriptor.info
+            info.finalize()
+            if descriptor.reverse:
+                near, far = info.forward_key, info.backward_key
+                target = info.owner
+            else:
+                near, far = info.backward_key, info.forward_key
+                target = info.resolve_target()
+            tmeta = target._meta
+            inner, params, idx = QuerySet(target)._compile_lookup(inner_key, value, dialect, idx)
+            target_pks = (
+                f"SELECT {q(tmeta.table)}.{q(tmeta.pk_field.db_column)} "
+                f"FROM {q(tmeta.table)} WHERE {inner}"
+            )
+            sub = (
+                f"SELECT {q(info.through)}.{q(near)} FROM {q(info.through)} "
+                f"WHERE {q(info.through)}.{q(far)} IN ({target_pks})"
+            )
+            return f"{table}.{pk} IN ({sub})", params, idx
+
+        raise FieldError(f"Cannot filter across unknown relation {seg!r} on {self.model.__name__}")
 
     def _compile_m2m_lookup(
         self,
@@ -630,9 +859,19 @@ class QuerySet:
             dialect: The active SQL dialect.
 
         Returns:
-            ``" FOR UPDATE"`` on backends that support it, else an empty string.
+            The ``FOR UPDATE [OF ...] [NOWAIT|SKIP LOCKED]`` clause on backends
+            that support it, else an empty string.
         """
-        return " FOR UPDATE" if self._for_update and dialect.name == "postgres" else ""
+        if not (self._for_update and dialect.name == "postgres"):
+            return ""
+        parts = ["FOR UPDATE"]
+        if self._for_update_of:
+            parts.append("OF " + ", ".join(dialect.quote(n) for n in self._for_update_of))
+        if self._for_update_nowait:
+            parts.append("NOWAIT")
+        elif self._for_update_skip_locked:
+            parts.append("SKIP LOCKED")
+        return " " + " ".join(parts)
 
     # -- aggregation helpers ---------------------------------------------
     def _add_relation_join(
@@ -804,28 +1043,70 @@ class QuerySet:
         return having, params, idx
 
     # -- execution --------------------------------------------------------
+    def _selected_fields(self) -> list[Field]:
+        """Return the fields to SELECT under ``only()`` / ``defer()``.
+
+        Returns:
+            The selected ``Field`` objects (all fields when neither is set).
+        """
+        meta = self.model._meta
+        if self._only is not None:
+            return [meta.get_field(n) for n in self._only]
+        if self._defer:
+            return [f for f in meta.field_list if f.model_field_name not in self._defer]
+        return meta.field_list
+
+    def _plain_select_sql(
+        self, dialect: BaseDialect, start: int = 1
+    ) -> tuple[str, list[Any], list[Field] | None]:
+        """Build the plain (no annotate/select_related) SELECT and its params.
+
+        Shared by ``_fetch``, ``sql()``, ``explain()`` and ``Subquery`` so they
+        always render the identical statement.
+
+        Args:
+            dialect: The SQL dialect providing quoting and placeholders.
+            start: The first bind-parameter index (``Subquery`` continues an
+                outer query's numbering).
+
+        Returns:
+            A ``(sql, params, fields)`` tuple; ``fields`` lists the selected
+            columns under ``only()``/``defer()`` (``None`` for a full row).
+        """
+        meta = self.model._meta
+        meta.compile(dialect)
+        where, params, _ = self._compile_conditions(dialect, start=start)
+        tail = f"{self._order_sql(dialect)}{self._tail_sql()}{self._lock_sql(dialect)}"
+        if self._only is not None or self._defer:
+            sel = self._selected_fields()
+            cols = ", ".join(dialect.quote(f.db_column) for f in sel)
+            prefix = self._distinct_prefix(f"SELECT {cols} FROM {dialect.quote(meta.table)}")
+            return f"{prefix}{where}{tail}", params, sel
+        prefix = self._distinct_prefix(meta.select_prefix)
+        return f"{prefix}{where}{tail}", params, None
+
     async def _fetch(self) -> list[Model]:
         """Execute the query and build model instances from the rows.
 
         Returns:
             A list of model instances, with any requested relations prefetched.
         """
-        if self._annotations:
-            return await self._fetch_annotated()
-        if self._select_related:
+        if self._annotations or self._select_related:
+            if self._only is not None or self._defer:
+                raise FieldError(
+                    "only()/defer() cannot be combined with annotate()/select_related()"
+                )
+            if self._annotations:
+                return await self._fetch_annotated()
             return await self._fetch_select_related()
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
-        meta = self.model._meta
-        meta.compile(dialect)
-        where, params, _ = self._compile_conditions(dialect)
-        prefix = self._distinct_prefix(meta.select_prefix)
-        sql = (
-            f"{prefix}{where}{self._order_sql(dialect)}{self._tail_sql()}{self._lock_sql(dialect)}"
-        )
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
+        sql, params, sel = self._plain_select_sql(dialect)
         rows = await engine.fetch_rows(sql, params)
-        build = self.model._from_db_row
-        instances = [build(row) for row in rows]
+        if sel is not None:
+            instances = [self.model._from_db_row_fields(row, sel) for row in rows]
+        else:
+            instances = [self.model._from_db_row(row) for row in rows]
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
             from .prefetch import prefetch_instances
@@ -844,8 +1125,8 @@ class QuerySet:
         Returns:
             The model instances with each selected relation cached.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -903,8 +1184,8 @@ class QuerySet:
             A list of model instances with each annotation value set as an
             attribute, with any requested relations prefetched.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -960,8 +1241,8 @@ class QuerySet:
         Returns:
             The raw database rows for the selected columns.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         fields = [meta.get_field(n) for n in field_names]
@@ -990,8 +1271,8 @@ class QuerySet:
             A list of dict rows when ``as_dict`` is ``True``, otherwise a list
             of tuple rows.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -1093,6 +1374,91 @@ class QuerySet:
             raise MultipleObjectsReturned(f"Multiple {self.model.__name__} objects returned")
         return rows[0]
 
+    async def get_or_none(self, **kwargs: Any) -> Model | None:
+        """Fetch the single object matching the lookups, or ``None``.
+
+        Args:
+            **kwargs: Optional field lookups further narrowing the query.
+
+        Returns:
+            The single matching instance, or ``None`` when there is no match.
+        """
+        qs = self.filter(**kwargs).limit(2) if kwargs else self.limit(2)
+        rows = await qs._fetch()
+        if len(rows) > 1:
+            raise MultipleObjectsReturned(f"Multiple {self.model.__name__} objects returned")
+        return rows[0] if rows else None
+
+    async def get_or_create(
+        self, defaults: dict[str, Any] | None = None, **kwargs: Any
+    ) -> tuple[Model, bool]:
+        """Fetch the row matching this query plus ``kwargs``, or create it.
+
+        Args:
+            defaults: Extra field values used only when creating the row.
+            **kwargs: Lookups identifying the row and reused on creation.
+
+        Returns:
+            A ``(instance, created)`` tuple; ``created`` is ``True`` on insert.
+        """
+        obj = await self.get_or_none(**kwargs)
+        if obj is not None:
+            return obj, False
+        return await self.model.create(**{**kwargs, **(defaults or {})}), True
+
+    async def update_or_create(
+        self, defaults: dict[str, Any] | None = None, **kwargs: Any
+    ) -> tuple[Model, bool]:
+        """Update the row matching this query plus ``kwargs``, or create it.
+
+        Args:
+            defaults: Field values to set (on update) or add (on create).
+            **kwargs: Lookups identifying the row and reused on creation.
+
+        Returns:
+            A ``(instance, created)`` tuple; ``created`` is ``True`` on insert.
+        """
+        defaults = defaults or {}
+        obj = await self.get_or_none(**kwargs)
+        if obj is None:
+            return await self.model.create(**{**kwargs, **defaults}), True
+        if defaults:
+            obj.update_from_dict(defaults)
+            await obj.save()
+        return obj, False
+
+    def sql(self) -> str:
+        """Return the SELECT statement this query set would execute.
+
+        Returns:
+            The SQL string (with dialect placeholders for bound parameters).
+
+        Raises:
+            UnSupportedError: With ``annotate()`` / ``select_related()`` set.
+        """
+        if self._annotations or self._select_related:
+            raise UnSupportedError("sql() is not supported with annotate()/select_related()")
+        dialect = get_dialect(self.model, using=self._using)
+        sql, _, _ = self._plain_select_sql(dialect)
+        return sql
+
+    async def explain(self) -> str:
+        """Return the database's query plan for this query set.
+
+        Returns:
+            The plan rows joined into a single string.
+
+        Raises:
+            UnSupportedError: With ``annotate()`` / ``select_related()`` set.
+        """
+        if self._annotations or self._select_related:
+            raise UnSupportedError("explain() is not supported with annotate()/select_related()")
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
+        sql, params, _ = self._plain_select_sql(dialect)
+        rows = await engine.fetch_rows(f"{dialect.explain_prefix}{sql}", params)
+        return "\n".join(" ".join(str(c) for c in row) for row in rows)
+
     async def first(self) -> Model | None:
         """Fetch the first matching object, if any.
 
@@ -1152,8 +1518,8 @@ class QuerySet:
         Returns:
             The number of matching rows.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
         row = await engine.fetch_row(f"SELECT COUNT(*) FROM {table}{where}", params)
@@ -1165,8 +1531,8 @@ class QuerySet:
         Returns:
             ``True`` if at least one matching row exists.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, using=self._using)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
         rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where} LIMIT 1", params)
@@ -1178,8 +1544,8 @@ class QuerySet:
         Returns:
             The number of rows deleted.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model, write=True)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, write=True, using=self._using)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
         return await engine.execute(f"DELETE FROM {table}{where}", params)
@@ -1194,8 +1560,8 @@ class QuerySet:
         Returns:
             The number of rows updated.
         """
-        dialect = get_dialect(self.model)
-        engine = get_executor(self.model, write=True)
+        dialect = get_dialect(self.model, using=self._using)
+        engine = get_executor(self.model, write=True, using=self._using)
         meta = self.model._meta
         assignments: list[str] = []
         params: list = []

@@ -431,6 +431,31 @@ class Model(metaclass=ModelMeta):
             d[name] = value if (decode is None or value is None) else decode(value)
         return obj
 
+    @classmethod
+    def _from_db_row_fields(cls, values: list[Any], fields: list[Field]) -> Model:
+        """Build a partially-populated instance from a subset of columns.
+
+        Powers ``only()`` / ``defer()``: only ``fields`` are set, so reading any
+        other column raises ``FieldError`` (via the field descriptor) rather
+        than returning a stale or wrong value.
+
+        Args:
+            values: Raw column values in ``fields`` order.
+            fields: The selected fields, matching the SELECT column order.
+
+        Returns:
+            A new, partially-populated instance marked as already persisted.
+        """
+        obj = cls.__new__(cls)
+        d = obj.__dict__
+        d["_in_db"] = True
+        for field, value in zip(fields, values):
+            decode = None if field.read_identity else field.to_python
+            d[field.model_field_name] = (
+                value if (decode is None or value is None) else decode(value)
+            )
+        return obj
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         """Return a debugging representation showing the type and primary key.
 

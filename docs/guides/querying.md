@@ -66,12 +66,15 @@ Append a double-underscore suffix to a field name to choose how it is compared. 
 | Lookup | SQL | Example |
 | --- | --- | --- |
 | `exact` (default) | `=` | `Book.filter(title="Dune")` |
+| `iexact` | case-insensitive `=` | `Author.filter(name__iexact="ada")` |
 | `not` | `!=` | `Book.filter(rating__not=0)` |
 | `gt` | `>` | `Book.filter(rating__gt=4)` |
 | `gte` | `>=` | `Book.filter(rating__gte=4)` |
 | `lt` | `<` | `Book.filter(rating__lt=2)` |
 | `lte` | `<=` | `Book.filter(rating__lte=2)` |
 | `in` | `IN (...)` | `Author.filter(name__in=["Ada", "Bob"])` |
+| `not_in` | `NOT IN (...)` | `Author.filter(name__not_in=["Ada"])` |
+| `range` | `BETWEEN a AND b` | `Book.filter(rating__range=(3, 5))` |
 | `isnull` | `IS NULL` / `IS NOT NULL` | `Author.filter(name__isnull=True)` |
 | `contains` | `LIKE '%v%'` | `Book.filter(title__contains="sea")` |
 | `icontains` | `ILIKE '%v%'` | `Book.filter(title__icontains="sea")` |
@@ -79,6 +82,9 @@ Append a double-underscore suffix to a field name to choose how it is compared. 
 | `istartswith` | `ILIKE 'v%'` | `Book.filter(title__istartswith="the")` |
 | `endswith` | `LIKE '%v'` | `Book.filter(title__endswith="II")` |
 | `iendswith` | `ILIKE '%v'` | `Book.filter(title__iendswith="ii")` |
+| `year`/`month`/`day`/`hour`/`minute`/`second` | extracted date part `=` | `Book.filter(published__year=2024)` |
+| `regex` / `iregex` | POSIX regex (PostgreSQL) | `Book.filter(title__regex="^The")` |
+| `search` | full-text (PostgreSQL) | `Book.filter(title__search="ocean")` |
 
 A few categories worth calling out:
 
@@ -97,6 +103,48 @@ await Book.filter(title__icontains="ocean")
 
 !!! note "Case-insensitive lookups across dialects"
     The `i*` lookups (`icontains`, `istartswith`, `iendswith`) use `ILIKE` on PostgreSQL. On SQLite they fall back to `LIKE`, which is already case-insensitive for ASCII — so the behaviour is consistent: a case-insensitive match on either backend.
+
+!!! warning "PostgreSQL-only lookups"
+    `regex`, `iregex` and `search` are implemented for PostgreSQL only; on SQLite they raise `UnSupportedError`.
+
+## Spanning relations in filters
+
+A lookup key can traverse relations with the `__` separator — a foreign key, a reverse FK or a many-to-many, to any depth:
+
+```python
+# Forward FK: books whose author's name matches
+await Book.filter(author__name__icontains="ada")
+
+# Multiple hops: book -> author -> country
+await Book.filter(author__country__name="UK")
+
+# Reverse FK: authors who have a 5-star book
+await Author.filter(books__rating__gte=5)
+
+# Many-to-many, either direction
+await Book.filter(tags__name="python")
+await Tag.filter(books__title="Dune")
+```
+
+Each relation hop compiles to a membership subquery, so spanning works at any depth (and across self-relations) without duplicating rows.
+
+## Loading a subset of columns: `only()` / `defer()`
+
+Fetch model instances carrying only some columns. The primary key is always loaded; reading a column that was not fetched raises `FieldError` (re-fetch without deferring it to read it).
+
+```python
+authors = await Author.all().only("name")        # SELECT id, name
+authors = await Author.all().defer("bio")         # everything except bio
+```
+
+For plain dict/tuple projections that skip model construction entirely, prefer [`values()` / `values_list()`](#projections-values-and-values_list). `only()`/`defer()` cannot be combined with `annotate()` or `select_related()`.
+
+## Inspecting a query: `sql()` / `explain()`
+
+```python
+print(Book.filter(rating__gte=4).sql())      # the SELECT statement
+print(await Book.filter(rating__gte=4).explain())  # the database query plan
+```
 
 ## `Q` objects for AND / OR / NOT
 

@@ -32,6 +32,22 @@ class BaseDialect:
     serial_map: dict[str, str] = {}
     #: Operator used for case-insensitive ``LIKE`` lookups.
     ilike = "ILIKE"
+    #: Lookup name -> SQL operator for regular-expression matches. Empty when
+    #: the backend has no regex operator (the lookup then raises).
+    regex_ops: dict[str, str] = {}
+    #: Whether the backend supports the ``__search`` full-text lookup.
+    supports_search = False
+    #: Statement prefix that returns a query plan for ``QuerySet.explain``.
+    explain_prefix = "EXPLAIN "
+    #: Date/time part -> the literal used inside ``EXTRACT(<part> FROM col)``.
+    _extract_parts = {
+        "year": "YEAR",
+        "month": "MONTH",
+        "day": "DAY",
+        "hour": "HOUR",
+        "minute": "MINUTE",
+        "second": "SECOND",
+    }
     #: Whether ``ADD COLUMN`` / ``DROP COLUMN`` accept an ``IF [NOT] EXISTS``
     #: guard (PostgreSQL does; SQLite has no such syntax).
     column_if_exists = True
@@ -69,6 +85,34 @@ class BaseDialect:
             The dialect-specific placeholder string.
         """
         raise NotImplementedError
+
+    # -- query lookups ----------------------------------------------------
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render an expression extracting a date/time part from a column.
+
+        Args:
+            part: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the integer part (e.g. ``EXTRACT(...)``).
+        """
+        return f"EXTRACT({self._extract_parts[part]} FROM {col})"
+
+    def search_sql(self, col: str, placeholder: str) -> str:
+        """Render a full-text ``__search`` condition.
+
+        Args:
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the search query.
+
+        Raises:
+            UnSupportedError: On backends without full-text search.
+
+        Returns:
+            A boolean SQL expression matching ``col`` against the query.
+        """
+        raise UnSupportedError(f"{self.name} does not support the __search lookup")
 
     # -- type rendering ---------------------------------------------------
     def column_type(self, field: Field) -> str:
@@ -688,6 +732,22 @@ class PostgresDialect(BaseDialect):
     """Dialect rendering SQL for PostgreSQL."""
 
     name = "postgres"
+    # `~` / `~*` are PostgreSQL's POSIX regex match operators (case-sensitive
+    # and case-insensitive); `__search` uses full-text via to_tsvector/tsquery.
+    regex_ops = {"regex": "~", "iregex": "~*"}
+    supports_search = True
+
+    def search_sql(self, col: str, placeholder: str) -> str:
+        """Render a PostgreSQL full-text match using ``to_tsvector``/``plainto_tsquery``.
+
+        Args:
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the search query.
+
+        Returns:
+            A ``to_tsvector(...) @@ plainto_tsquery(...)`` boolean expression.
+        """
+        return f"to_tsvector('english', {col}) @@ plainto_tsquery('english', {placeholder})"
 
     type_map = {
         "smallint": "SMALLINT",
@@ -730,6 +790,30 @@ class SqliteDialect(BaseDialect):
     name = "sqlite"
     # SQLite has no ILIKE; its LIKE is case-insensitive for ASCII text.
     ilike = "LIKE"
+    # SQLite's human-readable plan comes from EXPLAIN QUERY PLAN.
+    explain_prefix = "EXPLAIN QUERY PLAN "
+    # date/time part -> strftime format specifier (results CAST to INTEGER).
+    _strftime_parts = {
+        "year": "%Y",
+        "month": "%m",
+        "day": "%d",
+        "hour": "%H",
+        "minute": "%M",
+        "second": "%S",
+    }
+
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render a date/time part extraction using ``strftime``.
+
+        Args:
+            part: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
+            col: The already-qualified column reference.
+
+        Returns:
+            ``CAST(strftime('<fmt>', col) AS INTEGER)`` yielding the integer part.
+        """
+        return f"CAST(strftime('{self._strftime_parts[part]}', {col}) AS INTEGER)"
+
     # SQLite has no ``IF [NOT] EXISTS`` on ADD/DROP COLUMN, no ``CONCURRENTLY``,
     # no in-place ``ALTER COLUMN`` (a column change needs a table rebuild), no
     # ``ALTER INDEX ... RENAME``, and no ``ALTER TABLE ... CONSTRAINT`` syntax.

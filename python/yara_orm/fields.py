@@ -15,6 +15,7 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
 from .db_defaults import DatabaseDefault
+from .exceptions import FieldError
 
 if TYPE_CHECKING:
     from .validators import Validator
@@ -78,6 +79,32 @@ class Field:
         self.auto_increment = False
         #: Extra parameters consumed by the dialect type templates.
         self.type_params: dict[str, Any] = {}
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        """Non-data descriptor: guard access to columns not loaded into an instance.
+
+        A normally-constructed or fully-fetched instance has every field in its
+        ``__dict__``, so this descriptor is never consulted (``__dict__`` wins)
+        and the hot path pays nothing. It fires only for an instance that omits
+        the column — i.e. one produced by ``only()`` / ``defer()`` — turning a
+        silent wrong value into a clear error.
+
+        Args:
+            instance: The instance being accessed, or None for class access.
+            owner: The owning class.
+
+        Raises:
+            FieldError: When accessed on an instance that did not load this field.
+
+        Returns:
+            The field itself for class-level access.
+        """
+        if instance is None:
+            return self
+        raise FieldError(
+            f"Field {self.model_field_name!r} was not loaded on this instance "
+            f"(deferred via only()/defer()); re-fetch without deferring it to read it"
+        )
 
     # -- value conversion -------------------------------------------------
     def get_default(self) -> Any:
