@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 class Prefetch:
-    """Customise a prefetch with a queryset (mirrors Tortoise's ``Prefetch``)."""
+    """Customise a prefetch with a constrained queryset."""
 
     def __init__(self, relation: str, queryset: QuerySet) -> None:
         """Bind a relation name to the queryset used to load it.

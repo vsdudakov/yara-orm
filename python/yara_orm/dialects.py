@@ -105,6 +105,55 @@ class BaseDialect:
             parts.append("UNIQUE")
         return " ".join(parts)
 
+    def _group_columns(self, meta: MetaInfo, names: tuple[str, ...]) -> list[str]:
+        """Resolve a group of field/relation names to quoted column names.
+
+        Args:
+            meta: The model metadata.
+            names: Field names (or forward relation names) in the group.
+
+        Returns:
+            The quoted column names.
+        """
+        cols = []
+        for fname in names:
+            if fname in meta.relations:
+                column = meta.get_field(meta.relations[fname].source_attr).db_column
+            else:
+                column = meta.get_field(fname).db_column
+            cols.append(self.quote(column))
+        return cols
+
+    def _unique_together_lines(self, meta: MetaInfo) -> list[str]:
+        """Render ``UNIQUE (...)`` constraint lines for ``Meta.unique_together``.
+
+        Args:
+            meta: The model metadata.
+
+        Returns:
+            One ``UNIQUE (...)`` clause per group (possibly empty).
+        """
+        return [f"UNIQUE ({', '.join(self._group_columns(meta, g))})" for g in meta.unique_together]
+
+    def _composite_index_statements(self, meta: MetaInfo, ine: str) -> list[str]:
+        """Render ``CREATE INDEX`` statements for ``Meta.indexes``.
+
+        Args:
+            meta: The model metadata.
+            ine: The ``IF NOT EXISTS`` guard fragment (or empty).
+
+        Returns:
+            One ``CREATE INDEX`` statement per group (possibly empty).
+        """
+        out = []
+        for group in meta.indexes:
+            idx_name = f"idx_{meta.table}_" + "_".join(group)
+            cols = ", ".join(self._group_columns(meta, group))
+            out.append(
+                f"CREATE INDEX {ine}{self.quote(idx_name)} ON {self.quote(meta.table)} ({cols})"
+            )
+        return out
+
     def create_table_sql(self, meta: MetaInfo, safe: bool = True) -> list[str]:
         """Render statements to create a model's table, indexes and comments.
 
@@ -128,6 +177,7 @@ class BaseDialect:
                     f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) "
                     f"ON DELETE {field.on_delete}"
                 )
+        lines.extend(self._unique_together_lines(meta))
 
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)
@@ -141,6 +191,7 @@ class BaseDialect:
                     f"CREATE INDEX {ine}{self.quote(idx_name)} "
                     f"ON {self.quote(meta.table)} ({self.quote(field.db_column)})"
                 )
+        statements.extend(self._composite_index_statements(meta, ine))
 
         # Comments from `description=` and a model's `Meta.table_description`.
         statements.extend(self._comment_sql(meta))
@@ -577,6 +628,7 @@ class SqliteDialect(BaseDialect):
                     f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) "
                     f"ON DELETE {field.on_delete}"
                 )
+        lines.extend(self._unique_together_lines(meta))
 
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)
@@ -589,6 +641,7 @@ class SqliteDialect(BaseDialect):
                     f"CREATE INDEX {ine}{self.quote(idx_name)} "
                     f"ON {tbl} ({self.quote(field.db_column)})"
                 )
+        statements.extend(self._composite_index_statements(meta, ine))
         return statements
 
 

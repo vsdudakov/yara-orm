@@ -47,6 +47,8 @@ class MetaInfo:
         description: str | None = None,
         abstract: bool = False,
         ordering: list[tuple[str, bool]] | None = None,
+        unique_together: list[tuple[str, ...]] | None = None,
+        indexes: list[tuple[str, ...]] | None = None,
     ) -> None:
         """Store resolved table metadata and precompute the row-decode plan.
 
@@ -61,12 +63,17 @@ class MetaInfo:
                 own; only contributes fields to concrete subclasses).
             ordering: Default ordering as ``(field_name, descending)`` tuples,
                 applied to queries that set no explicit ``order_by``.
+            unique_together: Groups of field names forming composite UNIQUE
+                constraints.
+            indexes: Groups of field names forming composite indexes.
 
         Returns:
             None
         """
         self.abstract = abstract
         self.ordering = ordering or []
+        self.unique_together = unique_together or []
+        self.indexes = indexes or []
         self.table = table
         self.fields = fields
         self.pk_field = pk_field
@@ -127,6 +134,25 @@ class MetaInfo:
         else:
             self.insert_sql = f"INSERT INTO {q(self.table)} DEFAULT VALUES RETURNING {ret}"
         self._compiled_for = dialect.name
+
+
+def _normalize_field_groups(value: Any) -> list[tuple[str, ...]]:
+    """Normalise a ``unique_together`` / ``indexes`` Meta option to field groups.
+
+    Accepts a single group ``("a", "b")`` or several ``(("a", "b"), ("c",))``.
+
+    Args:
+        value: The raw Meta option value, or None.
+
+    Returns:
+        A list of field-name tuples (empty when ``value`` is falsy).
+    """
+    if not value:
+        return []
+    items = list(value)
+    if items and isinstance(items[0], str):
+        return [tuple(items)]
+    return [tuple(group) for group in items]
 
 
 class ModelMeta(type):
@@ -191,7 +217,7 @@ class ModelMeta(type):
         meta_cls = namespace.get("Meta")
         # `abstract` is intentionally read from the class's own Meta only (not
         # inherited): a concrete subclass of an abstract base is itself concrete
-        # unless it redeclares `abstract = True`, matching Tortoise ORM.
+        # unless it redeclares `abstract = True`.
         abstract = bool(getattr(meta_cls, "abstract", False))
         table = getattr(meta_cls, "table", None) or name.lower()
         description = getattr(meta_cls, "table_description", None) or getattr(
@@ -207,6 +233,9 @@ class ModelMeta(type):
             if fname != "pk" and fname not in fields:
                 raise FieldError(f"Meta.ordering refers to unknown field {fname!r} on {name}")
             ordering.append((fname, descending))
+
+        unique_together = _normalize_field_groups(getattr(meta_cls, "unique_together", None))
+        indexes = _normalize_field_groups(getattr(meta_cls, "indexes", None))
 
         relations = {}
         for rel_name, fk in fk_decls.items():
@@ -225,6 +254,8 @@ class ModelMeta(type):
             description=description,
             abstract=abstract,
             ordering=ordering,
+            unique_together=unique_together,
+            indexes=indexes,
         )
 
         # Install forward accessors and m2m managers as class descriptors.

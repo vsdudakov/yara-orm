@@ -159,9 +159,8 @@ class ForwardRelationDescriptor:
         Returns:
             This descriptor when accessed on the class; the related instance (or
             ``None``) directly when it has been prefetched or assigned — so
-            ``obj.rel.field`` and ``if obj.rel`` work after ``prefetch_related``,
-            matching Tortoise; otherwise a ``ForwardRelation`` awaitable that
-            lazily loads it.
+            ``obj.rel.field`` and ``if obj.rel`` work after ``prefetch_related``;
+            otherwise a ``ForwardRelation`` awaitable that lazily loads it.
         """
         if instance is None:
             return self

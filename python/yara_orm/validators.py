@@ -1,4 +1,4 @@
-"""Field value validators, mirroring Tortoise's ``tortoise.validators``.
+"""Field value validators.
 
 Attach validators to a field via ``validators=[...]``; they run on ``save()``
 and raise :class:`ValidationError` when a value is invalid.

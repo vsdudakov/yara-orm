@@ -93,6 +93,12 @@ Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `descrip
 `MinLengthValidator`, `MaxLengthValidator`, `RegexValidator`. Functions:
 `validate_ipv4_address`, `validate_ipv6_address`, `validate_ipv46_address`.
 
+## timezone
+
+`yara_orm.timezone` — helpers over `datetime` / `zoneinfo`: `now`, `is_aware`,
+`is_naive`, `make_aware`, `make_naive`, `localtime`, `parse_timezone`,
+`get_timezone`, `get_use_tz`, `get_default_timezone`.
+
 ## QuerySet & Q
 
 Lazy and chainable; runs when awaited or on a terminal method. See [Querying](guides/querying.md).

@@ -1,7 +1,8 @@
 """Exception hierarchy for the ORM.
 
-The names mirror Tortoise ORM so existing ``except`` blocks port across. The
-common base is :class:`ORMError` (aliased as :class:`BaseORMException`).
+The common base is :class:`ORMError` (also exported as
+:class:`BaseORMException`); database failures derive from
+:class:`OperationalError` and declaration/value errors from :class:`FieldError`.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ class ORMError(Exception):
     """Base class for all ORM errors."""
 
 
-#: Alias matching Tortoise's base exception name.
+#: Alias for the base ORM exception.
 BaseORMException = ORMError
 
 
@@ -39,7 +40,7 @@ class DoesNotExist(NotExistOrMultiple):
     """Raised by ``get()`` when no row matches."""
 
 
-#: Alias matching Tortoise's ``ObjectDoesNotExistError`` name.
+#: Alias for :class:`DoesNotExist`.
 ObjectDoesNotExistError = DoesNotExist
 
 
