@@ -154,7 +154,9 @@ async def test_one_to_one(db):
     e = await Event.create(name="Final", tournament=await Tournament.create(name="C"))
     addr = await Address.create(line="Main St", event=e)
 
-    assert (await addr.event).id == e.id
+    # Re-fetch (no cached relation) to exercise the lazy forward-O2O load.
+    fresh = await Address.get(id=addr.id)
+    assert (await fresh.event).id == e.id
     back = await e.address
     assert back.id == addr.id and back.line == "Main St"
 
@@ -246,6 +248,34 @@ async def test_recursive_fk(db):
     assert reports == ["Worker A", "Worker B"]
     worker = await Employee.get(name="Worker A")
     assert (await worker.manager).id == boss.id
+
+
+@pytest.mark.asyncio
+async def test_forward_fk_sync_access_after_prefetch(db):
+    """
+    GIVEN employees with and without a manager, fetched with prefetch_related
+    WHEN the forward FK is accessed after prefetching it
+    THEN it is served synchronously — obj.rel is the instance (or None), so
+    attribute access and truthiness work without awaiting (matching Tortoise),
+    while an un-prefetched relation still returns the awaitable accessor
+    """
+    boss = await Employee.create(name="Boss")
+    await Employee.create(name="Worker", manager=boss)
+
+    # Prefetched, non-null FK: synchronous attribute access and truthiness.
+    [worker] = await Employee.filter(name="Worker").prefetch_related("manager")
+    assert worker.manager is not None
+    assert worker.manager.name == "Boss"
+    assert (worker.manager.name if worker.manager else None) == "Boss"
+
+    # Prefetched, null FK: served as None, not an always-truthy wrapper.
+    [top] = await Employee.filter(name="Boss").prefetch_related("manager")
+    assert top.manager is None
+    assert (top.manager.name if top.manager else "none") == "none"
+
+    # Un-prefetched access still returns the lazy awaitable accessor.
+    fresh = await Employee.get(name="Worker")
+    assert (await fresh.manager).name == "Boss"
 
 
 @pytest.mark.asyncio

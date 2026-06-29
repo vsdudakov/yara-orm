@@ -71,7 +71,9 @@ async def test_uuid_fk_forward_and_filter(db):
     p = await UuidParent.create(name="root")
     c = await UuidChild.create(parent=p, label="leaf")
 
-    loaded_parent = await c.parent
+    # Re-fetch (no cached relation) to exercise the lazy forward-FK load.
+    fresh = await UuidChild.get(id=c.id)
+    loaded_parent = await fresh.parent
     assert loaded_parent.id == p.id
 
     matched = await UuidChild.filter(parent=p)

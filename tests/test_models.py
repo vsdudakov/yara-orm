@@ -172,7 +172,7 @@ async def test_prefetch_related_classmethod(db):
     u = await CvMUser.create(name="p")
     await CvMRef.create(user=u)
     [ref] = await CvMRef.prefetch_related("user")
-    assert (await ref.user).id == u.id
+    assert ref.user.id == u.id  # prefetched -> synchronous access
 
 
 @pytest.mark.asyncio

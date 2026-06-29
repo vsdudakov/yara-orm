@@ -99,7 +99,7 @@ async def test_relations(sqlite_orm):
     blue = await SqTeam.create(name="Blue")
     await e.participants.add(red, blue)
 
-    assert (await e.tournament).name == "Cup"
+    assert e.tournament.name == "Cup"  # cached from create() -> synchronous
     assert [ev.name for ev in await t.events] == ["Final"]
     assert sorted(team.name for team in await e.participants) == ["Blue", "Red"]
     assert [ev.id for ev in await red.events] == [e.id]

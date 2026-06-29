@@ -67,12 +67,24 @@ synthesises a concrete `<name>_id` backing column. For `Book.author` that is the
 
 ### Forward access
 
-Accessing the relation on an instance returns an awaitable descriptor that
-resolves to the related instance, or `None` when the foreign key is unset:
+When the relation has **not** been loaded, accessing it returns an awaitable
+descriptor that resolves to the related instance (or `None` when the foreign key
+is unset):
 
 ```python
 book = await Book.get(id=1)
 author = await book.author          # -> Author instance, or None
+```
+
+Once the relation is **known** — because you assigned it, created the row with
+it, or loaded it via `prefetch_related` — the attribute is the related instance
+directly (or `None`), served synchronously without awaiting, matching Tortoise:
+
+```python
+books = await Book.all().prefetch_related("author")
+books[0].author.name                # synchronous attribute access
+if books[0].author:                 # truthiness reflects a NULL FK correctly
+    ...
 ```
 
 Assign a related instance directly when creating or updating a row. You may pass
@@ -81,11 +93,14 @@ the model instance itself:
 ```python
 author = await Author.create(name="Ada")
 book = await Book.create(title="Foundations", author=author)
+
+book.author.name                    # "Ada" — cached on assignment, synchronous
 ```
 
 Assigning an instance sets the `author_id` backing column to the instance's
-primary key, and caches the instance so a subsequent `await book.author` returns
-it without a query.
+primary key and caches the instance, so `book.author` returns it without a
+query. Use `await book.author` only when the relation has not been cached
+(e.g. on a freshly fetched row).
 
 ### Reverse manager
 
@@ -260,12 +275,14 @@ accepts one or more relation names:
 book = await Book.get(id=1)
 await book.fetch_related("author", "tags")
 
-author = await book.author              # cached
-tags = await book.tags                  # cached
+author = book.author                    # cached forward FK -> synchronous
+tags = await book.tags                  # cached m2m manager -> awaited
 ```
 
 Both work across forward foreign keys, one-to-one relations, reverse managers,
-and many-to-many relations.
+and many-to-many relations. After caching, a **forward FK / one-to-one** is the
+instance itself (accessed synchronously); reverse managers and many-to-many
+relations stay awaitable and serve their cached rows.
 
 !!! tip "Reach for `prefetch_related` to kill N+1"
     Whenever you loop over a list of rows and touch a relation on each one,
