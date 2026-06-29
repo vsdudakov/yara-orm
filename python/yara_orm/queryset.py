@@ -676,29 +676,39 @@ class QuerySet:
 
     def _aggregate_expr(
         self,
-        agg: Aggregate | Function,
+        agg: Any,
         dialect: BaseDialect,
         joins: dict[str, str],
-    ) -> str:
-        """Compile an aggregate into a SQL function expression.
+        params: list[Any],
+        idx: int,
+    ) -> tuple[str, int]:
+        """Compile an annotation expression to SQL, binding any literals.
+
+        Aggregates and scalar functions bind nothing (``idx`` is returned
+        unchanged); param-producing expressions (``Case``, ``RawSQL``) expose an
+        ``as_sql`` hook that appends to ``params`` and advances ``idx``.
 
         Args:
-            agg: The aggregate describing the function and target field.
+            agg: The annotation expression (Aggregate, Function, Case, RawSQL).
             dialect: The SQL dialect providing identifier quoting.
             joins: Mapping of join key to join SQL, mutated in place when the
-                aggregate spans a relation.
+                expression spans a relation.
+            params: Bound-parameter list, extended in place.
+            idx: The next available bind-parameter index.
 
         Returns:
-            The SQL aggregate expression, e.g. ``COUNT(DISTINCT "t"."id")``.
+            A ``(sql, next_index)`` tuple.
         """
+        if hasattr(agg, "as_sql"):
+            return agg.as_sql(self, dialect, joins, params, idx)
 
         def resolve(name: str) -> str:
             return self._resolve_column(name, dialect, joins)
 
         if isinstance(agg, Function):
-            return agg.render(resolve)
+            return agg.render(resolve), idx
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
-        return f"{agg.function}({distinct}{resolve(agg.field)})"
+        return f"{agg.function}({distinct}{resolve(agg.field)})", idx
 
     def _resolve_column(self, field: str, dialect: BaseDialect, joins: dict[str, str]) -> str:
         """Resolve a field name to its qualified column, adding joins as needed.
@@ -724,6 +734,23 @@ class QuerySet:
         tmeta = self._add_relation_join(field, dialect, joins)
         return f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
 
+    def _compile_filter_dict(
+        self, conditions: dict[str, Any], dialect: BaseDialect, idx: int
+    ) -> tuple[str, list[Any], int]:
+        """Compile a dict of field lookups into a SQL boolean expression.
+
+        Used by ``Case``/``When`` to render an arm's conditions.
+
+        Args:
+            conditions: Field lookups (as passed to ``filter``).
+            dialect: The SQL dialect providing quoting and placeholders.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, params, next_index)`` tuple.
+        """
+        return self._compile_q(Q(**conditions), dialect, idx)
+
     def _compile_having(
         self,
         dialect: BaseDialect,
@@ -745,7 +772,7 @@ class QuerySet:
         """
         clauses, params = [], []
         for name, op, value in self._having:
-            expr = self._aggregate_expr(self._annotations[name], dialect, joins)
+            expr, idx = self._aggregate_expr(self._annotations[name], dialect, joins, params, idx)
             sql_op, _ = _OPERATORS[op]
             clauses.append(f"{expr} {sql_op} {dialect.placeholder(idx)}")
             params.append(value)
@@ -797,12 +824,16 @@ class QuerySet:
         joins: dict = {}
         select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
         annotation_names = list(self._annotations.keys())
+        select_params: list[Any] = []
+        idx = 1
         for name in annotation_names:
-            expr = self._aggregate_expr(self._annotations[name], dialect, joins)
+            expr, idx = self._aggregate_expr(
+                self._annotations[name], dialect, joins, select_params, idx
+            )
             select.append(f"{expr} AS {q(name)}")
-        where, params, idx = self._compile_conditions(dialect)
+        where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
-        params.extend(hparams)
+        params = select_params + wparams + hparams
         group = f" GROUP BY {table}.{q(meta.pk_field.db_column)}"
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"
@@ -894,15 +925,18 @@ class QuerySet:
                 select.append(col)
                 names.append(f)
                 group_cols.append(col)
+        select_params: list[Any] = []
+        idx = 1
         for name, agg in self._annotations.items():
             if requested and name not in requested:
                 continue
-            select.append(f"{self._aggregate_expr(agg, dialect, joins)} AS {q(name)}")
+            expr, idx = self._aggregate_expr(agg, dialect, joins, select_params, idx)
+            select.append(f"{expr} AS {q(name)}")
             names.append(name)
 
-        where, params, idx = self._compile_conditions(dialect)
+        where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
-        params.extend(hparams)
+        params = select_params + wparams + hparams
         group = (" GROUP BY " + ", ".join(group_cols)) if group_cols else ""
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"

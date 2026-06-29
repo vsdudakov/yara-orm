@@ -25,7 +25,7 @@ from .exceptions import (
     MultipleObjectsReturned,
     ORMError,
 )
-from .expressions import F
+from .expressions import Case, F, RawSQL, When
 from .functions import Coalesce, Concat, Length, Lower, Trim, Upper
 from .migrations import MigrationManager
 from .models import Model
@@ -48,6 +48,9 @@ __all__ = [
     "QuerySet",
     "Q",
     "F",
+    "Case",
+    "When",
+    "RawSQL",
     "fields",
     "migrations",
     "MigrationManager",

@@ -154,6 +154,59 @@ for author in authors:
 
 Here `Avg("books__rating")` reaches across the `books` relation to the related `rating` column using the `relation__column` path, `filter(book_count__gte=1)` becomes a `HAVING` clause, and `order_by("-book_count")` sorts by the annotation in descending order.
 
+## Scalar functions
+
+Beyond aggregates, `.annotate(...)` accepts **scalar functions** that compute a value per row. They are imported from `yara_orm`:
+
+```python
+from yara_orm import Lower, Upper, Length, Trim, Concat, Coalesce
+```
+
+| Function | SQL | Example |
+| --- | --- | --- |
+| `Lower(field)` | `LOWER(col)` | `Lower("title")` |
+| `Upper(field)` | `UPPER(col)` | `Upper("title")` |
+| `Length(field)` | `LENGTH(col)` | `Length("title")` |
+| `Trim(field)` | `TRIM(col)` | `Trim("title")` |
+| `Concat(*fields)` | `col1 \|\| col2 \|\| …` | `Concat("title", "author_id")` |
+| `Coalesce(field, default)` | `COALESCE(col, default)` | `Coalesce("title", "untitled")` |
+
+```python
+for book in await Book.annotate(slug=Lower("title"), n=Length("title")):
+    print(book.slug, book.n)
+```
+
+`Concat` renders with the portable `||` operator, so it behaves the same on PostgreSQL and SQLite. `Coalesce`'s second argument is a literal fallback used when the column is `NULL`.
+
+## Conditional expressions: `Case` / `When`
+
+`Case` builds a SQL `CASE` expression from one or more `When` arms and an optional `default`. Each `When` takes field lookups (like `filter`) plus a `then` value; the first matching arm wins.
+
+```python
+from yara_orm import Case, When, F
+
+graded = Book.annotate(
+    grade=Case(
+        When(rating__gte=4, then="high"),
+        When(rating__gte=2, then="mid"),
+        default="low",
+    )
+)
+
+# A `then` (or default) can be an F column reference, not just a literal
+bonus = Book.annotate(bonus=Case(When(rating__gte=4, then=F("rating")), default=0))
+```
+
+## Raw SQL annotations
+
+When you need an expression the helpers don't cover, drop to `RawSQL` — its fragment is spliced into the `SELECT` verbatim:
+
+```python
+from yara_orm import RawSQL
+
+await Book.annotate(double=RawSQL("rating * 2"))
+```
+
 ## See also
 
 - [Querying](querying.md)
