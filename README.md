@@ -202,10 +202,12 @@ python -m yara_orm --db postgres://localhost/app --models myapp.models history
 
 Each migration is a `class Migration(m.Migration)` whose `operations` are built
 from live field objects: `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`,
-`AlterField`, `AddIndex`, `RemoveIndex`, plus hand-written `RunSQL` / `RunPython`
-for data migrations. `makemigrations` emits the idempotent analogs
-(`CreateModelIfNotExists`, `AddFieldIfNotExists`, …) and detects `AlterField`
-automatically. The same commands are available programmatically via
+`AlterField`, `AddIndex`, `RemoveIndex`, plus hand-written renames
+(`RenameModel` / `RenameField` / `RenameIndex`), constraints (`AddConstraint` /
+`RemoveConstraint` / `RenameConstraint` with `UniqueConstraint` / `CheckConstraint`)
+and `RunSQL` / `RunPython` for data migrations. `makemigrations` emits the
+idempotent analogs (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …) and detects
+`AlterField` automatically. The same commands are available programmatically via
 `yara_orm.MigrationManager`.
 
 ## Performance

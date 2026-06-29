@@ -191,6 +191,35 @@ def test_fields_source_empty_is_braces():
     assert m._fields_source({}, 8) == "{}"
 
 
+# -- constraint definitions -------------------------------------------------
+def test_constraint_definitions_render_to_spec_and_source():
+    """
+    GIVEN unique and check constraint definitions
+    WHEN their spec and source are rendered
+    THEN the spec mapping and constructor source are produced
+    """
+    uniq = m.UniqueConstraint(fields=["a", "b"], name="uq")
+    assert uniq.to_spec() == {"kind": "unique", "name": "uq", "fields": ["a", "b"]}
+    assert uniq.to_source() == "m.UniqueConstraint(fields=['a', 'b'], name='uq')"
+
+    check = m.CheckConstraint(check="a > 0", name="ck")
+    assert check.to_spec() == {"kind": "check", "name": "ck", "check": "a > 0"}
+    assert check.to_source() == "m.CheckConstraint(check='a > 0', name='ck')"
+
+
+def test_constraint_base_is_abstract():
+    """
+    GIVEN the constraint base class
+    WHEN to_spec / to_source are called
+    THEN they raise NotImplementedError (subclasses must override)
+    """
+    base = m.Constraint(name="x")
+    with pytest.raises(NotImplementedError):
+        base.to_spec()
+    with pytest.raises(NotImplementedError):
+        base.to_source()
+
+
 # -- to_source per operation, with round-trip -------------------------------
 def test_create_model_roundtrip_with_fk_and_index():
     """
@@ -249,6 +278,14 @@ def test_create_model_composite_pk_roundtrip():
         m.AddUniqueIndexConcurrently("t", "c"),
         m.RemoveIndexIfExists("t", "c"),
         m.RemoveIndexConcurrently("t", "c"),
+        m.RenameModel("old_t", "new_t"),
+        m.RenameField("t", "old_c", "new_c"),
+        m.RenameIndex("t", "c", "idx_old", "idx_new"),
+        m.RenameIndex("t", "c", "idx_old", "idx_new", unique=True),
+        m.AddConstraint("t", m.UniqueConstraint(fields=["a", "b"], name="uq_t")),
+        m.AddConstraint("t", m.CheckConstraint(check="a > 0", name="ck_t")),
+        m.RemoveConstraint("t", m.UniqueConstraint(fields=["a"], name="uq_t")),
+        m.RenameConstraint("t", "uq_old", "uq_new"),
         m.RunSQL("SELECT 1", reverse_sql="SELECT 2"),
         m.RunSQL(["A", "B"]),
         m.RunSQL("SELECT 1"),

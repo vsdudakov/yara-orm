@@ -8,7 +8,7 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from yara_orm import MigrationManager, Model, YaraOrm, fields, migrations
+from yara_orm import IntegrityError, MigrationManager, Model, YaraOrm, fields, migrations
 from yara_orm import migrations as m
 from yara_orm.connection import get_engine
 from yara_orm.dialects import PostgresDialect, SqliteDialect
@@ -181,6 +181,51 @@ async def test_alter_field_migration_postgres(orm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rename_and_constraint_migration_postgres(orm, tmp_path):
+    """
+    GIVEN an applied table
+    WHEN a hand-written migration renames a column and adds a unique constraint
+    THEN the rename takes effect, the constraint is enforced, and both reverse
+    """
+    await _drop_all()
+    mgr = _manager(tmp_path)
+    mgr.make_migrations(name="initial")
+    await mgr.upgrade()
+
+    (tmp_path / "0002_tweaks.py").write_text(
+        "from yara_orm import migrations as m\n\n\n"
+        "class Migration(m.Migration):\n"
+        "    dependencies = ['0001_initial']\n"
+        "    operations = [\n"
+        "        m.RenameField('mg_user', 'name', 'full_name'),\n"
+        "        m.AddConstraint('mg_user', m.UniqueConstraint("
+        "fields=['full_name'], name='uq_mg_user_full_name')),\n"
+        "    ]\n"
+    )
+    assert await mgr.upgrade() == ["0002_tweaks"]
+
+    engine = get_engine()
+    # The column was renamed.
+    rows = await engine.fetch_rows(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = 'mg_user' AND column_name = 'full_name'"
+    )
+    assert rows[0][0] == 1
+    # The unique constraint is enforced.
+    await engine.execute("INSERT INTO mg_user (full_name) VALUES ('Ada')")
+    with pytest.raises(IntegrityError):
+        await engine.execute("INSERT INTO mg_user (full_name) VALUES ('Ada')")
+
+    # Reverse drops the constraint and restores the column name.
+    assert await mgr.downgrade(steps=1) == ["0002_tweaks"]
+    rows = await engine.fetch_rows(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = 'mg_user' AND column_name = 'name'"
+    )
+    assert rows[0][0] == 1
+
+
+@pytest.mark.asyncio
 async def test_sqlmigrate_and_heads(orm, tmp_path):
     """
     GIVEN a generated migration
@@ -261,6 +306,41 @@ async def test_alter_field_on_sqlite_rebuilds_table(sqlite_orm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rename_table_and_index_on_sqlite(sqlite_orm, tmp_path):
+    """
+    GIVEN an applied table with an indexed column on SQLite
+    WHEN a migration renames the table and the index
+    THEN both renames apply and reverse (SQLite drops/recreates the index)
+    """
+    mgr = _manager(tmp_path)
+    mgr.make_migrations(name="initial")
+    await mgr.upgrade()
+
+    (tmp_path / "0002_rename.py").write_text(
+        "from yara_orm import migrations as m\n\n\n"
+        "class Migration(m.Migration):\n"
+        "    dependencies = ['0001_initial']\n"
+        "    operations = [\n"
+        "        m.RenameIndex('mg_post', 'title', 'idx_mg_post_title', 'idx_post_title'),\n"
+        "        m.RenameModel('mg_post', 'mg_article'),\n"
+        "    ]\n"
+    )
+    assert await mgr.upgrade() == ["0002_rename"]
+
+    engine = get_engine()
+    rows = await engine.fetch_rows(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='mg_article'"
+    )
+    assert rows[0][0] == "mg_article"
+
+    assert await mgr.downgrade(steps=1) == ["0002_rename"]
+    rows = await engine.fetch_rows(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='mg_post'"
+    )
+    assert rows[0][0] == "mg_post"
+
+
+@pytest.mark.asyncio
 async def test_non_atomic_concurrent_index_migration(sqlite_orm, tmp_path):
     """
     GIVEN a hand-written non-atomic migration using a concurrent index op
@@ -329,6 +409,9 @@ def test_operation_rendering(dialect):
         m.AddUniqueIndexConcurrently("t", "n"),
         m.RemoveIndex("t", "n"),
         m.RemoveIndexConcurrently("t", "n"),
+        m.RenameModel("t", "t2"),
+        m.RenameField("t", "n", "nn"),
+        m.RenameIndex("t", "n", "idx_old", "idx_new"),
         m.RunSQL("SELECT 1", reverse_sql="SELECT 2"),
         m.RunSQL(["A", "B"]),
         m.RunPython(None),
@@ -336,6 +419,81 @@ def test_operation_rendering(dialect):
     for op in ops:
         assert all(isinstance(s, str) for s in op.forward_sql(dialect, state))
         assert all(isinstance(s, str) for s in op.backward_sql(dialect, state))
+
+
+def test_constraint_ops_render_on_postgres_and_reject_on_sqlite():
+    """
+    GIVEN add/drop/rename constraint operations
+    WHEN rendered on PostgreSQL and SQLite
+    THEN PostgreSQL produces ALTER TABLE DDL and SQLite raises UnSupportedError
+    """
+    from yara_orm.exceptions import UnSupportedError
+
+    pg, lite, state = PostgresDialect(), SqliteDialect(), {"tables": {}}
+    add = m.AddConstraint("t", m.UniqueConstraint(fields=["a", "b"], name="uq"))
+    remove = m.RemoveConstraint("t", m.CheckConstraint(check="a > 0", name="ck"))
+    rename = m.RenameConstraint("t", "uq", "uq2")
+    for op in (add, remove, rename):
+        assert all("ALTER TABLE" in s for s in op.forward_sql(pg, state))
+        assert all("ALTER TABLE" in s for s in op.backward_sql(pg, state))
+        with pytest.raises(UnSupportedError):
+            op.forward_sql(lite, state)
+
+
+def test_rename_and_constraint_state_evolution():
+    """
+    GIVEN rename and constraint operations
+    WHEN applied to and reverted from a schema state
+    THEN tables, columns, indexes and constraints evolve and unwind correctly
+    """
+    state = {"tables": {}}
+    m.CreateModel(
+        "t", fields={"id": fields.IntField(pk=True), "n": fields.IntField(index=True)}
+    ).apply_state(state)
+
+    # Rename a column: fields and the derived index entry follow.
+    rf = m.RenameField("t", "n", "num")
+    rf.apply_state(state)
+    assert "num" in state["tables"]["t"]["fields"]
+    assert state["tables"]["t"]["indexes"] == ["num"]
+    rf.revert_state(state)
+    assert "n" in state["tables"]["t"]["fields"]
+
+    # Rename a composite-pk join column updates the composite pk too.
+    jstate = {
+        "fields": {"a": fields.IntField(), "b": fields.IntField()},
+        "composite_pk": ["a", "b"],
+    }
+    m._rename_in_table(jstate, "a", "aa")
+    assert jstate["composite_pk"] == ["aa", "b"]
+
+    # Rename a table.
+    rm = m.RenameModel("t", "t2")
+    rm.apply_state(state)
+    assert "t2" in state["tables"] and "t" not in state["tables"]
+    rm.revert_state(state)
+    assert "t" in state["tables"]
+
+    # Constraints: add, rename, remove.
+    add = m.AddConstraint("t", m.UniqueConstraint(fields=["n"], name="uq"))
+    add.apply_state(state)
+    other = m.AddConstraint("t", m.CheckConstraint(check="num > 0", name="ck"))
+    other.apply_state(state)  # a non-matching constraint exercises the rename skip
+    assert [c["name"] for c in state["tables"]["t"]["constraints"]] == ["uq", "ck"]
+    ren = m.RenameConstraint("t", "uq", "uq2")
+    ren.apply_state(state)
+    assert state["tables"]["t"]["constraints"][0]["name"] == "uq2"
+    ren.revert_state(state)
+    assert state["tables"]["t"]["constraints"][0]["name"] == "uq"
+    other.revert_state(state)
+    add.revert_state(state)
+    assert state["tables"]["t"]["constraints"] == []
+
+    rm_c = m.RemoveConstraint("t", m.UniqueConstraint(fields=["n"], name="uq"))
+    rm_c.revert_state(state)  # re-add
+    assert state["tables"]["t"]["constraints"][0]["name"] == "uq"
+    rm_c.apply_state(state)  # drop
+    assert state["tables"]["t"]["constraints"] == []
 
 
 def test_operation_apply_and_revert_state():
