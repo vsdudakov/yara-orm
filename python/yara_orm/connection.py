@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from . import _engine, registry
 from .dialects import BaseDialect
 from .dialects import get_dialect as resolve_dialect
-from .exceptions import ConfigurationError
+from .exceptions import ConfigurationError, TransactionManagementError, UnSupportedError
 
 if TYPE_CHECKING:
     from .models import Model
@@ -29,6 +29,54 @@ _ROUTER = None
 #: execution routes through this instead of the pool so all statements share
 #: one transaction.
 _active_tx: contextvars.ContextVar = contextvars.ContextVar("orm_active_tx", default=None)
+
+
+class IsolationLevel:
+    """The four standard SQL transaction isolation levels.
+
+    Pass one to ``in_transaction(isolation=...)`` / ``@atomic(isolation=...)``.
+    SQLite only supports ``SERIALIZABLE``; the others raise ``UnSupportedError``.
+    """
+
+    READ_UNCOMMITTED = "READ UNCOMMITTED"
+    READ_COMMITTED = "READ COMMITTED"
+    REPEATABLE_READ = "REPEATABLE READ"
+    SERIALIZABLE = "SERIALIZABLE"
+
+
+_ISOLATION_LEVELS = frozenset(
+    {
+        IsolationLevel.READ_UNCOMMITTED,
+        IsolationLevel.READ_COMMITTED,
+        IsolationLevel.REPEATABLE_READ,
+        IsolationLevel.SERIALIZABLE,
+    }
+)
+
+
+def _normalize_isolation(isolation: str, dialect_name: str) -> str:
+    """Validate an isolation level for a dialect and return its canonical form.
+
+    Args:
+        isolation: The requested isolation level (case-insensitive).
+        dialect_name: The active dialect's name (e.g. ``"postgres"``).
+
+    Raises:
+        ConfigurationError: If the level is not a recognised SQL isolation level.
+        UnSupportedError: If the dialect cannot honour the level (SQLite only
+            supports ``SERIALIZABLE``).
+
+    Returns:
+        The canonical upper-case isolation level.
+    """
+    level = isolation.upper()
+    if level not in _ISOLATION_LEVELS:
+        raise ConfigurationError(f"Unknown isolation level: {isolation!r}")
+    if dialect_name == "sqlite" and level != IsolationLevel.SERIALIZABLE:
+        raise UnSupportedError(
+            f"SQLite only supports the SERIALIZABLE isolation level, not {isolation!r}"
+        )
+    return level
 
 
 def get_engine() -> Any:
@@ -222,6 +270,50 @@ class TransactionWrapper:
             None
         """
         self._tx = tx
+        #: Monotonic counter producing unique savepoint names for nested blocks.
+        self._savepoint_seq = 0
+
+    def new_savepoint(self) -> str:
+        """Return a fresh, unique savepoint name for this transaction.
+
+        Returns:
+            A savepoint identifier unique within the transaction.
+        """
+        self._savepoint_seq += 1
+        return f"yara_sp_{self._savepoint_seq}"
+
+    async def savepoint(self, name: str) -> None:
+        """Establish a savepoint on the transaction.
+
+        Args:
+            name: The savepoint name.
+
+        Returns:
+            None
+        """
+        await self._tx.savepoint(name)
+
+    async def release(self, name: str) -> None:
+        """Release (merge) a savepoint, keeping its work.
+
+        Args:
+            name: The savepoint name.
+
+        Returns:
+            None
+        """
+        await self._tx.release(name)
+
+    async def rollback_to(self, name: str) -> None:
+        """Roll back to a savepoint, discarding work since it was set.
+
+        Args:
+            name: The savepoint name.
+
+        Returns:
+            None
+        """
+        await self._tx.rollback_to(name)
 
     async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
         """Execute a statement on the transaction.
@@ -321,29 +413,56 @@ class in_transaction:
 
     Commits on clean exit, rolls back if the block raises. While active, all
     model/queryset statements route through the pinned connection.
+
+    Nesting is supported: a block entered while another transaction is active
+    opens a **savepoint** instead of a new transaction, so the inner block can
+    roll back (on error) without aborting the outer one, and its work is merged
+    into the outer transaction on success. An ``isolation`` level may be set on
+    the outermost block only.
     """
 
-    def __init__(self, connection_name: str = "default") -> None:
+    def __init__(self, connection_name: str = "default", isolation: str | None = None) -> None:
         """Initialise the transaction context manager.
 
         Args:
             connection_name: Name of the connection to open a transaction on.
+            isolation: SQL isolation level for the outermost transaction (see
+                :class:`IsolationLevel`), or None for the database default.
 
         Returns:
             None
         """
         self.connection_name = connection_name
+        self.isolation = isolation
         self._conn: TransactionWrapper | None = None
         self._token: contextvars.Token | None = None
+        self._savepoint: str | None = None
 
     async def __aenter__(self) -> Any:
-        """Begin a transaction and pin it as the active executor.
+        """Begin a transaction (or savepoint) and pin it as the active executor.
+
+        Raises:
+            TransactionManagementError: If an isolation level is requested for a
+                nested block (it can only be set when the transaction begins).
 
         Returns:
-            The transaction wrapper for the started transaction.
+            The active transaction wrapper.
         """
+        existing = _active_tx.get()
+        if existing is not None:
+            if self.isolation is not None:
+                raise TransactionManagementError(
+                    "isolation level cannot be set on a nested transaction"
+                )
+            self._conn = existing
+            self._savepoint = existing.new_savepoint()
+            await existing.savepoint(self._savepoint)
+            return existing
         engine = get_engine()
-        self._conn = TransactionWrapper(await engine.begin())
+        isolation = None
+        if self.isolation is not None:
+            isolation = _normalize_isolation(self.isolation, get_dialect().name)
+        self._conn = TransactionWrapper(await engine.begin(isolation))
         self._token = _active_tx.set(self._conn)
         return self._conn
 
@@ -353,7 +472,7 @@ class in_transaction:
         exc: BaseException | None,
         tb: Any,
     ) -> bool:
-        """Commit or roll back the transaction and unpin it.
+        """Commit/release on clean exit, roll back on error, and unpin.
 
         Args:
             exc_type: Exception type raised in the block, or None.
@@ -363,7 +482,14 @@ class in_transaction:
         Returns:
             False, so any exception is propagated.
         """
-        assert self._conn is not None and self._token is not None
+        assert self._conn is not None
+        if self._savepoint is not None:
+            if exc_type is None:
+                await self._conn.release(self._savepoint)
+            else:
+                await self._conn.rollback_to(self._savepoint)
+            return False
+        assert self._token is not None
         try:
             if exc_type is None:
                 await self._conn.commit()

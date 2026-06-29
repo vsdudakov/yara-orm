@@ -149,8 +149,10 @@ Handlers are async. The `Signals` enum names the four lifecycle signals. See
 
 ## Transactions
 
-`in_transaction(connection_name="default")` (async context manager) and
-`atomic(connection_name="default")` (decorator). See [Transactions](guides/transactions.md).
+`in_transaction(connection_name="default", isolation=None)` (async context manager) and
+`atomic(connection_name="default", isolation=None)` (decorator). Nested blocks open
+savepoints automatically; `isolation` takes an `IsolationLevel` constant (PostgreSQL honours
+all four, SQLite is serializable-only). See [Transactions](guides/transactions.md).
 
 ## Migrations
 

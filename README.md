@@ -152,8 +152,10 @@ from yara_orm import in_transaction, atomic, pre_save, connections
 
 async with in_transaction():            # commit on success, rollback on error
     await Account.create(name="A")
+    async with in_transaction():        # nesting opens a savepoint
+        await Account.create(name="B")  # rolls back independently on error
 
-@atomic()
+@atomic(isolation="SERIALIZABLE")       # isolation levels (PostgreSQL)
 async def transfer(): ...
 
 @pre_save(User)                          # lifecycle signals

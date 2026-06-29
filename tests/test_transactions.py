@@ -1,9 +1,15 @@
-"""Transactions: in_transaction, atomic and rollback."""
+"""Transactions: in_transaction, atomic, rollback, nested savepoints and
+isolation levels."""
 
 import pytest
 
-from yara_orm import Model, YaraOrm, atomic, fields, in_transaction
+from yara_orm import IsolationLevel, Model, YaraOrm, atomic, fields, in_transaction
 from yara_orm.connection import get_engine
+from yara_orm.exceptions import (
+    ConfigurationError,
+    TransactionManagementError,
+    UnSupportedError,
+)
 
 
 class TxAccount(Model):
@@ -12,6 +18,10 @@ class TxAccount(Model):
 
     class Meta:
         table = "t_account"
+
+
+#: Used by the cross-backend ``db`` fixture for the nesting/isolation tests.
+MODELS = [TxAccount]
 
 
 async def _reset():
@@ -97,3 +107,142 @@ async def test_reads_inside_transaction_see_writes(orm):
         await TxAccount.create(name="Z", balance=5)
         found = await TxAccount.get(name="Z")
         assert found.balance == 5
+
+
+# -- nested savepoints ------------------------------------------------------
+@pytest.mark.asyncio
+async def test_nested_savepoint_inner_rollback(db):
+    """
+    GIVEN a nested in_transaction (savepoint) that raises
+    WHEN the inner block rolls back but the outer block continues and commits
+    THEN the inner write is discarded and the outer write persists
+    """
+    async with in_transaction():
+        await TxAccount.create(name="A", balance=10)
+        with pytest.raises(RuntimeError):
+            async with in_transaction():  # savepoint
+                await TxAccount.create(name="B", balance=20)
+                raise RuntimeError("inner boom")
+        # The savepoint rolled back B; A is still pending in the outer tx.
+        assert await TxAccount.filter(name="B").exists() is False
+        assert await TxAccount.filter(name="A").exists() is True
+    assert {a.name for a in await TxAccount.all()} == {"A"}
+
+
+@pytest.mark.asyncio
+async def test_nested_savepoint_inner_commit(db):
+    """
+    GIVEN a nested in_transaction that exits cleanly
+    WHEN the outer block commits
+    THEN both the outer and inner writes persist
+    """
+    async with in_transaction():
+        await TxAccount.create(name="A", balance=1)
+        async with in_transaction():  # savepoint released on clean exit
+            await TxAccount.create(name="B", balance=2)
+    assert {a.name for a in await TxAccount.all()} == {"A", "B"}
+
+
+@pytest.mark.asyncio
+async def test_outer_rollback_discards_released_savepoint(db):
+    """
+    GIVEN a nested savepoint released into the outer transaction
+    WHEN the outer transaction later rolls back
+    THEN every write — outer and the released inner — is discarded
+    """
+    with pytest.raises(RuntimeError):
+        async with in_transaction():
+            await TxAccount.create(name="A", balance=1)
+            async with in_transaction():
+                await TxAccount.create(name="B", balance=2)
+            raise RuntimeError("outer boom")
+    assert await TxAccount.all().count() == 0
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_partial_rollback(db):
+    """
+    GIVEN three levels of nesting where only the deepest rolls back
+    WHEN the outer transaction commits
+    THEN the two outer levels persist and only the deepest write is discarded
+    """
+    async with in_transaction():
+        await TxAccount.create(name="L1", balance=1)
+        async with in_transaction():
+            await TxAccount.create(name="L2", balance=2)
+            with pytest.raises(ValueError):
+                async with in_transaction():
+                    await TxAccount.create(name="L3", balance=3)
+                    raise ValueError("deepest boom")
+    assert {a.name for a in await TxAccount.all()} == {"L1", "L2"}
+
+
+# -- isolation levels -------------------------------------------------------
+@pytest.mark.asyncio
+async def test_isolation_serializable_both_backends(db):
+    """
+    GIVEN a transaction requesting SERIALIZABLE isolation
+    WHEN it runs on either backend (both support SERIALIZABLE)
+    THEN the work commits normally
+    """
+    async with in_transaction(isolation=IsolationLevel.SERIALIZABLE):
+        await TxAccount.create(name="S", balance=1)
+    assert await TxAccount.all().count() == 1
+
+
+@pytest.mark.asyncio
+async def test_isolation_repeatable_read_per_backend(db):
+    """
+    GIVEN a transaction requesting REPEATABLE READ isolation
+    WHEN it runs on PostgreSQL (supported) versus SQLite (serializable-only)
+    THEN PostgreSQL applies it and SQLite raises UnSupportedError
+    """
+    if db == "postgres":
+        async with in_transaction(isolation=IsolationLevel.REPEATABLE_READ):
+            await TxAccount.create(name="R", balance=1)
+        assert await TxAccount.all().count() == 1
+    else:
+        with pytest.raises(UnSupportedError):
+            async with in_transaction(isolation=IsolationLevel.REPEATABLE_READ):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_unknown_isolation_level_raises(db):
+    """
+    GIVEN an unrecognised isolation level
+    WHEN a transaction is opened with it
+    THEN a ConfigurationError is raised
+    """
+    with pytest.raises(ConfigurationError):
+        async with in_transaction(isolation="TURBO"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_isolation_rejected_on_nested(db):
+    """
+    GIVEN an active transaction
+    WHEN a nested block requests an isolation level
+    THEN a TransactionManagementError is raised (it can only be set at BEGIN)
+    """
+    async with in_transaction():
+        with pytest.raises(TransactionManagementError):
+            async with in_transaction(isolation=IsolationLevel.SERIALIZABLE):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_atomic_decorator_with_isolation(db):
+    """
+    GIVEN an @atomic decorator carrying an isolation level
+    WHEN the wrapped coroutine runs
+    THEN it commits inside a transaction at that isolation level
+    """
+
+    @atomic(isolation=IsolationLevel.SERIALIZABLE)
+    async def seed():
+        await TxAccount.create(name="D", balance=1)
+
+    await seed()
+    assert await TxAccount.all().count() == 1
