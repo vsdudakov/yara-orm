@@ -82,6 +82,19 @@ Speedup vs `yara-orm` (competitor_time / yara_orm_time; >1 means `yara-orm` fast
 `single_insert` are latency-bound (one sequential round-trip per call) and sit
 near the raw client⇄PostgreSQL round-trip floor.
 
+### Chart
+
+The grouped-bar chart shown in the README and docs is rendered from these
+PostgreSQL numbers by `plot_benchmarks.py` (the values are embedded in the
+script, so it needs no database — just `pip install matplotlib`):
+
+```bash
+python benchmarks/plot_benchmarks.py   # writes docs/assets/benchmark-postgres.png
+```
+
+If you re-run `bench.py`, update the table above **and** the `TIMES_MS` dict in
+`plot_benchmarks.py` so the chart stays in sync.
+
 ### SQLite results
 
 `BENCH_BACKEND=sqlite`, Python 3.12, N=5000, median of 5 (ms, lower is better):

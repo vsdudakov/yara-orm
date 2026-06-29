@@ -88,6 +88,9 @@ extra:
       link: https://github.com/vsdudakov/yara-orm
     - icon: fontawesome/brands/python
       link: https://pypi.org/project/yara-orm/
+    - icon: fontawesome/solid/heart
+      link: https://github.com/sponsors/vsdudakov
+      name: Sponsor Yara ORM
   generator: false
 
 nav:
@@ -105,6 +108,7 @@ nav:
       - Manual SQL: guides/manual-sql.md
       - Multiple databases: guides/multiple-databases.md
       - Migrations: guides/migrations.md
+      - Migrating from Tortoise: guides/migrating-from-tortoise.md
   - Backends:
       - PostgreSQL & SQLite: backends/index.md
   - Performance: performance.md
