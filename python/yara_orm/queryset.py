@@ -1232,11 +1232,14 @@ class QuerySet:
         """
         return self._fetch().__await__()
 
-    async def _fetch_columns(self, field_names: tuple[str, ...]) -> list[Any]:
-        """Fetch raw rows for the given columns without building models.
+    async def _fetch_columns(self, field_paths: tuple[str, ...]) -> list[Any]:
+        """Fetch raw rows for the given column paths without building models.
+
+        Each path may traverse a relation (``"author__name"``); the needed
+        ``LEFT JOIN`` is added automatically via :meth:`_resolve_column`.
 
         Args:
-            field_names: The field names whose columns to select.
+            field_paths: The field names/paths whose columns to select.
 
         Returns:
             The raw database rows for the selected columns.
@@ -1245,13 +1248,13 @@ class QuerySet:
         engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
-        fields = [meta.get_field(n) for n in field_names]
-        cols = ", ".join(dialect.quote(f.db_column) for f in fields)
+        joins: dict[str, str] = {}
+        cols = ", ".join(self._resolve_column(p, dialect, joins) for p in field_paths)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(meta.table)
         distinct = "DISTINCT " if self._distinct else ""
         sql = (
-            f"SELECT {distinct}{cols} FROM {table}{where}"
+            f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
             f"{self._order_sql(dialect)}{self._tail_sql()}"
         )
         return await engine.fetch_rows(sql, params)
@@ -1325,7 +1328,8 @@ class QuerySet:
         """Return rows as tuples (or scalars when ``flat=True``); no model build.
 
         Args:
-            *fields: Field names to select; defaults to all model fields.
+            *fields: Field names/paths to select; a path may traverse a
+                relation (``"author__name"``). Defaults to all model fields.
             flat: When ``True`` return scalar values for a single field.
 
         Returns:
@@ -1333,28 +1337,35 @@ class QuerySet:
         """
         if self._annotations or self._group_by:
             return await self._values_grouped(fields, as_dict=False)
-        names = fields or tuple(self.model._meta.fields.keys())
+        paths = fields or tuple(self.model._meta.fields.keys())
         if flat:
-            if len(names) != 1:
+            if len(paths) != 1:
                 raise FieldError("flat=True requires exactly one field")
-            rows = await self._fetch_columns(names)
+            rows = await self._fetch_columns(paths)
             return [r[0] for r in rows]
-        rows = await self._fetch_columns(names)
+        rows = await self._fetch_columns(paths)
         return [tuple(r) for r in rows]
 
-    async def values(self, *fields: str) -> list[dict[str, Any]]:
+    async def values(self, *fields: str, **aliases: str) -> list[dict[str, Any]]:
         """Return rows as dicts of the requested columns; no model build.
 
         Args:
-            *fields: Field names to select; defaults to all model fields.
+            *fields: Field names/paths to select; the dict key is the path
+                itself (a path may traverse a relation, ``"author__name"``).
+            **aliases: ``output_name=field_path`` pairs, so a traversed column
+                can be given a clean key (``author_name="author__name"``).
 
         Returns:
-            A list of dicts mapping each requested field name to its value.
+            A list of dicts mapping each requested name to its value.
         """
         if self._annotations or self._group_by:
             return await self._values_grouped(fields, as_dict=True)
-        names = fields or tuple(self.model._meta.fields.keys())
-        rows = await self._fetch_columns(names)
+        if not fields and not aliases:
+            names = paths = tuple(self.model._meta.fields.keys())
+        else:
+            names = tuple(fields) + tuple(aliases.keys())
+            paths = tuple(fields) + tuple(aliases.values())
+        rows = await self._fetch_columns(paths)
         return [dict(zip(names, r)) for r in rows]
 
     async def get(self, **kwargs: Any) -> Model:

@@ -335,6 +335,18 @@ for author in authors:
 The supplied queryset constrains the lookup, while the batching guarantee still
 holds: one query loads the filtered related rows for the whole batch.
 
+Pass `to_attr` to store the result on a custom attribute instead of the relation
+accessor — useful for loading the *same* relation more than once with different
+filters:
+
+```python
+authors = await Author.all().prefetch_related(
+    Prefetch("books", queryset=Book.filter(rating__gte=4), to_attr="top_books")
+)
+for author in authors:
+    print(author.top_books)             # a plain list on the instance
+```
+
 ## See also
 
 - [Querying](querying.md)

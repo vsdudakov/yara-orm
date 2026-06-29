@@ -21,18 +21,21 @@ if TYPE_CHECKING:
 class Prefetch:
     """Customise a prefetch with a constrained queryset."""
 
-    def __init__(self, relation: str, queryset: QuerySet) -> None:
+    def __init__(self, relation: str, queryset: QuerySet, to_attr: str | None = None) -> None:
         """Bind a relation name to the queryset used to load it.
 
         Args:
             relation: Name of the relation to prefetch.
             queryset: Queryset used to fetch the related objects.
+            to_attr: When given, store the prefetched result on this instance
+                attribute instead of populating the relation accessor.
 
         Returns:
             None
         """
         self.relation = relation
         self.queryset = queryset
+        self.to_attr = to_attr
 
 
 async def prefetch_instances(instances: list[Model], specs: Sequence[str | Prefetch]) -> None:
@@ -49,18 +52,42 @@ async def prefetch_instances(instances: list[Model], specs: Sequence[str | Prefe
         return
     for spec in specs:
         if isinstance(spec, Prefetch):
-            await _prefetch_one(instances, spec.relation, spec.queryset)
+            await _prefetch_one(instances, spec.relation, spec.queryset, spec.to_attr)
         else:
-            await _prefetch_one(instances, spec, None)
+            await _prefetch_one(instances, spec, None, None)
 
 
-async def _prefetch_one(instances: list[Model], name: str, custom_qs: QuerySet | None) -> None:
+def _assign(instances: list[Model], name: str, to_attr: str | None, values: dict) -> None:
+    """Store each instance's prefetched result, by relation name or ``to_attr``.
+
+    Args:
+        instances: The instances to assign onto.
+        name: The relation name (used as the ``_prefetch`` cache key).
+        to_attr: When set, store on this plain attribute instead of the cache.
+        values: Mapping of instance to its prefetched value.
+
+    Returns:
+        None
+    """
+    for inst in instances:
+        value = values[inst]
+        if to_attr is not None:
+            inst.__dict__[to_attr] = value
+        else:
+            inst.__dict__.setdefault("_prefetch", {})[name] = value
+
+
+async def _prefetch_one(
+    instances: list[Model], name: str, custom_qs: QuerySet | None, to_attr: str | None = None
+) -> None:
     """Prefetch a single forward FK/O2O, reverse FK/O2O, or M2M relation.
 
     Args:
         instances: Instances whose relation should be loaded.
         name: Name of the relation to prefetch.
         custom_qs: Optional queryset to constrain the related lookup.
+        to_attr: When set, store the result on this attribute instead of the
+            relation accessor.
 
     Returns:
         None
@@ -79,9 +106,12 @@ async def _prefetch_one(instances: list[Model], name: str, custom_qs: QuerySet |
         }
         objs = await target.filter(pk__in=list(ids)) if ids else []
         by_id = {o.pk: o for o in objs}
-        for inst in instances:
-            cache = inst.__dict__.setdefault("_prefetch", {})
-            cache[name] = by_id.get(getattr(inst, info.source_attr))
+        _assign(
+            instances,
+            name,
+            to_attr,
+            {i: by_id.get(getattr(i, info.source_attr)) for i in instances},
+        )
         return
 
     descriptor = getattr(model, name, None)
@@ -95,28 +125,33 @@ async def _prefetch_one(instances: list[Model], name: str, custom_qs: QuerySet |
         grouped: dict = {}
         for child in children:
             grouped.setdefault(getattr(child, descriptor.source_attr), []).append(child)
+        values = {}
         for inst in instances:
-            cache = inst.__dict__.setdefault("_prefetch", {})
             group = grouped.get(inst.pk, [])
-            cache[name] = (group[0] if group else None) if descriptor.is_o2o else group
+            values[inst] = (group[0] if group else None) if descriptor.is_o2o else group
+        _assign(instances, name, to_attr, values)
         return
 
     # Many-to-many (forward or reverse); the descriptor is always installed on
     # the class for m2m relations, so an isinstance check covers both cases.
     if isinstance(descriptor, M2MDescriptor):
-        await _prefetch_m2m(instances, name, descriptor)
+        await _prefetch_m2m(instances, name, descriptor, to_attr)
         return
 
     raise ValueError(f"Cannot prefetch unknown relation {name!r} on {model.__name__}")
 
 
-async def _prefetch_m2m(instances: list[Model], name: str, descriptor: M2MDescriptor) -> None:
+async def _prefetch_m2m(
+    instances: list[Model], name: str, descriptor: M2MDescriptor, to_attr: str | None = None
+) -> None:
     """Prefetch a many-to-many relation with a single join query.
 
     Args:
         instances: Instances whose M2M relation should be loaded.
         name: Name of the M2M relation to prefetch.
         descriptor: Descriptor describing the M2M relation.
+        to_attr: When set, store the result on this attribute instead of the
+            relation accessor.
 
     Returns:
         None
@@ -150,6 +185,4 @@ async def _prefetch_m2m(instances: list[Model], name: str, descriptor: M2MDescri
     for row in rows:
         owner_id = row[0]
         grouped.setdefault(owner_id, []).append(target._from_db_row(row[1:]))
-    for inst in instances:
-        cache = inst.__dict__.setdefault("_prefetch", {})
-        cache[name] = grouped.get(inst.pk, [])
+    _assign(instances, name, to_attr, {i: grouped.get(i.pk, []) for i in instances})

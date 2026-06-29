@@ -337,6 +337,39 @@ titles = await Book.all().order_by("title").values_list("title", flat=True)
 
 Called with no field names, both default to every field on the model.
 
+A field name may **traverse a relation** with `__`, selecting a related-model
+column; `values()` additionally accepts keyword aliases so the dict key is clean:
+
+```python
+await Book.all().values("title", "author__name")
+# [{"title": "Dune", "author__name": "Herbert"}, ...]
+
+await Book.all().values("title", author_name="author__name")
+# [{"title": "Dune", "author_name": "Herbert"}, ...]
+
+await Book.all().values_list("author__name", flat=True)   # ["Herbert", ...]
+```
+
+## Upserts with `bulk_create`
+
+`bulk_create` accepts conflict-handling arguments that emit an `ON CONFLICT`
+clause (PostgreSQL and SQLite):
+
+```python
+# Skip rows that collide with an existing unique value:
+await Stat.bulk_create([Stat(key="a"), Stat(key="b")], ignore_conflicts=True)
+
+# Upsert: update the named fields when the conflict target already exists.
+await Stat.bulk_create(
+    [Stat(key="a", hits=99)],
+    update_fields=["hits"],
+    on_conflict=["key"],          # a unique column; defaults to the pk
+)
+```
+
+When conflict handling is requested, primary keys are **not** written back onto
+the instances (the database may insert, skip or update each row).
+
 ## `F` expressions
 
 `F` references a column instead of a Python value, so you can compare or update one column against another — or compute against a column — entirely in SQL (no read-modify-write round trip):

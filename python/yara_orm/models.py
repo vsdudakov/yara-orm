@@ -865,16 +865,17 @@ class Model(metaclass=ModelMeta):
         )
 
     @classmethod
-    async def values(cls, *fields: str) -> list[dict[str, Any]]:
+    async def values(cls, *fields: str, **aliases: str) -> list[dict[str, Any]]:
         """Return all rows as dicts of the requested columns.
 
         Args:
-            *fields: Field names to select; defaults to all model fields.
+            *fields: Field names/paths to select; defaults to all model fields.
+            **aliases: ``output_name=field_path`` pairs for traversed columns.
 
         Returns:
-            A list of dicts mapping each requested field name to its value.
+            A list of dicts mapping each requested name to its value.
         """
-        return await cls._meta.manager.get_queryset().values(*fields)
+        return await cls._meta.manager.get_queryset().values(*fields, **aliases)
 
     @classmethod
     async def values_list(cls, *fields: str, flat: bool = False) -> list[Any]:
@@ -1055,20 +1056,39 @@ class Model(metaclass=ModelMeta):
         return {getattr(obj, key): obj for obj in objects}
 
     @classmethod
-    async def bulk_create(cls, objects: Iterable[Model], batch_size: int = 500) -> list[Model]:
+    async def bulk_create(
+        cls,
+        objects: Iterable[Model],
+        batch_size: int = 500,
+        ignore_conflicts: bool = False,
+        update_fields: Iterable[str] | None = None,
+        on_conflict: Iterable[str] | None = None,
+    ) -> list[Model]:
         """Insert many instances using one multi-row INSERT per batch.
 
         Each batch is a single prepared statement (parsed once, cached on the
         connection), so the whole batch is one round-trip. The per-batch
-        placeholder string is built once and reused. Generated primary keys are
-        written back onto the instances.
+        placeholder string is built once and reused.
+
+        With no conflict handling, generated primary keys are written back onto
+        the instances. When ``ignore_conflicts`` or ``update_fields`` is set an
+        ``ON CONFLICT`` clause is emitted and primary keys are **not** written
+        back (the database may insert, skip or update each row).
 
         Args:
             objects: The instances to insert.
             batch_size: Maximum number of rows per INSERT statement.
+            ignore_conflicts: Emit ``ON CONFLICT DO NOTHING`` to skip rows that
+                violate a unique constraint.
+            update_fields: Field names to overwrite on conflict (upsert via
+                ``ON CONFLICT ... DO UPDATE``); mutually exclusive intent with
+                ``ignore_conflicts`` (update wins if both are given).
+            on_conflict: Field names forming the conflict target; defaults to
+                the primary key when ``update_fields`` is set.
 
         Returns:
-            The list of inserted instances with their primary keys populated.
+            The list of instances (primary keys populated only when no conflict
+            handling was requested).
         """
         objects = list(objects)
         if not objects:
@@ -1080,6 +1100,24 @@ class Model(metaclass=ModelMeta):
         pk_field = meta.pk_field
         table = dialect.quote(meta.table)
         returning = dialect.quote(pk_field.db_column)
+
+        def column_of(name: str) -> str:
+            """Resolve a field/relation name to its database column."""
+            if name in meta.relations:
+                return meta.get_field(meta.relations[name].source_attr).db_column
+            return meta.get_field(name).db_column
+
+        upsert = ignore_conflicts or update_fields is not None
+        conflict_sql = ""
+        if upsert:
+            update_cols = [column_of(n) for n in (update_fields or ())]
+            if on_conflict is not None:
+                conflict_cols = [column_of(n) for n in on_conflict]
+            elif update_cols:
+                conflict_cols = [pk_field.db_column]
+            else:
+                conflict_cols = []
+            conflict_sql = dialect.on_conflict_sql(conflict_cols, update_cols)
 
         insert_fields = [
             f
@@ -1122,11 +1160,13 @@ class Model(metaclass=ModelMeta):
                 nrows: Number of rows the statement should insert.
 
             Returns:
-                The complete INSERT SQL string with a RETURNING clause.
+                The complete INSERT SQL string (with conflict and/or RETURNING).
             """
+            # RETURNING is omitted under ON CONFLICT: skipped rows would not be
+            # returned, so the row order could not be matched back to objects.
+            ret = "" if upsert else f" RETURNING {returning}"
             return (
-                f"INSERT INTO {table} ({columns}) VALUES {values_clause(nrows)} "
-                f"RETURNING {returning}"
+                f"INSERT INTO {table} ({columns}) VALUES {values_clause(nrows)}{conflict_sql}{ret}"
             )
 
         # Pre-build the statement shared by every full-size batch.
@@ -1140,6 +1180,9 @@ class Model(metaclass=ModelMeta):
                 obj._apply_auto_now()
                 for field in insert_fields:
                     params.append(field.to_db(getattr(obj, field.model_field_name, None)))
+            if upsert:
+                await engine.execute(sql, params)
+                continue
             returned = await engine.fetch_rows(sql, params)
             for obj, row in zip(batch, returned):
                 setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))

@@ -8,6 +8,15 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Added
 
+- **`bulk_create` upsert.** New `ignore_conflicts`, `update_fields` and
+  `on_conflict` arguments emit an `ON CONFLICT` clause (`DO NOTHING` or
+  `DO UPDATE`) on PostgreSQL and SQLite. Primary keys are not written back when
+  conflict handling is requested.
+- **Relation traversal in `values()` / `values_list()`.** Select related-model
+  columns with `__`, e.g. `Book.values("title", "author__name")`; `values()`
+  also takes keyword aliases (`values(author_name="author__name")`).
+- **`Prefetch(to_attr=...)`** — store a prefetched result on a custom instance
+  attribute instead of the relation accessor.
 - **Model-level query shortcuts.** `first()`, `last()`, `earliest()`,
   `latest()`, `exists()`, `distinct()`, `select_for_update()`, `values()` and
   `values_list()` are now classmethods on the model (previously query-set only),

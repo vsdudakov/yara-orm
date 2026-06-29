@@ -99,6 +99,30 @@ class BaseDialect:
         """
         return f"EXTRACT({self._extract_parts[part]} FROM {col})"
 
+    def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
+        """Render an ``ON CONFLICT`` clause for ``bulk_create`` upserts.
+
+        ``ON CONFLICT [(cols)] DO NOTHING`` when ``update_columns`` is empty,
+        otherwise ``ON CONFLICT (cols) DO UPDATE SET col = EXCLUDED.col``. The
+        syntax is shared by PostgreSQL and SQLite.
+
+        Args:
+            conflict_columns: The columns forming the conflict target (may be
+                empty for a bare ``DO NOTHING``).
+            update_columns: The columns to overwrite on conflict; empty means
+                ignore the conflicting row.
+
+        Returns:
+            The ``ON CONFLICT`` clause (leading space included).
+        """
+        target = (
+            f" ({', '.join(self.quote(c) for c in conflict_columns)})" if conflict_columns else ""
+        )
+        if not update_columns:
+            return f" ON CONFLICT{target} DO NOTHING"
+        sets = ", ".join(f"{self.quote(c)} = EXCLUDED.{self.quote(c)}" for c in update_columns)
+        return f" ON CONFLICT{target} DO UPDATE SET {sets}"
+
     def search_sql(self, col: str, placeholder: str) -> str:
         """Render a full-text ``__search`` condition.
 
