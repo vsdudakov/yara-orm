@@ -82,6 +82,13 @@ class MetaInfo:
         #: Declarative table constraints (UniqueConstraint/CheckConstraint)
         #: from ``Meta.constraints``; emitted by ``generate_schemas``.
         self.constraints = constraints or []
+        #: Additional ``Meta`` options, populated by the metaclass. ``schema``,
+        #: ``app`` and ``fetch_db_defaults`` are recorded for introspection;
+        #: ``default_connection`` also routes the model's statements.
+        self.schema: str | None = None
+        self.app: str | None = None
+        self.default_connection: str | None = None
+        self.fetch_db_defaults: bool = False
         #: The model's manager; rebound to the declared/default one by the
         #: metaclass once the class object exists.
         self.manager: Manager = Manager()
@@ -326,6 +333,26 @@ class ModelMeta(type):
             constraints=constraints,
         )
 
+        # Additional Meta options are recorded (not silently dropped) so they
+        # are introspectable via `_meta` / `describe()`. `default_connection`
+        # also routes the model's statements (see connection._route); `schema`,
+        # `app` and `fetch_db_defaults` are stored for tooling/forward-compat.
+        cls._meta.schema = getattr(meta_cls, "schema", None)
+        cls._meta.app = getattr(meta_cls, "app", None)
+        cls._meta.default_connection = getattr(meta_cls, "default_connection", None)
+        cls._meta.fetch_db_defaults = bool(getattr(meta_cls, "fetch_db_defaults", False))
+
+        # Per-model exception subclasses so callers can `except User.DoesNotExist`.
+        # They subclass the global exceptions, so `except DoesNotExist` still works.
+        cls.DoesNotExist = type(
+            "DoesNotExist", (DoesNotExist,), {"__qualname__": f"{name}.DoesNotExist"}
+        )
+        cls.MultipleObjectsReturned = type(
+            "MultipleObjectsReturned",
+            (MultipleObjectsReturned,),
+            {"__qualname__": f"{name}.MultipleObjectsReturned"},
+        )
+
         # Bind the model's manager (a declared ``Meta.manager`` or the default).
         manager = getattr(meta_cls, "manager", None) or Manager()
         manager._model = cls
@@ -351,6 +378,9 @@ class Model(metaclass=ModelMeta):
     """Base class for ORM models with persistence and query entry points."""
 
     _meta: ClassVar[MetaInfo]  # populated by the metaclass
+    #: Per-model exception subclasses, installed by the metaclass.
+    DoesNotExist: ClassVar[type[DoesNotExist]]
+    MultipleObjectsReturned: ClassVar[type[MultipleObjectsReturned]]
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialise field values from keyword arguments.
@@ -707,6 +737,43 @@ class Model(metaclass=ModelMeta):
             "ordering": [("-" if desc else "") + n for n, desc in meta.ordering],
         }
 
+    @classmethod
+    def construct(cls, _from_db: bool = False, **kwargs: Any) -> Model:
+        """Build a detached instance directly, skipping validation and defaults.
+
+        A fast, low-ceremony constructor: the given values are written straight
+        onto the instance with no relation resolution, default filling or
+        validation. Use it when you already have trusted field values.
+
+        Args:
+            _from_db: Mark the instance as already persisted (so the next
+                ``save()`` issues an UPDATE rather than an INSERT).
+            **kwargs: Field values to set directly.
+
+        Returns:
+            A new, lightly-constructed instance.
+        """
+        obj = cls.__new__(cls)
+        obj.__dict__["_in_db"] = _from_db
+        obj.__dict__.update(kwargs)
+        return obj
+
+    @classmethod
+    async def fetch_for_list(cls, instances: list[Model], *relations: Any) -> list[Model]:
+        """Prefetch ``relations`` across a list of instances (one query each).
+
+        Args:
+            instances: The instances to populate.
+            *relations: Relation names or :class:`~yara_orm.Prefetch` specs.
+
+        Returns:
+            The same ``instances`` list, with the relations cached on each.
+        """
+        instances = list(instances)
+        if instances:
+            await prefetch_instances(instances, relations)
+        return instances
+
     # -- query entry points ----------------------------------------------
     @classmethod
     def all(cls) -> QuerySet:
@@ -960,9 +1027,9 @@ class Model(metaclass=ModelMeta):
         if rows is None:
             return await cls._meta.manager.get_queryset().get(**kwargs)
         if not rows:
-            raise DoesNotExist(f"{cls.__name__} matching query does not exist")
+            raise cls.DoesNotExist(f"{cls.__name__} matching query does not exist")
         if len(rows) > 1:
-            raise MultipleObjectsReturned(f"Multiple {cls.__name__} objects returned")
+            raise cls.MultipleObjectsReturned(f"Multiple {cls.__name__} objects returned")
         return cls._from_db_row(rows[0])
 
     @classmethod

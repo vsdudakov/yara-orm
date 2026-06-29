@@ -12,12 +12,13 @@ class Aggregate:
 
     function = ""
 
-    def __init__(self, field: str, distinct: bool = False) -> None:
+    def __init__(self, field: str, *, distinct: bool = False) -> None:
         """Initialise the aggregate.
 
         Args:
             field: Name of the target column or relation to aggregate.
-            distinct: Whether to aggregate over distinct values only.
+            distinct: Whether to aggregate over distinct values only
+                (keyword-only, so a stray positional cannot silently become it).
 
         Returns:
             None

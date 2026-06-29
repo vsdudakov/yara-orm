@@ -76,14 +76,16 @@ Append a double-underscore suffix to a field name to choose how it is compared. 
 | `not_in` | `NOT IN (...)` | `Author.filter(name__not_in=["Ada"])` |
 | `range` | `BETWEEN a AND b` | `Book.filter(rating__range=(3, 5))` |
 | `isnull` | `IS NULL` / `IS NOT NULL` | `Author.filter(name__isnull=True)` |
+| `not_isnull` | `IS NOT NULL` / `IS NULL` | `Author.filter(name__not_isnull=True)` |
+| `date` | truncate datetime to date | `Book.filter(created__date=d)` |
 | `contains` | `LIKE '%v%'` | `Book.filter(title__contains="sea")` |
 | `icontains` | `ILIKE '%v%'` | `Book.filter(title__icontains="sea")` |
 | `startswith` | `LIKE 'v%'` | `Book.filter(title__startswith="The")` |
 | `istartswith` | `ILIKE 'v%'` | `Book.filter(title__istartswith="the")` |
 | `endswith` | `LIKE '%v'` | `Book.filter(title__endswith="II")` |
 | `iendswith` | `ILIKE '%v'` | `Book.filter(title__iendswith="ii")` |
-| `year`/`month`/`day`/`hour`/`minute`/`second` | extracted date part `=` | `Book.filter(published__year=2024)` |
-| `regex` / `iregex` | POSIX regex (PostgreSQL) | `Book.filter(title__regex="^The")` |
+| `year`/`quarter`/`month`/`week`/`day`/`hour`/`minute`/`second`/`microsecond` | extracted date part `=` | `Book.filter(published__year=2024)` |
+| `regex` / `iregex` (aliases `posix_regex` / `iposix_regex`) | POSIX regex (PostgreSQL) | `Book.filter(title__regex="^The")` |
 | `search` | full-text (PostgreSQL) | `Book.filter(title__search="ocean")` |
 
 A few categories worth calling out:
@@ -105,7 +107,7 @@ await Book.filter(title__icontains="ocean")
     The `i*` lookups (`icontains`, `istartswith`, `iendswith`) use `ILIKE` on PostgreSQL. On SQLite they fall back to `LIKE`, which is already case-insensitive for ASCII — so the behaviour is consistent: a case-insensitive match on either backend.
 
 !!! warning "PostgreSQL-only lookups"
-    `regex`, `iregex` and `search` are implemented for PostgreSQL only; on SQLite they raise `UnSupportedError`.
+    `regex`, `iregex` (and their `posix_regex`/`iposix_regex` aliases) and `search` are implemented for PostgreSQL only; on SQLite they raise `UnSupportedError`. The `microsecond` date part is likewise PostgreSQL-only.
 
 ## Spanning relations in filters
 

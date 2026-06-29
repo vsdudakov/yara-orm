@@ -6,7 +6,41 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Transactions honor the connection name.** `in_transaction("name")` /
+  `@atomic("name")` previously always ran on the default connection; they now
+  open on the named connection.
+- **Aggregate `distinct` is keyword-only.** `Sum("x", 0)` (a stray positional)
+  raised no error and silently set `distinct`; it now raises `TypeError`. Use
+  `Sum("x", distinct=True)`.
+
 ### Added
+
+- **Modern Tortoise field parameter names** as aliases: `primary_key` (`pk`),
+  `db_index` (`index`), `source_field` (`db_column`), `db_default` (`default`),
+  and FK/M2M `to` (`reference`).
+- **`use_tz` / `timezone` arguments on `YaraOrm.init`** — actually wire the
+  timezone config (previously only settable via a private helper).
+- **`F` in `annotate()`** — project a column or arithmetic expression
+  (`annotate(x=F("a") + 1)`).
+- **`Subquery` / `RawSQL` as filter values** — `filter(pk=Subquery(...))`,
+  `filter(pk__in=Subquery(...))`.
+- **Multi-level `select_related` and `prefetch_related`** —
+  `select_related("author__country")`, `prefetch_related("authors__books")`.
+- **More lookups:** `not_isnull`, `posix_regex`/`iposix_regex` (aliases for
+  `regex`/`iregex`), the `quarter`/`week`/`microsecond` date parts and the
+  `date` truncation lookup.
+- **Multi-sender signals** — `@post_save(ModelA, ModelB)`.
+- **Per-model `DoesNotExist` / `MultipleObjectsReturned`** subclasses (still
+  catchable via the global exceptions).
+- **`Model.construct()`** (fast detached instance) and **`Model.fetch_for_list()`**
+  (prefetch across a list).
+- **`Meta` options recorded** (`schema`, `app`, `fetch_db_defaults`,
+  `default_connection`) instead of silently dropped; `default_connection` also
+  routes the model's statements to a named connection.
+
+### Added (earlier this cycle)
 
 - **`YaraOrm.get_schema_sql(safe=, models=)`** — return the schema DDL as a
   string without executing it (the read-only counterpart of

@@ -316,6 +316,12 @@ for e in employees:
     joined query. Use `prefetch_related` for reverse managers and many-to-many
     relations, where a separate batched query per relation is the right shape.
 
+!!! tip "Spanning multiple relations"
+    Both accept `__`-separated paths to traverse more than one hop:
+    `Book.all().select_related("author__country")` joins book→author→country in
+    one query, and `Country.all().prefetch_related("authors__books")` batches each
+    level. Intermediate hops load automatically.
+
 ### Customising a prefetch with `Prefetch`
 
 For finer control, pass a `Prefetch(relation, queryset=...)` object to filter or

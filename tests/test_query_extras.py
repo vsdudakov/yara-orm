@@ -427,7 +427,8 @@ def test_postgres_lookup_rendering():
     THEN the expected SQL is produced
     """
     pg = PostgresDialect()
-    assert pg.regex_ops == {"regex": "~", "iregex": "~*"}
+    assert pg.regex_ops["regex"] == "~" and pg.regex_ops["iregex"] == "~*"
+    assert pg.regex_ops["posix_regex"] == "~" and pg.regex_ops["iposix_regex"] == "~*"
     assert pg.supports_search is True
     assert pg.date_part_sql("year", '"t"."c"') == 'EXTRACT(YEAR FROM "t"."c")'
     assert "to_tsvector" in pg.search_sql('"c"', "$1")

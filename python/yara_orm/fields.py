@@ -46,6 +46,10 @@ class Field:
         db_column: str | None = None,
         description: str | None = None,
         validators: list[Validator] | None = None,
+        primary_key: bool | None = None,
+        db_index: bool | None = None,
+        source_field: str | None = None,
+        db_default: Any = None,
     ) -> None:
         """Initialize the field with its column options.
 
@@ -58,10 +62,24 @@ class Field:
             db_column: Explicit column name; the metaclass fills it when blank.
             description: Human-readable comment emitted as a column COMMENT.
             validators: Validators run against the value on ``save()``.
+            primary_key: Modern alias for ``pk`` (Tortoise spelling).
+            db_index: Modern alias for ``index`` (Tortoise spelling).
+            source_field: Modern alias for ``db_column`` (Tortoise spelling).
+            db_default: Modern alias for ``default`` (Tortoise spelling); used
+                only when ``default`` is not given.
 
         Returns:
             None
         """
+        # Accept the modern Tortoise parameter spellings as aliases.
+        if primary_key is not None:
+            pk = primary_key
+        if db_index is not None:
+            index = db_index
+        if source_field is not None:
+            db_column = source_field
+        if db_default is not None and default is None:
+            default = db_default
         self.pk = pk
         self.null = null
         self.default = default
@@ -164,7 +182,7 @@ class SmallIntField(Field):
             None
         """
         super().__init__(pk=pk, **kwargs)
-        if pk:
+        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
             self.auto_increment = True
 
 
@@ -184,7 +202,7 @@ class IntField(Field):
             None
         """
         super().__init__(pk=pk, **kwargs)
-        if pk:
+        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
             self.auto_increment = True
 
     def to_python(self, value: Any) -> Any:
@@ -215,7 +233,7 @@ class BigIntField(Field):
             None
         """
         super().__init__(pk=pk, **kwargs)
-        if pk:
+        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
             self.auto_increment = True
 
     def to_python(self, value: Any) -> Any:
@@ -585,11 +603,12 @@ class ForeignKeyField(Field):
 
     def __init__(
         self,
-        reference: str,
+        reference: str | None = None,
         related_name: str | None = None,
         on_delete: str = OnDelete.CASCADE,
         source_field: str | None = None,
         db_constraint: bool = True,
+        to: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the foreign key relation.
@@ -598,15 +617,22 @@ class ForeignKeyField(Field):
             reference: Dotted path or name of the target model.
             related_name: Name of the reverse accessor on the target model.
             on_delete: Referential action applied on deletion.
-            source_field: Target field referenced; defaults to its primary key.
+            source_field: Explicit name for this table's FK column (Tortoise's
+                ``source_field``); defaults to ``<name>_id``. The referenced
+                target column is always the target model's primary key.
             db_constraint: Whether to emit a database ``FOREIGN KEY`` constraint
                 (set ``False`` to keep the column without enforcing referential
                 integrity at the database level).
+            to: Modern alias for ``reference`` (Tortoise spelling).
             **kwargs: Additional options forwarded to :class:`Field`.
 
         Returns:
             None
         """
+        if to is not None:
+            reference = to
+        if reference is None:
+            raise TypeError("ForeignKeyField requires a target model (pass reference= or to=)")
         super().__init__(**kwargs)
         self.reference = reference
         self.related_name = related_name
@@ -620,11 +646,11 @@ class OneToOneField(ForeignKeyField):
 
     is_o2o = True
 
-    def __init__(self, reference: str, **kwargs: Any) -> None:
+    def __init__(self, reference: str | None = None, **kwargs: Any) -> None:
         """Initialize the one-to-one relation, enforcing uniqueness.
 
         Args:
-            reference: Dotted path or name of the target model.
+            reference: Dotted path or name of the target model (or pass ``to=``).
             **kwargs: Additional options forwarded to :class:`ForeignKeyField`.
 
         Returns:
@@ -648,11 +674,12 @@ class ManyToManyField(Field):
 
     def __init__(
         self,
-        reference: str,
+        reference: str | None = None,
         related_name: str | None = None,
         through: str | None = None,
         forward_key: str | None = None,
         backward_key: str | None = None,
+        to: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the many-to-many relation.
@@ -663,11 +690,16 @@ class ManyToManyField(Field):
             through: Name of the join table; synthesised when omitted.
             forward_key: Join-table column referencing the owning model.
             backward_key: Join-table column referencing the target model.
+            to: Modern alias for ``reference`` (Tortoise spelling).
             **kwargs: Additional options forwarded to :class:`Field`.
 
         Returns:
             None
         """
+        if to is not None:
+            reference = to
+        if reference is None:
+            raise TypeError("ManyToManyField requires a target model (pass reference= or to=)")
         super().__init__(**kwargs)
         self.reference = reference
         self.related_name = related_name

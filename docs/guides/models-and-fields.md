@@ -199,6 +199,12 @@ Every concrete field accepts the same column options:
 | `description` | `None`  | Column comment (emitted as a SQL `COMMENT`).                   |
 | `validators`  | `None`  | List of validators run against the value on `save()`.          |
 
+!!! note "Tortoise parameter spellings accepted"
+    The modern Tortoise names are accepted as aliases: `primary_key` (→ `pk`),
+    `db_index` (→ `index`), `source_field` (→ `db_column`), `db_default`
+    (→ `default`), and `to` (→ `reference`) on `ForeignKeyField` /
+    `ManyToManyField`.
+
 ```python
 import uuid
 
