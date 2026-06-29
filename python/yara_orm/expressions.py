@@ -316,6 +316,53 @@ class Case:
         return "(" + " ".join(parts) + ")", idx
 
 
+class Subquery:
+    """A nested ``SELECT`` embedded in an annotation or filter.
+
+    Wraps a :class:`~yara_orm.QuerySet`; render it where a scalar is expected by
+    restricting the inner query to one column (``.only(...)`` / ``.values_list``)
+    so it reads as ``(SELECT col FROM ... WHERE ...)``.
+    """
+
+    def __init__(self, queryset: Any) -> None:
+        """Store the inner query set.
+
+        Args:
+            queryset: The :class:`QuerySet` to embed as a subquery.
+
+        Returns:
+            None
+        """
+        self.queryset = queryset
+
+    def as_sql(
+        self,
+        queryset: Any,
+        dialect: BaseDialect,
+        joins: dict[str, str],
+        params: list[Any],
+        idx: int,
+    ) -> tuple[str, int]:
+        """Render the wrapped query as a parenthesised subquery.
+
+        Bound parameters of the inner query continue the outer query's
+        placeholder numbering, so it composes inside a larger statement.
+
+        Args:
+            queryset: The owning queryset (unused).
+            dialect: The active SQL dialect.
+            joins: Join map (unused; the subquery carries its own FROM).
+            params: Bound-parameter list, extended in place.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, next_index)`` tuple.
+        """
+        sub_sql, sub_params, _ = self.queryset._plain_select_sql(dialect, start=idx)
+        params.extend(sub_params)
+        return f"({sub_sql})", idx + len(sub_params)
+
+
 class RawSQL:
     """A raw SQL fragment spliced into an annotation, verbatim."""
 

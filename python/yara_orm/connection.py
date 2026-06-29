@@ -109,7 +109,9 @@ def _route(model: type[Model] | None, write: bool) -> str:
     return "default"
 
 
-def get_executor(model: type[Model] | None = None, write: bool = False) -> Any:
+def get_executor(
+    model: type[Model] | None = None, write: bool = False, using: str | None = None
+) -> Any:
     """Return the object statements run on for ``model``.
 
     This is the active transaction, or the connection chosen for ``model`` by
@@ -119,6 +121,8 @@ def get_executor(model: type[Model] | None = None, write: bool = False) -> Any:
     Args:
         model: Model class used to route to a connection, or None.
         write: Whether the executor is for a write operation.
+        using: Explicit connection name (from ``QuerySet.using_db``) that
+            overrides the router; an active transaction still takes precedence.
 
     Returns:
         The active transaction or the routed connection object.
@@ -126,21 +130,27 @@ def get_executor(model: type[Model] | None = None, write: bool = False) -> Any:
     tx = _active_tx.get()
     if tx is not None:
         return tx
+    if using is not None:
+        return _named_connection(using)[0]
     # Fast path: no router -> the default engine, skipping route resolution.
     if _ROUTER is None:
         return get_engine()
     return _CONNECTIONS[_route(model, write)][0]
 
 
-def get_dialect(model: type[Model] | None = None) -> BaseDialect:
+def get_dialect(model: type[Model] | None = None, using: str | None = None) -> BaseDialect:
     """Return the SQL dialect for ``model``'s connection.
 
     Args:
         model: Model class used to route to a connection, or None.
+        using: Explicit connection name (from ``QuerySet.using_db``) that
+            overrides the router.
 
     Returns:
         The dialect for the resolved connection.
     """
+    if using is not None:
+        return _named_connection(using)[1]
     if _ROUTER is None:
         if _DIALECT is None:
             raise ConfigurationError(
@@ -148,6 +158,24 @@ def get_dialect(model: type[Model] | None = None) -> BaseDialect:
             )
         return _DIALECT
     return _CONNECTIONS[_route(model, False)][1]
+
+
+def _named_connection(name: str) -> tuple[Any, BaseDialect]:
+    """Return the ``(engine, dialect)`` pair registered under ``name``.
+
+    Args:
+        name: The connection name.
+
+    Raises:
+        ConfigurationError: If no connection is registered under ``name``.
+
+    Returns:
+        The ``(engine, dialect)`` tuple for the named connection.
+    """
+    try:
+        return _CONNECTIONS[name]
+    except KeyError as exc:
+        raise ConfigurationError(f"No connection named {name!r}") from exc
 
 
 class YaraOrm:

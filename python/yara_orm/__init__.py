@@ -37,7 +37,7 @@ from .exceptions import (
     UnSupportedError,
     ValidationError,
 )
-from .expressions import Case, F, RawSQL, When
+from .expressions import Case, F, RawSQL, Subquery, When
 from .functions import Coalesce, Concat, Length, Lower, Trim, Upper
 from .manager import Manager
 from .migrations import MigrationManager
@@ -64,6 +64,7 @@ __all__ = [
     "Case",
     "When",
     "RawSQL",
+    "Subquery",
     "Now",
     "RandomHex",
     "SqlDefault",

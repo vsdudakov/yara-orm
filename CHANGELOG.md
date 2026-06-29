@@ -8,6 +8,26 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Added
 
+- **Relation-spanning filters.** `filter()` / `exclude()` now traverse
+  relations with the `__` syntax — `Book.filter(author__name__icontains="ad")`,
+  multi-level `Book.filter(author__country__name="UK")`, reverse FKs
+  (`Author.filter(books__rating__gte=5)`) and many-to-many in both directions.
+  Compiled as correlated membership subqueries, so any depth and self-relations
+  work without join-induced row duplication.
+- **More field lookups:** `iexact`, `not_in`, `range`, the date/time parts
+  `year`/`month`/`day`/`hour`/`minute`/`second`, and (PostgreSQL) `regex` /
+  `iregex` / `search` full-text. The regex/search lookups raise
+  `UnSupportedError` on SQLite.
+- **`only()` / `defer()`** — fetch a subset of columns and return partially
+  populated instances; reading a column that was not loaded raises `FieldError`.
+- **`QuerySet.get_or_none()` / `get_or_create()` / `update_or_create()`** —
+  previously only on the model class, now also chainable on a query set.
+- **`QuerySet.select_for_update(nowait=, skip_locked=, of=)`** — row-lock
+  modifiers (PostgreSQL; a no-op on SQLite).
+- **`QuerySet.using_db(name)`** — run a query set on a named connection.
+- **`QuerySet.sql()` / `QuerySet.explain()`** — inspect the compiled SQL and the
+  database's query plan.
+- **`Subquery`** — embed a query set as a nested `SELECT` in an annotation.
 - **`save(update_fields=[...])` now performs a partial-column update.**
   Previously the argument was forwarded only to the save signals; it now
   restricts the `UPDATE` to the named columns of an existing row. Relation names
