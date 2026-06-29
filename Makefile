@@ -46,6 +46,12 @@ bench-sqlite:
 	.venv312/bin/pip install -q -U aiosqlite
 	BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
 
+# yara-orm-only feature micro-benchmarks (nested-transaction savepoints, eager
+# loading vs N+1, projection). Runs on SQLite by default (zero setup); pass
+# BENCH_BACKEND=postgres ORM_TEST_DB=... for Postgres.
+bench-features: build
+	$(PY) benchmarks/bench_features.py
+
 # --- Documentation (MkDocs Material) -----------------------------------------
 # Install the docs extra from pyproject.toml ([project.optional-dependencies]).
 docs-install:

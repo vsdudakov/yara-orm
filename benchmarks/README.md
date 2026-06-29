@@ -123,3 +123,40 @@ sequential point reads, and everything throughput-shaped is far ahead.
 
 For pure projections, `values_list()` / `values()` select only the requested
 columns and skip model construction (~1.7–2.2× faster than full fetch).
+
+## Feature micro-benchmarks (`yara-orm` only)
+
+`bench_features.py` times the features the cross-ORM suite intentionally skips
+because they are not comparable across ORMs and feature sets: **nested-transaction
+savepoints**, **eager loading** (`select_related` / `prefetch_related` vs N+1) and
+**projection** (`values` / `values_list`). It is `yara-orm`-only, so it needs no
+competitor installs — just the built engine.
+
+```bash
+# SQLite (zero setup — a throwaway temp file)
+make bench-features
+# or directly, on either backend:
+python benchmarks/bench_features.py
+BENCH_BACKEND=postgres ORM_TEST_DB=postgres://USER@localhost/orm_demo \
+    python benchmarks/bench_features.py
+```
+
+Env knobs: `BENCH_AUTHORS` (parent rows, default 100), `BENCH_BOOKS_PER`
+(children each, 5), `BENCH_S` (transaction insert rows, 300), `BENCH_REPEAT` (5).
+
+It reports each operation's time plus a **feature payoff** ratio (slower ÷ faster).
+Representative ratios (100 authors × 5 books, 300 tx rows, median of 5):
+
+| payoff                                  | SQLite | PostgreSQL |
+|-----------------------------------------|-------:|-----------:|
+| `select_related` vs N+1 (forward FK)    | 28.5×  |     38.4×  |
+| `prefetch_related` vs N+1 (reverse)     |  9.7×  |     14.5×  |
+| one transaction vs autocommit           |  1.4×  |      1.0×  |
+| `values_list` vs full model fetch       |  1.6×  |      1.6×  |
+| savepoint-per-row overhead vs one tx    |  2.7×  |      2.8×  |
+
+Eager loading collapses the N+1 fan-out into one (`select_related`) or two
+(`prefetch_related`) queries, so its payoff grows with the row count and is
+largest on PostgreSQL, where each avoided query is a network round-trip. The
+last row is a **cost**, not a win: wrapping every row in its own savepoint adds a
+`SAVEPOINT`/`RELEASE` pair per insert — the price of fine-grained nested rollback.
