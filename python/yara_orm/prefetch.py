@@ -206,7 +206,7 @@ async def _prefetch_m2m(
     Returns:
         None
     """
-    if not instances:
+    if not instances:  # pragma: no cover - prefetch is only dispatched for non-empty sets
         return
     info = descriptor.info
     info.finalize()
