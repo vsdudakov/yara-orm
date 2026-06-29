@@ -153,6 +153,23 @@ pub struct Transaction {
     inner: Arc<Mutex<Option<Box<dyn TxConn>>>>,
 }
 
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        // Safety net: if a transaction is dropped without commit/rollback (e.g.
+        // the owning coroutine was discarded before `__aexit__` ran), roll it
+        // back on the background runtime. Otherwise the pinned connection would
+        // be recycled into the pool with `BEGIN` still open (deadpool's Fast
+        // recycling performs no reset), corrupting the next consumer's session.
+        if let Ok(mut guard) = self.inner.try_lock() {
+            if let Some(tx) = guard.take() {
+                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+                    let _ = tx.rollback().await;
+                });
+            }
+        }
+    }
+}
+
 fn tx_finished() -> PyErr {
     PyRuntimeError::new_err("transaction already committed or rolled back")
 }

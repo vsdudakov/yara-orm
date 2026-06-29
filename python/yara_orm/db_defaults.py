@@ -67,7 +67,16 @@ class RandomHex(DatabaseDefault):
             The random-hex default expression.
         """
         if dialect.name == "postgres":
-            return "md5(random()::text || clock_timestamp()::text)"
+            # Each md5() yields 32 lowercase hex chars (16 bytes); concatenate
+            # enough of them to cover ``size`` bytes, then trim — so the width
+            # honours ``size`` and matches the SQLite branch instead of always
+            # being 32 chars.
+            hex_len = self.size * 2
+            chunks = -(-hex_len // 32)  # ceil division
+            expr = " || ".join(
+                f"md5(random()::text || clock_timestamp()::text || {i})" for i in range(chunks)
+            )
+            return f"substr({expr}, 1, {hex_len})"
         return f"lower(hex(randomblob({self.size})))"
 
 

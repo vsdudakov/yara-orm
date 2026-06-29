@@ -1,7 +1,7 @@
 //! PostgreSQL backend built on tokio-postgres + deadpool connection pooling.
 
 use async_trait::async_trait;
-use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod};
+use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{NoTls, Statement};
 
@@ -44,6 +44,20 @@ impl PgBackend {
         let max_size = params.max_size.unwrap_or(DEFAULT_MAX_SIZE);
         let pool = Pool::builder(mgr)
             .max_size(max_size)
+            // Pin every connection to UTC. The engine stores and returns all
+            // timestamps in UTC, so a non-UTC server `TimeZone` would otherwise
+            // make `timestamptz` extraction (EXTRACT(HOUR FROM ...)) and
+            // CURRENT_TIMESTAMP depend on the server's locale. Applied per
+            // connection so lazily-created ones are covered too.
+            .post_create(Hook::async_fn(|client, _| {
+                Box::pin(async move {
+                    client
+                        .batch_execute("SET TIME ZONE 'UTC'")
+                        .await
+                        .map_err(HookError::Backend)?;
+                    Ok(())
+                })
+            }))
             .build()
             .map_err(|e| EngineError::Config(e.to_string()))?;
 
@@ -99,7 +113,7 @@ impl Backend for PgBackend {
         let stmt = prepare(&client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
-        Ok(rows.iter().map(decode_pg_row).collect())
+        rows.iter().map(decode_pg_row).collect()
     }
 
     async fn fetch_all_values(
@@ -111,7 +125,7 @@ impl Backend for PgBackend {
         let stmt = prepare(&client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
-        Ok(rows.iter().map(decode_pg_row_values).collect())
+        rows.iter().map(decode_pg_row_values).collect()
     }
 
     async fn execute_many(
@@ -131,10 +145,13 @@ impl Backend for PgBackend {
         let futures = bounds.iter().map(|bound| client.query(&stmt, bound));
         let results = futures_util::future::try_join_all(futures).await?;
 
-        Ok(results
+        results
             .into_iter()
-            .map(|rows| rows.first().map(decode_pg_row).unwrap_or_default())
-            .collect())
+            .map(|rows| match rows.first() {
+                Some(r) => decode_pg_row(r),
+                None => Ok(Row::new()),
+            })
+            .collect()
     }
 
     fn dialect(&self) -> &'static str {
@@ -179,7 +196,7 @@ impl TxConn for PgTx {
         let stmt = prepare(&self.client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client.query(&stmt, &bound).await?;
-        Ok(rows.iter().map(decode_pg_row).collect())
+        rows.iter().map(decode_pg_row).collect()
     }
 
     async fn fetch_all_values(
@@ -190,7 +207,7 @@ impl TxConn for PgTx {
         let stmt = prepare(&self.client, sql, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client.query(&stmt, &bound).await?;
-        Ok(rows.iter().map(decode_pg_row_values).collect())
+        rows.iter().map(decode_pg_row_values).collect()
     }
 
     async fn commit(self: Box<Self>) -> Result<(), EngineError> {

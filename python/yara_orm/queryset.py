@@ -307,13 +307,18 @@ class QuerySet:
 
         Args:
             *fields: Field names, optionally prefixed with ``-`` for
-                descending order; annotation names are also accepted.
+                descending order; annotation names are also accepted. The
+                special token ``"?"`` orders rows randomly (``RANDOM()``).
 
         Returns:
             A cloned ``QuerySet`` with the ordering applied.
         """
         qs = self._clone()
         for spec in fields:
+            if spec == "?":
+                # Random ordering; no column to validate or qualify.
+                qs._order.append(("?", False))
+                continue
             descending = spec.startswith("-")
             name = spec[1:] if descending else spec
             if name not in self._annotations:
@@ -537,7 +542,7 @@ class QuerySet:
     def _compile_field_op(
         self,
         col: str,
-        field: Field,
+        field: Field | None,
         op: str,
         value: Any,
         dialect: BaseDialect,
@@ -546,8 +551,10 @@ class QuerySet:
         """Compile a single ``column <op> value`` condition.
 
         Args:
-            col: The already-qualified column reference.
-            field: The field backing the column (for value coercion).
+            col: The already-qualified column reference (or a rendered
+                expression, e.g. an aggregate for a ``HAVING`` comparison).
+            field: The field backing the column (for value coercion), or None
+                when ``col`` is an expression with no backing field.
             op: The lookup operator (e.g. ``gte``, ``in``, ``year``, ``regex``).
             value: The comparison value.
             dialect: The SQL dialect providing quoting and placeholders.
@@ -569,6 +576,12 @@ class QuerySet:
                 return f"{col} {membership} {vsql}", vparams, idx
             sql_op = dialect.ilike if _OPERATORS[op][0] == "ILIKE" else _OPERATORS[op][0]
             return f"{col} {sql_op} {vsql}", vparams, idx
+
+        # When ``col`` is a bare expression (e.g. a HAVING aggregate) there is no
+        # backing field to coerce through, so bind the value as-is.
+        def coerce(v: Any) -> Any:
+            return field.to_db(v) if field is not None else v
+
         if op in ("in", "not_in"):
             membership = "NOT IN" if op == "not_in" else "IN"
             if not value:
@@ -577,13 +590,13 @@ class QuerySet:
             holes, params = [], []
             for item in value:
                 holes.append(dialect.placeholder(idx))
-                params.append(field.to_db(item.pk if _is_model(item) else item))
+                params.append(coerce(item.pk if _is_model(item) else item))
                 idx += 1
             return f"{col} {membership} ({', '.join(holes)})", params, idx
         if op == "range":
             lo, hi = value
             p1, p2 = dialect.placeholder(idx), dialect.placeholder(idx + 1)
-            return f"{col} BETWEEN {p1} AND {p2}", [field.to_db(lo), field.to_db(hi)], idx + 2
+            return f"{col} BETWEEN {p1} AND {p2}", [coerce(lo), coerce(hi)], idx + 2
         if op in _DATE_PARTS:
             return (
                 f"{dialect.date_part_sql(op, col)} = {dialect.placeholder(idx)}",
@@ -598,7 +611,7 @@ class QuerySet:
         if op == "date":
             return (
                 f"{dialect.truncate_date_sql(col)} = {dialect.placeholder(idx)}",
-                [field.to_db(value)],
+                [coerce(value)],
                 idx + 1,
             )
         if op == "search":
@@ -618,7 +631,7 @@ class QuerySet:
             return f"{col} {sql_op} {expr_sql}", expr_params, idx
         placeholder = dialect.placeholder(idx)
         idx += 1
-        bound = pattern(value) if pattern is not None else field.to_db(value)
+        bound = pattern(value) if pattern is not None else coerce(value)
         return f"{col} {sql_op} {placeholder}", [bound], idx
 
     def _compile_relation_lookup(
@@ -733,19 +746,26 @@ class QuerySet:
         info.finalize()
         if descriptor.reverse:
             near, far = info.forward_key, info.backward_key
+            target_model = info.owner
         else:
             near, far = info.backward_key, info.forward_key
+            target_model = info.resolve_target()
         q = dialect.quote
         meta = self.model._meta
         table = q(meta.table)
         pk = q(meta.pk_field.db_column)
         through = q(info.through)
+        far_pk = target_model._meta.pk_field
         if op == "in":
             vals = [v.pk if _is_model(v) else v for v in value]
+            if not vals:
+                # ``rel__in=[]`` matches no rows (an empty membership set);
+                # emit a constant false rather than the invalid ``IN ()``.
+                return "1 = 0", [], idx
             holes, params = [], []
             for v in vals:
                 holes.append(dialect.placeholder(idx))
-                params.append(v)
+                params.append(far_pk.to_db(v))
                 idx += 1
             inner = (
                 f"SELECT {through}.{q(near)} FROM {through} "
@@ -753,7 +773,7 @@ class QuerySet:
             )
             return f"{table}.{pk} IN ({inner})", params, idx
         membership = "NOT IN" if op == "not" else "IN"
-        target = value.pk if _is_model(value) else value
+        target = far_pk.to_db(value.pk if _is_model(value) else value)
         placeholder = dialect.placeholder(idx)
         idx += 1
         inner = (
@@ -838,6 +858,10 @@ class QuerySet:
         table = dialect.quote(meta.table)
         parts = []
         for name, descending in order:
+            if name == "?":
+                # Random ordering — RANDOM() is accepted by PostgreSQL and SQLite.
+                parts.append(dialect.random_function)
+                continue
             if name in self._annotations:
                 ref = dialect.quote(name)
             else:
@@ -991,15 +1015,22 @@ class QuerySet:
             # F / arithmetic projected as an annotation, e.g. annotate(x=F("a")+1).
             return agg.resolve(resolve, dialect, params, idx)
         if isinstance(agg, Function):
-            return agg.render(resolve), idx
+            return agg.render_params(resolve, dialect, params, idx)
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
         return f"{agg.function}({distinct}{resolve(agg.field)})", idx
 
     def _resolve_column(self, field: str, dialect: BaseDialect, joins: dict[str, str]) -> str:
         """Resolve a field name to its qualified column, adding joins as needed.
 
+        Supports multi-level forward-relation paths (``author__country__name``):
+        each non-final segment that names a forward relation is chain-joined, and
+        the final segment is the target column (or, if it too is a relation, its
+        primary key). A single reverse-FK/M2M hop (``rel__col``) is still handled
+        via the aggregate join helper.
+
         Args:
-            field: A local column, ``pk``, ``rel__col`` path, or relation name.
+            field: A local column, ``pk``, a relation name, or a (possibly
+                multi-level) ``rel__...__col`` path.
             dialect: The SQL dialect providing identifier quoting.
             joins: Mapping of join key to join SQL, mutated in place when the
                 field spans a relation.
@@ -1010,14 +1041,40 @@ class QuerySet:
         q = dialect.quote
         meta = self.model._meta
         table = q(meta.table)
-        if "__" in field:
-            rel, col = field.split("__", 1)
-            tmeta = self._add_relation_join(rel, dialect, joins)
-            return f"{q(tmeta.table)}.{q(tmeta.get_field(col).db_column)}"
-        if field in meta.fields or field == "pk":
-            return f"{table}.{q(meta.get_field(field).db_column)}"
-        tmeta = self._add_relation_join(field, dialect, joins)
-        return f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
+        if "__" not in field:
+            if field in meta.fields or field == "pk":
+                return f"{table}.{q(meta.get_field(field).db_column)}"
+            tmeta = self._add_relation_join(field, dialect, joins)
+            return f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
+
+        segments = field.split("__")
+        cur_meta = meta
+        cur_table = table
+        chain = ""
+        for i, seg in enumerate(segments):
+            last = i == len(segments) - 1
+            info = cur_meta.relations.get(seg)
+            if info is not None:
+                # Forward relation: chain a LEFT JOIN to its target table.
+                chain = f"{chain}__{seg}" if chain else seg
+                tmeta = info.resolve_target()._meta
+                src = q(cur_meta.get_field(info.source_attr).db_column)
+                joins[chain] = (
+                    f" LEFT JOIN {q(tmeta.table)} ON {cur_table}.{src} = "
+                    f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
+                )
+                cur_meta, cur_table = tmeta, q(tmeta.table)
+                if last:
+                    return f"{cur_table}.{q(cur_meta.pk_field.db_column)}"
+            elif last:
+                return f"{cur_table}.{q(cur_meta.get_field(seg).db_column)}"
+            elif cur_meta is meta and len(segments) == 2:
+                # A single reverse-FK / M2M hop, e.g. ``tags__name``.
+                tmeta = self._add_relation_join(seg, dialect, joins)
+                return f"{q(tmeta.table)}.{q(tmeta.get_field(segments[1]).db_column)}"
+            else:
+                raise FieldError(f"Cannot traverse relation path {field!r}")
+        raise FieldError(f"Cannot traverse relation path {field!r}")  # pragma: no cover
 
     def _compile_filter_dict(
         self, conditions: dict[str, Any], dialect: BaseDialect, idx: int
@@ -1057,11 +1114,14 @@ class QuerySet:
         """
         clauses, params = [], []
         for name, op, value in self._having:
+            # Render the annotation expression, then reuse the same comparison
+            # compiler as WHERE so every lookup (in/range/isnull/icontains/date
+            # parts/...) works against an aggregate, with dialect-correct
+            # operators and bound (never spliced) values.
             expr, idx = self._aggregate_expr(self._annotations[name], dialect, joins, params, idx)
-            sql_op, _ = _OPERATORS[op]
-            clauses.append(f"{expr} {sql_op} {dialect.placeholder(idx)}")
-            params.append(value)
-            idx += 1
+            clause, p, idx = self._compile_field_op(expr, None, op, value, dialect, idx)
+            clauses.append(clause)
+            params.extend(p)
         having = (" HAVING " + " AND ".join(clauses)) if clauses else ""
         return having, params, idx
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from . import registry
-from .connection import get_dialect, get_engine
+from .connection import get_dialect, get_executor
 from .queryset import QuerySet
 
 if TYPE_CHECKING:
@@ -556,8 +556,9 @@ class M2MManager:
         cache = self.instance.__dict__.get("_prefetch")
         if cache and self.name in cache:
             return cache[self.name]
-        dialect = get_dialect()
-        engine = get_engine()
+        owner = type(self.instance)
+        dialect = get_dialect(owner)
+        engine = get_executor(owner, write=False)
         meta = self.target._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -599,8 +600,9 @@ class M2MManager:
         """
         if not objects:
             return
-        dialect = get_dialect()
-        engine = get_engine()
+        owner = type(self.instance)
+        dialect = get_dialect(owner)
+        engine = get_executor(owner, write=True)
         q = dialect.quote
         near = self.instance.pk
         for obj in objects:
@@ -624,8 +626,9 @@ class M2MManager:
         """
         if not objects:
             return
-        dialect = get_dialect()
-        engine = get_engine()
+        owner = type(self.instance)
+        dialect = get_dialect(owner)
+        engine = get_executor(owner, write=True)
         q = dialect.quote
         fars = [obj.pk if hasattr(obj, "pk") else obj for obj in objects]
         holes = ", ".join(dialect.placeholder(i + 2) for i in range(len(fars)))
@@ -642,8 +645,9 @@ class M2MManager:
         Returns:
             None
         """
-        dialect = get_dialect()
-        engine = get_engine()
+        owner = type(self.instance)
+        dialect = get_dialect(owner)
+        engine = get_executor(owner, write=True)
         q = dialect.quote
         sql = (
             f"DELETE FROM {q(self.info.through)} "
