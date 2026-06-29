@@ -214,6 +214,15 @@ await book.save(update_fields=["rating"])
 await book.delete()
 ```
 
+!!! note "`update_fields` semantics"
+    `save(update_fields=[...])` writes **only** the named columns of an existing
+    row — handy for narrow updates on wide tables and to avoid clobbering columns
+    other code may have changed. A relation name (e.g. `"author"`) maps to its
+    foreign-key column, an `auto_now` timestamp is refreshed only if you name it,
+    an empty list is a no-op, and an unknown name raises `FieldError`. It is
+    ignored when the instance is being **inserted** (a new row needs every
+    column).
+
 Fetch-or-`None` and batched inserts:
 
 ```python

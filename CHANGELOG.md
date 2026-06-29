@@ -4,6 +4,24 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`save(update_fields=[...])` now performs a partial-column update.**
+  Previously the argument was forwarded only to the save signals; it now
+  restricts the `UPDATE` to the named columns of an existing row. Relation names
+  map to their foreign-key column, an `auto_now` timestamp is bumped only if
+  named, an empty list is a no-op, and an unknown name raises `FieldError`. The
+  argument is ignored on insert (a new row needs every column).
+
+### Changed
+
+- **Cached single-instance `UPDATE`/`DELETE` SQL.** `save()` on an existing row
+  and `delete()` now bind parameters against a statement compiled once per
+  model/dialect (matching the existing `INSERT`/`SELECT` caching) instead of
+  rebuilding the SQL string on every call.
+
 ## [1.0.0] - 2026-06-29
 
 First stable release. yara-orm reaches effectively full Tortoise-style API
