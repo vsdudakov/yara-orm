@@ -56,25 +56,27 @@ better).
 
 | operation       | yara-orm | tortoise | sqlalchemy |  pony |
 |-----------------|---------:|---------:|-----------:|------:|
-| bulk_insert     |     11.5 |     23.1 |       67.5 | 208.4 |
-| single_insert   |     32.8 |     80.4 |      153.3 |  59.1 |
-| fetch_all       |      3.5 |     16.0 |       12.2 |  30.4 |
-| count           |      0.4 |      0.5 |        1.2 |   0.5 |
-| filter          |      2.2 |      8.5 |       20.5 |  15.4 |
-| get_by_pk       |     63.2 |    194.4 |      292.8 |  82.7 |
-| update          |      3.3 |      3.4 |        4.1 | 117.8 |
+| bulk_insert     |     11.0 |     24.2 |       66.6 | 218.2 |
+| single_insert   |     33.4 |     79.5 |      151.3 |  59.7 |
+| fetch_all       |      3.4 |     16.1 |       11.8 |  30.4 |
+| count           |      0.3 |      0.5 |        0.9 |   0.5 |
+| filter          |      2.2 |      8.4 |       19.9 |  16.0 |
+| get_by_pk       |     62.5 |    193.6 |      294.3 |  82.5 |
+| update          |      3.4 |      3.4 |        3.8 | 119.5 |
+| delete          |      0.7 |      0.8 |        1.0 |  90.7 |
 
 Speedup vs `yara-orm` (competitor_time / yara_orm_time; >1 means `yara-orm` faster):
 
-| operation     | tortoise | sqlalchemy |  pony |
-|---------------|---------:|-----------:|------:|
-| bulk_insert   |    2.0×  |      5.9×  | 18.1× |
-| single_insert |    2.4×  |      4.7×  |  1.8× |
-| fetch_all     |    4.5×  |      3.5×  |  8.6× |
-| count         |    1.5×  |      3.1×  |  1.3× |
-| filter        |    3.9×  |      9.5×  |  7.2× |
-| get_by_pk     |    3.1×  |      4.6×  |  1.3× |
-| update        |    1.0×  |      1.3×  | 35.7× |
+| operation     | tortoise | sqlalchemy |   pony |
+|---------------|---------:|-----------:|-------:|
+| bulk_insert   |    2.1×  |      6.2×  |  18.7× |
+| single_insert |    2.5×  |      4.7×  |   1.8× |
+| fetch_all     |    4.7×  |      3.5×  |   8.9× |
+| count         |    2.1×  |      3.2×  |   1.7× |
+| filter        |    4.1×  |     10.0×  |   7.9× |
+| get_by_pk     |    3.1×  |      4.7×  |   1.3× |
+| update        |    1.1×  |      1.2×  |  36.5× |
+| delete        |    1.3×  |      1.6×  | 134.0× |
 
 `yara-orm` is fastest on every operation in this configuration. `get_by_pk` and
 `single_insert` are latency-bound (one sequential round-trip per call) and sit
@@ -86,18 +88,19 @@ near the raw client⇄PostgreSQL round-trip floor.
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
 |---------------|---------:|---------:|-----------:|------:|
-| bulk_insert   |      7.5 |     13.2 |      607.7 |  47.2 |
-| single_insert |     35.1 |     27.6 |      235.2 | 117.2 |
-| fetch_all     |      4.9 |     38.2 |       11.0 |  48.7 |
-| count         |      0.1 |      0.3 |        0.6 |   0.2 |
-| filter        |      2.6 |     19.5 |       17.6 |  24.9 |
-| get_by_pk     |     54.1 |     79.2 |      329.3 |  30.1 |
-| update        |      0.5 |      0.5 |        1.8 |  41.5 |
+| bulk_insert   |      7.4 |     13.2 |      608.2 |  45.7 |
+| single_insert |     35.7 |     25.8 |      240.3 | 110.7 |
+| fetch_all     |      4.9 |     38.2 |       11.3 |  46.9 |
+| count         |      0.1 |      0.2 |        0.7 |   0.2 |
+| filter        |      2.7 |     19.7 |       18.1 |  23.6 |
+| get_by_pk     |     54.7 |     79.7 |      332.8 |  29.0 |
+| update        |      0.5 |      0.5 |        1.8 |  40.6 |
+| delete        |      0.4 |      0.3 |        1.1 |  33.8 |
 
-`yara-orm` wins the throughput-bound operations decisively (bulk 1.8×/81×/6.3×,
-fetch_all 7.8×/2.2×/9.9×, filter 7.5×/6.8×/9.6× vs Tortoise/SQLAlchemy/Pony).
+`yara-orm` wins the throughput-bound operations decisively (bulk 1.8×/82×/6.2×,
+fetch_all 7.9×/2.3×/9.6×, filter 7.4×/6.8×/8.9× vs Tortoise/SQLAlchemy/Pony).
 It trails on the two **latency-bound** ops: in-process Pony beats us on
-`get_by_pk` (0.6×) and Tortoise edges `single_insert` (0.8×) — because our
+`get_by_pk` (0.5×) and Tortoise edges `single_insert` (0.7×) — because our
 SQLite backend bridges synchronous `rusqlite` to async by hopping to a
 blocking thread **per call**, which costs a few µs that an in-process driver
 avoids on sequential point queries. Real workloads rarely fire thousands of

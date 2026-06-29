@@ -143,6 +143,10 @@ async def run_ours() -> dict:
         await BOurs.filter(value__lt=HALF).update(value=0)
     res["update"] = sw.elapsed
 
+    with _Stopwatch() as sw:
+        await BOurs.filter(value__gte=HALF).delete()
+    res["delete"] = sw.elapsed
+
     await engine.execute(clear_sql("bench_ours"))
     with _Stopwatch() as sw:
         for i in range(S):
@@ -213,6 +217,10 @@ async def run_tortoise() -> dict:
         await BTort.filter(value__lt=HALF).update(value=0)
     res["update"] = sw.elapsed
 
+    with _Stopwatch() as sw:
+        await BTort.filter(value__gte=HALF).delete()
+    res["delete"] = sw.elapsed
+
     await conn.execute_query(clear_sql("bench_tortoise"))
     with _Stopwatch() as sw:
         for i in range(S):
@@ -227,7 +235,7 @@ async def run_tortoise() -> dict:
 # Pony ORM (synchronous)
 # ---------------------------------------------------------------------------
 def run_pony() -> dict:
-    from pony import yara_orm as pony
+    from pony import orm as pony
 
     db = pony.Database()
 
@@ -299,6 +307,11 @@ def run_pony() -> dict:
                 p.value = 0
     res["update"] = sw.elapsed
 
+    with _Stopwatch() as sw:
+        with pony.db_session:
+            pony.delete(p for p in BPony if p.value >= HALF)
+    res["delete"] = sw.elapsed
+
     with pony.db_session:
         db.execute(clear_sql("bench_pony"))
     with _Stopwatch() as sw:
@@ -316,6 +329,7 @@ def run_pony() -> dict:
 # ---------------------------------------------------------------------------
 try:
     from sqlalchemy import DateTime, Integer, String, func, select
+    from sqlalchemy import delete as sa_delete
     from sqlalchemy import update as sa_update
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
     from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -382,6 +396,12 @@ async def run_sqlalchemy() -> dict:
             await s.commit()
     res["update"] = sw.elapsed
 
+    with _Stopwatch() as sw:
+        async with Session() as s:
+            await s.execute(sa_delete(BAlc).where(BAlc.value >= HALF))
+            await s.commit()
+    res["delete"] = sw.elapsed
+
     async with engine.begin() as conn:
         await conn.exec_driver_sql(clear_sql("bench_alchemy"))
     with _Stopwatch() as sw:
@@ -406,6 +426,7 @@ OPS = [
     ("filter", N - HALF, "rows"),
     ("get_by_pk", GETS, "queries"),
     ("update", HALF, "rows"),
+    ("delete", N - HALF, "rows"),
 ]
 
 
