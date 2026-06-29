@@ -13,6 +13,8 @@ models, querysets, relations and migrations for PostgreSQL and SQLite.**
 
 📖 **Documentation: [vsdudakov.github.io/yara-orm](https://vsdudakov.github.io/yara-orm/)**
 
+✍️ **Deep dive: [How the GIL, PyO3 & asyncio cooperate](https://dev.to/vsdudakov/i-built-a-python-orm-with-a-rust-engine-heres-how-the-gil-pyo3-and-asyncio-actually-cooperate-4fkj)** — how the Rust engine bridges Python's event loop without the GIL collapsing it.
+
 Yara ORM is a high-performance **async ORM for Python** that pairs the ergonomics
 of a Django/Tortoise-style API — models, querysets, relations, aggregation and
 migrations — with a hot path (connection pooling, parameter binding, row decoding)
