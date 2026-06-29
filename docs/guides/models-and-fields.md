@@ -62,6 +62,22 @@ class Author(Model):
 | `description`       | Alternative spelling of `table_description` (used if the latter is unset). |
 | `abstract`          | Mark the model as an abstract base — no table of its own; see below. |
 | `ordering`          | Default `ORDER BY` for queries that set no explicit `order_by`; see below. |
+| `unique_together`   | Composite `UNIQUE` constraint(s) over groups of field names.         |
+| `indexes`           | Composite index(es) over groups of field names.                     |
+
+```python
+class Booking(Model):
+    room = fields.CharField(max_length=10)
+    slot = fields.IntField()
+    day = fields.CharField(max_length=10)
+
+    class Meta:
+        unique_together = ("room", "slot")    # one group; or (("room", "slot"), ...)
+        indexes = (("day", "slot"),)          # composite index
+```
+
+A field name in `unique_together` / `indexes` may be a foreign-key relation
+name; it resolves to that relation's backing column.
 
 ### Default ordering
 

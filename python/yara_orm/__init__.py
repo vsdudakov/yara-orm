@@ -1,4 +1,4 @@
-"""yara_orm: an async Python ORM with a Tortoise-style API and a Rust engine.
+"""yara_orm: an async Python ORM with an ergonomic API and a Rust engine.
 
 Quick start::
 
@@ -13,7 +13,7 @@ Quick start::
     await User.create(name="Ada")
 """
 
-from . import fields, migrations, validators
+from . import fields, migrations, timezone, validators
 from .aggregations import Avg, Count, Max, Min, Sum
 from .connection import Tortoise, YaraOrm, connections, in_transaction
 from .dialects import BaseDialect, PostgresDialect, SqliteDialect, register_dialect
@@ -78,6 +78,7 @@ __all__ = [
     "Coalesce",
     "Prefetch",
     "validators",
+    "timezone",
     "connections",
     "in_transaction",
     "atomic",

@@ -1,4 +1,4 @@
-"""A Django/Tortoise-style migration system.
+"""An operation-based migration system.
 
 Migrations are operation-based and backend-portable: each migration file lists
 ``operations`` (and ``dependencies``); operations render to SQL per active

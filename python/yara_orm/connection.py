@@ -205,7 +205,7 @@ class YaraOrm:
         _ROUTER = None
 
 
-# Tortoise-compatible alias.
+# Backward-compatible alias for YaraOrm.
 Tortoise = YaraOrm
 
 

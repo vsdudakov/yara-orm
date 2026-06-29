@@ -1,7 +1,7 @@
 """Model lifecycle signals: pre/post save and delete.
 
-Register a handler with the decorator for a model; handlers are coroutines and
-receive the same arguments as Tortoise's signals.
+Register a handler with the decorator for a model; handlers are coroutines that
+receive the sender model, the instance, and the operation's context.
 
     @post_save(User)
     async def on_user(sender, instance, created, using_db, update_fields):
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 class Signals(Enum):
-    """The model lifecycle signals, mirroring Tortoise's ``Signals`` enum."""
+    """The model lifecycle signals."""
 
     pre_save = "pre_save"
     post_save = "post_save"
