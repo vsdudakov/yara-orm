@@ -271,7 +271,9 @@ impl Backend for SqliteBackend {
         self.pool.close();
     }
 
-    async fn begin_tx(&self) -> Result<Box<dyn TxConn>, EngineError> {
+    async fn begin_tx(&self, _isolation: Option<&str>) -> Result<Box<dyn TxConn>, EngineError> {
+        // SQLite transactions are serializable; the Python layer rejects any
+        // other requested level, so the isolation hint is ignored here.
         let obj = self.obj().await?;
         obj.interact(|conn| conn.execute_batch("BEGIN"))
             .await
@@ -336,6 +338,33 @@ impl TxConn for SqliteTx {
     async fn rollback(self: Box<Self>) -> Result<(), EngineError> {
         self.obj
             .interact(|conn| conn.execute_batch("ROLLBACK"))
+            .await
+            .map_err(map_interact)?
+            .map_err(map_interact)
+    }
+
+    async fn savepoint(&self, name: &str) -> Result<(), EngineError> {
+        let sql = format!("SAVEPOINT {name}");
+        self.obj
+            .interact(move |conn| conn.execute_batch(&sql))
+            .await
+            .map_err(map_interact)?
+            .map_err(map_interact)
+    }
+
+    async fn release(&self, name: &str) -> Result<(), EngineError> {
+        let sql = format!("RELEASE SAVEPOINT {name}");
+        self.obj
+            .interact(move |conn| conn.execute_batch(&sql))
+            .await
+            .map_err(map_interact)?
+            .map_err(map_interact)
+    }
+
+    async fn rollback_to(&self, name: &str) -> Result<(), EngineError> {
+        let sql = format!("ROLLBACK TO SAVEPOINT {name}");
+        self.obj
+            .interact(move |conn| conn.execute_batch(&sql))
             .await
             .map_err(map_interact)?
             .map_err(map_interact)

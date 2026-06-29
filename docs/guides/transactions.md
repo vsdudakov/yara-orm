@@ -78,6 +78,57 @@ async with in_transaction():
 
 This pinning is why nested or deeply-called code "just works": any model or queryset call made while the block is open — directly or in a helper function it calls — runs on the active transaction without extra wiring.
 
+## Nested transactions (savepoints)
+
+`in_transaction` and `@atomic` **nest**. A block entered while another transaction is already active does not open a second transaction — it establishes a **savepoint** on the same connection. The inner block can roll back independently (when it raises) without aborting the outer transaction, and on a clean exit its work is **released** (merged) into the outer one.
+
+```python
+async with in_transaction():
+    await Account.create(name="A", balance=10)
+
+    try:
+        async with in_transaction():           # savepoint
+            await Account.create(name="B", balance=20)
+            raise RuntimeError("validation failed")
+    except RuntimeError:
+        pass  # only B is rolled back, to the savepoint
+
+    # A is still pending here; the outer transaction is intact.
+# Outer commit persists A. B never happened.
+```
+
+This makes it safe to wrap a risky sub-step in its own block: a failure there unwinds just that step. Savepoints nest to any depth — only the failing level rolls back. If the **outer** transaction later rolls back, everything goes with it, including savepoints that were already released.
+
+!!! note "Savepoints are automatic"
+    You do not name or manage savepoints yourself — nesting an `in_transaction` / `@atomic` block is enough. PostgreSQL and SQLite both support savepoints, so nesting behaves identically on either backend.
+
+## Isolation levels
+
+Pass `isolation=` to set the transaction's isolation level. Use the `IsolationLevel` constants (imported from `yara_orm`):
+
+```python
+from yara_orm import IsolationLevel, in_transaction
+
+async with in_transaction(isolation=IsolationLevel.SERIALIZABLE):
+    ...
+
+@atomic(isolation=IsolationLevel.REPEATABLE_READ)
+async def report() -> None:
+    ...
+```
+
+The level is applied when the transaction begins (`BEGIN ISOLATION LEVEL …` on PostgreSQL). The four standard levels are available:
+
+| Level | Constant |
+| --- | --- |
+| Read uncommitted | `IsolationLevel.READ_UNCOMMITTED` |
+| Read committed | `IsolationLevel.READ_COMMITTED` |
+| Repeatable read | `IsolationLevel.REPEATABLE_READ` |
+| Serializable | `IsolationLevel.SERIALIZABLE` |
+
+!!! warning "Backend differences"
+    **PostgreSQL** honours all four levels. **SQLite** transactions are always serializable, so it accepts `SERIALIZABLE` and raises `UnSupportedError` for any other level. An unrecognised level name raises `ConfigurationError`. Isolation can only be set on the **outermost** transaction — requesting it on a nested (savepoint) block raises `TransactionManagementError`.
+
 ## Choosing a connection
 
 In a multi-database setup, pass the connection name to run the transaction somewhere other than the default. Both APIs accept it positionally:

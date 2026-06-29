@@ -130,10 +130,17 @@ impl Engine {
     }
 
     /// Begin a transaction; resolves to a `Transaction` bound to one connection.
-    fn begin<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+    ///
+    /// `isolation`, when given, names a SQL isolation level applied at BEGIN
+    /// (validated per-dialect by the Python layer).
+    #[pyo3(signature = (isolation=None))]
+    fn begin<'p>(&self, py: Python<'p>, isolation: Option<String>) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
         future_into_py(py, async move {
-            let tx = backend.begin_tx().await.map_err(to_pyerr)?;
+            let tx = backend
+                .begin_tx(isolation.as_deref())
+                .await
+                .map_err(to_pyerr)?;
             Ok(Transaction {
                 inner: Arc::new(Mutex::new(Some(tx))),
             })
@@ -227,6 +234,36 @@ impl Transaction {
         future_into_py(py, async move {
             let tx = inner.lock().await.take().ok_or_else(tx_finished)?;
             tx.rollback().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Establish a savepoint within this transaction (nested-block support).
+    fn savepoint<'p>(&self, py: Python<'p>, name: String) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            tx.savepoint(&name).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Release (merge) a previously established savepoint.
+    fn release<'p>(&self, py: Python<'p>, name: String) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            tx.release(&name).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Roll back to a previously established savepoint.
+    fn rollback_to<'p>(&self, py: Python<'p>, name: String) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(tx_finished)?;
+            tx.rollback_to(&name).await.map_err(to_pyerr)
         })
     }
 }

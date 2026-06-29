@@ -145,9 +145,15 @@ impl Backend for PgBackend {
         self.pool.close();
     }
 
-    async fn begin_tx(&self) -> Result<Box<dyn TxConn>, EngineError> {
+    async fn begin_tx(&self, isolation: Option<&str>) -> Result<Box<dyn TxConn>, EngineError> {
         let client = self.get().await?;
-        client.batch_execute("BEGIN").await?;
+        // Apply the isolation level atomically at BEGIN (it must precede any
+        // query in the transaction). The level is validated by the Python layer.
+        let begin = match isolation {
+            Some(level) => format!("BEGIN ISOLATION LEVEL {level}"),
+            None => "BEGIN".to_string(),
+        };
+        client.batch_execute(&begin).await?;
         Ok(Box::new(PgTx {
             client,
             cache_statements: self.cache_statements,
@@ -194,6 +200,25 @@ impl TxConn for PgTx {
 
     async fn rollback(self: Box<Self>) -> Result<(), EngineError> {
         self.client.batch_execute("ROLLBACK").await?;
+        Ok(())
+    }
+
+    async fn savepoint(&self, name: &str) -> Result<(), EngineError> {
+        self.client.batch_execute(&format!("SAVEPOINT {name}")).await?;
+        Ok(())
+    }
+
+    async fn release(&self, name: &str) -> Result<(), EngineError> {
+        self.client
+            .batch_execute(&format!("RELEASE SAVEPOINT {name}"))
+            .await?;
+        Ok(())
+    }
+
+    async fn rollback_to(&self, name: &str) -> Result<(), EngineError> {
+        self.client
+            .batch_execute(&format!("ROLLBACK TO SAVEPOINT {name}"))
+            .await?;
         Ok(())
     }
 }
