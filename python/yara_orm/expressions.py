@@ -217,3 +217,137 @@ def _resolve_operand(
         return operand.resolve(render_column, dialect, params, idx)
     params.append(operand)
     return dialect.placeholder(idx), idx + 1
+
+
+def _render_value(
+    value: Any,
+    queryset: Any,
+    dialect: BaseDialect,
+    joins: dict[str, str],
+    params: list[Any],
+    idx: int,
+) -> tuple[str, int]:
+    """Render a ``THEN``/``ELSE`` value: an F as a column, else a bound literal.
+
+    Args:
+        value: An :class:`Expression` (column) or a plain literal value.
+        queryset: The owning queryset (for column resolution).
+        dialect: The active SQL dialect (for placeholders).
+        joins: Join map, mutated in place when a column spans a relation.
+        params: Bound-parameter list, extended in place with literals.
+        idx: The next available bind-parameter index.
+
+    Returns:
+        A ``(sql, next_index)`` tuple.
+    """
+    if isinstance(value, Expression):
+        return value.resolve(
+            lambda name: queryset._resolve_column(name, dialect, joins), dialect, params, idx
+        )
+    params.append(value)
+    return dialect.placeholder(idx), idx + 1
+
+
+class When:
+    """One ``WHEN <conditions> THEN <value>`` arm of a :class:`Case`."""
+
+    def __init__(self, then: Any, **conditions: Any) -> None:
+        """Store the arm's filter conditions and result value.
+
+        Args:
+            then: The value (literal or ``F``) produced when the arm matches.
+            **conditions: Field lookups (like ``filter``) gating this arm.
+
+        Returns:
+            None
+        """
+        self.then = then
+        self.conditions = conditions
+
+
+class Case:
+    """A SQL ``CASE`` expression built from :class:`When` arms and a default."""
+
+    def __init__(self, *whens: When, default: Any = None) -> None:
+        """Store the ``WHEN`` arms and the optional ``ELSE`` default.
+
+        Args:
+            *whens: The ordered :class:`When` arms.
+            default: The ``ELSE`` value (omitted when ``None``).
+
+        Returns:
+            None
+        """
+        self.whens = whens
+        self.default = default
+
+    def as_sql(
+        self,
+        queryset: Any,
+        dialect: BaseDialect,
+        joins: dict[str, str],
+        params: list[Any],
+        idx: int,
+    ) -> tuple[str, int]:
+        """Render the ``CASE`` expression, binding conditions and values.
+
+        Args:
+            queryset: The owning queryset (for condition/column compilation).
+            dialect: The active SQL dialect.
+            joins: Join map, mutated in place when a value spans a relation.
+            params: Bound-parameter list, extended in place.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, next_index)`` tuple.
+        """
+        parts = ["CASE"]
+        for when in self.whens:
+            cond_sql, cond_params, idx = queryset._compile_filter_dict(
+                when.conditions, dialect, idx
+            )
+            params.extend(cond_params)
+            then_sql, idx = _render_value(when.then, queryset, dialect, joins, params, idx)
+            parts.append(f"WHEN {cond_sql} THEN {then_sql}")
+        if self.default is not None:
+            default_sql, idx = _render_value(self.default, queryset, dialect, joins, params, idx)
+            parts.append(f"ELSE {default_sql}")
+        parts.append("END")
+        return "(" + " ".join(parts) + ")", idx
+
+
+class RawSQL:
+    """A raw SQL fragment spliced into an annotation, verbatim."""
+
+    def __init__(self, sql: str) -> None:
+        """Store the raw SQL fragment.
+
+        Args:
+            sql: The SQL expression text (no bound parameters).
+
+        Returns:
+            None
+        """
+        self.sql = sql
+
+    def as_sql(
+        self,
+        queryset: Any,
+        dialect: BaseDialect,
+        joins: dict[str, str],
+        params: list[Any],
+        idx: int,
+    ) -> tuple[str, int]:
+        """Return the raw fragment unchanged.
+
+        Args:
+            queryset: The owning queryset (unused).
+            dialect: The active SQL dialect (unused).
+            joins: Join map (unused).
+            params: Bound-parameter list (unused).
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, idx)`` tuple.
+        """
+        return self.sql, idx

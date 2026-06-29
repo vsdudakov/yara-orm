@@ -142,6 +142,19 @@ page = 3
 await Book.all().order_by("id").limit(page_size).offset(page * page_size)
 ```
 
+Slicing is shorthand for `offset`/`limit`. A slice returns a queryset (still lazy); an integer index returns an awaitable for that single row:
+
+```python
+page = await Book.all().order_by("id")[40:60]   # offset 40, limit 20 -> queryset
+third = await Book.all().order_by("id")[2]       # a single Book (IndexError if missing)
+```
+
+Use `.distinct()` to drop duplicate rows from the result:
+
+```python
+await Book.all().distinct().values_list("rating", flat=True)
+```
+
 ## Terminal methods
 
 These run the query. All are coroutines (`await` them), except awaiting the queryset itself.
@@ -151,10 +164,21 @@ These run the query. All are coroutines (`await` them), except awaiting the quer
 | `await qs` | `list[Model]` | Awaiting the queryset fetches all matching rows. |
 | `await qs.get(**kwargs)` | `Model` | Exactly one row. Raises `DoesNotExist` if none, `MultipleObjectsReturned` if more than one. |
 | `await qs.first()` | `Model \| None` | First row, or `None` when empty. |
+| `await qs.last()` | `Model \| None` | Last row (ordering reversed; defaults to descending pk). |
+| `await qs.earliest(*fields)` | `Model \| None` | First row ordered ascending by `fields` (pk by default). |
+| `await qs.latest(*fields)` | `Model \| None` | First row ordered descending by `fields` (pk by default). |
 | `await qs.count()` | `int` | Number of matching rows (`SELECT COUNT(*)`). |
 | `await qs.exists()` | `bool` | `True` if at least one row matches. |
 | `await qs.delete()` | `int` | Deletes matching rows, returns the count. |
 | `await qs.update(**kwargs)` | `int` | Updates matching rows, returns the count. |
+
+`.select_for_update()` adds `FOR UPDATE` to lock the selected rows for the duration of the surrounding transaction on PostgreSQL; it is a no-op on SQLite.
+
+```python
+async with in_transaction():
+    rows = await Book.filter(rating__lt=1).select_for_update()
+    ...  # rows are locked until the transaction commits
+```
 
 ```python
 from yara_orm import DoesNotExist, MultipleObjectsReturned
@@ -204,6 +228,35 @@ created = await Book.bulk_create(books, batch_size=500)
 !!! tip "`get` vs `get_or_none`"
     Use `Model.get(**kwargs)` when a missing row is an error (it raises `DoesNotExist` / `MultipleObjectsReturned`). Use `Model.get_or_none(**kwargs)` when "not found" is a normal outcome you want to branch on.
 
+### Get-or-create and bulk helpers
+
+| Call | Returns | Meaning |
+| --- | --- | --- |
+| `await Model.get_or_create(defaults=None, **kwargs)` | `(instance, created)` | Fetch the row matching `kwargs`, or create it (merging `defaults`). |
+| `await Model.update_or_create(defaults=None, **kwargs)` | `(instance, created)` | Update the match with `defaults`, or create it. |
+| `await Model.in_bulk(ids, field_name="pk")` | `dict[key, Model]` | Fetch many rows, keyed by `field_name`. |
+| `await Model.bulk_update(objects, fields, batch_size=500)` | `int` | Write the named `fields` of many instances in batched statements. |
+
+```python
+author, created = await Author.get_or_create(name="Ada", defaults={"rating": 5})
+author, created = await Author.update_or_create(name="Ada", defaults={"rating": 4})
+
+by_id = await Book.in_bulk([1, 2, 3])            # {1: <Book>, 2: <Book>, 3: <Book>}
+
+for book in books:
+    book.rating = 5
+await Book.bulk_update(books, ["rating"])         # one UPDATE per batch
+```
+
+Instance helpers for in-place edits:
+
+```python
+book.update_from_dict({"title": "New", "rating": 4})   # set fields, no DB write
+await book.save()
+
+await book.refresh_from_db()                            # reload column values from the row
+```
+
 ## Projections: `values()` and `values_list()`
 
 When you only need a few columns, project them directly. Both methods skip model construction, so they are faster for pure reads.
@@ -226,6 +279,25 @@ titles = await Book.all().order_by("title").values_list("title", flat=True)
 ```
 
 Called with no field names, both default to every field on the model.
+
+## `F` expressions
+
+`F` references a column instead of a Python value, so you can compare or update one column against another — or compute against a column — entirely in SQL (no read-modify-write round trip):
+
+```python
+from yara_orm import F
+
+# Arithmetic update: bump every book's rating by 1, atomically
+await Book.all().update(rating=F("rating") + 1)
+
+# Assign one column from another
+await Book.all().update(rating=F("rating"))
+
+# Compare two columns in a filter
+await Book.filter(rating__gt=F("rating"))
+```
+
+`F` supports `+`, `-`, `*` and `/`, with the column on either side (`F("a") + 1`, `10 - F("a")`).
 
 ## See also
 

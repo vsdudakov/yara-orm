@@ -1,13 +1,27 @@
 """Query expressions and scalar functions (Tortoise-reference parity).
 
-Covers F() column references in filters and arithmetic updates, and the DB
-functions Lower/Upper/Length/Trim/Concat/Coalesce used in annotate(). Runs on
-every configured backend; the SQL is rendered portably (Concat uses ``||``).
+Covers F() column references in filters and arithmetic updates, the DB
+functions Lower/Upper/Length/Trim/Concat/Coalesce, and Case/When and RawSQL
+annotations. Runs on every configured backend; the SQL is rendered portably
+(Concat uses ``||``).
 """
 
 import pytest
 
-from yara_orm import Coalesce, Concat, F, Length, Lower, Model, Trim, Upper, fields
+from yara_orm import (
+    Case,
+    Coalesce,
+    Concat,
+    F,
+    Length,
+    Lower,
+    Model,
+    RawSQL,
+    Trim,
+    Upper,
+    When,
+    fields,
+)
 
 
 class ExprRow(Model):
@@ -103,3 +117,46 @@ async def test_coalesce_function(db):
     await ExprRow.create(first="y", last="real")
     rows = await ExprRow.annotate(v=Coalesce("last", "anon")).order_by("first")
     assert [r.v for r in rows] == ["anon", "real"]
+
+
+@pytest.mark.asyncio
+async def test_case_when_literal(db):
+    """
+    GIVEN rows with an integer column
+    WHEN annotating with a Case of When arms and a default
+    THEN each row takes the first matching arm's value (or the default)
+    """
+    await ExprRow.create(first="hi", a=95)
+    await ExprRow.create(first="mid", a=75)
+    await ExprRow.create(first="lo", a=40)
+    rows = await ExprRow.annotate(
+        grade=Case(When(a__gte=90, then="A"), When(a__gte=60, then="C"), default="F")
+    ).order_by("-a")
+    assert [r.grade for r in rows] == ["A", "C", "F"]
+
+
+@pytest.mark.asyncio
+async def test_case_when_with_f_value(db):
+    """
+    GIVEN rows with an integer column
+    WHEN a Case arm's THEN value is an F column reference
+    THEN matching rows take the column value and others take the default
+    """
+    await ExprRow.create(first="hi", a=95)
+    await ExprRow.create(first="lo", a=40)
+    rows = await ExprRow.annotate(bonus=Case(When(a__gte=90, then=F("a")), default=0)).order_by(
+        "-a"
+    )
+    assert [r.bonus for r in rows] == [95, 0]
+
+
+@pytest.mark.asyncio
+async def test_raw_sql_annotation(db):
+    """
+    GIVEN a row with an integer column
+    WHEN annotating with a RawSQL fragment
+    THEN the fragment is evaluated per row
+    """
+    await ExprRow.create(first="x", a=21)
+    [r] = await ExprRow.annotate(dbl=RawSQL("a * 2"))
+    assert r.dbl == 42

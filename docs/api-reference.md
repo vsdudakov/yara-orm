@@ -10,8 +10,10 @@ see the [guides](guides/models-and-fields.md).
 
 ```python
 from yara_orm import (
-    YaraOrm, Tortoise, Model, QuerySet, Q, fields, migrations,
-    Count, Sum, Avg, Min, Max, Prefetch,
+    YaraOrm, Tortoise, Model, QuerySet, Q, F, fields, migrations,
+    Count, Sum, Avg, Min, Max,
+    Lower, Upper, Length, Trim, Concat, Coalesce,
+    Case, When, RawSQL, Prefetch,
     connections, in_transaction, atomic,
     pre_save, post_save, pre_delete, post_delete,
     BaseDialect, PostgresDialect, SqliteDialect, register_dialect,
@@ -19,6 +21,8 @@ from yara_orm import (
     MultipleObjectsReturned, IntegrityError, FieldError,
 )
 ```
+
+`F` is a column reference for filters and arithmetic updates; `Lower`/`Upper`/`Length`/`Trim`/`Concat`/`Coalesce` are scalar functions and `Case`/`When`/`RawSQL` are conditional/raw expressions for `annotate()` — see [Querying](guides/querying.md) and [Aggregation](guides/aggregation.md).
 
 ## YaraOrm
 
@@ -29,7 +33,7 @@ Entry point for connections and schema. `Tortoise` is an alias for `YaraOrm`.
 | `init` | `await YaraOrm.init(db_url, router=None)` | Connect the default database and resolve relations. |
 | `add_connection` | `await YaraOrm.add_connection(name, db_url)` | Register an additional named connection. |
 | `set_router` | `YaraOrm.set_router(router)` | Set the per-model read/write router. |
-| `generate_schemas` | `await YaraOrm.generate_schemas(safe=True)` | Create tables and join tables. |
+| `generate_schemas` | `await YaraOrm.generate_schemas(safe=True, models=None)` | Create tables and join tables (optionally scoped to `models`). |
 | `close` | `await YaraOrm.close()` | Close all connections and reset state. |
 
 Related: `connections.get(name="default")` returns the active executor;
@@ -43,7 +47,11 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | Member | Signature | Purpose |
 |--------|-----------|---------|
 | `create` | `await Model.create(**kwargs)` | Construct and save a new instance. |
+| `get_or_create` | `await Model.get_or_create(defaults=None, **kwargs)` | Fetch or create → `(instance, created)`. |
+| `update_or_create` | `await Model.update_or_create(defaults=None, **kwargs)` | Update or create → `(instance, created)`. |
 | `bulk_create` | `await Model.bulk_create(objects, batch_size=500)` | Multi-row insert. |
+| `bulk_update` | `await Model.bulk_update(objects, fields, batch_size=500)` | Batched multi-row update. |
+| `in_bulk` | `await Model.in_bulk(ids, field_name="pk")` | Fetch many rows as a `{key: instance}` dict. |
 | `get` | `await Model.get(**kwargs)` | Single row; raises `DoesNotExist` / `MultipleObjectsReturned`. |
 | `get_or_none` | `await Model.get_or_none(**kwargs)` | Single row or `None`. |
 | `all` | `Model.all()` | QuerySet over all rows. |
@@ -53,6 +61,8 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | `raw` | `await Model.raw(sql, params=None)` | Raw SQL → model instances. |
 | `save` | `await instance.save(update_fields=None)` | Persist (emits save signals). |
 | `delete` | `await instance.delete()` | Delete the row (emits delete signals). |
+| `refresh_from_db` | `await instance.refresh_from_db()` | Reload column values from the row. |
+| `update_from_dict` | `instance.update_from_dict(data)` | Set fields in place (no DB write). |
 | `fetch_related` | `await instance.fetch_related(*names)` | Populate relations on the instance. |
 | `pk` | `instance.pk` | Primary key value. |
 
@@ -75,19 +85,24 @@ Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `descrip
 Lazy and chainable; runs when awaited or on a terminal method. See [Querying](guides/querying.md).
 
 **Chainable:** `filter`, `exclude`, `annotate`, `group_by`, `prefetch_related`, `order_by`,
-`limit`, `offset`.
+`limit`, `offset`, `distinct`, `select_for_update`, slicing (`qs[start:stop]`).
 
-**Terminal (async):** `await qs` → `list[Model]`, `get`, `first`, `count`, `exists`,
-`values`, `values_list`, `delete`, `update`.
+**Terminal (async):** `await qs` → `list[Model]`, `get`, `first`, `last`, `earliest`,
+`latest`, `count`, `exists`, `values`, `values_list`, `delete`, `update`.
 
 **`Q`** combines lookups with `&` (AND), `|` (OR), `~` (NOT).
+
+**`F`** references a column for filters and arithmetic updates, e.g. `update(n=F("n") + 1)`
+or `filter(a__gt=F("b"))`.
 
 **Lookups:** `exact` (default), `not`, `gt`, `gte`, `lt`, `lte`, `in`, `isnull`, `contains`,
 `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`.
 
-## Aggregations
+## Aggregations & functions
 
-`Count`, `Sum`, `Avg`, `Min`, `Max` — each constructed as `Agg(field, distinct=False)`. See
+`Count`, `Sum`, `Avg`, `Min`, `Max` — each constructed as `Agg(field, distinct=False)`.
+Scalar functions `Lower`, `Upper`, `Length`, `Trim`, `Concat`, `Coalesce`, plus `Case`/`When`
+and `RawSQL`, are also usable as `annotate()` expressions. See
 [Aggregation & grouping](guides/aggregation.md).
 
 ## Relations
