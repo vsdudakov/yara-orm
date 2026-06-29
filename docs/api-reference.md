@@ -16,9 +16,13 @@ from yara_orm import (
     Case, When, RawSQL, Prefetch,
     connections, in_transaction, atomic,
     pre_save, post_save, pre_delete, post_delete,
+    Signals, validators,
     BaseDialect, PostgresDialect, SqliteDialect, register_dialect,
-    ORMError, ConfigurationError, DoesNotExist,
-    MultipleObjectsReturned, IntegrityError, FieldError,
+    ORMError, BaseORMException, ConfigurationError, OperationalError,
+    DBConnectionError, TransactionManagementError, NotExistOrMultiple,
+    DoesNotExist, ObjectDoesNotExistError, MultipleObjectsReturned,
+    IntegrityError, FieldError, ParamsError, ValidationError,
+    NoValuesFetched, IncompleteInstanceError, UnSupportedError,
 )
 ```
 
@@ -75,11 +79,19 @@ The inner `Meta` class supports `table`, `table_description` / `description`,
 
 See the full table in [Models & fields](guides/models-and-fields.md). Field classes:
 `SmallIntField`, `IntField`, `BigIntField`, `FloatField`, `DecimalField`, `CharField`,
-`TextField`, `BinaryField`, `BooleanField`, `DatetimeField`, `DateField`, `TimeField`,
+`TextField`, `BinaryField`, `BooleanField`, `DatetimeField`, `DateField`, `TimeField`, `TimeDeltaField`,
 `UUIDField`, `JSONField`, `IntEnumField`, `CharEnumField`, `ForeignKeyField`,
 `OneToOneField`, `ManyToManyField`.
 
-Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `description`.
+Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `description`,
+`validators`.
+
+## validators
+
+`yara_orm.validators` — attach via `validators=[...]`; runs on `save()`, raising
+`ValidationError`. Classes: `Validator` (base), `MinValueValidator`, `MaxValueValidator`,
+`MinLengthValidator`, `MaxLengthValidator`, `RegexValidator`. Functions:
+`validate_ipv4_address`, `validate_ipv6_address`, `validate_ipv46_address`.
 
 ## QuerySet & Q
 
@@ -116,7 +128,8 @@ reverse and many-to-many managers support `await`, `async for`, `.add/.remove/.c
 ## Signals
 
 Decorators `pre_save`, `post_save`, `pre_delete`, `post_delete` — each takes the model class.
-Handlers are async. See [Signals](guides/signals.md) for exact signatures.
+Handlers are async. The `Signals` enum names the four lifecycle signals. See
+[Signals](guides/signals.md) for exact signatures.
 
 ## Transactions
 
@@ -137,5 +150,9 @@ adding a backend. See [Backends](backends/index.md) and [Architecture](architect
 
 ## Exceptions
 
-`ORMError` (base), `ConfigurationError`, `DoesNotExist`, `MultipleObjectsReturned`,
-`IntegrityError`, `FieldError`.
+Names mirror Tortoise. `ORMError` is the base (aliased `BaseORMException`):
+`ConfigurationError`, `OperationalError` (→ `DBConnectionError`,
+`TransactionManagementError`, `IntegrityError`, `NotExistOrMultiple` → `DoesNotExist`
+(alias `ObjectDoesNotExistError`) / `MultipleObjectsReturned`, `NoValuesFetched`),
+`FieldError` (→ `ParamsError`, `ValidationError`), `IncompleteInstanceError`,
+`UnSupportedError`.

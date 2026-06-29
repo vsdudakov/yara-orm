@@ -217,14 +217,14 @@ class ForwardRelation:
         return self._resolve().__await__()
 
     async def _resolve(self) -> Model | None:
-        """Resolve the related instance, using the prefetch cache if present.
+        """Load the related instance from the database and cache it.
+
+        Only reached for an un-cached relation — the descriptor serves a
+        prefetched/assigned relation directly, without an awaitable.
 
         Returns:
             The related model instance, or None if there is no foreign key.
         """
-        cache = self.instance.__dict__.get("_prefetch")
-        if cache and self.info.name in cache:
-            return cache[self.info.name]
         fk = self.instance.__dict__.get(self.info.source_attr)
         if fk is None:
             return None

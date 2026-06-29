@@ -13,17 +13,28 @@ Quick start::
     await User.create(name="Ada")
 """
 
-from . import fields, migrations
+from . import fields, migrations, validators
 from .aggregations import Avg, Count, Max, Min, Sum
 from .connection import Tortoise, YaraOrm, connections, in_transaction
 from .dialects import BaseDialect, PostgresDialect, SqliteDialect, register_dialect
 from .exceptions import (
+    BaseORMException,
     ConfigurationError,
+    DBConnectionError,
     DoesNotExist,
     FieldError,
+    IncompleteInstanceError,
     IntegrityError,
     MultipleObjectsReturned,
+    NotExistOrMultiple,
+    NoValuesFetched,
+    ObjectDoesNotExistError,
+    OperationalError,
     ORMError,
+    ParamsError,
+    TransactionManagementError,
+    UnSupportedError,
+    ValidationError,
 )
 from .expressions import Case, F, RawSQL, When
 from .functions import Coalesce, Concat, Length, Lower, Trim, Upper
@@ -31,7 +42,7 @@ from .migrations import MigrationManager
 from .models import Model
 from .prefetch import Prefetch
 from .queryset import Q, QuerySet
-from .signals import post_delete, post_save, pre_delete, pre_save
+from .signals import Signals, post_delete, post_save, pre_delete, pre_save
 from .transactions import atomic
 
 try:  # populated by maturin; absent only in source checkouts pre-build
@@ -66,9 +77,11 @@ __all__ = [
     "Concat",
     "Coalesce",
     "Prefetch",
+    "validators",
     "connections",
     "in_transaction",
     "atomic",
+    "Signals",
     "pre_save",
     "post_save",
     "pre_delete",
@@ -78,9 +91,20 @@ __all__ = [
     "SqliteDialect",
     "register_dialect",
     "ORMError",
+    "BaseORMException",
     "ConfigurationError",
+    "OperationalError",
+    "DBConnectionError",
+    "TransactionManagementError",
+    "NotExistOrMultiple",
     "DoesNotExist",
+    "ObjectDoesNotExistError",
     "MultipleObjectsReturned",
     "IntegrityError",
     "FieldError",
+    "ParamsError",
+    "ValidationError",
+    "NoValuesFetched",
+    "IncompleteInstanceError",
+    "UnSupportedError",
 ]

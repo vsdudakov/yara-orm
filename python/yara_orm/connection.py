@@ -62,11 +62,11 @@ def _route(model: type[Model] | None, write: bool) -> str:
 
 
 def get_executor(model: type[Model] | None = None, write: bool = False) -> Any:
-    """The object statements run on: the active transaction, or the connection
-    chosen for ``model`` by the router (falling back to the default pool).
+    """Return the object statements run on for ``model``.
 
-    All such objects expose ``execute`` / ``fetch_row`` / ``fetch_rows`` /
-    ``fetch_all``.
+    This is the active transaction, or the connection chosen for ``model`` by
+    the router (falling back to the default pool). All such objects expose
+    ``execute`` / ``fetch_row`` / ``fetch_rows`` / ``fetch_all``.
 
     Args:
         model: Model class used to route to a connection, or None.

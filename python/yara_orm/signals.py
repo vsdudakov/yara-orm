@@ -11,10 +11,21 @@ receive the same arguments as Tortoise's signals.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .models import Model
+
+
+class Signals(Enum):
+    """The model lifecycle signals, mirroring Tortoise's ``Signals`` enum."""
+
+    pre_save = "pre_save"
+    post_save = "post_save"
+    pre_delete = "pre_delete"
+    post_delete = "post_delete"
+
 
 _HANDLERS: dict[str, dict[type, list]] = {
     "pre_save": {},

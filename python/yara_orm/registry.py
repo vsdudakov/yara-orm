@@ -18,6 +18,14 @@ _MODELS: dict[str, type[Model]] = {}
 
 
 def register(model: type[Model]) -> None:
+    """Register a model under its qualified ``module.ClassName`` key.
+
+    Args:
+        model: The model class to register.
+
+    Returns:
+        None
+    """
     _MODELS[f"{model.__module__}.{model.__name__}"] = model
 
 
@@ -36,10 +44,20 @@ def get_model(name: str) -> type[Model]:
 
 
 def all_models() -> list[type[Model]]:
+    """Return every registered model class.
+
+    Returns:
+        The list of registered model classes.
+    """
     return list(_MODELS.values())
 
 
 def clear() -> None:
+    """Drop all registered models and reset relation resolution.
+
+    Returns:
+        None
+    """
     _MODELS.clear()
     _RESOLVED.clear()
 

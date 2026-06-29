@@ -160,3 +160,48 @@ async def test_raw_sql_annotation(db):
     await ExprRow.create(first="x", a=21)
     [r] = await ExprRow.annotate(dbl=RawSQL("a * 2"))
     assert r.dbl == 42
+
+
+def test_f_operators_build_expressions():
+    """
+    GIVEN an F column reference
+    WHEN combined with every supported arithmetic operator (both operand sides)
+    THEN each yields a CombinedExpression
+    """
+    from yara_orm.expressions import CombinedExpression
+
+    for expr in (
+        F("a") + 1,
+        F("a") - 1,
+        F("a") * 2,
+        F("a") / 2,
+        1 + F("a"),
+        1 - F("a"),
+        2 * F("a"),
+    ):
+        assert isinstance(expr, CombinedExpression)
+
+
+@pytest.mark.asyncio
+async def test_case_without_default(db):
+    """
+    GIVEN a Case with no default
+    WHEN a row matches no arm
+    THEN its annotation is NULL (the ELSE clause is omitted)
+    """
+    await ExprRow.create(first="hi", a=95)
+    await ExprRow.create(first="lo", a=1)
+    rows = await ExprRow.annotate(tag=Case(When(a__gte=90, then="A"))).order_by("-a")
+    assert [r.tag for r in rows] == ["A", None]
+
+
+@pytest.mark.asyncio
+async def test_coalesce_numeric_default(db):
+    """
+    GIVEN a numeric column and a numeric Coalesce fallback
+    WHEN the annotation renders
+    THEN the numeric literal is inlined and the present value is returned
+    """
+    await ExprRow.create(first="x", a=7)
+    [r] = await ExprRow.annotate(v=Coalesce("a", 0))
+    assert r.v == 7
