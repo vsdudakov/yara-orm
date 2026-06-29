@@ -149,19 +149,25 @@ class ForwardRelationDescriptor:
 
     def __get__(
         self, instance: Model | None, owner: type[Model] | None
-    ) -> ForwardRelationDescriptor | ForwardRelation:
-        """Return the descriptor itself or an awaitable forward relation.
+    ) -> ForwardRelationDescriptor | ForwardRelation | Model | None:
+        """Return the descriptor, the prefetched instance, or an awaitable.
 
         Args:
             instance: The model instance the attribute is accessed on, or None.
             owner: The model class owning the descriptor.
 
         Returns:
-            This descriptor when accessed on the class, otherwise a
-            ``ForwardRelation`` bound to the instance.
+            This descriptor when accessed on the class; the related instance (or
+            ``None``) directly when it has been prefetched or assigned — so
+            ``obj.rel.field`` and ``if obj.rel`` work after ``prefetch_related``,
+            matching Tortoise; otherwise a ``ForwardRelation`` awaitable that
+            lazily loads it.
         """
         if instance is None:
             return self
+        cache = instance.__dict__.get("_prefetch")
+        if cache and self.info.name in cache:
+            return cache[self.info.name]
         return ForwardRelation(instance, self.info)
 
     def __set__(self, instance: Model, value: Model | Any) -> None:

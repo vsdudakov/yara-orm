@@ -55,14 +55,15 @@ async def test_prefetch_forward_fk(db):
     """
     GIVEN Books each linked to an PfAuthor
     WHEN Books are fetched with prefetch_related("author")
-    THEN the forward author is cached and awaiting it makes no query
+    THEN the forward author is cached and accessible synchronously (no query)
     """
     a = await PfAuthor.create(name="Grace")
     await PfBook.create(title="X", author=a)
     await PfBook.create(title="Y", author=a)
 
     books = await PfBook.all().prefetch_related("author").order_by("title")
-    assert (await books[0].author).name == "Grace"
+    # A prefetched forward FK is served synchronously, matching Tortoise.
+    assert books[0].author.name == "Grace"
     assert books[0].__dict__["_prefetch"]["author"].id == a.id
 
 
