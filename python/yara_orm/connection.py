@@ -6,7 +6,9 @@ the accessors here so the model layer never imports the native module directly.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 from . import _engine, registry
@@ -266,6 +268,42 @@ class YaraOrm:
                     await engine.execute(statement)
 
     @classmethod
+    def get_schema_sql(cls, safe: bool = True, models: list[type[Model]] | None = None) -> str:
+        """Return the schema DDL for the models without executing it.
+
+        The read-only counterpart of :meth:`generate_schemas`: it builds the
+        ``CREATE TABLE`` / index / join-table statements for the registered
+        models (or the given subset) and returns them as one SQL string, handy
+        for previewing or dumping a schema. Requires the ORM to be initialised
+        (the active dialect determines the SQL).
+
+        Args:
+            safe: Whether to emit ``IF NOT EXISTS``-style guards.
+            models: Models to render, in dependency order; defaults to every
+                registered model.
+
+        Returns:
+            The schema DDL as a single ``;``-terminated string (empty when
+            there are no models).
+        """
+        registry.resolve_relations()
+        targets = list(models) if models is not None else registry.all_models()
+        statements: list[str] = []
+        for model in targets:
+            dialect = get_dialect(model)
+            statements.extend(dialect.create_table_sql(model._meta, safe=safe))
+        seen: set[str] = set()
+        for model in targets:
+            dialect = get_dialect(model)
+            for info in model._meta.m2m.values():
+                info.finalize()
+                if info.through in seen:  # pragma: no cover - defensive de-dup
+                    continue
+                seen.add(info.through)
+                statements.extend(dialect.create_m2m_table_sql(info, safe=safe))
+        return "\n".join(f"{statement};" for statement in statements)
+
+    @classmethod
     async def close(cls) -> None:
         """Close all connections and reset the global engine state.
 
@@ -283,6 +321,29 @@ class YaraOrm:
 
 # Backward-compatible alias for YaraOrm.
 Tortoise = YaraOrm
+
+
+def run_async(coro: Coroutine[Any, Any, Any]) -> None:
+    """Run a coroutine to completion, then close all connections.
+
+    A convenience for scripts and one-off tasks: it drives the event loop with
+    ``asyncio.run`` and guarantees :meth:`YaraOrm.close` runs even if the
+    coroutine raises, so connections never leak.
+
+    Args:
+        coro: The coroutine to run (typically your ``main()``).
+
+    Returns:
+        None
+    """
+
+    async def _runner() -> None:
+        try:
+            await coro
+        finally:
+            await YaraOrm.close()
+
+    asyncio.run(_runner())
 
 
 class TransactionWrapper:
