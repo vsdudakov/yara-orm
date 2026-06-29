@@ -3,7 +3,7 @@
 Covers a previously-broken case: binding a tz-aware datetime with a non-UTC
 offset raised ``expected a datetime without tzinfo``. tz-aware values are now
 normalised to UTC on the way in and read back as UTC-aware datetimes, so the
-instant is preserved across a round-trip on both backends.
+instant is preserved across a round-trip. Runs on every configured backend.
 """
 
 import datetime as dt
@@ -11,7 +11,6 @@ import datetime as dt
 import pytest
 
 from yara_orm import Model, fields
-from yara_orm.connection import get_engine
 
 UTC = dt.timezone.utc
 PLUS5 = dt.timezone(dt.timedelta(hours=5))
@@ -27,22 +26,30 @@ class TzEvent(Model):
         table = "tz_event"
 
 
-async def _reset_pg():
-    from yara_orm import YaraOrm
-
-    await get_engine().execute("DROP TABLE IF EXISTS tz_event CASCADE")
-    await YaraOrm.generate_schemas()
+MODELS = [TzEvent]
 
 
-async def _roundtrip(value, field="aware"):
+async def _roundtrip(value: dt.datetime, field: str = "aware") -> dt.datetime:
+    """Create a row holding ``value`` and read the column back.
+
+    Args:
+        value: The datetime to persist.
+        field: The column to write and read (``aware`` or ``naive``).
+
+    Returns:
+        The value as returned by the database.
+    """
     row = await TzEvent.create(**{field: value})
     return getattr(await TzEvent.get(id=row.id), field)
 
 
-# -- tz-aware: instant preserved -------------------------------------------
 @pytest.mark.asyncio
-async def test_aware_offset_roundtrip_sqlite(sqlite_db):
-    """A +05:00 datetime round-trips to the same instant (regression)."""
+async def test_aware_offset_roundtrip(db):
+    """
+    GIVEN a tz-aware datetime with a +05:00 offset
+    WHEN it is written and re-read
+    THEN it round-trips to the same instant as an aware value (regression)
+    """
     value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456, tzinfo=PLUS5)
     out = await _roundtrip(value)
     assert out.tzinfo is not None
@@ -50,19 +57,13 @@ async def test_aware_offset_roundtrip_sqlite(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_aware_offset_roundtrip_postgres(orm):
-    """A +05:00 datetime round-trips to the same instant on PostgreSQL."""
-    await _reset_pg()
-    value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456, tzinfo=PLUS5)
-    out = await _roundtrip(value)
-    assert out.tzinfo is not None
-    assert out == value
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("tz", [UTC, PLUS5, MINUS8])
-async def test_various_offsets_same_instant_sqlite(sqlite_db, tz):
-    """Equivalent instants in different zones store identically."""
+async def test_various_offsets_same_instant(db, tz):
+    """
+    GIVEN the same instant expressed in different timezone offsets
+    WHEN each value is written and re-read
+    THEN it stores identically and is surfaced as the same UTC instant
+    """
     value = dt.datetime(2022, 1, 1, 0, 0, 0, tzinfo=tz)
     out = await _roundtrip(value)
     assert out == value
@@ -70,27 +71,29 @@ async def test_various_offsets_same_instant_sqlite(sqlite_db, tz):
 
 
 @pytest.mark.asyncio
-async def test_naive_datetime_roundtrip_sqlite(sqlite_db):
-    """A naive datetime keeps its wall-clock value (returned naive on SQLite)."""
+async def test_naive_datetime_roundtrip(db):
+    """
+    GIVEN a naive datetime
+    WHEN it is written and re-read
+    THEN its wall-clock value is preserved (returned naive on SQLite, aware on
+    PostgreSQL's TIMESTAMPTZ column)
+    """
     value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456)
     out = await _roundtrip(value, field="naive")
-    assert out.tzinfo is None
-    assert out == value
+    if db == "sqlite":
+        assert out.tzinfo is None
+        assert out == value
+    else:
+        assert out.replace(tzinfo=None) == value
 
 
 @pytest.mark.asyncio
-async def test_naive_datetime_roundtrip_postgres(orm):
-    """A naive datetime preserves its instant on PostgreSQL (TIMESTAMPTZ)."""
-    await _reset_pg()
-    value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456)
-    out = await _roundtrip(value, field="naive")
-    # TIMESTAMPTZ returns an aware value; the wall-clock fields are preserved.
-    assert out.replace(tzinfo=None) == value
-
-
-@pytest.mark.asyncio
-async def test_microsecond_precision_preserved_sqlite(sqlite_db):
-    """Microseconds survive the round-trip (no truncation to seconds)."""
+async def test_microsecond_precision_preserved(db):
+    """
+    GIVEN a tz-aware datetime carrying microseconds
+    WHEN it is written and re-read
+    THEN the microseconds survive the round-trip without truncation to seconds
+    """
     value = dt.datetime(2021, 6, 15, 12, 30, 45, 654321, tzinfo=UTC)
     out = await _roundtrip(value)
     assert out.microsecond == 654321

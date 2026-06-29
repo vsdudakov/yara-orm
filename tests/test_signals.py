@@ -2,8 +2,7 @@
 
 import pytest
 
-from yara_orm import Model, YaraOrm, fields, post_delete, post_save, pre_delete, pre_save
-from yara_orm.connection import get_engine
+from yara_orm import Model, fields, post_delete, post_save, pre_delete, pre_save
 
 EVENTS = []
 
@@ -37,21 +36,17 @@ async def _post_delete(sender, instance, using_db):
     EVENTS.append(("post_delete", instance.name))
 
 
-async def _reset():
-    EVENTS.clear()
-    engine = get_engine()
-    await engine.execute("DROP TABLE IF EXISTS s_signal CASCADE")
-    await YaraOrm.generate_schemas()
+MODELS = [Signal]
 
 
 @pytest.mark.asyncio
-async def test_pre_save_mutates_and_fires(orm):
+async def test_pre_save_mutates_and_fires(db):
     """
     GIVEN a pre_save handler that derives a slug
     WHEN an instance is created
     THEN the handler runs before persistence and the slug is stored
     """
-    await _reset()
+    EVENTS.clear()
     obj = await Signal.create(name="Hello")
     assert ("pre_save", "Hello") in EVENTS
     assert obj.slug == "hello"
@@ -60,13 +55,13 @@ async def test_pre_save_mutates_and_fires(orm):
 
 
 @pytest.mark.asyncio
-async def test_post_save_created_flag(orm):
+async def test_post_save_created_flag(db):
     """
     GIVEN a post_save handler receiving `created`
     WHEN an instance is first created and then updated
     THEN created is True on insert and False on update
     """
-    await _reset()
+    EVENTS.clear()
     obj = await Signal.create(name="Item")
     obj.name = "Item2"
     await obj.save()
@@ -75,13 +70,13 @@ async def test_post_save_created_flag(orm):
 
 
 @pytest.mark.asyncio
-async def test_delete_signals(orm):
+async def test_delete_signals(db):
     """
     GIVEN pre/post delete handlers
     WHEN an instance is deleted
     THEN both delete signals fire in order
     """
-    await _reset()
+    EVENTS.clear()
     obj = await Signal.create(name="Gone")
     EVENTS.clear()
     await obj.delete()

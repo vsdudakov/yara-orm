@@ -1,0 +1,105 @@
+"""Query expressions and scalar functions (Tortoise-reference parity).
+
+Covers F() column references in filters and arithmetic updates, and the DB
+functions Lower/Upper/Length/Trim/Concat/Coalesce used in annotate(). Runs on
+every configured backend; the SQL is rendered portably (Concat uses ``||``).
+"""
+
+import pytest
+
+from yara_orm import Coalesce, Concat, F, Length, Lower, Model, Trim, Upper, fields
+
+
+class ExprRow(Model):
+    id = fields.IntField(pk=True)
+    first = fields.CharField(max_length=20)
+    last = fields.CharField(max_length=20, null=True)
+    a = fields.IntField(default=0)
+    b = fields.IntField(default=0)
+
+    class Meta:
+        table = "expr_row"
+
+
+MODELS = [ExprRow]
+
+
+@pytest.mark.asyncio
+async def test_f_arithmetic_update(db):
+    """
+    GIVEN rows with integer columns
+    WHEN update() assigns an F arithmetic expression
+    THEN each row's column is updated relative to its own value
+    """
+    await ExprRow.create(first="x", a=5, b=3)
+    await ExprRow.create(first="y", a=2, b=9)
+    assert await ExprRow.all().update(a=F("a") + 10) == 2
+    assert sorted(r.a for r in await ExprRow.all()) == [12, 15]
+
+
+@pytest.mark.asyncio
+async def test_f_column_to_column_update(db):
+    """
+    GIVEN a row with two integer columns
+    WHEN update() assigns one column to another via F
+    THEN the target column takes the source column's value
+    """
+    await ExprRow.create(first="x", a=7, b=1)
+    await ExprRow.all().update(b=F("a"))
+    row = await ExprRow.get(first="x")
+    assert row.b == 7
+
+
+@pytest.mark.asyncio
+async def test_f_in_filter(db):
+    """
+    GIVEN rows comparing two columns
+    WHEN filtering with a column referenced by F
+    THEN only rows satisfying the column-to-column comparison match
+    """
+    await ExprRow.create(first="x", a=5, b=3)
+    await ExprRow.create(first="y", a=2, b=9)
+    rows = await ExprRow.filter(a__gt=F("b"))
+    assert [r.first for r in rows] == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_text_functions(db):
+    """
+    GIVEN a row with text columns
+    WHEN annotating with Lower/Upper/Length/Trim
+    THEN each function is applied per row
+    """
+    await ExprRow.create(first="  Ada  ", last="LOVELACE")
+    [r] = await ExprRow.annotate(
+        lo=Lower("last"), up=Upper("last"), n=Length("last"), tr=Trim("first")
+    )
+    assert r.lo == "lovelace"
+    assert r.up == "LOVELACE"
+    assert r.n == 8
+    assert r.tr == "Ada"
+
+
+@pytest.mark.asyncio
+async def test_concat_function(db):
+    """
+    GIVEN a row with two text columns
+    WHEN annotating with Concat
+    THEN the columns are joined via the portable || operator
+    """
+    await ExprRow.create(first="Ada", last="Lovelace")
+    [r] = await ExprRow.annotate(full=Concat("first", "last"))
+    assert r.full == "AdaLovelace"
+
+
+@pytest.mark.asyncio
+async def test_coalesce_function(db):
+    """
+    GIVEN rows with a nullable column
+    WHEN annotating with Coalesce and a fallback literal
+    THEN NULL values fall back and present values are kept
+    """
+    await ExprRow.create(first="x", last=None)
+    await ExprRow.create(first="y", last="real")
+    rows = await ExprRow.annotate(v=Coalesce("last", "anon")).order_by("first")
+    assert [r.v for r in rows] == ["anon", "real"]

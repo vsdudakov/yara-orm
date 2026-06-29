@@ -37,6 +37,8 @@ def _run(argv):
         sys.argv = old
 
 
+# SQLite-only: the CLI is driven end-to-end against a concrete sqlite:// URL
+# created by cli_project, so this stays single-backend (no shared db fixture).
 def test_cli_full_lifecycle(cli_project, capsys):
     """
     GIVEN a project with a models module

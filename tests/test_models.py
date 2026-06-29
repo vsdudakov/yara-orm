@@ -49,6 +49,9 @@ class CvMConcrete(CvMTimestamped):
         table = "cov_mconcrete"
 
 
+MODELS = [CvMUser, CvMOnlyPk, CvMConcrete, CvMRef]
+
+
 def test_abstract_base_is_not_registered():
     """
     GIVEN an abstract model and a concrete subclass of it
@@ -74,7 +77,7 @@ def test_abstract_is_not_inherited_and_fields_propagate():
 
 
 @pytest.mark.asyncio
-async def test_m2m_kwarg_rejected_at_construction(sqlite_db):
+async def test_m2m_kwarg_rejected_at_construction(db):
     """
     GIVEN a model with a many-to-many field
     WHEN it is constructed with that field as a kwarg
@@ -85,7 +88,7 @@ async def test_m2m_kwarg_rejected_at_construction(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_init_relation_value_variants(sqlite_db):
+async def test_init_relation_value_variants(db):
     """
     GIVEN a foreign-key relation
     WHEN constructing with None, a model instance, and a raw id
@@ -98,7 +101,7 @@ async def test_init_relation_value_variants(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_db_column_override_kwarg(sqlite_db):
+async def test_db_column_override_kwarg(db):
     """
     GIVEN a field whose db_column differs from its attribute name
     WHEN constructing with the column name as a kwarg
@@ -110,7 +113,7 @@ async def test_db_column_override_kwarg(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_auto_now_updates_on_save(sqlite_db):
+async def test_auto_now_updates_on_save(db):
     """
     GIVEN a model with an auto_now timestamp
     WHEN it is saved and re-saved
@@ -124,7 +127,7 @@ async def test_auto_now_updates_on_save(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_create_with_explicit_pk_uses_full_insert(sqlite_db):
+async def test_create_with_explicit_pk_uses_full_insert(db):
     """
     GIVEN an explicit primary key on a new instance
     WHEN it is created
@@ -136,7 +139,7 @@ async def test_create_with_explicit_pk_uses_full_insert(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_default_values_insert_and_bulk(sqlite_db):
+async def test_default_values_insert_and_bulk(db):
     """
     GIVEN a model whose only column is an auto-increment primary key
     WHEN rows are created singly and via bulk_create
@@ -150,7 +153,7 @@ async def test_default_values_insert_and_bulk(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_bulk_create_empty_is_noop(sqlite_db):
+async def test_bulk_create_empty_is_noop(db):
     """
     GIVEN an empty iterable
     WHEN bulk_create is called
@@ -160,7 +163,7 @@ async def test_bulk_create_empty_is_noop(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_prefetch_related_classmethod(sqlite_db):
+async def test_prefetch_related_classmethod(db):
     """
     GIVEN a model
     WHEN prefetch_related is called as a classmethod
@@ -173,7 +176,7 @@ async def test_prefetch_related_classmethod(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_get_and_get_or_none_operator_fallback(sqlite_db):
+async def test_get_and_get_or_none_operator_fallback(db):
     """
     GIVEN lookups that use an operator (not plain equality)
     WHEN get / get_or_none run

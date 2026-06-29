@@ -29,8 +29,11 @@ class UuidChild(Model):
         table = "uuid_child"
 
 
+MODELS = [UuidParent, UuidChild]
+
+
 @pytest.mark.asyncio
-async def test_uuid_pk_roundtrips(sqlite_db):
+async def test_uuid_pk_roundtrips(db):
     """
     GIVEN a model with a UUID primary key
     WHEN a row is created and re-fetched
@@ -43,7 +46,7 @@ async def test_uuid_pk_roundtrips(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_uuid_fk_column_is_uuid_and_binds(sqlite_db):
+async def test_uuid_fk_column_is_uuid_and_binds(db):
     """
     GIVEN a child whose foreign key references a UUID-pk parent
     WHEN the child is created with a parent instance
@@ -59,7 +62,7 @@ async def test_uuid_fk_column_is_uuid_and_binds(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_uuid_fk_forward_and_filter(sqlite_db):
+async def test_uuid_fk_forward_and_filter(db):
     """
     GIVEN a child linked to a UUID-pk parent
     WHEN the forward accessor and a FK filter are used
@@ -76,7 +79,7 @@ async def test_uuid_fk_forward_and_filter(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_uuid_fk_reverse_relation(sqlite_db):
+async def test_uuid_fk_reverse_relation(db):
     """
     GIVEN multiple children of one UUID-pk parent
     WHEN the reverse manager is iterated

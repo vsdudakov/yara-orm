@@ -2,8 +2,7 @@
 
 import pytest
 
-from yara_orm import Avg, Count, Max, Min, Model, Sum, YaraOrm, fields
-from yara_orm.connection import get_engine
+from yara_orm import Avg, Count, Max, Min, Model, Sum, fields
 
 
 class AggAuthor(Model):
@@ -22,11 +21,7 @@ class AggBook(Model):
         table = "g_book"
 
 
-async def _reset():
-    engine = get_engine()
-    for table in ("g_book", "g_author"):
-        await engine.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    await YaraOrm.generate_schemas()
+MODELS = [AggAuthor, AggBook]
 
 
 async def _seed():
@@ -39,13 +34,12 @@ async def _seed():
 
 
 @pytest.mark.asyncio
-async def test_annotate_count_relation_and_filter(orm):
+async def test_annotate_count_relation_and_filter(db):
     """
     GIVEN Authors with differing numbers of Books
     WHEN annotating with Count("books") and filtering on the annotation
     THEN only Authors meeting the HAVING condition are returned with the count
     """
-    await _reset()
     a, b = await _seed()
     await AggAuthor.create(name="Carol")  # no books
 
@@ -55,13 +49,12 @@ async def test_annotate_count_relation_and_filter(orm):
 
 
 @pytest.mark.asyncio
-async def test_group_by_values_sum(orm):
+async def test_group_by_values_sum(db):
     """
     GIVEN Books grouped by author
     WHEN annotating Sum("rating") with group_by("author_id").values(...)
     THEN one aggregated dict per author is returned
     """
-    await _reset()
     a, b = await _seed()
 
     rows = (
@@ -75,13 +68,12 @@ async def test_group_by_values_sum(orm):
 
 
 @pytest.mark.asyncio
-async def test_group_by_count(orm):
+async def test_group_by_count(db):
     """
     GIVEN Books per author
     WHEN annotating Count("id") grouped by author_id
     THEN the per-group row counts are returned
     """
-    await _reset()
     a, b = await _seed()
     rows = (
         await AggBook.annotate(count=Count("id")).group_by("author_id").values("author_id", "count")
@@ -91,13 +83,12 @@ async def test_group_by_count(orm):
 
 
 @pytest.mark.asyncio
-async def test_avg_min_max(orm):
+async def test_avg_min_max(db):
     """
     GIVEN a set of AggBook ratings
     WHEN aggregating with Avg/Min/Max via values over a single group
     THEN the computed statistics match the data
     """
-    await _reset()
     await _seed()
     [row] = (
         await AggBook.annotate(avg=Avg("rating"), lo=Min("rating"), hi=Max("rating"))

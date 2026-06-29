@@ -16,6 +16,9 @@ class OrdPost(Model):
         ordering = ["-rank", "title"]
 
 
+MODELS = [OrdPost]
+
+
 def test_meta_ordering_parsed_onto_meta():
     """
     GIVEN a model declaring Meta.ordering
@@ -42,7 +45,7 @@ def test_meta_ordering_rejects_unknown_field():
 
 
 @pytest.mark.asyncio
-async def test_default_ordering_applied(sqlite_db):
+async def test_default_ordering_applied(db):
     """
     GIVEN rows and a model with Meta.ordering = ["-rank", "title"]
     WHEN they are fetched without an explicit order_by
@@ -58,7 +61,7 @@ async def test_default_ordering_applied(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_explicit_order_by_overrides_default(sqlite_db):
+async def test_explicit_order_by_overrides_default(db):
     """
     GIVEN a model with a default ordering
     WHEN an explicit order_by is supplied
@@ -72,7 +75,7 @@ async def test_explicit_order_by_overrides_default(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_default_ordering_applies_through_filter(sqlite_db):
+async def test_default_ordering_applies_through_filter(db):
     """
     GIVEN a filtered query with no explicit order_by
     WHEN it is evaluated

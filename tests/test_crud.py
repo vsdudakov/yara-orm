@@ -11,7 +11,6 @@ from decimal import Decimal
 import pytest
 
 from yara_orm import DoesNotExist, Model, MultipleObjectsReturned, fields
-from yara_orm.connection import get_engine
 
 
 class CrudAuthor(Model):
@@ -37,23 +36,16 @@ class CrudBook(Model):
         table = "c_book"
 
 
-async def _reset():
-    engine = get_engine()
-    await engine.execute("DROP TABLE IF EXISTS c_book CASCADE")
-    await engine.execute("DROP TABLE IF EXISTS c_author CASCADE")
-    from yara_orm import YaraOrm
-
-    await YaraOrm.generate_schemas()
+MODELS = [CrudAuthor, CrudBook]
 
 
 @pytest.mark.asyncio
-async def test_create_and_get(orm):
+async def test_create_and_get(db):
     """
     GIVEN a fresh schema
     WHEN an Author is created and then fetched by id
     THEN the persisted fields and primary key round-trip correctly
     """
-    await _reset()
     a = await CrudAuthor.create(name="Ada", age=36)
     assert a.pk == 1
     assert a._in_db is True
@@ -64,13 +56,12 @@ async def test_create_and_get(orm):
 
 
 @pytest.mark.asyncio
-async def test_rich_types_roundtrip(orm):
+async def test_rich_types_roundtrip(db):
     """
     GIVEN a Book with decimal, json, uuid, date and boolean fields
     WHEN it is created and re-read
     THEN every value round-trips to its native Python type
     """
-    await _reset()
     a = await CrudAuthor.create(name="Grace")
     code = uuid.uuid4()
     b = await CrudBook.create(
@@ -90,13 +81,12 @@ async def test_rich_types_roundtrip(orm):
 
 
 @pytest.mark.asyncio
-async def test_filtering_and_ordering(orm):
+async def test_filtering_and_ordering(db):
     """
     GIVEN several Books for one Author
     WHEN filtering with lookups and ordering
     THEN the matching rows come back in the requested order
     """
-    await _reset()
     a = await CrudAuthor.create(name="Don")
     for title in ["Alpha", "Beta", "Gamma", "Algorithms"]:
         await CrudBook.create(title=title, author=a)
@@ -110,13 +100,12 @@ async def test_filtering_and_ordering(orm):
 
 
 @pytest.mark.asyncio
-async def test_update_and_delete(orm):
+async def test_update_and_delete(db):
     """
     GIVEN a persisted Author
     WHEN it is updated via instance.save and queryset.update, then deleted
     THEN each mutation is reflected in the database
     """
-    await _reset()
     a = await CrudAuthor.create(name="Linus", age=20)
     a.age = 54
     await a.save()
@@ -131,13 +120,12 @@ async def test_update_and_delete(orm):
 
 
 @pytest.mark.asyncio
-async def test_get_errors(orm):
+async def test_get_errors(db):
     """
     GIVEN a query that matches zero or many rows
     WHEN get() / get_or_none() are called
     THEN DoesNotExist / MultipleObjectsReturned / None behave as documented
     """
-    await _reset()
     a = await CrudAuthor.create(name="Solo")
     await CrudBook.create(title="Dup", author=a)
     await CrudBook.create(title="Dup", author=a)
@@ -150,13 +138,12 @@ async def test_get_errors(orm):
 
 
 @pytest.mark.asyncio
-async def test_bulk_create(orm):
+async def test_bulk_create(db):
     """
     GIVEN 1500 unsaved Book instances
     WHEN bulk_create persists them in batches
     THEN all rows are inserted and generated primary keys are written back
     """
-    await _reset()
     a = await CrudAuthor.create(name="Bulk")
     books = [CrudBook(title=f"B{i}", author=a) for i in range(1500)]
     created = await CrudBook.bulk_create(books, batch_size=400)
@@ -167,13 +154,12 @@ async def test_bulk_create(orm):
 
 
 @pytest.mark.asyncio
-async def test_values_and_values_list(orm):
+async def test_values_and_values_list(db):
     """
     GIVEN persisted Books and Authors
     WHEN projecting with values() and values_list()
     THEN dict and tuple/scalar projections are returned without model objects
     """
-    await _reset()
     a = await CrudAuthor.create(name="Vee", age=40)
     await CrudBook.create(title="One", author=a)
     await CrudBook.create(title="Two", author=a)
@@ -190,13 +176,12 @@ async def test_values_and_values_list(orm):
 
 
 @pytest.mark.asyncio
-async def test_in_and_isnull(orm):
+async def test_in_and_isnull(db):
     """
     GIVEN Authors with and without an age
     WHEN filtering with __isnull and __in lookups
     THEN null-aware and membership filters select the right rows
     """
-    await _reset()
     await CrudAuthor.create(name="Kay", age=None)
     await CrudAuthor.create(name="Bob", age=30)
     assert await CrudAuthor.filter(age__isnull=True).count() == 1

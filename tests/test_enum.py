@@ -4,8 +4,7 @@ from enum import Enum, IntEnum
 
 import pytest
 
-from yara_orm import Model, YaraOrm, fields
-from yara_orm.connection import get_engine
+from yara_orm import Model, fields
 
 
 class Service(IntEnum):
@@ -26,20 +25,16 @@ class EnumAccount(Model):
         table = "e_account"
 
 
-async def _reset():
-    engine = get_engine()
-    await engine.execute("DROP TABLE IF EXISTS e_account CASCADE")
-    await YaraOrm.generate_schemas()
+MODELS = [EnumAccount]
 
 
 @pytest.mark.asyncio
-async def test_int_enum_roundtrip(orm):
+async def test_int_enum_roundtrip(db):
     """
     GIVEN an IntEnumField storing an IntEnum
     WHEN an instance is created and re-read
     THEN the value round-trips back to the enum member
     """
-    await _reset()
     acc = await EnumAccount.create(service=Service.RUST)
     reloaded = await EnumAccount.get(id=acc.id)
     assert reloaded.service is Service.RUST
@@ -47,13 +42,12 @@ async def test_int_enum_roundtrip(orm):
 
 
 @pytest.mark.asyncio
-async def test_char_enum_default_and_filter(orm):
+async def test_char_enum_default_and_filter(db):
     """
     GIVEN a CharEnumField with an enum default
     WHEN an instance is created without specifying it and filtered by enum
     THEN the default is applied and filtering by the enum member works
     """
-    await _reset()
     await EnumAccount.create(service=Service.PYTHON)
     await EnumAccount.create(service=Service.PYTHON, currency=Currency.USD)
 

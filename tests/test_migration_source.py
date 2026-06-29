@@ -41,7 +41,11 @@ def _roundtrip(op: m.Operation) -> m.Operation:
 
 # -- _fmt -------------------------------------------------------------------
 def test_fmt_short_values_stay_inline():
-    """Scalars and short containers render as a plain ``repr`` (no wrapping)."""
+    """
+    GIVEN scalars and short containers under the wrap threshold
+    WHEN they are formatted with ``_fmt``
+    THEN each renders as a plain ``repr`` on a single line
+    """
     assert m._fmt("hello") == "'hello'"
     assert m._fmt(42) == "42"
     assert m._fmt(None) == "None"
@@ -52,7 +56,11 @@ def test_fmt_short_values_stay_inline():
 
 
 def test_fmt_non_container_never_wraps_even_when_long():
-    """A long scalar (e.g. a big SQL string) is never broken across lines."""
+    """
+    GIVEN a scalar (e.g. a big SQL string) whose repr exceeds ``_WRAP``
+    WHEN it is formatted with ``_fmt``
+    THEN it is emitted as its repr without being broken across lines
+    """
     long_sql = "SELECT " + ", ".join(f"col_{i}" for i in range(80))
     assert len(repr(long_sql)) > m._WRAP
     out = m._fmt(long_sql)
@@ -61,7 +69,11 @@ def test_fmt_non_container_never_wraps_even_when_long():
 
 
 def test_fmt_long_dict_breaks_one_item_per_line():
-    """A dict wider than ``_WRAP`` expands to one key per line and re-evaluates."""
+    """
+    GIVEN a dict whose single-line form is wider than ``_WRAP``
+    WHEN it is formatted with ``_fmt``
+    THEN it expands to one key per line and re-evaluates to the original dict
+    """
     columns = {"id": PK, "name": INT, "email": INT, "age": INT}
     out = m._fmt(columns, indent=0)
     assert out.startswith("{\n")
@@ -74,7 +86,11 @@ def test_fmt_long_dict_breaks_one_item_per_line():
 
 
 def test_fmt_long_list_breaks_one_item_per_line():
-    """A list wider than ``_WRAP`` expands to one element per line."""
+    """
+    GIVEN a list whose single-line form is wider than ``_WRAP``
+    WHEN it is formatted with ``_fmt``
+    THEN it expands to one element per line and re-evaluates to the original list
+    """
     items = [f"column_number_{i}" for i in range(40)]
     out = m._fmt(items, indent=0)
     assert out.startswith("[\n") and out.rstrip().endswith("]")
@@ -82,7 +98,11 @@ def test_fmt_long_list_breaks_one_item_per_line():
 
 
 def test_fmt_indentation_is_relative_to_argument():
-    """Closing bracket aligns to ``indent``; contents sit four spaces deeper."""
+    """
+    GIVEN a long dict formatted with a non-zero ``indent``
+    WHEN ``_fmt`` wraps it across lines
+    THEN the closing bracket aligns to ``indent`` and contents sit four spaces deeper
+    """
     columns = {"id": PK, "name": INT, "email": INT}
     out = m._fmt(columns, indent=8)
     lines = out.splitlines()
@@ -93,13 +113,21 @@ def test_fmt_indentation_is_relative_to_argument():
 
 # -- _call ------------------------------------------------------------------
 def test_call_short_stays_on_one_line():
-    """A call whose single-line form fits within ``_WRAP`` is not wrapped."""
+    """
+    GIVEN a call whose single-line form fits within ``_WRAP``
+    WHEN it is rendered with ``_call``
+    THEN it stays on one line, unwrapped
+    """
     out = m._call("m.DropIndex", ["'t'", "'col'"])
     assert out == "m.DropIndex('t', 'col')"
 
 
 def test_call_long_wraps_one_arg_per_line():
-    """A call exceeding ``_WRAP`` puts each argument on its own line."""
+    """
+    GIVEN a call whose single-line form exceeds ``_WRAP``
+    WHEN it is rendered with ``_call``
+    THEN each argument is placed on its own line, indented eight spaces
+    """
     args = [repr(f"argument_value_{i}") for i in range(20)]
     out = m._call("m.SomeOp", args)
     assert out.startswith("m.SomeOp(\n")
@@ -108,7 +136,11 @@ def test_call_long_wraps_one_arg_per_line():
 
 
 def test_call_wraps_when_an_argument_is_already_multiline():
-    """Even a 'short' call wraps if one argument already contains a newline."""
+    """
+    GIVEN an otherwise short call where one argument already contains a newline
+    WHEN it is rendered with ``_call``
+    THEN the whole call is wrapped across lines
+    """
     multiline_arg = "columns={\n            'id': 1,\n        }"
     out = m._call("m.CreateTable", ["'t'", multiline_arg])
     assert out.startswith("m.CreateTable(\n")
@@ -116,7 +148,11 @@ def test_call_wraps_when_an_argument_is_already_multiline():
 
 # -- to_source per operation, with round-trip -------------------------------
 def test_create_table_roundtrip_with_fks_and_indexes():
-    """CreateTable renders multi-line and rebuilds with all fields intact."""
+    """
+    GIVEN a CreateTable op with columns, pk, fks and indexes
+    WHEN it is rendered to source and re-evaluated
+    THEN it renders multi-line and rebuilds with all fields intact
+    """
     op = m.CreateTable(
         "post",
         columns={"id": PK, "title": INT, "author_id": INT},
@@ -135,7 +171,11 @@ def test_create_table_roundtrip_with_fks_and_indexes():
 
 
 def test_create_table_composite_pk_roundtrip():
-    """A composite-pk table round-trips and only emits composite_pk when set."""
+    """
+    GIVEN CreateTable ops with and without a composite primary key
+    WHEN each is rendered to source and round-tripped
+    THEN composite_pk is only emitted when set and round-trips intact
+    """
     plain = m.CreateTable("t", columns={"id": PK})
     assert "composite_pk" not in plain.to_source()
 
@@ -145,7 +185,11 @@ def test_create_table_composite_pk_roundtrip():
 
 
 def test_create_table_empty_defaults_roundtrip():
-    """Missing fks/indexes serialise as empty containers, not ``None``."""
+    """
+    GIVEN a CreateTable op with no fks or indexes supplied
+    WHEN it is rendered to source and round-tripped
+    THEN the missing fks/indexes serialise as empty containers, not ``None``
+    """
     op = m.CreateTable("t", columns={"id": PK})
     rebuilt = _roundtrip(op)
     assert rebuilt.fks == {}
@@ -167,19 +211,31 @@ def test_create_table_empty_defaults_roundtrip():
     ],
 )
 def test_operation_roundtrip(op):
-    """Every serialisable operation re-parses to an identical rendering."""
+    """
+    GIVEN any serialisable migration operation
+    WHEN it is rendered to source and re-evaluated
+    THEN the rebuilt op re-parses to an identical rendering
+    """
     _roundtrip(op)
 
 
 def test_short_ops_stay_on_one_line():
-    """Compact operations are not needlessly exploded across lines."""
+    """
+    GIVEN compact operations (CreateIndex, DropIndex, short RunSQL)
+    WHEN they are rendered to source
+    THEN each stays on a single line without being exploded across lines
+    """
     assert "\n" not in m.CreateIndex("t", "c").to_source()
     assert "\n" not in m.DropIndex("t", "c").to_source()
     assert "\n" not in m.RunSQL("SELECT 1").to_source()
 
 
 def test_runsql_normalises_str_to_list_and_roundtrips():
-    """RunSQL stores SQL as lists; the rendering preserves that on reload."""
+    """
+    GIVEN a RunSQL op built from a single SQL string
+    WHEN it is rendered to source and round-tripped
+    THEN the SQL is normalised to a list and that form is preserved on reload
+    """
     op = m.RunSQL("SELECT 1")
     rebuilt = _roundtrip(op)
     assert rebuilt.sql == ["SELECT 1"]
@@ -188,7 +244,11 @@ def test_runsql_normalises_str_to_list_and_roundtrips():
 
 # -- special characters in rendered values ----------------------------------
 def test_quotes_and_unicode_in_values_survive_roundtrip():
-    """SQL containing quotes/newlines/unicode round-trips byte-for-byte."""
+    """
+    GIVEN a RunSQL op whose SQL contains quotes, newlines and unicode
+    WHEN it is rendered to source and round-tripped
+    THEN the SQL survives byte-for-byte
+    """
     sql = "INSERT INTO t (s) VALUES ('O''Brien — café\n\t')"
     op = m.RunSQL(sql)
     rebuilt = _roundtrip(op)
@@ -196,7 +256,11 @@ def test_quotes_and_unicode_in_values_survive_roundtrip():
 
 
 def test_default_with_special_chars_in_column_spec_roundtrips():
-    """A column spec carrying an awkward default value stays faithful."""
+    """
+    GIVEN an AddColumn op whose column spec carries an awkward default value
+    WHEN it is rendered to source and round-tripped
+    THEN the spec stays faithful through the round-trip
+    """
     spec = {**INT, "type_params": {"default": "a'b\"c\\d"}}
     op = m.AddColumn("t", "weird", spec=spec, fk=None)
     rebuilt = _roundtrip(op)
@@ -220,7 +284,11 @@ class SrcPost(Model):
 
 
 def test_generated_migration_file_is_valid_python(tmp_path):
-    """A full generated migration file parses and reloads into real ops."""
+    """
+    GIVEN a migration file generated for two related models
+    WHEN the file is parsed, reloaded and its ops are round-tripped
+    THEN it is valid Python that reloads into real ops with wide maps broken out
+    """
     mgr = MigrationManager(directory=str(tmp_path), app="src", models=[SrcUser, SrcPost])
     filename = mgr.make_migrations(name="initial")
     text = (tmp_path / filename).read_text()

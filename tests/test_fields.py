@@ -45,8 +45,11 @@ class CvBigPk(Model):
         table = "cov_bigpk"
 
 
+MODELS = [CvAll, CvSmallPk, CvBigPk]
+
+
 @pytest.mark.asyncio
-async def test_all_field_types_roundtrip(sqlite_db):
+async def test_all_field_types_roundtrip(db):
     """
     GIVEN a model declaring every supported field type
     WHEN a fully-populated row is created and re-read
@@ -77,7 +80,9 @@ async def test_all_field_types_roundtrip(sqlite_db):
     assert got.flag is True
     assert got.day == dt.date(2021, 5, 6)
     assert got.clock == dt.time(13, 14, 15)
-    assert got.stamp == dt.datetime(2021, 5, 6, 13, 14, 15)
+    # Postgres TIMESTAMPTZ returns a UTC-aware value; SQLite returns naive.
+    # Compare wall-clock fields so the round-trip check holds on both.
+    assert got.stamp.replace(tzinfo=None) == dt.datetime(2021, 5, 6, 13, 14, 15)
     assert got.uid == code
     assert got.js == {"a": [1, 2]}
     assert got.dec == Decimal("12.34")
@@ -85,7 +90,7 @@ async def test_all_field_types_roundtrip(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_null_values_roundtrip(sqlite_db):
+async def test_null_values_roundtrip(db):
     """
     GIVEN a model with nullable columns left unset
     WHEN the row is created and re-read
@@ -98,7 +103,7 @@ async def test_null_values_roundtrip(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_smallint_and_bigint_primary_keys(sqlite_db):
+async def test_smallint_and_bigint_primary_keys(db):
     """
     GIVEN models keyed by SmallIntField and BigIntField primary keys
     WHEN rows are created
@@ -111,7 +116,7 @@ async def test_smallint_and_bigint_primary_keys(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_uuid_field_accepts_string(sqlite_db):
+async def test_uuid_field_accepts_string(db):
     """
     GIVEN a UUID provided as a string
     WHEN it is stored and re-read

@@ -627,6 +627,67 @@ class Model(metaclass=ModelMeta):
         return obj
 
     @classmethod
+    async def get_or_create(
+        cls, defaults: dict[str, Any] | None = None, **kwargs: Any
+    ) -> tuple[Model, bool]:
+        """Fetch the row matching ``kwargs`` or create it.
+
+        Args:
+            defaults: Extra field values used only when creating the row.
+            **kwargs: Lookups identifying the row and reused on creation.
+
+        Returns:
+            A ``(instance, created)`` tuple; ``created`` is ``True`` when a new
+            row was inserted.
+        """
+        try:
+            return await cls.get(**kwargs), False
+        except DoesNotExist:
+            return await cls.create(**{**kwargs, **(defaults or {})}), True
+
+    @classmethod
+    async def update_or_create(
+        cls, defaults: dict[str, Any] | None = None, **kwargs: Any
+    ) -> tuple[Model, bool]:
+        """Update the row matching ``kwargs`` with ``defaults``, or create it.
+
+        Args:
+            defaults: Field values to set (on update) or add (on create).
+            **kwargs: Lookups identifying the row and reused on creation.
+
+        Returns:
+            A ``(instance, created)`` tuple; ``created`` is ``True`` when a new
+            row was inserted.
+        """
+        defaults = defaults or {}
+        try:
+            obj = await cls.get(**kwargs)
+        except DoesNotExist:
+            return await cls.create(**{**kwargs, **defaults}), True
+        if defaults:
+            obj.update_from_dict(defaults)
+            await obj.save()
+        return obj, False
+
+    @classmethod
+    async def in_bulk(cls, id_list: Iterable[Any], field_name: str = "pk") -> dict[Any, Model]:
+        """Fetch instances keyed by ``field_name`` for the given values.
+
+        Args:
+            id_list: The values to look up.
+            field_name: The field to match and key the result by (default pk).
+
+        Returns:
+            A dict mapping each present key to its instance.
+        """
+        ids = list(id_list)
+        if not ids:
+            return {}
+        objects = await cls.filter(**{f"{field_name}__in": ids})
+        key = cls._meta.pk_field.model_field_name if field_name == "pk" else field_name
+        return {getattr(obj, key): obj for obj in objects}
+
+    @classmethod
     async def bulk_create(cls, objects: Iterable[Model], batch_size: int = 500) -> list[Model]:
         """Insert many instances using one multi-row INSERT per batch.
 
@@ -714,3 +775,101 @@ class Model(metaclass=ModelMeta):
                 setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
                 obj._in_db = True
         return objects
+
+    @classmethod
+    async def bulk_update(
+        cls, objects: Iterable[Model], fields: Iterable[str], batch_size: int = 500
+    ) -> int:
+        """Update the given ``fields`` of many instances in batched statements.
+
+        Each batch issues a single ``UPDATE ... SET col = CASE pk ... END``
+        statement, so a batch is one round-trip rather than one per row.
+
+        Args:
+            objects: The instances to update (each must have a primary key).
+            fields: Names of the fields to write back.
+            batch_size: Maximum number of rows per ``UPDATE`` statement.
+
+        Returns:
+            The total number of rows updated.
+        """
+        objects = list(objects)
+        field_names = list(fields)
+        if not objects or not field_names:
+            return 0
+        dialect = get_dialect(cls)
+        engine = get_executor(cls, write=True)
+        meta = cls._meta
+        pk_field = meta.pk_field
+        q = dialect.quote
+        table = q(meta.table)
+        targets = [
+            (name, meta.get_field(meta.relations[name].source_attr))
+            if name in meta.relations
+            else (name, meta.get_field(name))
+            for name in field_names
+        ]
+        total = 0
+        for start in range(0, len(objects), batch_size):
+            batch = objects[start : start + batch_size]
+            params: list[Any] = []
+            idx = 1
+            set_parts = []
+            for name, field in targets:
+                whens = []
+                for obj in batch:
+                    value = getattr(obj, name)
+                    if name in meta.relations and hasattr(value, "pk"):
+                        value = value.pk
+                    whens.append(
+                        f"WHEN {dialect.placeholder(idx)} THEN {dialect.placeholder(idx + 1)}"
+                    )
+                    params.extend([pk_field.to_db(obj.pk), field.to_db(value)])
+                    idx += 2
+                # ``ELSE <column>`` anchors the CASE result type to the column,
+                # so PostgreSQL unifies the untyped placeholders to it instead
+                # of defaulting them to text (it never fires: WHERE limits the
+                # statement to the batch's primary keys).
+                col = q(field.db_column)
+                set_parts.append(
+                    f"{col} = CASE {q(pk_field.db_column)} {' '.join(whens)} ELSE {col} END"
+                )
+            holes = []
+            for obj in batch:
+                holes.append(dialect.placeholder(idx))
+                params.append(pk_field.to_db(obj.pk))
+                idx += 1
+            sql = (
+                f"UPDATE {table} SET {', '.join(set_parts)} "
+                f"WHERE {q(pk_field.db_column)} IN ({', '.join(holes)})"
+            )
+            total += await engine.execute(sql, params)
+        return total
+
+    async def refresh_from_db(self) -> Model:
+        """Reload this instance's column values from the database.
+
+        Returns:
+            ``self``, with every field refreshed from its persisted row.
+        """
+        fresh = await type(self).get(pk=self.pk)
+        for field in self._meta.field_list:
+            setattr(self, field.model_field_name, getattr(fresh, field.model_field_name))
+        return self
+
+    def update_from_dict(self, data: dict[str, Any]) -> Model:
+        """Set attributes from ``data`` in place (without saving).
+
+        Args:
+            data: Mapping of field or relation name to its new value.
+
+        Returns:
+            ``self``, for chaining (call ``save()`` to persist).
+        """
+        meta = self._meta
+        for key, value in data.items():
+            if key in meta.fields or key in meta.relations:
+                setattr(self, key, value)
+            else:
+                raise FieldError(f"{type(self).__name__} has no field {key!r}")
+        return self

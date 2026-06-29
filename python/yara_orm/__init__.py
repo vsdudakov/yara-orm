@@ -25,6 +25,8 @@ from .exceptions import (
     MultipleObjectsReturned,
     ORMError,
 )
+from .expressions import F
+from .functions import Coalesce, Concat, Length, Lower, Trim, Upper
 from .migrations import MigrationManager
 from .models import Model
 from .prefetch import Prefetch
@@ -45,6 +47,7 @@ __all__ = [
     "Model",
     "QuerySet",
     "Q",
+    "F",
     "fields",
     "migrations",
     "MigrationManager",
@@ -53,6 +56,12 @@ __all__ = [
     "Avg",
     "Min",
     "Max",
+    "Lower",
+    "Upper",
+    "Length",
+    "Trim",
+    "Concat",
+    "Coalesce",
     "Prefetch",
     "connections",
     "in_transaction",
