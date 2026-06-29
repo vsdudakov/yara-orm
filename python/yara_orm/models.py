@@ -527,6 +527,18 @@ class Model(metaclass=ModelMeta):
         return QuerySet(cls).prefetch_related(*specs)
 
     @classmethod
+    def select_related(cls, *relations: str) -> QuerySet:
+        """Return a query set that eager-loads forward FK/O2O relations by join.
+
+        Args:
+            *relations: Forward relation names to join and load in one query.
+
+        Returns:
+            A new ``QuerySet`` configured to select the relations.
+        """
+        return QuerySet(cls).select_related(*relations)
+
+    @classmethod
     async def raw(cls, sql: str, params: list[Any] | None = None) -> list[Model]:
         """Run raw SQL returning this model's instances (positional columns).
 

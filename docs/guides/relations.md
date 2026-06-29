@@ -291,6 +291,31 @@ relations stay awaitable and serve their cached rows.
     query per author. The related rows are cached on each instance, so awaiting
     the relation inside the loop is free.
 
+### `select_related` for forward relations
+
+For **forward** foreign keys and one-to-one relations, `select_related` loads the
+related row in the *same* query with a `JOIN` (no second query at all), and caches
+it so you access it synchronously:
+
+```python
+for book in await Book.all().select_related("author"):
+    print(book.title, book.author.name)   # one query total; synchronous access
+```
+
+Each relation is joined under an alias of its own name, so self-referential joins
+work too:
+
+```python
+employees = await Employee.select_related("manager").order_by("name")
+for e in employees:
+    print(e.name, e.manager.name if e.manager else "—")
+```
+
+!!! note "`select_related` vs `prefetch_related`"
+    Use `select_related` for forward FK / one-to-one relations — it's a single
+    joined query. Use `prefetch_related` for reverse managers and many-to-many
+    relations, where a separate batched query per relation is the right shape.
+
 ### Customising a prefetch with `Prefetch`
 
 For finer control, pass a `Prefetch(relation, queryset=...)` object to filter or

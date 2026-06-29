@@ -3,7 +3,7 @@ managers, aggregation joins and prefetch variants."""
 
 import pytest
 
-from yara_orm import Avg, Count, Max, Min, Model, Prefetch, Sum, fields
+from yara_orm import Avg, Count, FieldError, Max, Min, Model, Prefetch, Sum, fields
 
 
 class Tournament(Model):
@@ -276,6 +276,60 @@ async def test_forward_fk_sync_access_after_prefetch(db):
     # Un-prefetched access still returns the lazy awaitable accessor.
     fresh = await Employee.get(name="Worker")
     assert (await fresh.manager).name == "Boss"
+
+
+@pytest.mark.asyncio
+async def test_select_related_forward_fk(db):
+    """
+    GIVEN events linked to tournaments
+    WHEN fetched with select_related("tournament")
+    THEN the forward FK is joined and accessible synchronously
+    """
+    t = await Tournament.create(name="Cup")
+    await Event.create(name="Final", tournament=t)
+    [event] = await Event.select_related("tournament")
+    assert event.tournament.name == "Cup"  # synchronous, hydrated by the join
+
+
+@pytest.mark.asyncio
+async def test_select_related_one_to_one(db):
+    """
+    GIVEN an address linked to an event by one-to-one
+    WHEN fetched with select_related("event")
+    THEN the forward O2O is joined and accessible synchronously
+    """
+    e = await Event.create(name="Final", tournament=await Tournament.create(name="C"))
+    await Address.create(line="Main St", event=e)
+    [addr] = await Address.select_related("event")
+    assert addr.event.id == e.id
+
+
+@pytest.mark.asyncio
+async def test_select_related_self_fk_and_null(db):
+    """
+    GIVEN employees with and without a manager (a self-referential FK)
+    WHEN fetched with select_related("manager") ordered by name
+    THEN the aliased self-join hydrates the manager (None at the top)
+    """
+    boss = await Employee.create(name="Boss")
+    await Employee.create(name="Worker", manager=boss)
+    rows = await Employee.select_related("manager").order_by("name")
+    assert [(e.name, e.manager.name if e.manager else None) for e in rows] == [
+        ("Boss", None),
+        ("Worker", "Boss"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_select_related_unknown_relation_raises(db):
+    """
+    GIVEN a model
+    WHEN select_related names something that is not a forward relation
+    THEN a FieldError is raised
+    """
+    await Tournament.create(name="Cup")
+    with pytest.raises(FieldError):
+        await Event.select_related("participants")  # m2m, not a forward FK
 
 
 @pytest.mark.asyncio

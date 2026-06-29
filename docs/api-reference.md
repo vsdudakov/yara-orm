@@ -57,7 +57,8 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | `all` | `Model.all()` | QuerySet over all rows. |
 | `filter` / `exclude` | `Model.filter(*q, **lookups)` | Narrow / negate a QuerySet. |
 | `annotate` | `Model.annotate(**aggregates)` | Add computed columns. |
-| `prefetch_related` | `Model.prefetch_related(*specs)` | Prefetch relations (no N+1). |
+| `prefetch_related` | `Model.prefetch_related(*specs)` | Prefetch reverse/m2m relations (no N+1). |
+| `select_related` | `Model.select_related(*relations)` | Join-load forward FK/O2O relations in one query. |
 | `raw` | `await Model.raw(sql, params=None)` | Raw SQL → model instances. |
 | `save` | `await instance.save(update_fields=None)` | Persist (emits save signals). |
 | `delete` | `await instance.delete()` | Delete the row (emits delete signals). |
@@ -84,8 +85,9 @@ Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `descrip
 
 Lazy and chainable; runs when awaited or on a terminal method. See [Querying](guides/querying.md).
 
-**Chainable:** `filter`, `exclude`, `annotate`, `group_by`, `prefetch_related`, `order_by`,
-`limit`, `offset`, `distinct`, `select_for_update`, slicing (`qs[start:stop]`).
+**Chainable:** `filter`, `exclude`, `annotate`, `group_by`, `prefetch_related`,
+`select_related`, `order_by`, `limit`, `offset`, `distinct`, `select_for_update`,
+slicing (`qs[start:stop]`).
 
 **Terminal (async):** `await qs` → `list[Model]`, `get`, `first`, `last`, `earliest`,
 `latest`, `count`, `exists`, `values`, `values_list`, `delete`, `update`.
