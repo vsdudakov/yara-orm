@@ -12,6 +12,7 @@ from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 from . import _engine, registry
+from . import timezone as _tz
 from .dialects import BaseDialect
 from .dialects import get_dialect as resolve_dialect
 from .exceptions import ConfigurationError, TransactionManagementError, UnSupportedError
@@ -108,6 +109,11 @@ def _route(model: type[Model] | None, write: bool) -> str:
         name = _ROUTER.db_for_write(model) if write else _ROUTER.db_for_read(model)
         if name:
             return name
+    if model is not None:
+        # A model's ``Meta.default_connection`` pins it to a named connection.
+        dc = getattr(model._meta, "default_connection", None)
+        if dc:
+            return dc
     return "default"
 
 
@@ -134,10 +140,9 @@ def get_executor(
         return tx
     if using is not None:
         return _named_connection(using)[0]
-    # Fast path: no router -> the default engine, skipping route resolution.
-    if _ROUTER is None:
-        return get_engine()
-    return _CONNECTIONS[_route(model, write)][0]
+    name = _route(model, write)
+    # "default" goes through get_engine() so an uninitialised ORM errors clearly.
+    return get_engine() if name == "default" else _named_connection(name)[0]
 
 
 def get_dialect(model: type[Model] | None = None, using: str | None = None) -> BaseDialect:
@@ -153,13 +158,14 @@ def get_dialect(model: type[Model] | None = None, using: str | None = None) -> B
     """
     if using is not None:
         return _named_connection(using)[1]
-    if _ROUTER is None:
+    name = _route(model, False)
+    if name == "default":
         if _DIALECT is None:
             raise ConfigurationError(
                 "ORM is not initialised. Call `await YaraOrm.init(db_url=...)` first."
             )
         return _DIALECT
-    return _CONNECTIONS[_route(model, False)][1]
+    return _named_connection(name)[1]
 
 
 def _named_connection(name: str) -> tuple[Any, BaseDialect]:
@@ -184,7 +190,13 @@ class YaraOrm:
     """Entry point: initialise connections, generate schemas and resolve relations."""
 
     @classmethod
-    async def init(cls, db_url: str, router: Any = None) -> None:
+    async def init(
+        cls,
+        db_url: str,
+        router: Any = None,
+        use_tz: bool = False,
+        timezone: str = "UTC",
+    ) -> None:
         """Connect to ``db_url`` (the default connection) and resolve relations.
 
         Pass ``router`` to direct per-model reads/writes; register additional
@@ -193,11 +205,15 @@ class YaraOrm:
         Args:
             db_url: Database URL for the default connection.
             router: Optional router selecting a connection per model.
+            use_tz: When True, :func:`yara_orm.timezone.now` returns timezone-aware
+                UTC datetimes (used for ``auto_now``/``auto_now_add``).
+            timezone: IANA name of the timezone datetimes are presented in.
 
         Returns:
             None
         """
         global _ENGINE, _DIALECT, _ROUTER
+        _tz._set_config(timezone=timezone, use_tz=use_tz)
         _ENGINE = await _engine.connect(db_url)
         _DIALECT = resolve_dialect(_ENGINE.dialect)
         _CONNECTIONS["default"] = (_ENGINE, _DIALECT)
@@ -317,6 +333,7 @@ class YaraOrm:
         _ENGINE = None
         _DIALECT = None
         _ROUTER = None
+        _tz._set_config(timezone="UTC", use_tz=False)
 
 
 # Backward-compatible alias for YaraOrm.
@@ -547,10 +564,10 @@ class in_transaction:
             self._savepoint = existing.new_savepoint()
             await existing.savepoint(self._savepoint)
             return existing
-        engine = get_engine()
+        engine, dialect = _named_connection(self.connection_name)
         isolation = None
         if self.isolation is not None:
-            isolation = _normalize_isolation(self.isolation, get_dialect().name)
+            isolation = _normalize_isolation(self.isolation, dialect.name)
         self._conn = TransactionWrapper(await engine.begin(isolation))
         self._token = _active_tx.set(self._conn)
         return self._conn

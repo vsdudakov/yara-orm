@@ -36,20 +36,20 @@ _HANDLERS: dict[str, dict[type, list]] = {
 
 
 def _decorator(
-    kind: str, model: type[Model]
+    kind: str, models: tuple[type[Model], ...]
 ) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
-    """Build a decorator that registers a handler for ``kind`` and ``model``.
+    """Build a decorator that registers a handler for ``kind`` and ``models``.
 
     Args:
         kind: Signal name, one of the keys in ``_HANDLERS``.
-        model: Model class the handler is registered for.
+        models: One or more model classes the handler is registered for.
 
     Returns:
         A decorator that registers and returns the wrapped handler.
     """
 
     def register(func: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
-        """Register ``func`` as a handler and return it unchanged.
+        """Register ``func`` for every sender model and return it unchanged.
 
         Args:
             func: The async handler to register.
@@ -57,66 +57,67 @@ def _decorator(
         Returns:
             The same handler that was passed in.
         """
-        _HANDLERS[kind].setdefault(model, []).append(func)
+        for model in models:
+            _HANDLERS[kind].setdefault(model, []).append(func)
         return func
 
     return register
 
 
 def pre_save(
-    model: type[Model],
+    *models: type[Model],
 ) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
-    """Return a decorator registering a pre-save handler for ``model``.
+    """Return a decorator registering a pre-save handler for one or more models.
 
     Args:
-        model: Model class to attach the handler to.
+        *models: Model class(es) to attach the handler to.
 
     Returns:
         A decorator registering the wrapped handler.
     """
-    return _decorator("pre_save", model)
+    return _decorator("pre_save", models)
 
 
 def post_save(
-    model: type[Model],
+    *models: type[Model],
 ) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
-    """Return a decorator registering a post-save handler for ``model``.
+    """Return a decorator registering a post-save handler for one or more models.
 
     Args:
-        model: Model class to attach the handler to.
+        *models: Model class(es) to attach the handler to.
 
     Returns:
         A decorator registering the wrapped handler.
     """
-    return _decorator("post_save", model)
+    return _decorator("post_save", models)
 
 
 def pre_delete(
-    model: type[Model],
+    *models: type[Model],
 ) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
-    """Return a decorator registering a pre-delete handler for ``model``.
+    """Return a decorator registering a pre-delete handler for one or more models.
 
     Args:
-        model: Model class to attach the handler to.
+        *models: Model class(es) to attach the handler to.
 
     Returns:
         A decorator registering the wrapped handler.
     """
-    return _decorator("pre_delete", model)
+    return _decorator("pre_delete", models)
 
 
 def post_delete(
-    model: type[Model],
+    *models: type[Model],
 ) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
-    """Return a decorator registering a post-delete handler for ``model``.
+    """Return a decorator registering a post-delete handler for one or more models.
 
     Args:
-        model: Model class to attach the handler to.
+        *models: Model class(es) to attach the handler to.
 
     Returns:
         A decorator registering the wrapped handler.
     """
-    return _decorator("post_delete", model)
+    return _decorator("post_delete", models)
 
 
 async def emit_pre_save(

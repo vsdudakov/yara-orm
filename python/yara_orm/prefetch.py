@@ -52,9 +52,59 @@ async def prefetch_instances(instances: list[Model], specs: Sequence[str | Prefe
         return
     for spec in specs:
         if isinstance(spec, Prefetch):
-            await _prefetch_one(instances, spec.relation, spec.queryset, spec.to_attr)
+            await _prefetch_path(instances, spec.relation, spec.queryset, spec.to_attr)
         else:
-            await _prefetch_one(instances, spec, None, None)
+            await _prefetch_path(instances, spec, None, None)
+
+
+def _gather_related(instances: list[Model], name: str) -> list[Model]:
+    """Collect the loaded related instances cached under ``name`` across a batch.
+
+    Args:
+        instances: The instances whose ``_prefetch`` cache to read.
+        name: The relation name the prior hop stored under.
+
+    Returns:
+        A flat list of the related instances (single values and lists merged,
+        ``None`` skipped).
+    """
+    out: list[Model] = []
+    for inst in instances:
+        value = inst.__dict__.get("_prefetch", {}).get(name)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            out.extend(value)
+        else:
+            out.append(value)
+    return out
+
+
+async def _prefetch_path(
+    instances: list[Model], path: str, custom_qs: QuerySet | None, to_attr: str | None
+) -> None:
+    """Prefetch a possibly multi-hop relation path (``"author__publisher"``).
+
+    Intermediate hops load plainly; the optional queryset and ``to_attr`` apply
+    to the final hop.
+
+    Args:
+        instances: The instances to start from.
+        path: The relation path, hops separated by ``__``.
+        custom_qs: Optional queryset constraining the final hop.
+        to_attr: Optional custom attribute for the final hop's result.
+
+    Returns:
+        None
+    """
+    head, sep, rest = path.partition("__")
+    if not sep:
+        await _prefetch_one(instances, head, custom_qs, to_attr)
+        return
+    await _prefetch_one(instances, head, None, None)
+    children = _gather_related(instances, head)
+    if children:
+        await _prefetch_path(children, rest, custom_qs, to_attr)
 
 
 def _assign(instances: list[Model], name: str, to_attr: str | None, values: dict) -> None:

@@ -42,11 +42,14 @@ class BaseDialect:
     #: Date/time part -> the literal used inside ``EXTRACT(<part> FROM col)``.
     _extract_parts = {
         "year": "YEAR",
+        "quarter": "QUARTER",
         "month": "MONTH",
+        "week": "WEEK",
         "day": "DAY",
         "hour": "HOUR",
         "minute": "MINUTE",
         "second": "SECOND",
+        "microsecond": "MICROSECONDS",
     }
     #: Whether ``ADD COLUMN`` / ``DROP COLUMN`` accept an ``IF [NOT] EXISTS``
     #: guard (PostgreSQL does; SQLite has no such syntax).
@@ -98,6 +101,17 @@ class BaseDialect:
             A SQL expression yielding the integer part (e.g. ``EXTRACT(...)``).
         """
         return f"EXTRACT({self._extract_parts[part]} FROM {col})"
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render an expression truncating a datetime column to a date.
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the date part (for the ``__date`` lookup).
+        """
+        return f"CAST({col} AS DATE)"
 
     def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
         """Render an ``ON CONFLICT`` clause for ``bulk_create`` upserts.
@@ -760,7 +774,7 @@ class PostgresDialect(BaseDialect):
     name = "postgres"
     # `~` / `~*` are PostgreSQL's POSIX regex match operators (case-sensitive
     # and case-insensitive); `__search` uses full-text via to_tsvector/tsquery.
-    regex_ops = {"regex": "~", "iregex": "~*"}
+    regex_ops = {"regex": "~", "iregex": "~*", "posix_regex": "~", "iposix_regex": "~*"}
     supports_search = True
 
     def search_sql(self, col: str, placeholder: str) -> str:
@@ -822,6 +836,7 @@ class SqliteDialect(BaseDialect):
     _strftime_parts = {
         "year": "%Y",
         "month": "%m",
+        "week": "%W",
         "day": "%d",
         "hour": "%H",
         "minute": "%M",
@@ -832,13 +847,33 @@ class SqliteDialect(BaseDialect):
         """Render a date/time part extraction using ``strftime``.
 
         Args:
-            part: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
+            part: A supported date/time part name.
+            col: The already-qualified column reference.
+
+        Raises:
+            UnSupportedError: For ``microsecond`` (SQLite's stored timestamp
+                resolution makes it unreliable).
+
+        Returns:
+            A SQL integer expression yielding the requested part.
+        """
+        if part == "quarter":
+            # SQLite has no quarter; derive it from the month (1-12 -> 1-4).
+            return f"((CAST(strftime('%m', {col}) AS INTEGER) + 2) / 3)"
+        if part == "microsecond":
+            raise UnSupportedError("SQLite does not support the __microsecond lookup")
+        return f"CAST(strftime('{self._strftime_parts[part]}', {col}) AS INTEGER)"
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render a date truncation using SQLite's ``date()`` function.
+
+        Args:
             col: The already-qualified column reference.
 
         Returns:
-            ``CAST(strftime('<fmt>', col) AS INTEGER)`` yielding the integer part.
+            ``date(col)`` for the ``__date`` lookup.
         """
-        return f"CAST(strftime('{self._strftime_parts[part]}', {col}) AS INTEGER)"
+        return f"date({col})"
 
     # SQLite has no ``IF [NOT] EXISTS`` on ADD/DROP COLUMN, no ``CONCURRENTLY``,
     # no in-place ``ALTER COLUMN`` (a column change needs a table rebuild), no

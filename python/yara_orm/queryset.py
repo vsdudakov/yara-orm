@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import registry
 from .connection import get_dialect, get_executor
-from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned, UnSupportedError
+from .exceptions import FieldError, UnSupportedError
 from .expressions import Expression
 from .functions import Function
 
@@ -42,11 +42,14 @@ _OPERATORS = {
 }
 
 # Date/time part lookups, e.g. ``created_at__year=2024`` (rendered per dialect).
-_DATE_PARTS = frozenset({"year", "month", "day", "hour", "minute", "second"})
-# Regex lookups, e.g. ``name__regex=r"^A"`` (rendered per dialect operator).
-_REGEX_OPS = frozenset({"regex", "iregex"})
+_DATE_PARTS = frozenset(
+    {"year", "quarter", "month", "week", "day", "hour", "minute", "second", "microsecond"}
+)
+# Regex lookups, e.g. ``name__regex=r"^A"`` (rendered per dialect operator). The
+# ``posix_regex``/``iposix_regex`` spellings match Tortoise; they are aliases.
+_REGEX_OPS = frozenset({"regex", "iregex", "posix_regex", "iposix_regex"})
 # Lookups handled by dedicated branches rather than the ``_OPERATORS`` table.
-_SPECIAL_OPS = frozenset({"in", "not_in", "isnull", "range", "search"})
+_SPECIAL_OPS = frozenset({"in", "not_in", "isnull", "not_isnull", "range", "search", "date"})
 # Every recognized trailing lookup suffix.
 _LOOKUPS = frozenset(_OPERATORS) | _DATE_PARTS | _REGEX_OPS | _SPECIAL_OPS
 
@@ -555,6 +558,17 @@ class QuerySet:
         """
         if op == "isnull":
             return (f"{col} IS NULL" if value else f"{col} IS NOT NULL"), [], idx
+        if op == "not_isnull":
+            return (f"{col} IS NOT NULL" if value else f"{col} IS NULL"), [], idx
+        if hasattr(value, "as_sql"):
+            # A Subquery / RawSQL / Case used as the comparison value.
+            vparams: list[Any] = []
+            vsql, idx = value.as_sql(self, dialect, {}, vparams, idx)
+            if op in ("in", "not_in"):
+                membership = "NOT IN" if op == "not_in" else "IN"
+                return f"{col} {membership} {vsql}", vparams, idx
+            sql_op = dialect.ilike if _OPERATORS[op][0] == "ILIKE" else _OPERATORS[op][0]
+            return f"{col} {sql_op} {vsql}", vparams, idx
         if op in ("in", "not_in"):
             membership = "NOT IN" if op == "not_in" else "IN"
             if not value:
@@ -581,6 +595,12 @@ class QuerySet:
             if regex_op is None:
                 raise UnSupportedError(f"{dialect.name} does not support the __{op} lookup")
             return f"{col} {regex_op} {dialect.placeholder(idx)}", [value], idx + 1
+        if op == "date":
+            return (
+                f"{dialect.truncate_date_sql(col)} = {dialect.placeholder(idx)}",
+                [field.to_db(value)],
+                idx + 1,
+            )
         if op == "search":
             return dialect.search_sql(col, dialect.placeholder(idx)), [value], idx + 1
 
@@ -967,6 +987,9 @@ class QuerySet:
         def resolve(name: str) -> str:
             return self._resolve_column(name, dialect, joins)
 
+        if isinstance(agg, Expression):
+            # F / arithmetic projected as an annotation, e.g. annotate(x=F("a")+1).
+            return agg.resolve(resolve, dialect, params, idx)
         if isinstance(agg, Function):
             return agg.render(resolve), idx
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
@@ -1133,26 +1156,54 @@ class QuerySet:
         table = q(meta.table)
         select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
         joins: list[str] = []
-        specs: list[tuple[str, Any, int, int]] = []
+        # One node per (possibly nested) relation path, in join order. Each
+        # records its parent path (None = base), the last segment, target model
+        # and the column slice it occupies in the SELECT.
+        nodes: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
         offset = len(meta.field_list)
-        for rel in self._select_related:
-            if rel not in meta.relations:
+
+        def ensure_path(path: str) -> dict[str, Any]:
+            """Add the LEFT JOIN(s) for ``path``, recursing through its parents."""
+            nonlocal offset
+            if path in nodes:
+                return nodes[path]
+            if "__" in path:
+                parent_path, _, seg = path.rpartition("__")
+                parent_meta = ensure_path(parent_path)["target"]._meta
+                left_alias = q(parent_path)
+                parent: str | None = parent_path
+            else:
+                parent_meta, left_alias, parent, seg = meta, table, None, path
+            if seg not in parent_meta.relations:
                 raise FieldError(
-                    f"select_related: {rel!r} is not a forward relation of {self.model.__name__}"
+                    f"select_related: {path!r} is not a forward relation of {self.model.__name__}"
                 )
-            info = meta.relations[rel]
+            info = parent_meta.relations[seg]
             target = info.resolve_target()
             tmeta = target._meta
             tmeta.compile(dialect)
-            alias = q(rel)
-            fk_col = q(meta.get_field(info.source_attr).db_column)
+            alias = q(path)
+            fk_col = q(parent_meta.get_field(info.source_attr).db_column)
             joins.append(
                 f" LEFT JOIN {q(tmeta.table)} AS {alias} "
-                f"ON {table}.{fk_col} = {alias}.{q(tmeta.pk_field.db_column)}"
+                f"ON {left_alias}.{fk_col} = {alias}.{q(tmeta.pk_field.db_column)}"
             )
             select.extend(f"{alias}.{q(f.db_column)}" for f in tmeta.field_list)
-            specs.append((rel, target, offset, len(tmeta.field_list)))
-            offset += len(tmeta.field_list)
+            node = {
+                "parent": parent,
+                "seg": seg,
+                "target": target,
+                "offset": offset,
+                "width": len(tmeta.field_list),
+            }
+            offset += node["width"]
+            nodes[path] = node
+            order.append(path)
+            return node
+
+        for rel in self._select_related:
+            ensure_path(rel)
         where, params, _ = self._compile_conditions(dialect)
         sql = (
             f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
@@ -1163,12 +1214,22 @@ class QuerySet:
         instances = []
         for row in rows:
             obj = self.model._from_db_row(row[:ncols])
-            cache = obj.__dict__.setdefault("_prefetch", {})
-            for rel, target, start, n in specs:
-                chunk = row[start : start + n]
-                cache[rel] = (
-                    target._from_db_row(chunk) if any(v is not None for v in chunk) else None
+            built: dict[str | None, Any] = {None: obj}
+            obj.__dict__.setdefault("_prefetch", {})
+            for path in order:
+                node = nodes[path]
+                parent_inst = built[node["parent"]]
+                if parent_inst is None:
+                    built[path] = None
+                    continue
+                chunk = row[node["offset"] : node["offset"] + node["width"]]
+                child = (
+                    node["target"]._from_db_row(chunk)
+                    if any(v is not None for v in chunk)
+                    else None
                 )
+                parent_inst.__dict__.setdefault("_prefetch", {})[node["seg"]] = child
+                built[path] = child
             instances.append(obj)
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
@@ -1380,9 +1441,11 @@ class QuerySet:
         qs = self.filter(**kwargs).limit(2) if kwargs else self.limit(2)
         rows = await qs._fetch()
         if not rows:
-            raise DoesNotExist(f"{self.model.__name__} matching query does not exist")
+            raise self.model.DoesNotExist(f"{self.model.__name__} matching query does not exist")
         if len(rows) > 1:
-            raise MultipleObjectsReturned(f"Multiple {self.model.__name__} objects returned")
+            raise self.model.MultipleObjectsReturned(
+                f"Multiple {self.model.__name__} objects returned"
+            )
         return rows[0]
 
     async def get_or_none(self, **kwargs: Any) -> Model | None:
@@ -1397,7 +1460,9 @@ class QuerySet:
         qs = self.filter(**kwargs).limit(2) if kwargs else self.limit(2)
         rows = await qs._fetch()
         if len(rows) > 1:
-            raise MultipleObjectsReturned(f"Multiple {self.model.__name__} objects returned")
+            raise self.model.MultipleObjectsReturned(
+                f"Multiple {self.model.__name__} objects returned"
+            )
         return rows[0] if rows else None
 
     async def get_or_create(
