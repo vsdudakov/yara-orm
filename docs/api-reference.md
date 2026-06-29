@@ -13,10 +13,11 @@ from yara_orm import (
     YaraOrm, Tortoise, Model, QuerySet, Q, F, fields, migrations,
     Count, Sum, Avg, Min, Max,
     Lower, Upper, Length, Trim, Concat, Coalesce,
-    Case, When, RawSQL, Prefetch,
+    Case, When, RawSQL, Prefetch, Manager,
+    Now, RandomHex, SqlDefault, DatabaseDefault,
     connections, in_transaction, atomic,
     pre_save, post_save, pre_delete, post_delete,
-    Signals, validators,
+    Signals, validators, timezone,
     BaseDialect, PostgresDialect, SqliteDialect, register_dialect,
     ORMError, BaseORMException, ConfigurationError, OperationalError,
     DBConnectionError, TransactionManagementError, NotExistOrMultiple,
@@ -72,8 +73,10 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | `pk` | `instance.pk` | Primary key value. |
 
 The inner `Meta` class supports `table`, `table_description` / `description`,
-`abstract` (mark as a base model with no table; not inherited by subclasses), and
-`ordering` (default `ORDER BY` field list, e.g. `["-created_at"]`).
+`abstract` (mark as a base model with no table; not inherited by subclasses),
+`ordering` (default `ORDER BY` field list, e.g. `["-created_at"]`),
+`unique_together` / `indexes` (composite constraints/indexes over field groups),
+and `manager` (a `Manager` instance scoping the base queryset).
 
 ## fields
 
@@ -98,6 +101,13 @@ Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `descrip
 `yara_orm.timezone` — helpers over `datetime` / `zoneinfo`: `now`, `is_aware`,
 `is_naive`, `make_aware`, `make_naive`, `localtime`, `parse_timezone`,
 `get_timezone`, `get_use_tz`, `get_default_timezone`.
+
+## Database defaults & managers
+
+Database-side column defaults (pass as a field `default`): `Now()`,
+`RandomHex(size)`, `SqlDefault(sql)` (base `DatabaseDefault`). The database fills
+the value on insert. `Manager` is the base queryset provider; subclass it and set
+`Meta.manager` to scope every query. See [Models & fields](guides/models-and-fields.md).
 
 ## QuerySet & Q
 
@@ -156,7 +166,7 @@ adding a backend. See [Backends](backends/index.md) and [Architecture](architect
 
 ## Exceptions
 
-Names mirror Tortoise. `ORMError` is the base (aliased `BaseORMException`):
+`ORMError` is the base (also exported as `BaseORMException`):
 `ConfigurationError`, `OperationalError` (→ `DBConnectionError`,
 `TransactionManagementError`, `IntegrityError`, `NotExistOrMultiple` → `DoesNotExist`
 (alias `ObjectDoesNotExistError`) / `MultipleObjectsReturned`, `NoValuesFetched`),

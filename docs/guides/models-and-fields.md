@@ -211,6 +211,48 @@ Available validators: `MinValueValidator`, `MaxValueValidator`, `MinLengthValida
 Write your own by subclassing `Validator` and implementing `__call__` to raise
 `ValidationError` on failure.
 
+## Database-side defaults
+
+Pass `Now()`, `RandomHex(size)`, or `SqlDefault(sql)` as a field's `default` to
+emit a SQL `DEFAULT` clause in the column DDL. The column is omitted from the
+`INSERT`, so the **database** computes the value (not Python):
+
+```python
+from yara_orm import fields, Now, RandomHex, SqlDefault
+
+
+class Session(Model):
+    created = fields.DatetimeField(default=Now())          # DEFAULT CURRENT_TIMESTAMP
+    token = fields.CharField(max_length=64, default=RandomHex(16))
+    state = fields.IntField(default=SqlDefault("0"))
+```
+
+`Now()` and `SqlDefault(...)` are portable; `RandomHex` renders per backend
+(SQLite honours the byte count, PostgreSQL uses a 32-char `md5`). The value is
+filled on insert — call `refresh_from_db()` if you need it on the in-memory
+instance immediately.
+
+## Custom managers
+
+Set `Meta.manager` to a `Manager` subclass to scope every query (`all`,
+`filter`, `get`, …) — for example to hide soft-deleted rows:
+
+```python
+from yara_orm import Manager
+
+
+class ActiveManager(Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(deleted=False)
+
+
+class Article(Model):
+    deleted = fields.BooleanField(default=False)
+
+    class Meta:
+        manager = ActiveManager()
+```
+
 ## Enum fields
 
 `IntEnumField` stores an `IntEnum` as its integer value; `CharEnumField` stores a

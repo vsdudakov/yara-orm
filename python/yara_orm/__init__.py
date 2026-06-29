@@ -16,6 +16,7 @@ Quick start::
 from . import fields, migrations, timezone, validators
 from .aggregations import Avg, Count, Max, Min, Sum
 from .connection import Tortoise, YaraOrm, connections, in_transaction
+from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .dialects import BaseDialect, PostgresDialect, SqliteDialect, register_dialect
 from .exceptions import (
     BaseORMException,
@@ -38,6 +39,7 @@ from .exceptions import (
 )
 from .expressions import Case, F, RawSQL, When
 from .functions import Coalesce, Concat, Length, Lower, Trim, Upper
+from .manager import Manager
 from .migrations import MigrationManager
 from .models import Model
 from .prefetch import Prefetch
@@ -62,9 +64,14 @@ __all__ = [
     "Case",
     "When",
     "RawSQL",
+    "Now",
+    "RandomHex",
+    "SqlDefault",
+    "DatabaseDefault",
     "fields",
     "migrations",
     "MigrationManager",
+    "Manager",
     "Count",
     "Sum",
     "Avg",

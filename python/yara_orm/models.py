@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from . import registry, signals
 from .connection import get_dialect, get_executor
+from .db_defaults import DatabaseDefault
 from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
+from .manager import Manager
 from .fields import (
     DatetimeField,
     Field,
@@ -74,6 +76,9 @@ class MetaInfo:
         self.ordering = ordering or []
         self.unique_together = unique_together or []
         self.indexes = indexes or []
+        #: The model's manager; rebound to the declared/default one by the
+        #: metaclass once the class object exists.
+        self.manager: Manager = Manager()
         self.table = table
         self.fields = fields
         self.pk_field = pk_field
@@ -121,8 +126,12 @@ class MetaInfo:
         self.select_prefix = f"SELECT {self.columns_sql} FROM {q(self.table)}"
 
         # Single-row INSERT for the common case of an unset auto-increment pk.
+        # Database-default columns are omitted so the database supplies them.
         self.insert_fields = [
-            f for f in self.field_list if not (f is self.pk_field and f.auto_increment)
+            f
+            for f in self.field_list
+            if not (f is self.pk_field and f.auto_increment)
+            and not isinstance(f.default, DatabaseDefault)
         ]
         ret = q(self.pk_field.db_column)
         if self.insert_fields:
@@ -257,6 +266,11 @@ class ModelMeta(type):
             unique_together=unique_together,
             indexes=indexes,
         )
+
+        # Bind the model's manager (a declared ``Meta.manager`` or the default).
+        manager = getattr(meta_cls, "manager", None) or Manager()
+        manager._model = cls
+        cls._meta.manager = manager
 
         # Install forward accessors and m2m managers as class descriptors.
         for rel_name, info in relations.items():
@@ -461,6 +475,9 @@ class Model(metaclass=ModelMeta):
             idx = 1
             for name, field in meta.fields.items():
                 value = getattr(self, name, None)
+                # Omit an unset database-default column so the DB supplies it.
+                if value is None and isinstance(field.default, DatabaseDefault):
+                    continue
                 columns.append(dialect.quote(field.db_column))
                 placeholders.append(dialect.placeholder(idx))
                 params.append(field.to_db(value))
@@ -521,7 +538,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new ``QuerySet`` bound to this model.
         """
-        return QuerySet(cls)
+        return cls._meta.manager.get_queryset()
 
     @classmethod
     def filter(cls, *args: Any, **kwargs: Any) -> QuerySet:
@@ -534,7 +551,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new ``QuerySet`` with the filters applied.
         """
-        return QuerySet(cls).filter(*args, **kwargs)
+        return cls._meta.manager.get_queryset().filter(*args, **kwargs)
 
     @classmethod
     def exclude(cls, *args: Any, **kwargs: Any) -> QuerySet:
@@ -547,7 +564,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new ``QuerySet`` with the exclusions applied.
         """
-        return QuerySet(cls).exclude(*args, **kwargs)
+        return cls._meta.manager.get_queryset().exclude(*args, **kwargs)
 
     @classmethod
     def annotate(cls, **annotations: Any) -> QuerySet:
@@ -559,7 +576,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new ``QuerySet`` carrying the annotations.
         """
-        return QuerySet(cls).annotate(**annotations)
+        return cls._meta.manager.get_queryset().annotate(**annotations)
 
     @classmethod
     def prefetch_related(cls, *specs: Any) -> QuerySet:
@@ -571,7 +588,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new ``QuerySet`` configured to prefetch the relations.
         """
-        return QuerySet(cls).prefetch_related(*specs)
+        return cls._meta.manager.get_queryset().prefetch_related(*specs)
 
     @classmethod
     def select_related(cls, *relations: str) -> QuerySet:
@@ -583,7 +600,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new ``QuerySet`` configured to select the relations.
         """
-        return QuerySet(cls).select_related(*relations)
+        return cls._meta.manager.get_queryset().select_related(*relations)
 
     @classmethod
     async def raw(cls, sql: str, params: list[Any] | None = None) -> list[Model]:
@@ -619,6 +636,10 @@ class Model(metaclass=ModelMeta):
             equality lookup.
         """
         meta = cls._meta
+        # A custom manager may scope the base queryset, so skip the fast path
+        # (which selects straight from the table) and use the full builder.
+        if type(meta.manager) is not Manager:
+            return None
         if not kwargs or any(
             ("__" in key) or (key != "pk" and key not in meta.fields) for key in kwargs
         ):
@@ -649,7 +670,7 @@ class Model(metaclass=ModelMeta):
         """
         rows = await cls._simple_equality_rows(kwargs, limit=2)
         if rows is None:
-            return await QuerySet(cls).get(**kwargs)
+            return await cls._meta.manager.get_queryset().get(**kwargs)
         if not rows:
             raise DoesNotExist(f"{cls.__name__} matching query does not exist")
         if len(rows) > 1:
@@ -668,7 +689,7 @@ class Model(metaclass=ModelMeta):
         """
         rows = await cls._simple_equality_rows(kwargs, limit=1)
         if rows is None:
-            return await QuerySet(cls).filter(**kwargs).first()
+            return await cls._meta.manager.get_queryset().filter(**kwargs).first()
         return cls._from_db_row(rows[0]) if rows else None
 
     @classmethod
@@ -774,7 +795,10 @@ class Model(metaclass=ModelMeta):
         returning = dialect.quote(pk_field.db_column)
 
         insert_fields = [
-            f for f in meta.fields.values() if not (f is pk_field and f.auto_increment)
+            f
+            for f in meta.fields.values()
+            if not (f is pk_field and f.auto_increment)
+            and not isinstance(f.default, DatabaseDefault)
         ]
         ncols = len(insert_fields)
         if not ncols:

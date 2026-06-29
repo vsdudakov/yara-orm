@@ -14,6 +14,8 @@ from decimal import Decimal
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
+from .db_defaults import DatabaseDefault
+
 if TYPE_CHECKING:
     from .validators import Validator
 
@@ -79,11 +81,14 @@ class Field:
 
     # -- value conversion -------------------------------------------------
     def get_default(self) -> Any:
-        """Resolve the configured default value.
+        """Resolve the configured Python-side default value.
 
         Returns:
-            The default value, invoking it first if it is callable.
+            The default value (invoked if callable), or ``None`` for a
+            database-side default — the database supplies that value.
         """
+        if isinstance(self.default, DatabaseDefault):
+            return None
         return self.default() if callable(self.default) else self.default
 
     def to_db(self, value: Any) -> Any:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .db_defaults import DatabaseDefault
 from .exceptions import ConfigurationError
 from .fields import ForeignKeyField
 from .registry import get_model
@@ -103,6 +104,10 @@ class BaseDialect:
             parts.append("NOT NULL")
         if field.unique and not field.pk:
             parts.append("UNIQUE")
+        if isinstance(field.default, DatabaseDefault):
+            # Parenthesise: SQLite requires expression defaults in parens, and
+            # PostgreSQL accepts them, so one form works on both backends.
+            parts.append(f"DEFAULT ({field.default.to_sql(self)})")
         return " ".join(parts)
 
     def _group_columns(self, meta: MetaInfo, names: tuple[str, ...]) -> list[str]:
