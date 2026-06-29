@@ -1189,7 +1189,7 @@ class QuerySet:
         if sel is not None:
             instances = [self.model._from_db_row_fields(row, sel) for row in rows]
         else:
-            instances = [self.model._from_db_row(row) for row in rows]
+            instances = self.model._from_db_rows(rows)
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
             from .prefetch import prefetch_instances

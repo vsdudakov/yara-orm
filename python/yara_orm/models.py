@@ -105,11 +105,39 @@ class MetaInfo:
         self.decoders = [
             (f.model_field_name, None if f.read_identity else f.to_python) for f in self.field_list
         ]
+        self._build_decode_plan()
         self._compiled_for: str | None = None
         # Memoised partial-UPDATE statements for ``save(update_fields=...)``,
         # keyed by ``(dialect, ordered db columns)``. A given column set always
         # maps to the same SQL, so entries never need invalidating.
         self._partial_update_cache: dict[tuple[str, tuple[str, ...]], str] = {}
+
+    def _build_decode_plan(self) -> None:
+        """Precompute the fast-path row-hydration plan from ``self.decoders``.
+
+        Splits the decode plan into the column names (assigned in one C-level
+        ``dict.update``) and the subset of columns that actually need a Python
+        converter, so :meth:`Model._from_db_row` skips a per-field branch and a
+        per-field Python call for the common all-identity case.
+
+        Returns:
+            None
+        """
+        self.decoder_names = [name for name, _ in self.decoders]
+        self.active_decoders = [
+            (i, name, decode)
+            for i, (name, decode) in enumerate(self.decoders)
+            if decode is not None
+        ]
+        # Save-path plans: only the fields that actually need work, so save()
+        # skips a full-field scan + isinstance when a model has no auto_now or
+        # validated columns (the common case).
+        self.auto_now_fields = [
+            (f.model_field_name, f)
+            for f in self.field_list
+            if isinstance(f, DatetimeField) and (f.auto_now or f.auto_now_add)
+        ]
+        self.validated_fields = [f for f in self.field_list if f.validators]
 
     def get_field(self, name: str) -> Field:
         """Return the field for ``name``, treating ``"pk"`` as the primary key.
@@ -138,6 +166,9 @@ class MetaInfo:
         """
         if self._compiled_for == dialect.name:
             return
+        # The field set may have changed since construction (migrations); refresh
+        # the hydration plan so it stays in sync with the current columns.
+        self._build_decode_plan()
         q = dialect.quote
         self.columns_sql = ", ".join(q(f.db_column) for f in self.field_list)
         self.select_prefix = f"SELECT {self.columns_sql} FROM {q(self.table)}"
@@ -536,12 +567,50 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new instance marked as already persisted.
         """
+        meta = cls._meta
         obj = cls.__new__(cls)
         d = obj.__dict__
         d["_in_db"] = True
-        for (name, decode), value in zip(cls._meta.decoders, values):
-            d[name] = value if (decode is None or value is None) else decode(value)
+        # Assign every column at C speed, then convert only the few columns that
+        # need a Python decoder (datetime/decimal/enum/...); most models are
+        # all-identity, so the loop below is empty and this is a single update.
+        d.update(zip(meta.decoder_names, values))
+        for i, name, decode in meta.active_decoders:
+            value = values[i]
+            if value is not None:
+                d[name] = decode(value)
         return obj
+
+    @classmethod
+    def _from_db_rows(cls, rows: list[list[Any]]) -> list[Model]:
+        """Build instances for many rows, hoisting the per-row invariants once.
+
+        The batch counterpart of :meth:`_from_db_row` for the common
+        ``SELECT * -> list[Model]`` path: the decode plan and ``__new__`` are
+        resolved a single time instead of once per row.
+
+        Args:
+            rows: Raw column-value lists in ``_meta.field_list`` order.
+
+        Returns:
+            The hydrated instances.
+        """
+        meta = cls._meta
+        names = meta.decoder_names
+        active = meta.active_decoders
+        new = cls.__new__
+        out: list[Model] = []
+        for values in rows:
+            obj = new(cls)
+            d = obj.__dict__
+            d["_in_db"] = True
+            d.update(zip(names, values))
+            for i, name, decode in active:
+                value = values[i]
+                if value is not None:
+                    d[name] = decode(value)
+            out.append(obj)
+        return out
 
     @classmethod
     def _from_db_row_fields(cls, values: list[Any], fields: list[Field]) -> Model:
@@ -589,17 +658,20 @@ class Model(metaclass=ModelMeta):
         Returns:
             None
         """
+        auto_now_fields = self._meta.auto_now_fields
+        if not auto_now_fields:
+            return
         # Honour ``use_tz``: aware UTC when enabled, naive UTC otherwise, so
         # auto_now columns match manually-set values and never mix aware/naive.
         now = _tz.now()
-        for name, field in self._meta.fields.items():
-            if isinstance(field, DatetimeField):
-                if field.auto_now or (field.auto_now_add and not self._in_db):
-                    if field.auto_now_add and self._in_db:
-                        continue
-                    if only is not None and name not in only:
-                        continue
-                    setattr(self, name, now)
+        in_db = self._in_db
+        for name, field in auto_now_fields:
+            if field.auto_now or (field.auto_now_add and not in_db):
+                if field.auto_now_add and in_db:
+                    continue
+                if only is not None and name not in only:
+                    continue
+                setattr(self, name, now)
 
     async def save(self, update_fields: list[str] | None = None) -> Model:
         """Persist this instance, emitting pre/post-save signals if registered.
@@ -633,9 +705,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             None
         """
-        for field in self._meta.field_list:
-            if not field.validators:
-                continue
+        for field in self._meta.validated_fields:
             value = getattr(self, field.model_field_name, None)
             if value is None:
                 continue
@@ -1046,7 +1116,7 @@ class Model(metaclass=ModelMeta):
         """
         executor = get_executor(cls)
         rows = await executor.fetch_rows(sql, params or [])
-        return [cls._from_db_row(row) for row in rows]
+        return cls._from_db_rows(rows)
 
     @classmethod
     async def _simple_equality_rows(

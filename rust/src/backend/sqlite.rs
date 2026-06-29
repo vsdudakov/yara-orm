@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::backend::pool::extract_pool_params;
 use crate::backend::{Backend, TxConn};
 use crate::error::EngineError;
-use crate::value::{decode_sqlite, value_to_sqlite, Row, Value};
+use crate::value::{decode_sqlite, value_into_sqlite, Row, Value};
 
 /// Default pool size for file-backed databases when the URL omits `max_size`.
 const DEFAULT_MAX_SIZE: usize = 8;
@@ -65,10 +65,10 @@ fn sqlite_path(url: &str) -> String {
 fn sql_execute(
     conn: &Connection,
     sql: &str,
-    params: &[Value],
+    params: Vec<Value>,
     cache: bool,
 ) -> Result<u64, EngineError> {
-    let bound: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
+    let bound: Vec<rusqlite::types::Value> = params.into_iter().map(value_into_sqlite).collect();
     with_stmt(conn, sql, cache, |stmt| {
         let n = stmt
             .execute(rusqlite::params_from_iter(bound))
@@ -77,21 +77,28 @@ fn sql_execute(
     })
 }
 
-fn column_meta(stmt: &rusqlite::Statement) -> Vec<(String, Option<String>)> {
+fn column_meta(stmt: &rusqlite::Statement) -> Vec<(String, String)> {
+    // Upper-case the declared type once per column here; `decode_sqlite` then
+    // matches against it per cell without re-allocating an uppercased string.
     stmt.columns()
         .iter()
-        .map(|c| (c.name().to_string(), c.decl_type().map(|s| s.to_string())))
+        .map(|c| {
+            (
+                c.name().to_string(),
+                c.decl_type().unwrap_or("").to_ascii_uppercase(),
+            )
+        })
         .collect()
 }
 
 fn sql_fetch_rows(
     conn: &Connection,
     sql: &str,
-    params: &[Value],
+    params: Vec<Value>,
     with_names: bool,
     cache: bool,
-) -> Result<(Vec<(String, Option<String>)>, Vec<Vec<Value>>), EngineError> {
-    let bound: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
+) -> Result<(Vec<(String, String)>, Vec<Vec<Value>>), EngineError> {
+    let bound: Vec<rusqlite::types::Value> = params.into_iter().map(value_into_sqlite).collect();
     with_stmt(conn, sql, cache, |stmt| {
         let meta = column_meta(stmt);
         let mut rows = stmt
@@ -102,7 +109,7 @@ fn sql_fetch_rows(
             let mut values = Vec::with_capacity(meta.len());
             for (idx, (_, decl)) in meta.iter().enumerate() {
                 let vr = row.get_ref(idx).map_err(map_interact)?;
-                values.push(decode_sqlite(decl.as_deref(), vr));
+                values.push(decode_sqlite(decl, vr));
             }
             out.push(values);
         }
@@ -114,7 +121,7 @@ fn sql_fetch_rows(
 fn sql_execute_many(
     conn: &Connection,
     sql: &str,
-    rows: &[Vec<Value>],
+    rows: Vec<Vec<Value>>,
     cache: bool,
 ) -> Result<Vec<Row>, EngineError> {
     with_stmt(conn, sql, cache, |stmt| {
@@ -122,7 +129,7 @@ fn sql_execute_many(
         let mut out = Vec::with_capacity(rows.len());
         for row_params in rows {
             let bound: Vec<rusqlite::types::Value> =
-                row_params.iter().map(value_to_sqlite).collect();
+                row_params.into_iter().map(value_into_sqlite).collect();
             let mut qrows = stmt
                 .query(rusqlite::params_from_iter(bound))
                 .map_err(map_sqlite)?;
@@ -130,7 +137,7 @@ fn sql_execute_many(
                 let mut r = Vec::with_capacity(meta.len());
                 for (idx, (name, decl)) in meta.iter().enumerate() {
                     let vr = row.get_ref(idx).map_err(map_interact)?;
-                    r.push((name.clone(), decode_sqlite(decl.as_deref(), vr)));
+                    r.push((name.clone(), decode_sqlite(decl, vr)));
                 }
                 out.push(r);
             } else {
@@ -141,7 +148,7 @@ fn sql_execute_many(
     })
 }
 
-fn to_named(meta: &[(String, Option<String>)], rows: Vec<Vec<Value>>) -> Vec<Row> {
+fn to_named(meta: &[(String, String)], rows: Vec<Vec<Value>>) -> Vec<Row> {
     rows.into_iter()
         .map(|vals| {
             meta.iter()
@@ -237,7 +244,7 @@ impl Backend for SqliteBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
         let obj = self.obj().await?;
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        obj.interact(move |conn| sql_execute(conn, &sql, &params, cache))
+        obj.interact(move |conn| sql_execute(conn, &sql, params, cache))
             .await
             .map_err(map_interact)?
     }
@@ -246,7 +253,7 @@ impl Backend for SqliteBackend {
         let obj = self.obj().await?;
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         let (meta, rows) = obj
-            .interact(move |conn| sql_fetch_rows(conn, &sql, &params, true, cache))
+            .interact(move |conn| sql_fetch_rows(conn, &sql, params, true, cache))
             .await
             .map_err(map_interact)??;
         Ok(to_named(&meta, rows))
@@ -260,7 +267,7 @@ impl Backend for SqliteBackend {
         let obj = self.obj().await?;
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         let (_, rows) = obj
-            .interact(move |conn| sql_fetch_rows(conn, &sql, &params, false, cache))
+            .interact(move |conn| sql_fetch_rows(conn, &sql, params, false, cache))
             .await
             .map_err(map_interact)??;
         Ok(rows)
@@ -273,7 +280,7 @@ impl Backend for SqliteBackend {
     ) -> Result<Vec<Row>, EngineError> {
         let obj = self.obj().await?;
         let (sql, rows, cache) = (sql.to_string(), rows.to_vec(), self.cache_statements);
-        obj.interact(move |conn| sql_execute_many(conn, &sql, &rows, cache))
+        obj.interact(move |conn| sql_execute_many(conn, &sql, rows, cache))
             .await
             .map_err(map_interact)?
     }
@@ -313,7 +320,7 @@ impl TxConn for SqliteTx {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         self.obj
-            .interact(move |conn| sql_execute(conn, &sql, &params, cache))
+            .interact(move |conn| sql_execute(conn, &sql, params, cache))
             .await
             .map_err(map_interact)?
     }
@@ -322,7 +329,7 @@ impl TxConn for SqliteTx {
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         let (meta, rows) = self
             .obj
-            .interact(move |conn| sql_fetch_rows(conn, &sql, &params, true, cache))
+            .interact(move |conn| sql_fetch_rows(conn, &sql, params, true, cache))
             .await
             .map_err(map_interact)??;
         Ok(to_named(&meta, rows))
@@ -336,7 +343,7 @@ impl TxConn for SqliteTx {
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         let (_, rows) = self
             .obj
-            .interact(move |conn| sql_fetch_rows(conn, &sql, &params, false, cache))
+            .interact(move |conn| sql_fetch_rows(conn, &sql, params, false, cache))
             .await
             .map_err(map_interact)??;
         Ok(rows)

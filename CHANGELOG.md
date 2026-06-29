@@ -6,6 +6,24 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-30
+
+### Performance
+
+- **Decode/bind hot paths.** The `uuid.UUID` / `decimal.Decimal` type objects are
+  cached once per interpreter (were re-imported per cell/bind); PostgreSQL result
+  decoding dispatches on the type OID (jump table) instead of a ~16-deep type
+  comparison chain; SQLite upper-cases each column's declared type once per
+  result set rather than per cell and binds parameters by move instead of a
+  double copy. ~6–7% higher SQLite `fetch_all`/`bulk_insert`/`filter` throughput.
+- **`ManyToManyField.add(*objs)` issues a single multi-row `INSERT`** instead of
+  one round-trip per object; the static join-table SQL for
+  `add`/`remove`/`clear`/fetch is rendered once and reused.
+- **Lighter row hydration and save path.** Rows are hydrated in a batch with a
+  C-level bulk assign for non-decoded columns; `save()` skips full-field scans
+  when a model has no `auto_now`/validated columns; signal dispatch and bare-name
+  model resolution use a set/cache fast path.
+
 ### Fixed
 
 - **SQLite foreign keys are now enforced.** `PRAGMA foreign_keys=ON` is applied
@@ -230,6 +248,7 @@ Initial public release: an async Python ORM with a Rust (PyO3 + tokio) engine.
   with a per-model router, and an operation-based migration CLI
   (`python -m yara_orm`).
 
+[1.1.0]: https://github.com/vsdudakov/yara-orm/releases/tag/v1.1.0
 [1.0.0]: https://github.com/vsdudakov/yara-orm/releases/tag/v1.0.0
 [0.1.1]: https://github.com/vsdudakov/yara-orm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vsdudakov/yara-orm/releases/tag/v0.1.0

@@ -547,6 +547,46 @@ class M2MManager:
             self.target = info.resolve_target()
         self.name = info.name
 
+    def _sql(self, dialect: Any) -> dict[str, str]:
+        """Return cached static SQL pieces for this side of the relation.
+
+        The join-table SELECT/DELETE and the quoted join-table identifiers are
+        constant per ``(dialect, direction)``; they are rendered once and reused
+        on every ``add``/``remove``/``clear``/fetch instead of being rebuilt (and
+        re-quoted) on each call.
+
+        Args:
+            dialect: The active SQL dialect.
+
+        Returns:
+            A mapping with the rendered ``fetch``/``clear`` statements and the
+            quoted ``through``/``near``/``far`` identifiers.
+        """
+        cache = self.info.__dict__.setdefault("_sql_cache", {})
+        key = (dialect.name, self.near_key, self.far_key)
+        entry = cache.get(key)
+        if entry is None:
+            q = dialect.quote
+            ph = dialect.placeholder
+            through, near, far = q(self.info.through), q(self.near_key), q(self.far_key)
+            meta = self.target._meta
+            meta.compile(dialect)
+            ttbl = q(meta.table)
+            cols = ", ".join(f"{ttbl}.{q(f.db_column)}" for f in meta.field_list)
+            entry = {
+                "through": through,
+                "near": near,
+                "far": far,
+                "fetch": (
+                    f"SELECT {cols} FROM {ttbl} JOIN {through} "
+                    f"ON {ttbl}.{q(meta.pk_field.db_column)} = {through}.{far} "
+                    f"WHERE {through}.{near} = {ph(1)}"
+                ),
+                "clear": f"DELETE FROM {through} WHERE {near} = {ph(1)}",
+            }
+            cache[key] = entry
+        return entry
+
     async def _fetch(self) -> list[Model]:
         """Fetch related rows through the join table, using the cache if set.
 
@@ -559,19 +599,8 @@ class M2MManager:
         owner = type(self.instance)
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=False)
-        meta = self.target._meta
-        meta.compile(dialect)
-        q = dialect.quote
-        ttbl = q(meta.table)
-        cols = ", ".join(f"{ttbl}.{q(f.db_column)}" for f in meta.field_list)
-        sql = (
-            f"SELECT {cols} FROM {ttbl} "
-            f"JOIN {q(self.info.through)} ON {ttbl}.{q(meta.pk_field.db_column)} = "
-            f"{q(self.info.through)}.{q(self.far_key)} "
-            f"WHERE {q(self.info.through)}.{q(self.near_key)} = {dialect.placeholder(1)}"
-        )
-        rows = await engine.fetch_rows(sql, [self.instance.pk])
-        return [self.target._from_db_row(r) for r in rows]
+        rows = await engine.fetch_rows(self._sql(dialect)["fetch"], [self.instance.pk])
+        return self.target._from_db_rows(rows)
 
     def __await__(self) -> Generator[Any, None, list[Model]]:
         """Await the related rows through the join table.
@@ -603,17 +632,21 @@ class M2MManager:
         owner = type(self.instance)
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=True)
-        q = dialect.quote
+        parts = self._sql(dialect)
+        ph = dialect.placeholder
         near = self.instance.pk
-        for obj in objects:
-            far = obj.pk if hasattr(obj, "pk") else obj
-            sql = (
-                f"INSERT INTO {q(self.info.through)} "
-                f"({q(self.near_key)}, {q(self.far_key)}) "
-                f"VALUES ({dialect.placeholder(1)}, {dialect.placeholder(2)}) "
-                f"ON CONFLICT DO NOTHING"
-            )
-            await engine.execute(sql, [near, far])
+        fars = [obj.pk if hasattr(obj, "pk") else obj for obj in objects]
+        # One multi-row INSERT instead of N round-trips.
+        values = ", ".join(f"({ph(2 * i + 1)}, {ph(2 * i + 2)})" for i in range(len(fars)))
+        params: list[Any] = []
+        for far in fars:
+            params.append(near)
+            params.append(far)
+        sql = (
+            f"INSERT INTO {parts['through']} ({parts['near']}, {parts['far']}) "
+            f"VALUES {values} ON CONFLICT DO NOTHING"
+        )
+        await engine.execute(sql, params)
 
     async def remove(self, *objects: Model | Any) -> None:
         """Remove related objects from the join table.
@@ -629,13 +662,12 @@ class M2MManager:
         owner = type(self.instance)
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=True)
-        q = dialect.quote
+        parts = self._sql(dialect)
         fars = [obj.pk if hasattr(obj, "pk") else obj for obj in objects]
         holes = ", ".join(dialect.placeholder(i + 2) for i in range(len(fars)))
         sql = (
-            f"DELETE FROM {q(self.info.through)} "
-            f"WHERE {q(self.near_key)} = {dialect.placeholder(1)} "
-            f"AND {q(self.far_key)} IN ({holes})"
+            f"DELETE FROM {parts['through']} WHERE {parts['near']} = {dialect.placeholder(1)} "
+            f"AND {parts['far']} IN ({holes})"
         )
         await engine.execute(sql, [self.instance.pk, *fars])
 
@@ -648,9 +680,4 @@ class M2MManager:
         owner = type(self.instance)
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=True)
-        q = dialect.quote
-        sql = (
-            f"DELETE FROM {q(self.info.through)} "
-            f"WHERE {q(self.near_key)} = {dialect.placeholder(1)}"
-        )
-        await engine.execute(sql, [self.instance.pk])
+        await engine.execute(self._sql(dialect)["clear"], [self.instance.pk])
