@@ -254,19 +254,12 @@ async def test_m2m_without_explicit_through_and_direct_aiter(db):
 @pytest.mark.asyncio
 async def test_no_pk_table_rendering():
     """
-    GIVEN a CreateTable operation for a table without a primary key
+    GIVEN a CreateModel operation for a table without a primary key
     WHEN it is rendered
     THEN the primary-key clause is omitted
     """
-    spec_col = {
-        "kind": "int",
-        "type_params": {},
-        "null": True,
-        "unique": False,
-        "pk": False,
-        "auto_increment": False,
-    }
-    sql = m.CreateTable("nopk", columns={"x": spec_col}).forward_sql(SqliteDialect())
+    op = m.CreateModel("nopk", fields={"x": fields.IntField(null=True)})
+    sql = op.forward_sql(SqliteDialect(), {"tables": {}})
     assert "PRIMARY KEY" not in sql[0]
 
 
@@ -290,12 +283,13 @@ async def test_upgrade_to_target_and_runpython_downgrade(sqlite_empty, tmp_path)
     mgr = MigrationManager(directory=str(tmp_path), app="up", models=[CvUpUser])
     mgr.make_migrations(name="initial")
     (tmp_path / "0002_py.py").write_text(
-        "from yara_orm import migrations as m\n"
+        "from yara_orm import migrations as m\n\n"
         "marks = []\n\n"
         "async def fwd():\n    marks.append('f')\n\n"
-        "async def bwd():\n    marks.append('b')\n\n"
-        "dependencies = ['0001_initial']\n"
-        "operations = [m.RunPython(fwd, bwd)]\n"
+        "async def bwd():\n    marks.append('b')\n\n\n"
+        "class Migration(m.Migration):\n"
+        "    dependencies = ['0001_initial']\n"
+        "    operations = [m.RunPython(fwd, bwd)]\n"
     )
     # Upgrade only as far as the initial migration (target stops the loop).
     applied = await mgr.upgrade(target="0001_initial")
