@@ -15,7 +15,14 @@ Quick start::
 
 from . import fields, migrations, timezone, validators
 from .aggregations import Avg, Count, Max, Min, Sum
-from .connection import IsolationLevel, Tortoise, YaraOrm, connections, in_transaction
+from .connection import (
+    IsolationLevel,
+    Tortoise,
+    YaraOrm,
+    connections,
+    in_transaction,
+    run_async,
+)
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .dialects import BaseDialect, PostgresDialect, SqliteDialect, register_dialect
 from .exceptions import (
@@ -93,6 +100,7 @@ __all__ = [
     "connections",
     "in_transaction",
     "atomic",
+    "run_async",
     "IsolationLevel",
     "Signals",
     "pre_save",

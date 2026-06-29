@@ -8,6 +8,15 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Added
 
+- **`YaraOrm.get_schema_sql(safe=, models=)`** — return the schema DDL as a
+  string without executing it (the read-only counterpart of
+  `generate_schemas`), for previewing or dumping a schema.
+- **`run_async(coro)`** — a lifecycle helper for scripts that runs a coroutine
+  and guarantees `YaraOrm.close()` runs afterwards, even on error.
+- **Documented connection-URL pool/cache parameters** — `max_size`, `min_size`
+  and `statement_cache_size` (set `statement_cache_size=0` for PgBouncer
+  transaction pooling). These were already honored by the engine; they are now
+  documented and covered by tests.
 - **`bulk_create` upsert.** New `ignore_conflicts`, `update_fields` and
   `on_conflict` arguments emit an `ON CONFLICT` clause (`DO NOTHING` or
   `DO UPDATE`) on PostgreSQL and SQLite. Primary keys are not written back when

@@ -129,6 +129,26 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+!!! tip "`run_async` — one-call lifecycle for scripts"
+    `run_async(main())` drives the event loop and guarantees `YaraOrm.close()`
+    runs afterwards (even on error), so a script's `main()` need not close
+    connections itself:
+
+    ```python
+    from yara_orm import run_async
+
+    run_async(main())            # replaces asyncio.run(main()) + manual close
+    ```
+
+!!! tip "Preview the schema with `get_schema_sql`"
+    `YaraOrm.get_schema_sql()` returns the `CREATE TABLE` DDL as a string
+    without touching the database — handy for inspection or dumping it to a file:
+
+    ```python
+    print(YaraOrm.get_schema_sql())            # all registered models
+    print(YaraOrm.get_schema_sql(models=[Author]))
+    ```
+
 ## Next steps
 
 - [Models & fields](../guides/models-and-fields.md) — every field type and option.
