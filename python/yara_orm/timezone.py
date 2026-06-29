@@ -157,7 +157,10 @@ def localtime(value: _dt.datetime | None = None, timezone: str | None = None) ->
     if value is None:
         value = now()
     if is_naive(value):
-        value = make_aware(value)
+        # Naive datetimes in this ORM represent UTC (that is what ``now()``
+        # returns when ``use_tz`` is off), so interpret them as UTC rather than
+        # mislabelling the wall-clock as the (possibly non-UTC) default zone.
+        value = value.replace(tzinfo=_dt.timezone.utc)
     tz = parse_timezone(timezone) if timezone else get_default_timezone()
     return value.astimezone(tz)
 

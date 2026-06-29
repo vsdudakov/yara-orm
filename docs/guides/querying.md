@@ -180,6 +180,12 @@ Pass field names to `.order_by()`. Prefix a name with `-` for descending order; 
 await Book.all().order_by("-rating", "title")   # highest rating first, then A→Z by title
 ```
 
+Pass the special token `"?"` to order rows randomly (rendered as `RANDOM()`):
+
+```python
+await Book.all().order_by("?").limit(1)   # one random book
+```
+
 A model can declare a default ordering via [`Meta.ordering`](models-and-fields.md#default-ordering), applied to any query that does not call `.order_by()` itself; an explicit `.order_by()` always overrides it.
 
 ## Pagination
@@ -339,12 +345,17 @@ titles = await Book.all().order_by("title").values_list("title", flat=True)
 
 Called with no field names, both default to every field on the model.
 
-A field name may **traverse a relation** with `__`, selecting a related-model
-column; `values()` additionally accepts keyword aliases so the dict key is clean:
+A field name may **traverse one or more forward relations** with `__`, selecting
+a related-model column; the joins are chained automatically. `values()` also
+accepts keyword aliases so the dict key is clean:
 
 ```python
 await Book.all().values("title", "author__name")
 # [{"title": "Dune", "author__name": "Herbert"}, ...]
+
+# Multi-level: chain across several relations.
+await Book.all().values("title", "author__publisher__country__name")
+# [{"title": "Dune", "author__publisher__country__name": "US"}, ...]
 
 await Book.all().values("title", author_name="author__name")
 # [{"title": "Dune", "author_name": "Herbert"}, ...]

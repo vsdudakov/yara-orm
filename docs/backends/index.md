@@ -75,6 +75,9 @@ await YaraOrm.init("sqlite:///app.db")     # file-backed
   reconstructed on read from the declared column type — so your models behave identically.
 - Case-insensitive lookups use `LIKE` (SQLite's `LIKE` is already case-insensitive for
   ASCII), since `ILIKE` is PostgreSQL-only. This is handled for you by the dialect.
+- **Foreign keys are enforced.** `PRAGMA foreign_keys=ON` is applied to every pooled
+  connection, so `on_delete` actions (CASCADE / SET NULL / RESTRICT) and referential
+  integrity behave the same as on PostgreSQL. File databases also run in WAL mode.
 
 !!! note "When to choose which"
     SQLite is ideal for tests, local development, embedded apps and small services;

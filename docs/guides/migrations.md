@@ -35,6 +35,20 @@ carry a single `Field` — so a migration reads like your models.
     column whose type or nullability changed is emitted as `AlterField`
     automatically (PostgreSQL alters in place; SQLite rebuilds the table).
 
+!!! tip "What `makemigrations` auto-detects"
+    Beyond create/drop table and add/drop/alter column, the diff also detects:
+
+    - **Renames** — a field renamed with an unchanged type becomes a single
+      `RenameField` (preserving the data) instead of a destructive drop + add.
+    - **Composite indexes** — adding/removing a `Meta.indexes` entry (including
+      partial `Index(..., condition=...)` indexes) emits
+      `AddCompositeIndex` / `RemoveCompositeIndex`.
+    - **Named constraints** — adding/removing a named `UniqueConstraint` /
+      `CheckConstraint` in `Meta.constraints` emits `AddConstraint` /
+      `RemoveConstraint`.
+    - **Many-to-many fields** — adding/removing an M2M field creates/drops its
+      join table.
+
 ## The CLI
 
 Run the tool as a module:
@@ -215,20 +229,23 @@ A migration file is plain Python: a `class Migration(m.Migration)` with an
 
 | Operation | Purpose |
 | --- | --- |
-| `CreateModel(table, fields, composite_pk=None)` | Create a table from a `{column: Field}` set (columns, pk, foreign keys, indexes). |
+| `CreateModel(table, fields, composite_pk=None, composite_indexes=None, constraints=None)` | Create a table from a `{column: Field}` set (columns, pk, foreign keys, indexes, named constraints). |
 | `DeleteModel(table, fields, composite_pk=None)` | Drop a table (keeps its fields so it can be reversed). |
 | `AddField(table, name, field)` | Add a column from a field object. |
 | `RemoveField(table, name, field)` | Drop a column (keeps the field so it can be reversed). |
 | `AlterField(table, name, field, old)` | Change a column's type/nullability (PostgreSQL in place; SQLite rebuild). |
-| `AddIndex(table, column)` | Create an index on a column. |
-| `RemoveIndex(table, column)` | Drop an index on a column. |
+| `AddIndex(table, column)` | Create an index on a single column. |
+| `RemoveIndex(table, column)` | Drop a single-column index. |
+| `AddCompositeIndex(table, name, columns, condition=None)` | Create a multi-column (optionally partial) index. |
+| `RemoveCompositeIndex(table, name, columns, condition=None)` | Drop a multi-column index. |
 | `RunSQL(sql, reverse_sql=None)` | Run literal SQL forward and, optionally, its reverse. |
 | `RunPython(forward, backward=None)` | Run async Python callables (hand-written migrations only). |
 
 `makemigrations` generates the **idempotent** analogs of the schema operations —
 `CreateModelIfNotExists`, `DeleteModelIfExists`, `AddFieldIfNotExists`,
-`RemoveFieldIfExists`, `AddIndexIfNotExists`, `RemoveIndexIfExists` — plus
-`AlterField`. For online index builds on PostgreSQL, hand-written migrations can
+`RemoveFieldIfExists`, `AddIndexIfNotExists`, `RemoveIndexIfExists`,
+`AddCompositeIndexIfNotExists`, `RemoveCompositeIndexIfExists` — plus
+`AlterField`, `RenameField` and constraint add/remove. For online index builds on PostgreSQL, hand-written migrations can
 use `AddIndexConcurrently`, `AddUniqueIndexConcurrently` or
 `RemoveIndexConcurrently` with `atomic = False` (those builds cannot run inside a
 transaction). `RunSQL` and `RunPython` are for hand-written `--empty` migrations.
@@ -264,18 +281,22 @@ class Migration(m.Migration):
 
 ### Renames and constraints
 
-`makemigrations` sees a rename as a drop plus an add (it has no way to know a
-column was renamed), so **renames are hand-written**:
+`makemigrations` **auto-detects a column rename** (a removed column and an added
+one with an identical definition) and emits a single `RenameField`, preserving
+the data. A rename whose type *also* changed is not detected as a rename and
+falls back to drop + add. Table and index renames are still hand-written:
 
 | Operation | Purpose |
 | --- | --- |
 | `RenameModel(old, new)` | Rename a table. |
-| `RenameField(table, old, new)` | Rename a column. |
+| `RenameField(table, old, new)` | Rename a column (auto-detected, or hand-written). |
 | `RenameIndex(table, column, old_name, new_name, unique=False)` | Rename an index (PostgreSQL in place; SQLite drops/recreates). |
 
-Constraints are likewise hand-written. Build a constraint with
-`UniqueConstraint(fields=[...], name=...)` or `CheckConstraint(check="...", name=...)`
-and manage it with `AddConstraint` / `RemoveConstraint` / `RenameConstraint`:
+Named constraints in `Meta.constraints` are diffed automatically (added/removed
+constraints emit `AddConstraint` / `RemoveConstraint`). You can also manage them
+by hand — build a constraint with `UniqueConstraint(fields=[...], name=...)` or
+`CheckConstraint(check="...", name=...)` and use
+`AddConstraint` / `RemoveConstraint` / `RenameConstraint`:
 
 ```python
 from yara_orm import migrations as m

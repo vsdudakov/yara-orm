@@ -10,7 +10,7 @@ see the [guides](guides/models-and-fields.md).
 
 ```python
 from yara_orm import (
-    YaraOrm, Tortoise, Model, QuerySet, Q, F, fields, migrations,
+    YaraOrm, Tortoise, Model, Index, QuerySet, Q, F, fields, migrations,
     Count, Sum, Avg, Min, Max,
     Lower, Upper, Length, Trim, Concat, Coalesce,
     Case, When, RawSQL, Prefetch, Manager,
@@ -159,7 +159,8 @@ all four, SQLite is serializable-only). See [Transactions](guides/transactions.m
 `migrations.MigrationManager(directory="migrations", app="models", models=None)` plus the
 `migrations.Migration` base class (carrying `operations`, `dependencies`, `atomic`) and the
 operation classes `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`, `AlterField`,
-`AddIndex`, `RemoveIndex`, `RenameModel`, `RenameField`, `RenameIndex`, `AddConstraint`,
+`AddIndex`, `RemoveIndex`, `AddCompositeIndex`, `RemoveCompositeIndex`, `RenameModel`,
+`RenameField`, `RenameIndex`, `AddConstraint`,
 `RemoveConstraint`, `RenameConstraint`, `RunSQL`, `RunPython` (constraints built with
 `UniqueConstraint` / `CheckConstraint`). Generated migrations use the idempotent analogs
 (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,

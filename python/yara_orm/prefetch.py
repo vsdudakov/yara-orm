@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from . import registry
-from .connection import get_dialect, get_engine
+from .connection import get_dialect, get_executor
 from .relations import M2MDescriptor, ReverseFKDescriptor, model_name
 
 if TYPE_CHECKING:
@@ -206,6 +206,8 @@ async def _prefetch_m2m(
     Returns:
         None
     """
+    if not instances:
+        return
     info = descriptor.info
     info.finalize()
     if descriptor.reverse:
@@ -215,8 +217,11 @@ async def _prefetch_m2m(
         near_key, far_key = info.backward_key, info.forward_key
         target = info.resolve_target()
 
-    dialect = get_dialect()
-    engine = get_engine()
+    # Route through the active transaction / the owning model's connection so a
+    # prefetch inside `in_transaction()` sees the transaction's uncommitted rows.
+    owner = type(instances[0])
+    dialect = get_dialect(owner)
+    engine = get_executor(owner, write=False)
     tmeta = target._meta
     tmeta.compile(dialect)
     q = dialect.quote

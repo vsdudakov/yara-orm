@@ -80,6 +80,34 @@ class Booking(Model):
 A field name in `unique_together` / `indexes` may be a foreign-key relation
 name; it resolves to that relation's backing column.
 
+#### Partial (conditional) indexes
+
+For a custom name or a **partial index** (an index with a `WHERE` predicate),
+put an `Index` object in `Meta.indexes` instead of a plain group. Plain groups
+and `Index` objects can be mixed:
+
+```python
+from yara_orm import Index
+
+class Job(Model):
+    id = fields.IntField(pk=True)
+    status = fields.CharField(max_length=20)
+    priority = fields.IntField()
+
+    class Meta:
+        indexes = [
+            ("status", "priority"),                       # plain composite index
+            Index(
+                fields=["priority"],
+                name="idx_active_priority",
+                condition="status = 'active'",            # -> CREATE INDEX ... WHERE status = 'active'
+            ),
+        ]
+```
+
+Partial indexes are supported on both PostgreSQL and SQLite, and the condition
+round-trips through [migrations](migrations.md).
+
 ### Declarative constraints
 
 `Meta.constraints` takes `UniqueConstraint` / `CheckConstraint` objects, emitted

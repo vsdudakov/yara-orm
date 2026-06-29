@@ -8,6 +8,32 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Fixed
 
+- **SQLite foreign keys are now enforced.** `PRAGMA foreign_keys=ON` is applied
+  to every pooled connection, so `ForeignKeyField(on_delete=...)` actions and
+  referential checks actually run on SQLite (previously they were silently
+  ignored). The WAL/synchronous PRAGMAs are likewise applied to every
+  connection, not just the pre-warmed ones.
+- **M2M operations honor the active transaction.** `obj.rel.add/remove/clear`,
+  awaiting an M2M relation, and M2M `prefetch_related` now run on the active
+  `in_transaction()` connection (and respect the model's router /
+  `Meta.default_connection`) instead of a separate autocommit connection — so
+  they are atomic, roll back with the block, and can read their own writes.
+- **No silent integer corruption.** Binding an out-of-range value to a
+  `SMALLINT`/`INTEGER` column on PostgreSQL now raises instead of wrapping to a
+  wrong number; integers compared against a `NUMERIC`/`FLOAT` expression (e.g.
+  `created__year=2024`) bind in the right type instead of returning no rows.
+- **Result decode errors are no longer masked as NULL.** A failed decode of a
+  known column type (e.g. a `NUMERIC` beyond the supported range) raises rather
+  than silently returning `None`.
+- **`order_by("?")`** for random ordering (renders `RANDOM()`).
+- **Multi-level relation traversal in `values()` / `values_list()`** —
+  `Book.values("author__publisher__country__name")` chains the joins (previously
+  only a single relation hop worked).
+- **`auto_now` / `auto_now_add` honor `use_tz`.** They now match manually-set
+  datetimes (aware when `use_tz=True`, naive UTC otherwise) instead of always
+  being aware UTC.
+- **`RandomHex(size=...)` honors `size` on PostgreSQL** (the width matches the
+  SQLite branch instead of always being a 32-char md5).
 - **Transactions honor the connection name.** `in_transaction("name")` /
   `@atomic("name")` previously always ran on the default connection; they now
   open on the named connection.
@@ -16,6 +42,17 @@ All notable changes to **yara-orm** are documented here. The format is based on
   `Sum("x", distinct=True)`.
 
 ### Added
+
+- **`makemigrations` detects column renames.** A renamed field with an unchanged
+  type now generates a `RenameField` (preserving the data) instead of a
+  destructive drop + add.
+- **`Meta.indexes` and named `Meta.constraints` are diffed by migrations.**
+  Adding or removing a composite index or a named `UniqueConstraint` /
+  `CheckConstraint` generates the corresponding migration operation.
+- **Partial (conditional) indexes** via the new `Index` declaration:
+  `Meta.indexes = [Index(fields=["status"], condition="status = 'active'")]`
+  renders `CREATE INDEX ... WHERE ...` on PostgreSQL and SQLite, and round-trips
+  through migrations. Plain column groups (`("a", "b")`) still work alongside it.
 
 - **Modern Tortoise field parameter names** as aliases: `primary_key` (`pk`),
   `db_index` (`index`), `source_field` (`db_column`), `db_default` (`default`),

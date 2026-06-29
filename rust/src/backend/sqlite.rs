@@ -4,7 +4,7 @@
 //! thread via `Object::interact`, keeping the async `Backend` contract.
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Config, Object, Pool, Runtime};
+use deadpool_sqlite::{Config, Hook, HookError, Object, Pool, Runtime};
 use rusqlite::Connection;
 
 use crate::backend::pool::extract_pool_params;
@@ -175,31 +175,46 @@ impl SqliteBackend {
         } else {
             params.max_size.unwrap_or(DEFAULT_MAX_SIZE)
         };
+
+        // PRAGMAs that must hold on *every* connection, not just the pre-warmed
+        // ones. `foreign_keys=ON` is essential: SQLite ignores FOREIGN KEY
+        // constraints (and ON DELETE actions) unless it is set per connection,
+        // and the setting does not survive into connections the pool creates
+        // lazily — so it is applied from a post_create hook. File databases also
+        // get WAL + relaxed sync for throughput; :memory: supports neither WAL
+        // nor multiple connections, so it only gets foreign_keys.
+        let pragma = if in_memory {
+            "PRAGMA foreign_keys=ON;"
+        } else {
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;"
+        };
         let pool = cfg
             .builder(Runtime::Tokio1)
             .map_err(|e| EngineError::Config(e.to_string()))?
             .max_size(max_size)
+            .post_create(Hook::async_fn(move |obj, _| {
+                Box::pin(async move {
+                    obj.interact(move |conn| conn.execute_batch(pragma))
+                        .await
+                        .map_err(|e| HookError::message(e.to_string()))?
+                        .map_err(HookError::Backend)?;
+                    Ok(())
+                })
+            }))
             .build()
             .map_err(|e| EngineError::Config(e.to_string()))?;
 
-        // Pre-warm at least one connection (fail fast + apply PRAGMAs), and up
-        // to `min_size` so early queries skip connection setup.
+        // Pre-warm at least one connection so we fail fast on an unreachable
+        // database, and up to `min_size` so early queries skip connection setup.
+        // The post_create hook above has already applied the PRAGMAs.
         let warm = params.min_size.unwrap_or(0).max(1).min(max_size);
         let mut held = Vec::with_capacity(warm);
         for _ in 0..warm {
-            let obj = pool
-                .get()
-                .await
-                .map_err(|e| EngineError::Connection(e.to_string()))?;
-            if !in_memory {
-                obj.interact(|conn| {
-                    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-                })
-                .await
-                .map_err(map_interact)?
-                .map_err(map_interact)?;
-            }
-            held.push(obj);
+            held.push(
+                pool.get()
+                    .await
+                    .map_err(|e| EngineError::Connection(e.to_string()))?,
+            );
         }
         drop(held); // return the warmed connections to the pool as idle
 
