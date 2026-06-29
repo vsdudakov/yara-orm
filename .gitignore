@@ -16,3 +16,6 @@ Cargo.lock
 /site
 .cache/
 docs-requirements.txt
+
+# macOS Finder metadata
+.DS_Store
