@@ -10,7 +10,6 @@ from . import registry, signals
 from .connection import get_dialect, get_executor
 from .db_defaults import DatabaseDefault
 from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
-from .manager import Manager
 from .fields import (
     DatetimeField,
     Field,
@@ -18,6 +17,7 @@ from .fields import (
     IntField,
     ManyToManyField,
 )
+from .manager import Manager
 from .prefetch import prefetch_instances
 from .queryset import QuerySet
 from .relations import (

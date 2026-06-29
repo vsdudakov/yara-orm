@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from .db_defaults import DatabaseDefault
-from .exceptions import ConfigurationError
+from .exceptions import ConfigurationError, UnSupportedError
 from .fields import ForeignKeyField
 from .registry import get_model
 
@@ -32,6 +32,20 @@ class BaseDialect:
     serial_map: dict[str, str] = {}
     #: Operator used for case-insensitive ``LIKE`` lookups.
     ilike = "ILIKE"
+    #: Whether ``ADD COLUMN`` / ``DROP COLUMN`` accept an ``IF [NOT] EXISTS``
+    #: guard (PostgreSQL does; SQLite has no such syntax).
+    column_if_exists = True
+    #: Whether index DDL accepts the ``CONCURRENTLY`` keyword (PostgreSQL only).
+    index_concurrently = True
+    #: Whether a column's type/null can be changed in place with ``ALTER COLUMN``
+    #: (PostgreSQL); SQLite requires a full table rebuild instead.
+    alter_column_in_place = True
+    #: Whether an index can be renamed in place with ``ALTER INDEX`` (PostgreSQL);
+    #: otherwise it is dropped and recreated under the new name.
+    rename_index_in_place = True
+    #: Whether named constraints can be added/dropped/renamed with ``ALTER TABLE``
+    #: (PostgreSQL); SQLite has no such syntax.
+    alter_constraint_in_place = True
 
     # -- identifiers & placeholders --------------------------------------
     def quote(self, identifier: str) -> str:
@@ -354,6 +368,8 @@ class BaseDialect:
                     od=ref.get("on_delete", "CASCADE"),
                 )
             )
+        for constraint in tspec.get("constraints", []):
+            lines.append(self._constraint_clause(constraint))
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)
         out = [f"CREATE TABLE {ine}{self.quote(table)} (\n  {body}\n)"]
@@ -372,63 +388,300 @@ class BaseDialect:
         """
         return [f"DROP TABLE IF EXISTS {self.quote(table)} CASCADE"]
 
-    def render_add_column(self, table: str, name: str, spec: dict[str, Any]) -> list[str]:
+    def render_add_column(
+        self, table: str, name: str, spec: dict[str, Any], safe: bool = False
+    ) -> list[str]:
         """Render a statement to add a column to a table.
 
         Args:
             table: The table name.
             name: The column name.
             spec: The migration column spec.
+            safe: Whether to emit an ``IF NOT EXISTS`` guard (honoured only on
+                dialects whose ``column_if_exists`` is set).
 
         Returns:
             The list with the add-column statement.
         """
-        return [f"ALTER TABLE {self.quote(table)} ADD COLUMN {self.render_column_def(name, spec)}"]
+        ine = "IF NOT EXISTS " if safe and self.column_if_exists else ""
+        return [
+            f"ALTER TABLE {self.quote(table)} ADD COLUMN {ine}{self.render_column_def(name, spec)}"
+        ]
 
-    def render_drop_column(self, table: str, name: str) -> list[str]:
+    def render_drop_column(self, table: str, name: str, safe: bool = False) -> list[str]:
         """Render a statement to drop a column from a table.
 
         Args:
             table: The table name.
             name: The column name.
+            safe: Whether to emit an ``IF EXISTS`` guard (honoured only on
+                dialects whose ``column_if_exists`` is set).
 
         Returns:
             The list with the drop-column statement.
         """
-        return [f"ALTER TABLE {self.quote(table)} DROP COLUMN {self.quote(name)}"]
+        ie = "IF EXISTS " if safe and self.column_if_exists else ""
+        return [f"ALTER TABLE {self.quote(table)} DROP COLUMN {ie}{self.quote(name)}"]
 
-    def render_create_index(self, table: str, column: str, safe: bool = True) -> list[str]:
+    def render_alter_column(
+        self,
+        table: str,
+        name: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+        table_spec: dict[str, Any],
+    ) -> list[str]:
+        """Render statements that change a column's type and nullability.
+
+        On dialects that can alter a column in place (PostgreSQL) this emits the
+        targeted ``ALTER COLUMN`` statements; otherwise it rebuilds the table
+        from ``table_spec`` (the SQLite-safe create/copy/drop/rename dance).
+
+        Args:
+            table: The table name.
+            name: The column being altered.
+            old: The column spec before the change.
+            new: The column spec after the change.
+            table_spec: The full table spec reflecting the post-change columns.
+
+        Returns:
+            The list of SQL statements applying the column change.
+        """
+        if not self.alter_column_in_place:
+            return self._rebuild_table(table, table_spec, old, new, name)
+        t = self.quote(table)
+        col = self.quote(name)
+        out: list[str] = []
+        if old.get("kind") != new.get("kind") or old.get("type_params") != new.get("type_params"):
+            out.append(
+                f"ALTER TABLE {t} ALTER COLUMN {col} TYPE {self._spec_type(new)} "
+                f"USING {col}::{self._spec_type(new)}"
+            )
+        if bool(old.get("null")) != bool(new.get("null")):
+            action = "DROP NOT NULL" if new.get("null") else "SET NOT NULL"
+            out.append(f"ALTER TABLE {t} ALTER COLUMN {col} {action}")
+        return out
+
+    def _rebuild_table(
+        self,
+        table: str,
+        table_spec: dict[str, Any],
+        old: dict[str, Any],
+        new: dict[str, Any],
+        name: str,
+    ) -> list[str]:
+        """Rebuild a table to apply a change a dialect cannot do in place.
+
+        Copies the rows into a freshly created table (carrying ``table_spec``)
+        and swaps it in, the standard SQLite approach to altering a column.
+
+        Args:
+            table: The table name.
+            table_spec: The full table spec the rebuilt table should match.
+            old: The column spec before the change (unused; kept for symmetry).
+            new: The column spec after the change (unused; kept for symmetry).
+            name: The column being altered (carried over in the copy).
+
+        Returns:
+            The list of SQL statements rebuilding the table.
+        """
+        tmp = f"_new_{table}"
+        cols = ", ".join(self.quote(c) for c in table_spec["columns"])
+        out = self.render_create_table(tmp, table_spec, safe=False)
+        out.append(f"INSERT INTO {self.quote(tmp)} ({cols}) SELECT {cols} FROM {self.quote(table)}")
+        out.append(f"DROP TABLE {self.quote(table)}")
+        out.append(f"ALTER TABLE {self.quote(tmp)} RENAME TO {self.quote(table)}")
+        return out
+
+    def render_create_index(
+        self,
+        table: str,
+        column: str,
+        safe: bool = True,
+        unique: bool = False,
+        concurrently: bool = False,
+        name: str | None = None,
+    ) -> list[str]:
         """Render a statement to create an index on a column.
 
         Args:
             table: The table name.
             column: The column to index.
             safe: Whether to emit ``IF NOT EXISTS`` guards.
+            unique: Whether to create a ``UNIQUE`` index.
+            concurrently: Whether to build the index ``CONCURRENTLY`` (honoured
+                only on dialects whose ``index_concurrently`` is set).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
 
         Returns:
             The list with the create-index statement.
         """
+        uniq = "UNIQUE " if unique else ""
+        conc = "CONCURRENTLY " if concurrently and self.index_concurrently else ""
         ine = "IF NOT EXISTS " if safe else ""
         return [
-            "CREATE INDEX {ine}{name} ON {t} ({c})".format(
+            "CREATE {u}INDEX {conc}{ine}{name} ON {t} ({c})".format(
+                u=uniq,
+                conc=conc,
                 ine=ine,
-                name=self.quote(f"idx_{table}_{column}"),
+                name=self.quote(name or f"idx_{table}_{column}"),
                 t=self.quote(table),
                 c=self.quote(column),
             )
         ]
 
-    def render_drop_index(self, table: str, column: str) -> list[str]:
+    def render_drop_index(
+        self, table: str, column: str, concurrently: bool = False, name: str | None = None
+    ) -> list[str]:
         """Render a statement to drop a column's index.
 
         Args:
             table: The table name.
             column: The indexed column.
+            concurrently: Whether to drop the index ``CONCURRENTLY`` (honoured
+                only on dialects whose ``index_concurrently`` is set).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
 
         Returns:
             The list with the drop-index statement.
         """
-        return [f"DROP INDEX IF EXISTS {self.quote(f'idx_{table}_{column}')}"]
+        conc = "CONCURRENTLY " if concurrently and self.index_concurrently else ""
+        return [f"DROP INDEX {conc}IF EXISTS {self.quote(name or f'idx_{table}_{column}')}"]
+
+    # -- rename / constraint rendering -----------------------------------
+    def render_rename_table(self, old: str, new: str) -> list[str]:
+        """Render a statement to rename a table.
+
+        Args:
+            old: The current table name.
+            new: The new table name.
+
+        Returns:
+            The list with the rename-table statement.
+        """
+        return [f"ALTER TABLE {self.quote(old)} RENAME TO {self.quote(new)}"]
+
+    def render_rename_column(self, table: str, old: str, new: str) -> list[str]:
+        """Render a statement to rename a column.
+
+        Args:
+            table: The table name.
+            old: The current column name.
+            new: The new column name.
+
+        Returns:
+            The list with the rename-column statement.
+        """
+        return [
+            f"ALTER TABLE {self.quote(table)} RENAME COLUMN {self.quote(old)} TO {self.quote(new)}"
+        ]
+
+    def render_rename_index(
+        self,
+        table: str,
+        column: str,
+        old_name: str,
+        new_name: str,
+        unique: bool = False,
+    ) -> list[str]:
+        """Render statements that rename an index.
+
+        On dialects that can rename an index in place (PostgreSQL) this emits a
+        single ``ALTER INDEX`` statement; otherwise the index is dropped and
+        recreated under the new name.
+
+        Args:
+            table: The table owning the index.
+            column: The indexed column (used to recreate on rebuild dialects).
+            old_name: The current index name.
+            new_name: The new index name.
+            unique: Whether the recreated index should be ``UNIQUE``.
+
+        Returns:
+            The list of SQL statements renaming the index.
+        """
+        if self.rename_index_in_place:
+            return [
+                f"ALTER INDEX IF EXISTS {self.quote(old_name)} RENAME TO {self.quote(new_name)}"
+            ]
+        out = self.render_drop_index(table, column, name=old_name)
+        out.extend(self.render_create_index(table, column, unique=unique, name=new_name))
+        return out
+
+    def _constraint_clause(self, constraint: dict[str, Any]) -> str:
+        """Render the inline DDL clause for a table constraint.
+
+        Args:
+            constraint: A constraint spec with ``kind`` (``unique``/``check``),
+                an optional ``name``, and either ``fields`` or ``check``.
+
+        Returns:
+            The constraint clause SQL fragment.
+        """
+        named = f"CONSTRAINT {self.quote(constraint['name'])} " if constraint.get("name") else ""
+        if constraint["kind"] == "check":
+            return f"{named}CHECK ({constraint['check']})"
+        cols = ", ".join(self.quote(c) for c in constraint["fields"])
+        return f"{named}UNIQUE ({cols})"
+
+    def render_add_constraint(self, table: str, constraint: dict[str, Any]) -> list[str]:
+        """Render a statement that adds a table constraint.
+
+        Args:
+            table: The table name.
+            constraint: The constraint spec to add.
+
+        Raises:
+            UnSupportedError: If the dialect cannot alter constraints in place.
+
+        Returns:
+            The list with the add-constraint statement.
+        """
+        if not self.alter_constraint_in_place:
+            raise UnSupportedError(
+                f"{self.name} cannot ADD a constraint in place; use a unique index or RunSQL"
+            )
+        return [f"ALTER TABLE {self.quote(table)} ADD {self._constraint_clause(constraint)}"]
+
+    def render_drop_constraint(self, table: str, name: str) -> list[str]:
+        """Render a statement that drops a named table constraint.
+
+        Args:
+            table: The table name.
+            name: The constraint name to drop.
+
+        Raises:
+            UnSupportedError: If the dialect cannot alter constraints in place.
+
+        Returns:
+            The list with the drop-constraint statement.
+        """
+        if not self.alter_constraint_in_place:
+            raise UnSupportedError(
+                f"{self.name} cannot DROP a constraint in place; rebuild the table via RunSQL"
+            )
+        return [f"ALTER TABLE {self.quote(table)} DROP CONSTRAINT IF EXISTS {self.quote(name)}"]
+
+    def render_rename_constraint(self, table: str, old: str, new: str) -> list[str]:
+        """Render a statement that renames a table constraint.
+
+        Args:
+            table: The table name.
+            old: The current constraint name.
+            new: The new constraint name.
+
+        Raises:
+            UnSupportedError: If the dialect cannot alter constraints in place.
+
+        Returns:
+            The list with the rename-constraint statement.
+        """
+        if not self.alter_constraint_in_place:
+            raise UnSupportedError(f"{self.name} cannot RENAME a constraint in place")
+        return [
+            f"ALTER TABLE {self.quote(table)} "
+            f"RENAME CONSTRAINT {self.quote(old)} TO {self.quote(new)}"
+        ]
 
 
 class PostgresDialect(BaseDialect):
@@ -477,6 +730,14 @@ class SqliteDialect(BaseDialect):
     name = "sqlite"
     # SQLite has no ILIKE; its LIKE is case-insensitive for ASCII text.
     ilike = "LIKE"
+    # SQLite has no ``IF [NOT] EXISTS`` on ADD/DROP COLUMN, no ``CONCURRENTLY``,
+    # no in-place ``ALTER COLUMN`` (a column change needs a table rebuild), no
+    # ``ALTER INDEX ... RENAME``, and no ``ALTER TABLE ... CONSTRAINT`` syntax.
+    column_if_exists = False
+    index_concurrently = False
+    alter_column_in_place = False
+    rename_index_in_place = False
+    alter_constraint_in_place = False
 
     type_map = {
         "smallint": "INTEGER",

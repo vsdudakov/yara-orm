@@ -16,12 +16,24 @@ Crucially, migrations are **backend-portable**. A migration records *operations*
 correct SQL for the active dialect **at apply time**, so one migration set runs
 unchanged on **PostgreSQL** or **SQLite**.
 
+Each migration file declares a `class Migration(m.Migration)` with `operations`
+(and optional `dependencies` / `atomic`). Operations are built from **live field
+objects** — `CreateModel` lists `fields={col: Field}`, `AddField` / `AlterField`
+carry a single `Field` — so a migration reads like your models.
+
 !!! info "How state is tracked"
     The target schema is **replayed from the migration files** on disk
-    (Django-style) — each file's `operations` are applied in order to rebuild
-    the recorded schema state, which is then diffed against your current models.
-    Applied migrations are recorded per app in an `orm_migrations` table, which
-    is created automatically on first use.
+    (Django-style) — each file's `Migration.operations` are applied in order to
+    rebuild the recorded schema state, which is then diffed against your current
+    models. Applied migrations are recorded per app in an `orm_migrations` table,
+    which is created automatically on first use.
+
+!!! tip "Idempotent by default"
+    `makemigrations` emits the **idempotent** analog of each operation
+    (`CreateModelIfNotExists`, `AddFieldIfNotExists`, `RemoveFieldIfExists`,
+    `AddIndexIfNotExists`, …), so re-running a half-applied migration is safe. A
+    column whose type or nullability changed is emitted as `AlterField`
+    automatically (PostgreSQL alters in place; SQLite rebuilds the table).
 
 ## The CLI
 
@@ -196,24 +208,59 @@ asyncio.run(main())
 
 ## Operations reference
 
-Migration files are plain Python: a `dependencies` list and an `operations`
-list, built from `yara_orm.migrations` (imported in generated files as
-`from yara_orm import migrations as m`).
+A migration file is plain Python: a `class Migration(m.Migration)` with an
+`operations` list (and optional `dependencies` / `atomic`), built from
+`yara_orm.migrations` (imported in generated files as
+`from yara_orm import migrations as m`, alongside `from yara_orm import fields`).
 
 | Operation | Purpose |
 | --- | --- |
-| `CreateTable` | Create a table with its columns, primary key, foreign keys, and indexes. |
-| `DropTable` | Drop a table (keeps its spec so it can be reversed). |
-| `AddColumn` | Add a column, optionally with a foreign-key spec. |
-| `DropColumn` | Drop a column (keeps its spec so it can be reversed). |
-| `CreateIndex` | Create an index on a column. |
-| `DropIndex` | Drop an index on a column. |
+| `CreateModel(table, fields, composite_pk=None)` | Create a table from a `{column: Field}` set (columns, pk, foreign keys, indexes). |
+| `DeleteModel(table, fields, composite_pk=None)` | Drop a table (keeps its fields so it can be reversed). |
+| `AddField(table, name, field)` | Add a column from a field object. |
+| `RemoveField(table, name, field)` | Drop a column (keeps the field so it can be reversed). |
+| `AlterField(table, name, field, old)` | Change a column's type/nullability (PostgreSQL in place; SQLite rebuild). |
+| `AddIndex(table, column)` | Create an index on a column. |
+| `RemoveIndex(table, column)` | Drop an index on a column. |
 | `RunSQL(sql, reverse_sql=None)` | Run literal SQL forward and, optionally, its reverse. |
 | `RunPython(forward, backward=None)` | Run async Python callables (hand-written migrations only). |
 
-`CreateTable`, `DropTable`, `AddColumn`, `DropColumn`, `CreateIndex`, and
-`DropIndex` are generated automatically by `makemigrations`. `RunSQL` and
-`RunPython` are for hand-written `--empty` migrations.
+`makemigrations` generates the **idempotent** analogs of the schema operations —
+`CreateModelIfNotExists`, `DeleteModelIfExists`, `AddFieldIfNotExists`,
+`RemoveFieldIfExists`, `AddIndexIfNotExists`, `RemoveIndexIfExists` — plus
+`AlterField`. For online index builds on PostgreSQL, hand-written migrations can
+use `AddIndexConcurrently`, `AddUniqueIndexConcurrently` or
+`RemoveIndexConcurrently` with `atomic = False` (those builds cannot run inside a
+transaction). `RunSQL` and `RunPython` are for hand-written `--empty` migrations.
+
+A generated initial migration for a `User` and a related `Post` looks like:
+
+```python
+from yara_orm import fields
+from yara_orm import migrations as m
+
+
+class Migration(m.Migration):
+    atomic = True
+    dependencies = []
+    operations = [
+        m.CreateModelIfNotExists(
+            "user",
+            fields={
+                "id": fields.IntField(pk=True),
+                "name": fields.CharField(max_length=100),
+            },
+        ),
+        m.CreateModelIfNotExists(
+            "post",
+            fields={
+                "id": fields.IntField(pk=True),
+                "title": fields.CharField(max_length=200, index=True),
+                "author_id": fields.ForeignKeyField("User"),
+            },
+        ),
+    ]
+```
 
 ### Data migration with `--empty`
 
@@ -229,14 +276,15 @@ it reversible):
 ```python
 from yara_orm import migrations as m
 
-dependencies = ["0001_initial"]
 
-operations = [
-    m.RunSQL(
-        "UPDATE users SET active = TRUE WHERE active IS NULL",
-        reverse_sql="UPDATE users SET active = NULL WHERE active = TRUE",
-    ),
-]
+class Migration(m.Migration):
+    dependencies = ["0001_initial"]
+    operations = [
+        m.RunSQL(
+            "UPDATE users SET active = TRUE WHERE active IS NULL",
+            reverse_sql="UPDATE users SET active = NULL WHERE active = TRUE",
+        ),
+    ]
 ```
 
 Or with async Python via `RunPython` — handy for ORM-driven data changes
@@ -255,11 +303,11 @@ async def unseed() -> None:
     await User.objects.filter(name="admin").delete()
 
 
-dependencies = ["0001_initial"]
-
-operations = [
-    m.RunPython(seed, unseed),
-]
+class Migration(m.Migration):
+    dependencies = ["0001_initial"]
+    operations = [
+        m.RunPython(seed, unseed),
+    ]
 ```
 
 !!! tip "Reversibility"

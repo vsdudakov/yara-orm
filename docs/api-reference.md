@@ -155,9 +155,12 @@ Handlers are async. The `Signals` enum names the four lifecycle signals. See
 ## Migrations
 
 `migrations.MigrationManager(directory="migrations", app="models", models=None)` plus the
-operation classes `CreateTable`, `DropTable`, `AddColumn`, `DropColumn`, `CreateIndex`,
-`DropIndex`, `RunSQL`, `RunPython`. CLI: `python -m yara_orm …`. See
-[Migrations](guides/migrations.md).
+`migrations.Migration` base class (carrying `operations`, `dependencies`, `atomic`) and the
+operation classes `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`, `AlterField`,
+`AddIndex`, `RemoveIndex`, `RunSQL`, `RunPython`. Generated migrations use the idempotent
+analogs (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,
+`AddUniqueIndexConcurrently` and `RemoveIndexConcurrently` are for hand-written
+non-atomic migrations. CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
 
 ## Dialects
 
