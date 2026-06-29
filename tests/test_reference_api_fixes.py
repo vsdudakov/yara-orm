@@ -1,8 +1,8 @@
-"""Fixes from the from-scratch audit: P0 (transaction routing, aggregate
-distinct keyword-only), P1 (use_tz init, F in annotate, Subquery/RawSQL in
-filter, multi-level select_related/prefetch_related), P2 (modern field params,
-extra lookups, multi-sender signals, per-model exceptions, Meta options,
-construct/fetch_for_list)."""
+"""Tortoise reference-API parity fixes: transaction routing and keyword-only
+aggregate ``distinct``; ``use_tz`` init, ``F`` in annotate, ``Subquery``/``RawSQL``
+in filter, multi-level ``select_related``/``prefetch_related``; modern field
+parameter aliases, extra lookups, multi-sender signals, per-model exceptions,
+recorded ``Meta`` options, and ``construct``/``fetch_for_list``."""
 
 import datetime as dt
 

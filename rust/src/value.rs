@@ -12,6 +12,8 @@ use pyo3::types::{
     PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
 };
 use pyo3::Borrowed;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::PyType;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
 use crate::error::EngineError;
@@ -19,6 +21,21 @@ use crate::error::EngineError;
 /// Build an "out of range" SQL bind error for a narrowing integer cast.
 fn oob(v: i64, sql_type: &str) -> Box<dyn Error + Sync + Send> {
     format!("integer {v} is out of range for {sql_type} column").into()
+}
+
+// `uuid.UUID` and `decimal.Decimal` have no dedicated Python C-type, so they are
+// resolved by import. They are returned on essentially every row (UUID primary
+// keys) and bound on every `WHERE id = ?`, so the type objects are imported and
+// cached once per interpreter instead of re-imported per value.
+static UUID_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static DECIMAL_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    UUID_TYPE.import(py, "uuid", "UUID")
+}
+
+fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    DECIMAL_TYPE.import(py, "decimal", "Decimal")
 }
 
 #[derive(Debug, Clone)]
@@ -88,31 +105,28 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
         if ob.is_instance_of::<PyDict>() || ob.is_instance_of::<PyList>() {
             return Ok(Value::Json(py_to_json(ob)?));
         }
-        // uuid.UUID and decimal.Decimal have no dedicated Python C-type; match
-        // on the qualified name. Decimal is bound as an exact NUMERIC value
-        // rather than going through f64, which would silently lose precision.
-        if let Ok(qual) = ob.get_type().qualname() {
-            let qual = qual.to_string();
-            if qual == "UUID" {
-                let s = ob.str()?.to_string();
-                let parsed = uuid::Uuid::parse_str(&s)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-                return Ok(Value::Uuid(parsed));
-            }
-            if qual == "Decimal" {
-                // Python's ``str(Decimal)`` may use scientific notation
-                // (e.g. ``1E-10``), which ``from_str_exact`` rejects — fall
-                // back to ``from_scientific`` so either form parses exactly.
-                let s = ob.str()?.to_string();
-                let parsed = rust_decimal::Decimal::from_str_exact(&s)
-                    .or_else(|_| rust_decimal::Decimal::from_scientific(&s))
-                    .map_err(|e| {
-                        pyo3::exceptions::PyValueError::new_err(format!(
-                            "invalid decimal {s:?}: {e}"
-                        ))
-                    })?;
-                return Ok(Value::Decimal(parsed));
-            }
+        // uuid.UUID and decimal.Decimal have no dedicated Python C-type; dispatch
+        // against the cached type objects (avoids a per-bind qualname() string
+        // alloc + compare). Decimal is bound as an exact NUMERIC value rather
+        // than going through f64, which would silently lose precision.
+        let py = ob.py();
+        if ob.is_instance(uuid_type(py)?.as_any())? {
+            let s = ob.str()?.to_string();
+            let parsed = uuid::Uuid::parse_str(&s)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(Value::Uuid(parsed));
+        }
+        if ob.is_instance(decimal_type(py)?.as_any())? {
+            // Python's ``str(Decimal)`` may use scientific notation
+            // (e.g. ``1E-10``), which ``from_str_exact`` rejects — fall back to
+            // ``from_scientific`` so either form parses exactly.
+            let s = ob.str()?.to_string();
+            let parsed = rust_decimal::Decimal::from_str_exact(&s)
+                .or_else(|_| rust_decimal::Decimal::from_scientific(&s))
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("invalid decimal {s:?}: {e}"))
+                })?;
+            return Ok(Value::Decimal(parsed));
         }
         Err(pyo3::exceptions::PyTypeError::new_err(format!(
             "unsupported parameter type: {}",
@@ -175,20 +189,8 @@ impl<'py> IntoPyObject<'py> for Value {
             Value::Text(v) => v.into_pyobject(py)?.into_any(),
             Value::Bytes(v) => PyBytes::new(py, &v).into_any(),
             Value::Json(v) => json_to_py(py, &v)?,
-            Value::Uuid(v) => {
-                let uuid_mod = py.import("uuid")?;
-                uuid_mod
-                    .getattr("UUID")?
-                    .call1((v.to_string(),))?
-                    .into_any()
-            }
-            Value::Decimal(v) => {
-                let decimal_mod = py.import("decimal")?;
-                decimal_mod
-                    .getattr("Decimal")?
-                    .call1((v.to_string(),))?
-                    .into_any()
-            }
+            Value::Uuid(v) => uuid_type(py)?.call1((v.to_string(),))?.into_any(),
+            Value::Decimal(v) => decimal_type(py)?.call1((v.to_string(),))?.into_any(),
             Value::Timestamp(v) => v.into_pyobject(py)?.into_any(),
             Value::TimestampTz(v) => v.into_pyobject(py)?.into_any(),
             Value::Date(v) => v.into_pyobject(py)?.into_any(),
@@ -325,18 +327,19 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
 // SQLite conversions
 // ---------------------------------------------------------------------------
 
-/// Bind a [`Value`] as a SQLite parameter. SQLite has few storage classes, so
-/// richer types are encoded as TEXT and reconstructed on read via the declared
-/// column type (see [`decode_sqlite`]).
-pub fn value_to_sqlite(v: &Value) -> rusqlite::types::Value {
+/// Bind an owned [`Value`] as a SQLite parameter, moving (not cloning) the
+/// `String`/`Bytes` payloads. SQLite has few storage classes, so richer types
+/// are encoded as TEXT and reconstructed on read via the declared column type
+/// (see [`decode_sqlite`]).
+pub fn value_into_sqlite(v: Value) -> rusqlite::types::Value {
     use rusqlite::types::Value as S;
     match v {
         Value::Null => S::Null,
-        Value::Bool(b) => S::Integer(if *b { 1 } else { 0 }),
-        Value::Int(i) => S::Integer(*i),
-        Value::Float(f) => S::Real(*f),
-        Value::Text(s) => S::Text(s.clone()),
-        Value::Bytes(b) => S::Blob(b.clone()),
+        Value::Bool(b) => S::Integer(if b { 1 } else { 0 }),
+        Value::Int(i) => S::Integer(i),
+        Value::Float(f) => S::Real(f),
+        Value::Text(s) => S::Text(s),
+        Value::Bytes(b) => S::Blob(b),
         Value::Json(j) => S::Text(j.to_string()),
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Decimal(d) => S::Text(d.to_string()),
@@ -351,12 +354,13 @@ pub fn value_to_sqlite(v: &Value) -> rusqlite::types::Value {
 /// datetime/decimal columns round-trip to native Python types — keeping the
 /// model layer identical across backends. Aggregates (no declared type) fall
 /// back to the storage class.
-pub fn decode_sqlite(decl: Option<&str>, vr: rusqlite::types::ValueRef) -> Value {
+pub fn decode_sqlite(decl: &str, vr: rusqlite::types::ValueRef) -> Value {
     use rusqlite::types::ValueRef as R;
     if let R::Null = vr {
         return Value::Null;
     }
-    let decl = decl.unwrap_or("").to_ascii_uppercase();
+    // `decl` is already upper-cased once per column by `column_meta`, so the
+    // per-cell path here only does substring scans, no allocation.
     let text = |vr: R| -> Option<String> {
         match vr {
             R::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
@@ -462,51 +466,35 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Va
         };
     }
 
-    if *ty == Type::BOOL {
-        get!(bool, Value::Bool)
-    } else if *ty == Type::INT2 {
-        get!(i16, |v| Value::Int(v as i64))
-    } else if *ty == Type::INT4 {
-        get!(i32, |v| Value::Int(v as i64))
-    } else if *ty == Type::INT8 {
-        get!(i64, Value::Int)
-    } else if *ty == Type::FLOAT4 {
-        get!(f32, |v| Value::Float(v as f64))
-    } else if *ty == Type::FLOAT8 {
-        get!(f64, Value::Float)
-    } else if *ty == Type::VARCHAR
-        || *ty == Type::TEXT
-        || *ty == Type::BPCHAR
-        || *ty == Type::NAME
-    {
-        get!(String, Value::Text)
-    } else if *ty == Type::BYTEA {
-        get!(Vec<u8>, Value::Bytes)
-    } else if *ty == Type::JSON || *ty == Type::JSONB {
-        get!(serde_json::Value, Value::Json)
-    } else if *ty == Type::UUID {
-        get!(uuid::Uuid, Value::Uuid)
-    } else if *ty == Type::NUMERIC {
-        get!(rust_decimal::Decimal, Value::Decimal)
-    } else if *ty == Type::TIMESTAMP {
-        get!(NaiveDateTime, Value::Timestamp)
-    } else if *ty == Type::TIMESTAMPTZ {
-        get!(DateTime<Utc>, Value::TimestampTz)
-    } else if *ty == Type::DATE {
-        get!(NaiveDate, Value::Date)
-    } else if *ty == Type::TIME {
-        get!(NaiveTime, Value::Time)
-    } else if *ty == Type::VOID {
-        // `void` (e.g. the result of pg_sleep) carries no value.
-        Ok(Value::Null)
-    } else {
-        // Genuinely unknown type: try its text representation, and if even that
-        // fails we don't understand the type at all, so degrade to NULL rather
-        // than failing the whole query. (Known types above still error on a
-        // decode failure, since there it would mean real data loss.)
-        match row.try_get::<_, Option<String>>(idx) {
-            Ok(Some(v)) => Ok(Value::Text(v)),
-            _ => Ok(Value::Null),
+    // Dispatch on the stable type OID so the compiler lowers this to a jump
+    // table / binary search instead of a ~16-deep chain of `Type` equality
+    // comparisons per cell. OIDs are fixed catalog values (see pg_type.dat).
+    match ty.oid() {
+        16 => get!(bool, Value::Bool),                  // BOOL
+        21 => get!(i16, |v| Value::Int(v as i64)),      // INT2
+        23 => get!(i32, |v| Value::Int(v as i64)),      // INT4
+        20 => get!(i64, Value::Int),                    // INT8
+        700 => get!(f32, |v| Value::Float(v as f64)),   // FLOAT4
+        701 => get!(f64, Value::Float),                 // FLOAT8
+        25 | 1043 | 1042 | 19 => get!(String, Value::Text), // TEXT/VARCHAR/BPCHAR/NAME
+        17 => get!(Vec<u8>, Value::Bytes),              // BYTEA
+        114 | 3802 => get!(serde_json::Value, Value::Json), // JSON/JSONB
+        2950 => get!(uuid::Uuid, Value::Uuid),          // UUID
+        1700 => get!(rust_decimal::Decimal, Value::Decimal), // NUMERIC
+        1114 => get!(NaiveDateTime, Value::Timestamp),  // TIMESTAMP
+        1184 => get!(DateTime<Utc>, Value::TimestampTz), // TIMESTAMPTZ
+        1082 => get!(NaiveDate, Value::Date),           // DATE
+        1083 => get!(NaiveTime, Value::Time),           // TIME
+        2278 => Ok(Value::Null),                        // VOID (e.g. pg_sleep)
+        _ => {
+            // Genuinely unknown type: try its text representation, and if even
+            // that fails we don't understand the type at all, so degrade to NULL
+            // rather than failing the whole query. (Known types above still
+            // error on a decode failure, since there it would mean data loss.)
+            match row.try_get::<_, Option<String>>(idx) {
+                Ok(Some(v)) => Ok(Value::Text(v)),
+                _ => Ok(Value::Null),
+            }
         }
     }
 }

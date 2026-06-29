@@ -34,6 +34,11 @@ _HANDLERS: dict[str, dict[type, list]] = {
     "post_delete": {},
 }
 
+#: Models that have at least one handler on any signal. Lets the (very hot)
+#: save/delete path skip the four-dict scan in :func:`_has_handlers` with a
+#: single set membership test.
+_MODELS_WITH_HANDLERS: set[type] = set()
+
 
 def _decorator(
     kind: str, models: tuple[type[Model], ...]
@@ -59,6 +64,7 @@ def _decorator(
         """
         for model in models:
             _HANDLERS[kind].setdefault(model, []).append(func)
+            _MODELS_WITH_HANDLERS.add(model)
         return func
 
     return register
@@ -200,4 +206,4 @@ def _has_handlers(model: type[Model]) -> bool:
     Returns:
         True if at least one handler is registered, otherwise False.
     """
-    return any(model in handlers for handlers in _HANDLERS.values())
+    return model in _MODELS_WITH_HANDLERS
