@@ -1,0 +1,93 @@
+# Changelog
+
+All notable changes to **yara-orm** are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0] - 2026-06-29
+
+First stable release. yara-orm reaches effectively full Tortoise-style API
+parity — models, querysets, relations, aggregation, signals, validators,
+migrations and transactions — backed by the Rust engine, green on PostgreSQL
+and SQLite with 100% test coverage.
+
+### Added
+
+- **Migrations — class-based, field-object system.** Each migration file is a
+  `class Migration(m.Migration)` whose `operations` are built from live field
+  objects (`CreateModel(fields={col: Field})`, `AddField`/`AlterField`, …).
+  - Core ops: `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`,
+    `AlterField`, `AddIndex`, `RemoveIndex`, `RunSQL`, `RunPython`.
+  - Idempotent analogs emitted by `makemigrations`
+    (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …) and automatic
+    `AlterField` detection on column type/nullability changes.
+  - Concurrent index ops (`AddIndexConcurrently`, `AddUniqueIndexConcurrently`,
+    `RemoveIndexConcurrently`) for non-atomic migrations.
+  - Rename ops (`RenameModel`, `RenameField`, `RenameIndex`).
+  - Constraints: `UniqueConstraint` / `CheckConstraint` with `AddConstraint` /
+    `RemoveConstraint` / `RenameConstraint` (PostgreSQL in place; SQLite raises
+    a clear `UnSupportedError`).
+- **Transactions — nesting and isolation.** Nested `in_transaction` / `@atomic`
+  blocks open **savepoints** (inner rollback without aborting the outer
+  transaction); `isolation=` accepts the four standard `IsolationLevel`s
+  (PostgreSQL honours all, SQLite is serializable-only).
+- **Eager loading** — `select_related` for forward FK / one-to-one relations,
+  and synchronous serving of prefetched forward FK / O2O.
+- **Query expressions** — `Case` / `When` and `RawSQL` annotations.
+- **Fields & validation** — `validators=`, `TimeDeltaField`, `IntEnumField` /
+  `CharEnumField`, and database-side default expressions.
+- **Models & metadata** — `Meta.unique_together` / `Meta.indexes`,
+  `Meta.abstract`, custom managers, timezone helpers, the `Signals` enum with
+  lifecycle signals, and column/table comments.
+- **Benchmarks** — a `delete` operation in the 4-way suite and a new
+  yara-orm-only feature micro-benchmark (`bench_features.py`) covering
+  savepoints, eager loading vs N+1, and projection.
+
+### Changed
+
+- Migration files moved from module-level `operations`/`dependencies` to the
+  `class Migration` format; operations now carry field objects rather than
+  plain spec dicts.
+- Google-style docstrings enforced across the package; 100% branch coverage
+  gated in CI.
+
+### Fixed
+
+- Exact `Decimal` binding (no float round-trip), typed `IntegrityError`, and
+  timezone-aware datetime handling.
+- Pony import in the benchmark suite (the Pony column had been silently
+  dropped).
+
+## [0.1.1] - 2026-06-29
+
+### Added
+
+- `Meta.ordering` for default queryset ordering.
+- Configurable connection-pool size and per-connection statement-cache (via URL
+  parameters).
+- Expanded documentation.
+
+### Changed
+
+- CI/release wheel matrix housekeeping (dropped the Intel macOS runner; grouped
+  GitHub Actions dependency bumps).
+
+## [0.1.0] - 2026-06-28
+
+Initial public release: an async Python ORM with a Rust (PyO3 + tokio) engine.
+
+### Added
+
+- Declarative models with a metaclass-driven schema, abstract field types and
+  per-dialect SQL rendering for **PostgreSQL** and **SQLite**.
+- Lazy `QuerySet` query builder: filtering, ordering, aggregation, `values` /
+  `values_list` projections and bulk create/update/delete.
+- Relations — foreign keys, one-to-one and many-to-many with reverse accessors
+  and `prefetch_related`.
+- Transactions (`in_transaction`, `@atomic`), manual SQL, multiple databases
+  with a per-model router, and an operation-based migration CLI
+  (`python -m yara_orm`).
+
+[1.0.0]: https://github.com/vsdudakov/yara-orm/releases/tag/v1.0.0
+[0.1.1]: https://github.com/vsdudakov/yara-orm/releases/tag/v0.1.1
+[0.1.0]: https://github.com/vsdudakov/yara-orm/releases/tag/v0.1.0

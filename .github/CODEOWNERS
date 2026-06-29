@@ -1,0 +1,15 @@
+# Code owners for yara-orm.
+#
+# Owners listed here are automatically requested for review on pull requests
+# that touch matching paths. The last matching pattern takes precedence.
+# See https://docs.github.com/articles/about-code-owners.
+
+# Default owner for everything in the repository.
+*               @vsdudakov
+
+# Rust engine.
+/rust/          @vsdudakov
+/Cargo.toml     @vsdudakov
+
+# Release / CI configuration.
+/.github/       @vsdudakov
