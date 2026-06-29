@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 #: different modules don't overwrite each other (every table still gets built).
 _MODELS: dict[str, type[Model]] = {}
 
+#: Memoised bare-name -> model resolutions, so a relation lookup does not rescan
+#: every registered model on each call. Invalidated whenever the model set
+#: changes (a new model can alter a bare name's resolution).
+_RESOLVE_CACHE: dict[str, type[Model]] = {}
+
 
 def register(model: type[Model]) -> None:
     """Register a model under its qualified ``module.ClassName`` key.
@@ -27,20 +32,26 @@ def register(model: type[Model]) -> None:
         None
     """
     _MODELS[f"{model.__module__}.{model.__name__}"] = model
+    _RESOLVE_CACHE.clear()
 
 
 def get_model(name: str) -> type[Model]:
     """Resolve a model reference: exact ``module.Name`` or a bare class name."""
-    if name in _MODELS:
-        return _MODELS[name]
+    model = _MODELS.get(name)
+    if model is not None:
+        return model
+    cached = _RESOLVE_CACHE.get(name)
+    if cached is not None:
+        return cached
     short = name.rsplit(".", 1)[-1]
     matches = [m for m in _MODELS.values() if m.__name__ == short]
-    if len(matches) == 1:
-        return matches[0]
-    if matches:
-        # Ambiguous bare name across modules; the most recently defined wins.
-        return matches[-1]
-    raise KeyError(f"Unknown model referenced: {name!r}")
+    if not matches:
+        raise KeyError(f"Unknown model referenced: {name!r}")
+    # A single match is exact; an ambiguous bare name resolves to the most
+    # recently defined model across modules.
+    result = matches[0] if len(matches) == 1 else matches[-1]
+    _RESOLVE_CACHE[name] = result
+    return result
 
 
 def all_models() -> list[type[Model]]:
@@ -59,6 +70,7 @@ def clear() -> None:
         None
     """
     _MODELS.clear()
+    _RESOLVE_CACHE.clear()
     _RESOLVED.clear()
 
 
