@@ -9,6 +9,7 @@ models, querysets, relations and migrations for PostgreSQL and SQLite.**
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#development)
 [![Docs](https://img.shields.io/badge/docs-vsdudakov.github.io%2Fyara--orm-blue.svg)](https://vsdudakov.github.io/yara-orm/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE.md)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ec6cb9.svg?logo=github-sponsors)](https://github.com/sponsors/vsdudakov)
 
 📖 **Documentation: [vsdudakov.github.io/yara-orm](https://vsdudakov.github.io/yara-orm/)**
 
@@ -40,7 +41,9 @@ print(await User.filter(name__icontains="ad").count())
 - ⚡ **Rust engine** — pooling, binding and decoding in compiled code; the async
   bridge (PyO3 + tokio) keeps your event loop free.
 - 🧩 **Familiar API** — Tortoise/Django-style models, lazy chainable querysets,
-  `Q` objects, aggregation, `prefetch_related`, transactions, signals.
+  `Q` objects, aggregation, `prefetch_related`, transactions, signals. Coming from
+  Tortoise? Most code moves across unchanged — see
+  [Migrating from Tortoise ORM](https://vsdudakov.github.io/yara-orm/guides/migrating-from-tortoise/).
 - 🗄️ **Pluggable backends** — PostgreSQL and SQLite today, selected by URL; a new
   database is one Rust trait + one Python dialect.
 - 🚚 **Migrations** — operation-based, auto-generated, backend-portable
@@ -219,6 +222,8 @@ every operation measured. Cells show Yara ORM's time and each competitor's
 slowdown factor (>1 means Yara ORM is faster). Full methodology in
 [`benchmarks/`](benchmarks/).
 
+![Yara ORM vs Tortoise, SQLAlchemy and Pony on PostgreSQL — latency per operation, log scale, lower is better](docs/assets/benchmark-postgres.png)
+
 | operation     | yara-orm | vs Tortoise | vs SQLAlchemy | vs Pony |
 |---------------|---------:|------------:|--------------:|--------:|
 | bulk_insert   | 11.0 ms  | 2.1×        | 6.2×          | 18.7×   |
@@ -281,6 +286,13 @@ tests; the SQLite tests are self-contained.
 
 Issues and pull requests are welcome. Please run `make lint` and `make cov`
 (both must be green — lint clean and 100% coverage) before opening a PR.
+
+## Sponsor
+
+Yara ORM is MIT-licensed and developed in the open. If it saves your project
+time — or you'd like to support continued work on the Rust engine, backends and
+docs — please consider [**sponsoring on GitHub**](https://github.com/sponsors/vsdudakov).
+Every bit helps and is hugely appreciated. ❤️
 
 ## License
 

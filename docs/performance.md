@@ -19,6 +19,8 @@ lower than pure-Python ORMs. The numbers below compare Yara ORM against **Tortoi
 
 ## PostgreSQL
 
+![Yara ORM vs Tortoise, SQLAlchemy and Pony on PostgreSQL — latency per operation, log scale, lower is better](assets/benchmark-postgres.png)
+
 PostgreSQL 18, Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower is better).
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
