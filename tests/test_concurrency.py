@@ -33,7 +33,11 @@ async def _reset():
 
 @pytest.mark.asyncio
 async def test_many_concurrent_inserts(orm):
-    """50 concurrent inserts all commit and are individually retrievable."""
+    """
+    GIVEN 50 inserts issued concurrently against a fresh table
+    WHEN they all run through the shared pool
+    THEN every insert commits and each distinct row is retrievable exactly once
+    """
     await _reset()
     await asyncio.gather(*(CnCounter.create(name=f"row-{i}") for i in range(50)))
     assert await CnCounter.all().count() == 50
@@ -44,7 +48,11 @@ async def test_many_concurrent_inserts(orm):
 
 @pytest.mark.asyncio
 async def test_concurrent_reads_under_load(orm):
-    """Many concurrent SELECTs return consistent results without errors."""
+    """
+    GIVEN a seeded table and 40 SELECT counts issued concurrently
+    WHEN they all run through the shared pool
+    THEN every read returns the same consistent result without errors
+    """
     await _reset()
     await CnCounter.create(name="seed")
     results = await asyncio.gather(
@@ -55,7 +63,11 @@ async def test_concurrent_reads_under_load(orm):
 
 @pytest.mark.asyncio
 async def test_concurrent_independent_transactions(orm):
-    """Parallel atomic blocks each commit on their own pinned connection."""
+    """
+    GIVEN 20 atomic insert blocks run in parallel
+    WHEN each executes on its own pinned pooled connection
+    THEN all transactions commit and every row is persisted
+    """
     await _reset()
 
     @atomic()
@@ -68,7 +80,11 @@ async def test_concurrent_independent_transactions(orm):
 
 @pytest.mark.asyncio
 async def test_one_transaction_rollback_does_not_affect_others(orm):
-    """A rollback in one concurrent transaction leaves the others intact."""
+    """
+    GIVEN concurrent atomic transactions where one raises and rolls back
+    WHEN they all run together
+    THEN the failing transaction's row is discarded and the others stay committed
+    """
     await _reset()
 
     @atomic()
@@ -88,9 +104,10 @@ async def test_one_transaction_rollback_does_not_affect_others(orm):
 
 @pytest.mark.asyncio
 async def test_pool_queues_more_work_than_connections():
-    """With a 2-connection pool, 12 concurrent queries still all complete.
-
-    Verifies checkout queues rather than failing when demand exceeds pool size.
+    """
+    GIVEN a 2-connection pool and 12 slow concurrent queries
+    WHEN demand exceeds the pool size
+    THEN checkout queues rather than failing and every query completes
     """
     await YaraOrm.init(f"{DB_URL}?max_size=2")
     try:

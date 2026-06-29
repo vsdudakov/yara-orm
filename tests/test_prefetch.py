@@ -2,8 +2,7 @@
 
 import pytest
 
-from yara_orm import Model, Prefetch, YaraOrm, fields
-from yara_orm.connection import get_engine
+from yara_orm import Model, Prefetch, fields
 
 
 class PfAuthor(Model):
@@ -29,21 +28,16 @@ class PfTag(Model):
         table = "p_tag"
 
 
-async def _reset():
-    engine = get_engine()
-    for table in ("p_book_tag", "p_book", "p_author", "p_tag"):
-        await engine.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    await YaraOrm.generate_schemas()
+MODELS = [PfAuthor, PfBook, PfTag]
 
 
 @pytest.mark.asyncio
-async def test_prefetch_reverse_fk(orm):
+async def test_prefetch_reverse_fk(db):
     """
     GIVEN Authors each with several Books
     WHEN Authors are fetched with prefetch_related("books")
     THEN each PfAuthor's books are populated without further queries
     """
-    await _reset()
     a1 = await PfAuthor.create(name="Ada")
     a2 = await PfAuthor.create(name="Bob")
     await PfBook.create(title="A1", author=a1)
@@ -57,13 +51,12 @@ async def test_prefetch_reverse_fk(orm):
 
 
 @pytest.mark.asyncio
-async def test_prefetch_forward_fk(orm):
+async def test_prefetch_forward_fk(db):
     """
     GIVEN Books each linked to an PfAuthor
     WHEN Books are fetched with prefetch_related("author")
     THEN the forward author is cached and awaiting it makes no query
     """
-    await _reset()
     a = await PfAuthor.create(name="Grace")
     await PfBook.create(title="X", author=a)
     await PfBook.create(title="Y", author=a)
@@ -74,13 +67,12 @@ async def test_prefetch_forward_fk(orm):
 
 
 @pytest.mark.asyncio
-async def test_prefetch_with_queryset(orm):
+async def test_prefetch_with_queryset(db):
     """
     GIVEN an PfAuthor with multiple Books
     WHEN prefetching with Prefetch("books", queryset=filtered)
     THEN only the matching related rows are loaded
     """
-    await _reset()
     a = await PfAuthor.create(name="Don")
     await PfBook.create(title="Keep", author=a)
     await PfBook.create(title="Drop", author=a)
@@ -93,13 +85,12 @@ async def test_prefetch_with_queryset(orm):
 
 
 @pytest.mark.asyncio
-async def test_prefetch_m2m(orm):
+async def test_prefetch_m2m(db):
     """
     GIVEN Books tagged via a many-to-many relation
     WHEN Books are fetched with prefetch_related("tags")
     THEN each PfBook's tags are grouped and cached
     """
-    await _reset()
     a = await PfAuthor.create(name="Kay")
     b1 = await PfBook.create(title="One", author=a)
     b2 = await PfBook.create(title="Two", author=a)
@@ -114,13 +105,12 @@ async def test_prefetch_m2m(orm):
 
 
 @pytest.mark.asyncio
-async def test_fetch_related_instance(orm):
+async def test_fetch_related_instance(db):
     """
     GIVEN a single PfBook instance
     WHEN fetch_related("author") is awaited on it
     THEN the forward relation is populated on that instance
     """
-    await _reset()
     a = await PfAuthor.create(name="Lin")
     b = await PfBook.create(title="Solo", author=a)
 

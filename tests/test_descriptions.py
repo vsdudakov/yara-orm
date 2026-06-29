@@ -21,6 +21,7 @@ async def _reset():
     await YaraOrm.generate_schemas()
 
 
+# Postgres-only: SQLite has no COMMENT support nor a way to query object comments.
 @pytest.mark.asyncio
 async def test_table_comment(orm):
     """
@@ -34,6 +35,7 @@ async def test_table_comment(orm):
     assert rows[0][0] == "a fully described table"
 
 
+# Postgres-only: SQLite has no COMMENT support nor a way to query object comments.
 @pytest.mark.asyncio
 async def test_column_comment(orm):
     """

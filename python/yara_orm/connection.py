@@ -154,24 +154,31 @@ class YaraOrm:
         _ROUTER = router
 
     @classmethod
-    async def generate_schemas(cls, safe: bool = True) -> None:
-        """Create each model's tables (on its write connection) and join tables.
+    async def generate_schemas(
+        cls, safe: bool = True, models: list[type[Model]] | None = None
+    ) -> None:
+        """Create model tables (on each write connection) and their join tables.
 
         Args:
             safe: Whether to use ``IF NOT EXISTS``-style safe creation.
+            models: Models to create, in dependency order; defaults to every
+                registered model. Pass a subset to build only those tables (the
+                caller is responsible for ordering them so foreign-key targets
+                come first).
 
         Returns:
             None
         """
         registry.resolve_relations()
-        for model in registry.all_models():
+        targets = list(models) if models is not None else registry.all_models()
+        for model in targets:
             engine = get_executor(model, write=True)
             dialect = get_dialect(model)
             for statement in dialect.create_table_sql(model._meta, safe=safe):
                 await engine.execute(statement)
         # Join tables for many-to-many relations (created once per through name).
         seen = set()
-        for model in registry.all_models():
+        for model in targets:
             for info in model._meta.m2m.values():
                 info.finalize()
                 if info.through in seen:  # pragma: no cover - defensive de-dup

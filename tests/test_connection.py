@@ -25,6 +25,9 @@ class CvPlanet(Model):
         table = "cov_planet"
 
 
+MODELS = [CvStar, CvPlanet]
+
+
 class _Router:
     def db_for_read(self, model):
         return "second" if model.__name__ == "CvPlanet" else "default"
@@ -75,6 +78,7 @@ def test_dialect_registry():
     assert isinstance(get_dialect("mydb"), MyDialect)
 
 
+# SQLite-only: exercises routing across two SQLite files it sets up itself.
 @pytest.mark.asyncio
 async def test_router_directs_models_between_sqlite_files():
     """
@@ -114,7 +118,7 @@ async def test_router_directs_models_between_sqlite_files():
 
 
 @pytest.mark.asyncio
-async def test_set_router_and_transaction_fetch_all(sqlite_db):
+async def test_set_router_and_transaction_fetch_all(db):
     """
     GIVEN an initialised ORM
     WHEN set_router is toggled and a transaction runs manual SQL

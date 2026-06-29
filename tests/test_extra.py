@@ -56,6 +56,9 @@ class CvENoRel(Model):
         table = "cov_e_norel"
 
 
+MODELS = [CvEAuthor, CvETag, CvEBook, CvEUuid, CvENoRel]
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -91,7 +94,7 @@ def test_registry_resolution_and_clear():
 # Relations
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_forward_relation_setattr(sqlite_db):
+async def test_forward_relation_setattr(db):
     """
     GIVEN a forward foreign-key descriptor
     WHEN the attribute is set to None, an instance, and a raw id
@@ -109,7 +112,7 @@ async def test_forward_relation_setattr(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_reverse_manager_all_and_async_for(sqlite_db):
+async def test_reverse_manager_all_and_async_for(db):
     """
     GIVEN an author with books
     WHEN iterating the reverse manager via all() and async for
@@ -124,7 +127,7 @@ async def test_reverse_manager_all_and_async_for(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_aggregation_forward_fk_and_m2m_joins(sqlite_db):
+async def test_aggregation_forward_fk_and_m2m_joins(db):
     """
     GIVEN books linked to authors and tags
     WHEN aggregating over a forward-FK column and an m2m relation
@@ -144,7 +147,7 @@ async def test_aggregation_forward_fk_and_m2m_joins(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_m2m_manager_empty_ops_and_cached_prefetch(sqlite_db):
+async def test_m2m_manager_empty_ops_and_cached_prefetch(db):
     """
     GIVEN an m2m manager
     WHEN add/remove are called with no objects and after prefetch
@@ -162,7 +165,7 @@ async def test_m2m_manager_empty_ops_and_cached_prefetch(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_prefetch_empty_instances(sqlite_db):
+async def test_prefetch_empty_instances(db):
     """
     GIVEN a query that matches no rows
     WHEN prefetch_related is requested
@@ -172,7 +175,7 @@ async def test_prefetch_empty_instances(sqlite_db):
 
 
 @pytest.mark.asyncio
-async def test_uuid_primary_key_on_sqlite(sqlite_db):
+async def test_uuid_primary_key_on_sqlite(db):
     """
     GIVEN a model keyed by a UUID primary key
     WHEN a row is created on SQLite

@@ -2,8 +2,7 @@
 
 import pytest
 
-from yara_orm import Model, Q, YaraOrm, fields
-from yara_orm.connection import get_engine
+from yara_orm import Model, Q, fields
 
 
 class Item(Model):
@@ -14,10 +13,7 @@ class Item(Model):
         table = "f_item"
 
 
-async def _reset():
-    engine = get_engine()
-    await engine.execute("DROP TABLE IF EXISTS f_item CASCADE")
-    await YaraOrm.generate_schemas()
+MODELS = [Item]
 
 
 async def _seed():
@@ -27,52 +23,48 @@ async def _seed():
 
 
 @pytest.mark.asyncio
-async def test_q_or(orm):
+async def test_q_or(db):
     """
     GIVEN several Items
     WHEN filtering with Q(value=1) | Q(name="gamma")
     THEN rows matching either branch are returned
     """
-    await _reset()
     await _seed()
     rows = await Item.filter(Q(value=1) | Q(name="gamma")).order_by("name")
     assert [r.name for r in rows] == ["alpha", "gamma"]
 
 
 @pytest.mark.asyncio
-async def test_q_and_with_kwargs(orm):
+async def test_q_and_with_kwargs(db):
     """
     GIVEN several Items
     WHEN combining a Q with keyword filters (implicit AND)
     THEN only rows satisfying every condition are returned
     """
-    await _reset()
     await _seed()
     rows = await Item.filter(Q(value__gte=1), name__in=["alpha", "beta"]).order_by("name")
     assert [r.name for r in rows] == ["alpha", "beta"]
 
 
 @pytest.mark.asyncio
-async def test_q_negation(orm):
+async def test_q_negation(db):
     """
     GIVEN several Items
     WHEN filtering with ~Q(name="alpha")
     THEN rows not matching the negated branch are returned
     """
-    await _reset()
     await _seed()
     rows = await Item.filter(~Q(name="alpha")).order_by("name")
     assert [r.name for r in rows] == ["beta", "gamma"]
 
 
 @pytest.mark.asyncio
-async def test_q_nested_or_and(orm):
+async def test_q_nested_or_and(db):
     """
     GIVEN several Items
     WHEN filtering with (Q(value=1) | Q(value=3)) & ~Q(name="gamma")
     THEN the nested boolean logic selects the right rows
     """
-    await _reset()
     await _seed()
     rows = await Item.filter((Q(value=1) | Q(value=3)) & ~Q(name="gamma")).order_by("name")
     assert [r.name for r in rows] == ["alpha"]

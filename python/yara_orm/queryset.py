@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from . import registry
 from .connection import get_dialect, get_executor
 from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
+from .expressions import Expression
+from .functions import Function
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -153,6 +155,8 @@ class QuerySet:
         self._annotations: dict = {}
         self._group_by: list[str] = []
         self._prefetch: list = []
+        self._distinct: bool = False
+        self._for_update: bool = False
 
     # -- cloning / chaining ----------------------------------------------
     def _clone(self) -> QuerySet:
@@ -171,6 +175,8 @@ class QuerySet:
         qs._annotations = dict(self._annotations)
         qs._group_by = list(self._group_by)
         qs._prefetch = list(self._prefetch)
+        qs._distinct = self._distinct
+        qs._for_update = self._for_update
         return qs
 
     def filter(self, *args: Q, **kwargs: Any) -> QuerySet:
@@ -295,6 +301,66 @@ class QuerySet:
         qs._offset = int(value)
         return qs
 
+    def distinct(self) -> QuerySet:
+        """Return a new query set that selects only distinct rows.
+
+        Returns:
+            A cloned ``QuerySet`` rendering ``SELECT DISTINCT``.
+        """
+        qs = self._clone()
+        qs._distinct = True
+        return qs
+
+    def select_for_update(self) -> QuerySet:
+        """Return a new query set that locks matched rows (``FOR UPDATE``).
+
+        The lock is emitted on backends that support it (PostgreSQL) and is a
+        no-op on SQLite; it only takes effect inside a transaction.
+
+        Returns:
+            A cloned ``QuerySet`` that locks the selected rows.
+        """
+        qs = self._clone()
+        qs._for_update = True
+        return qs
+
+    def __getitem__(self, item: slice | int) -> QuerySet | Any:
+        """Apply offset/limit via ``qs[start:stop]`` or fetch ``qs[i]``.
+
+        Args:
+            item: A slice (returns a narrowed query set) or an integer index
+                (returns an awaitable resolving to that single row).
+
+        Returns:
+            A cloned ``QuerySet`` for a slice, or an awaitable for an index.
+        """
+        if isinstance(item, slice):
+            if item.step not in (None, 1):
+                raise ValueError("QuerySet slicing does not support a step")
+            if (item.start is not None and item.start < 0) or (
+                item.stop is not None and item.stop < 0
+            ):
+                raise ValueError("negative indexing is not supported")
+            qs = self._clone()
+            start = item.start or 0
+            qs._offset = start or None
+            qs._limit = (item.stop - start) if item.stop is not None else None
+            return qs
+        if isinstance(item, int):
+            if item < 0:
+                raise ValueError("negative indexing is not supported")
+
+            async def _get_index() -> Model:
+                qs = self._clone()
+                qs._offset, qs._limit = item, 1
+                rows = await qs._fetch()
+                if not rows:
+                    raise IndexError("QuerySet index out of range")
+                return rows[0]
+
+            return _get_index()
+        raise TypeError("QuerySet indices must be integers or slices")
+
     # -- WHERE (Q tree) compilation --------------------------------------
     def _qualified(self, dialect: BaseDialect, field: Field) -> str:
         """Build a table-qualified, quoted column reference.
@@ -361,6 +427,13 @@ class QuerySet:
         if sql_op == "ILIKE":
             # ILIKE is PostgreSQL-only; SQLite's LIKE is already case-insensitive.
             sql_op = dialect.ilike
+        if isinstance(value, Expression):
+            # Compare the column against another column expression (e.g. F).
+            expr_params: list[Any] = []
+            expr_sql, idx = value.resolve(
+                lambda n: self._qualified(dialect, meta.get_field(n)), dialect, expr_params, idx
+            )
+            return f"{col} {sql_op} {expr_sql}", expr_params, idx
         placeholder = dialect.placeholder(idx)
         idx += 1
         bound = pattern(value) if pattern is not None else field.to_db(value)
@@ -516,6 +589,28 @@ class QuerySet:
             tail += f" OFFSET {int(self._offset)}"
         return tail
 
+    def _distinct_prefix(self, prefix: str) -> str:
+        """Inject ``DISTINCT`` into a ``SELECT`` prefix when requested.
+
+        Args:
+            prefix: A ``SELECT ... FROM ...`` prefix string.
+
+        Returns:
+            The prefix with ``DISTINCT`` applied, or unchanged when not set.
+        """
+        return prefix.replace("SELECT ", "SELECT DISTINCT ", 1) if self._distinct else prefix
+
+    def _lock_sql(self, dialect: BaseDialect) -> str:
+        """Build the row-locking clause for ``select_for_update``.
+
+        Args:
+            dialect: The active SQL dialect.
+
+        Returns:
+            ``" FOR UPDATE"`` on backends that support it, else an empty string.
+        """
+        return " FOR UPDATE" if self._for_update and dialect.name == "postgres" else ""
+
     # -- aggregation helpers ---------------------------------------------
     def _add_relation_join(
         self,
@@ -581,7 +676,7 @@ class QuerySet:
 
     def _aggregate_expr(
         self,
-        agg: Aggregate,
+        agg: Aggregate | Function,
         dialect: BaseDialect,
         joins: dict[str, str],
     ) -> str:
@@ -596,21 +691,38 @@ class QuerySet:
         Returns:
             The SQL aggregate expression, e.g. ``COUNT(DISTINCT "t"."id")``.
         """
+
+        def resolve(name: str) -> str:
+            return self._resolve_column(name, dialect, joins)
+
+        if isinstance(agg, Function):
+            return agg.render(resolve)
+        distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
+        return f"{agg.function}({distinct}{resolve(agg.field)})"
+
+    def _resolve_column(self, field: str, dialect: BaseDialect, joins: dict[str, str]) -> str:
+        """Resolve a field name to its qualified column, adding joins as needed.
+
+        Args:
+            field: A local column, ``pk``, ``rel__col`` path, or relation name.
+            dialect: The SQL dialect providing identifier quoting.
+            joins: Mapping of join key to join SQL, mutated in place when the
+                field spans a relation.
+
+        Returns:
+            The qualified ``"table"."column"`` reference.
+        """
         q = dialect.quote
         meta = self.model._meta
         table = q(meta.table)
-        distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
-        field = agg.field
         if "__" in field:
             rel, col = field.split("__", 1)
             tmeta = self._add_relation_join(rel, dialect, joins)
-            expr = f"{q(tmeta.table)}.{q(tmeta.get_field(col).db_column)}"
-        elif field in meta.fields or field == "pk":
-            expr = f"{table}.{q(meta.get_field(field).db_column)}"
-        else:
-            tmeta = self._add_relation_join(field, dialect, joins)
-            expr = f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
-        return f"{agg.function}({distinct}{expr})"
+            return f"{q(tmeta.table)}.{q(tmeta.get_field(col).db_column)}"
+        if field in meta.fields or field == "pk":
+            return f"{table}.{q(meta.get_field(field).db_column)}"
+        tmeta = self._add_relation_join(field, dialect, joins)
+        return f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
 
     def _compile_having(
         self,
@@ -655,7 +767,10 @@ class QuerySet:
         meta = self.model._meta
         meta.compile(dialect)
         where, params, _ = self._compile_conditions(dialect)
-        sql = f"{meta.select_prefix}{where}{self._order_sql(dialect)}{self._tail_sql()}"
+        prefix = self._distinct_prefix(meta.select_prefix)
+        sql = (
+            f"{prefix}{where}{self._order_sql(dialect)}{self._tail_sql()}{self._lock_sql(dialect)}"
+        )
         rows = await engine.fetch_rows(sql, params)
         build = self.model._from_db_row
         instances = [build(row) for row in rows]
@@ -734,7 +849,11 @@ class QuerySet:
         cols = ", ".join(dialect.quote(f.db_column) for f in fields)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(meta.table)
-        sql = f"SELECT {cols} FROM {table}{where}{self._order_sql(dialect)}{self._tail_sql()}"
+        distinct = "DISTINCT " if self._distinct else ""
+        sql = (
+            f"SELECT {distinct}{cols} FROM {table}{where}"
+            f"{self._order_sql(dialect)}{self._tail_sql()}"
+        )
         return await engine.fetch_rows(sql, params)
 
     async def _values_grouped(
@@ -862,6 +981,49 @@ class QuerySet:
         rows = await self.limit(1)._fetch()
         return rows[0] if rows else None
 
+    async def last(self) -> Model | None:
+        """Fetch the last matching object under the current ordering.
+
+        With no explicit ``order_by`` the ordering defaults to descending
+        primary key; otherwise the configured ordering is reversed.
+
+        Returns:
+            The last matching model instance, or ``None`` when there are none.
+        """
+        qs = self._clone()
+        if qs._order:
+            qs._order = [(name, not desc) for name, desc in qs._order]
+        else:
+            qs._order = [(self.model._meta.pk_field.model_field_name, True)]
+        rows = await qs.limit(1)._fetch()
+        return rows[0] if rows else None
+
+    async def earliest(self, *fields: str) -> Model | None:
+        """Fetch the first object ordered ascending by ``fields``.
+
+        Args:
+            *fields: Field names to order by; defaults to the primary key.
+
+        Returns:
+            The earliest matching instance, or ``None`` when there are none.
+        """
+        order = fields or (self.model._meta.pk_field.model_field_name,)
+        return await self.order_by(*order).first()
+
+    async def latest(self, *fields: str) -> Model | None:
+        """Fetch the first object ordered descending by ``fields``.
+
+        Args:
+            *fields: Field names to order by descending; defaults to the
+                primary key.
+
+        Returns:
+            The latest matching instance, or ``None`` when there are none.
+        """
+        order = fields or (self.model._meta.pk_field.model_field_name,)
+        flipped = [name[1:] if name.startswith("-") else f"-{name}" for name in order]
+        return await self.order_by(*flipped).first()
+
     async def count(self) -> int:
         """Count the rows matching the current conditions.
 
@@ -923,9 +1085,16 @@ class QuerySet:
                     value = value.pk
             else:
                 field = meta.get_field(name)
-            assignments.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
-            params.append(field.to_db(value))
-            idx += 1
+            if isinstance(value, Expression):
+                # Assign a column expression, e.g. ``update(qty=F("qty") + 1)``.
+                expr_sql, idx = value.resolve(
+                    lambda n: dialect.quote(meta.get_field(n).db_column), dialect, params, idx
+                )
+                assignments.append(f"{dialect.quote(field.db_column)} = {expr_sql}")
+            else:
+                assignments.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
+                params.append(field.to_db(value))
+                idx += 1
         where, where_params, _ = self._compile_conditions(dialect, start=idx)
         params.extend(where_params)
         table = dialect.quote(meta.table)
