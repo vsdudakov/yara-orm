@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from . import registry, signals
+from . import timezone as _tz
 from .connection import get_dialect, get_executor
 from .db_defaults import DatabaseDefault
 from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
@@ -50,7 +50,7 @@ class MetaInfo:
         abstract: bool = False,
         ordering: list[tuple[str, bool]] | None = None,
         unique_together: list[tuple[str, ...]] | None = None,
-        indexes: list[tuple[str, ...]] | None = None,
+        indexes: list[Index] | None = None,
         constraints: list[Any] | None = None,
     ) -> None:
         """Store resolved table metadata and precompute the row-decode plan.
@@ -228,6 +228,80 @@ def _normalize_field_groups(value: Any) -> list[tuple[str, ...]]:
     return [tuple(group) for group in items]
 
 
+class Index:
+    """A secondary index declared in ``Meta.indexes``.
+
+    Beyond a plain column group it can carry an explicit ``name`` and a partial
+    ``condition`` (a raw SQL predicate), rendering ``CREATE INDEX ... WHERE
+    <condition>``. Both PostgreSQL and SQLite support partial indexes.
+
+    Example::
+
+        class Meta:
+            indexes = [Index(fields=["status"], condition="status = 'active'")]
+    """
+
+    def __init__(
+        self,
+        *,
+        fields: list[str],
+        name: str | None = None,
+        condition: str | None = None,
+    ) -> None:
+        """Store the indexed fields and optional name/partial condition.
+
+        Args:
+            fields: Field (or forward-relation) names the index covers.
+            name: Explicit index name; defaults to ``idx_<table>_<fields>``.
+            condition: Optional partial-index predicate (raw SQL); ``None`` for a
+                full index.
+
+        Returns:
+            None
+        """
+        self.fields = list(fields)
+        self.name = name
+        self.condition = condition
+
+    def resolve_name(self, table: str) -> str:
+        """Return this index's name, deriving a default from ``table`` if unset.
+
+        Args:
+            table: The owning table name.
+
+        Returns:
+            The explicit name, or ``idx_<table>_<field1>_<field2>...``.
+        """
+        return self.name or (f"idx_{table}_" + "_".join(self.fields))
+
+
+def _normalize_indexes(value: Any) -> list[Index]:
+    """Normalise ``Meta.indexes`` to a list of :class:`Index` objects.
+
+    Accepts the legacy forms (a single ``("a", "b")`` group or several groups)
+    as well as explicit :class:`Index` instances (which may carry a partial
+    ``condition``), so plain and conditional indexes can be mixed.
+
+    Args:
+        value: The raw ``Meta.indexes`` value, or None.
+
+    Returns:
+        A list of ``Index`` objects (empty when ``value`` is falsy).
+    """
+    if not value:
+        return []
+    if isinstance(value, Index):
+        return [value]
+    items = list(value)
+    # A single group of plain field names, e.g. ``indexes = ("a", "b")``.
+    if items and all(isinstance(i, str) for i in items):
+        return [Index(fields=list(items))]
+    out: list[Index] = []
+    for item in items:
+        out.append(item if isinstance(item, Index) else Index(fields=list(item)))
+    return out
+
+
 class ModelMeta(type):
     """Metaclass that collects fields and installs relation descriptors."""
 
@@ -308,7 +382,7 @@ class ModelMeta(type):
             ordering.append((fname, descending))
 
         unique_together = _normalize_field_groups(getattr(meta_cls, "unique_together", None))
-        indexes = _normalize_field_groups(getattr(meta_cls, "indexes", None))
+        indexes = _normalize_indexes(getattr(meta_cls, "indexes", None))
         constraints = list(getattr(meta_cls, "constraints", None) or ())
 
         relations = {}
@@ -515,7 +589,9 @@ class Model(metaclass=ModelMeta):
         Returns:
             None
         """
-        now = datetime.now(timezone.utc)
+        # Honour ``use_tz``: aware UTC when enabled, naive UTC otherwise, so
+        # auto_now columns match manually-set values and never mix aware/naive.
+        now = _tz.now()
         for name, field in self._meta.fields.items():
             if isinstance(field, DatetimeField):
                 if field.auto_now or (field.auto_now_add and not self._in_db):
@@ -733,7 +809,7 @@ class Model(metaclass=ModelMeta):
             "fk_fields": sorted(meta.relations),
             "m2m_fields": sorted(meta.m2m),
             "unique_together": [list(g) for g in meta.unique_together],
-            "indexes": [list(g) for g in meta.indexes],
+            "indexes": [list(ix.fields) for ix in meta.indexes],
             "ordering": [("-" if desc else "") + n for n, desc in meta.ordering],
         }
 

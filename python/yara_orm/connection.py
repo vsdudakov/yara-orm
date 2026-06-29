@@ -156,6 +156,12 @@ def get_dialect(model: type[Model] | None = None, using: str | None = None) -> B
     Returns:
         The dialect for the resolved connection.
     """
+    # An active transaction pins the connection, so SQL must be rendered for
+    # that connection's dialect — mirroring get_executor, which gives the
+    # transaction precedence over the router and any ``using`` override.
+    tx = _active_tx.get()
+    if tx is not None and tx.dialect is not None:
+        return tx.dialect
     if using is not None:
         return _named_connection(using)[1]
     name = _route(model, False)
@@ -366,16 +372,20 @@ def run_async(coro: Coroutine[Any, Any, Any]) -> None:
 class TransactionWrapper:
     """Adapts a native transaction handle to the executor interface."""
 
-    def __init__(self, tx: Any) -> None:
+    def __init__(self, tx: Any, dialect: BaseDialect | None = None) -> None:
         """Wrap a native transaction handle.
 
         Args:
             tx: The native transaction object to adapt.
+            dialect: The dialect of the connection the transaction runs on, so
+                statements routed to the transaction render for the right SQL.
 
         Returns:
             None
         """
         self._tx = tx
+        #: Dialect of the pinned connection (read by ``get_dialect``).
+        self.dialect = dialect
         #: Monotonic counter producing unique savepoint names for nested blocks.
         self._savepoint_seq = 0
 
@@ -568,7 +578,7 @@ class in_transaction:
         isolation = None
         if self.isolation is not None:
             isolation = _normalize_isolation(self.isolation, dialect.name)
-        self._conn = TransactionWrapper(await engine.begin(isolation))
+        self._conn = TransactionWrapper(await engine.begin(isolation), dialect)
         self._token = _active_tx.set(self._conn)
         return self._conn
 

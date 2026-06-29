@@ -14,6 +14,13 @@ use pyo3::types::{
 use pyo3::Borrowed;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
+use crate::error::EngineError;
+
+/// Build an "out of range" SQL bind error for a narrowing integer cast.
+fn oob(v: i64, sql_type: &str) -> Box<dyn Error + Sync + Send> {
+    format!("integer {v} is out of range for {sql_type} column").into()
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
@@ -235,12 +242,29 @@ impl ToSql for Value {
             Value::Null => Ok(IsNull::Yes),
             Value::Bool(v) => v.to_sql(ty, out),
             Value::Int(v) => match *ty {
-                Type::INT2 => (*v as i16).to_sql(ty, out),
-                Type::INT4 => (*v as i32).to_sql(ty, out),
+                // Range-check narrowing casts: silently wrapping a too-large
+                // integer into a smaller column would corrupt data, so error
+                // instead and let the caller see the out-of-range value.
+                Type::INT2 => i16::try_from(*v)
+                    .map_err(|_| oob(*v, "SMALLINT"))?
+                    .to_sql(ty, out),
+                Type::INT4 => i32::try_from(*v)
+                    .map_err(|_| oob(*v, "INTEGER"))?
+                    .to_sql(ty, out),
+                // When the inferred parameter type is NUMERIC/FLOAT (e.g. the
+                // server inferred it from a numeric expression), encode the
+                // integer in that type rather than mislabelling int8 bytes.
+                Type::NUMERIC => rust_decimal::Decimal::from(*v).to_sql(ty, out),
+                Type::FLOAT4 => (*v as f32).to_sql(ty, out),
+                Type::FLOAT8 => (*v as f64).to_sql(ty, out),
                 _ => v.to_sql(ty, out),
             },
             Value::Float(v) => match *ty {
                 Type::FLOAT4 => (*v as f32).to_sql(ty, out),
+                Type::NUMERIC => match rust_decimal::Decimal::from_f64_retain(*v) {
+                    Some(d) => d.to_sql(ty, out),
+                    None => v.to_sql(ty, out),
+                },
                 _ => v.to_sql(ty, out),
             },
             Value::Text(v) => v.to_sql(ty, out),
@@ -289,12 +313,12 @@ impl<'py> IntoPyObject<'py> for PyRow {
 }
 
 /// Decode a tokio-postgres row into our backend-agnostic representation.
-pub fn decode_pg_row(row: &tokio_postgres::Row) -> Row {
+pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
     let mut out = Row::with_capacity(row.columns().len());
     for (idx, col) in row.columns().iter().enumerate() {
-        out.push((col.name().to_string(), decode_pg_cell(row, idx, col.type_())));
+        out.push((col.name().to_string(), decode_pg_cell(row, idx, col.type_())?));
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -409,22 +433,31 @@ pub fn decode_sqlite(decl: Option<&str>, vr: rusqlite::types::ValueRef) -> Value
 /// Decode a row into positional values only — no column-name allocation and no
 /// per-row dict. The model layer maps positions to fields itself, so this is the
 /// fast path for `SELECT`ing known columns.
-pub fn decode_pg_row_values(row: &tokio_postgres::Row) -> Vec<Value> {
+pub fn decode_pg_row_values(row: &tokio_postgres::Row) -> Result<Vec<Value>, EngineError> {
     let cols = row.columns();
     let mut out = Vec::with_capacity(cols.len());
     for (idx, col) in cols.iter().enumerate() {
-        out.push(decode_pg_cell(row, idx, col.type_()));
+        out.push(decode_pg_cell(row, idx, col.type_())?);
     }
-    out
+    Ok(out)
 }
 
-fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Value {
+fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Value, EngineError> {
     macro_rules! get {
         ($rust:ty, $wrap:expr) => {
+            // A genuine SQL NULL is ``Ok(None)``; a decode failure is a real
+            // error (type mismatch, value out of the Rust type's range) and is
+            // surfaced rather than silently masked as NULL — which would drop
+            // data, e.g. a high-precision NUMERIC beyond rust_decimal's range.
             match row.try_get::<_, Option<$rust>>(idx) {
-                Ok(Some(v)) => $wrap(v),
-                Ok(None) => Value::Null,
-                Err(_) => Value::Null,
+                Ok(Some(v)) => Ok($wrap(v)),
+                Ok(None) => Ok(Value::Null),
+                Err(e) => Err(EngineError::Conversion(format!(
+                    "failed to decode column {} ({}): {}",
+                    idx,
+                    ty.name(),
+                    e
+                ))),
             }
         };
     }
@@ -463,8 +496,17 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Value {
         get!(NaiveDate, Value::Date)
     } else if *ty == Type::TIME {
         get!(NaiveTime, Value::Time)
+    } else if *ty == Type::VOID {
+        // `void` (e.g. the result of pg_sleep) carries no value.
+        Ok(Value::Null)
     } else {
-        // Unknown type: fall back to its text representation when possible.
-        get!(String, Value::Text)
+        // Genuinely unknown type: try its text representation, and if even that
+        // fails we don't understand the type at all, so degrade to NULL rather
+        // than failing the whole query. (Known types above still error on a
+        // decode failure, since there it would mean real data loss.)
+        match row.try_get::<_, Option<String>>(idx) {
+            Ok(Some(v)) => Ok(Value::Text(v)),
+            _ => Ok(Value::Null),
+        }
     }
 }

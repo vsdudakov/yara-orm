@@ -246,6 +246,65 @@ def _derived_indexes(fields: dict[str, Field]) -> list[str]:
     return [c for c, f in fields.items() if f.index and not f.unique and not f.pk]
 
 
+def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
+    """Return the composite indexes a model declares via ``Meta.indexes``.
+
+    Args:
+        meta: The model metadata.
+
+    Returns:
+        A mapping of index name to the ordered db columns it covers. The name
+        matches the one :meth:`create_table_sql` generates, so migration- and
+        ``generate_schemas``-built schemas stay consistent.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for index in meta.indexes:
+        name = index.resolve_name(meta.table)
+        cols = []
+        for n in index.fields:
+            if n in meta.relations:
+                cols.append(meta.get_field(meta.relations[n].source_attr).db_column)
+            else:
+                cols.append(meta.get_field(n).db_column)
+        out[name] = {"columns": cols, "condition": index.condition}
+    return out
+
+
+def _meta_named_constraint_specs(meta: Any) -> list[dict[str, Any]]:
+    """Return the **named** declarative constraints from ``Meta.constraints``.
+
+    Only named constraints are tracked for diffing: ALTER TABLE drops a
+    constraint by name, so an unnamed one (like a bare ``unique_together``,
+    rendered inline) cannot be added/removed by a later migration.
+
+    Args:
+        meta: The model metadata.
+
+    Returns:
+        The list of constraint specs (each with a non-empty ``name``).
+    """
+    specs: list[dict[str, Any]] = []
+    for constraint in meta.constraints:
+        spec = constraint.to_spec()
+        if spec.get("name"):
+            specs.append(spec)
+    return specs
+
+
+def _constraint_from_spec(spec: dict[str, Any]) -> Constraint:
+    """Rebuild a :class:`Constraint` object from its spec mapping.
+
+    Args:
+        spec: A constraint spec (``kind`` plus ``name`` and ``fields``/``check``).
+
+    Returns:
+        The reconstructed ``UniqueConstraint`` or ``CheckConstraint``.
+    """
+    if spec["kind"] == "check":
+        return CheckConstraint(check=spec["check"], name=spec["name"])
+    return UniqueConstraint(fields=list(spec["fields"]), name=spec["name"])
+
+
 def _tspec(tstate: dict[str, Any]) -> dict[str, Any]:
     """Build a full dialect table spec from a table's migration state.
 
@@ -273,6 +332,10 @@ def _tspec(tstate: dict[str, Any]) -> dict[str, Any]:
     spec = {"columns": columns, "pk": pk, "fks": fks, "indexes": list(indexes)}
     if tstate.get("composite_pk"):
         spec["composite_pk"] = tstate["composite_pk"]
+    if tstate.get("composite_indexes"):
+        spec["composite_indexes"] = dict(tstate["composite_indexes"])
+    if tstate.get("constraints"):
+        spec["constraints"] = list(tstate["constraints"])
     return spec
 
 
@@ -290,6 +353,8 @@ def _new_tstate(fields: dict[str, Field], composite_pk: list[str] | None) -> dic
         "fields": dict(fields),
         "composite_pk": composite_pk,
         "indexes": _derived_indexes(fields),
+        "composite_indexes": {},
+        "constraints": [],
     }
 
 
@@ -495,6 +560,8 @@ class CreateModel(Operation):
         table: str,
         fields: dict[str, Field],
         composite_pk: list[str] | None = None,
+        composite_indexes: dict[str, list[str]] | None = None,
+        constraints: list[Constraint] | None = None,
     ) -> None:
         """Store the table name and its field set.
 
@@ -502,6 +569,12 @@ class CreateModel(Operation):
             table: Name of the table to create.
             fields: Mapping of column name to field.
             composite_pk: Column names forming a composite primary key, if any.
+            composite_indexes: ``Meta.indexes`` as a mapping of index name to its
+                ordered columns, rendered inline so the table is created with
+                them (works on SQLite, which cannot ALTER them in afterwards).
+            constraints: ``Meta.constraints`` (named ``UniqueConstraint`` /
+                ``CheckConstraint`` objects), rendered inline in the
+                ``CREATE TABLE``.
 
         Returns:
             None
@@ -509,6 +582,8 @@ class CreateModel(Operation):
         self.table = table
         self.fields = fields
         self.composite_pk = composite_pk
+        self.composite_indexes = composite_indexes or {}
+        self.constraints: list[Constraint] = list(constraints or [])
 
     def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
         """Render the ``CREATE TABLE`` statements.
@@ -520,7 +595,14 @@ class CreateModel(Operation):
         Returns:
             The SQL statements that create the table.
         """
-        spec = _tspec({"fields": self.fields, "composite_pk": self.composite_pk})
+        spec = _tspec(
+            {
+                "fields": self.fields,
+                "composite_pk": self.composite_pk,
+                "composite_indexes": self.composite_indexes,
+                "constraints": [c.to_spec() for c in self.constraints],
+            }
+        )
         return dialect.render_create_table(self.table, spec, safe=self.safe)
 
     def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
@@ -544,7 +626,10 @@ class CreateModel(Operation):
         Returns:
             None
         """
-        state["tables"][self.table] = _new_tstate(self.fields, self.composite_pk)
+        tstate = _new_tstate(self.fields, self.composite_pk)
+        tstate["composite_indexes"] = dict(self.composite_indexes)
+        tstate["constraints"] = [c.to_spec() for c in self.constraints]
+        state["tables"][self.table] = tstate
 
     def revert_state(self, state: dict[str, Any]) -> None:
         """Remove the table from the schema state.
@@ -566,6 +651,11 @@ class CreateModel(Operation):
         args = [repr(self.table), f"fields={_fields_source(self.fields, 8)}"]
         if self.composite_pk:
             args.append(f"composite_pk={self.composite_pk!r}")
+        if self.composite_indexes:
+            args.append(f"composite_indexes={self.composite_indexes!r}")
+        if self.constraints:
+            cons_src = ", ".join(c.to_source() for c in self.constraints)
+            args.append(f"constraints=[{cons_src}]")
         return _call(f"m.{type(self).__name__}", args)
 
 
@@ -1138,6 +1228,185 @@ class RemoveIndexConcurrently(RemoveIndex):
     concurrently = True
 
 
+class AddCompositeIndex(Operation):
+    """Create a multi-column index (from ``Meta.indexes``)."""
+
+    #: Whether the rendered ``CREATE INDEX`` carries an ``IF NOT EXISTS`` guard.
+    safe = False
+
+    def __init__(
+        self, table: str, name: str, columns: list[str], condition: str | None = None
+    ) -> None:
+        """Store the index's table, name, covered columns and partial predicate.
+
+        Args:
+            table: Name of the table to index.
+            name: The index name.
+            columns: The ordered columns the index covers.
+            condition: Optional partial-index predicate (raw SQL ``WHERE``).
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.name = name
+        self.columns = list(columns)
+        self.condition = condition
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the ``CREATE INDEX`` statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that create the index.
+        """
+        return dialect.render_create_composite_index(
+            self.table, self.name, self.columns, safe=self.safe, condition=self.condition
+        )
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the ``DROP INDEX`` statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that drop the index.
+        """
+        return dialect.render_drop_composite_index(self.name)
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Record the composite index in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        idx = state["tables"][self.table].setdefault("composite_indexes", {})
+        idx[self.name] = {"columns": list(self.columns), "condition": self.condition}
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Remove the composite index from the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        state["tables"][self.table].get("composite_indexes", {}).pop(self.name, None)
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        args = [repr(self.table), repr(self.name), repr(self.columns)]
+        if self.condition is not None:
+            args.append(f"condition={self.condition!r}")
+        return _call(f"m.{type(self).__name__}", args)
+
+
+class AddCompositeIndexIfNotExists(AddCompositeIndex):
+    """Idempotent :class:`AddCompositeIndex`: emits an ``IF NOT EXISTS`` guard."""
+
+    safe = True
+
+
+class RemoveCompositeIndex(Operation):
+    """Drop a multi-column index (keeping its definition so it can be reversed)."""
+
+    def __init__(
+        self, table: str, name: str, columns: list[str], condition: str | None = None
+    ) -> None:
+        """Store the index's table, name, covered columns and partial predicate.
+
+        Args:
+            table: Name of the table.
+            name: The index name.
+            columns: The columns the index covered (used to recreate on reverse).
+            condition: Optional partial-index predicate (used to recreate).
+
+        Returns:
+            None
+        """
+        self.table = table
+        self.name = name
+        self.columns = list(columns)
+        self.condition = condition
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the ``DROP INDEX`` statements.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that drop the index.
+        """
+        return dialect.render_drop_composite_index(self.name)
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the statements that recreate the index.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that create the index back.
+        """
+        return dialect.render_create_composite_index(
+            self.table, self.name, self.columns, condition=self.condition
+        )
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Remove the composite index from the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        state["tables"][self.table].get("composite_indexes", {}).pop(self.name, None)
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Restore the composite index in the schema state.
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        idx = state["tables"][self.table].setdefault("composite_indexes", {})
+        idx[self.name] = {"columns": list(self.columns), "condition": self.condition}
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        args = [repr(self.table), repr(self.name), repr(self.columns)]
+        if self.condition is not None:
+            args.append(f"condition={self.condition!r}")
+        return _call("m.RemoveCompositeIndex", args)
+
+
+class RemoveCompositeIndexIfExists(RemoveCompositeIndex):
+    """Idempotent :class:`RemoveCompositeIndex` (drop already guards ``IF EXISTS``)."""
+
+
 # -- rename operations (hand-written) ---------------------------------------
 class RenameModel(Operation):
     """Rename a table."""
@@ -1706,7 +1975,10 @@ def model_state(models: list[type[Model]] | None = None) -> dict[str, Any]:
     for model in models if models is not None else registry.all_models():
         meta = model._meta
         fields = {f.db_column: f for f in meta.field_list}
-        tables[meta.table] = _new_tstate(fields, None)
+        tstate = _new_tstate(fields, None)
+        tstate["composite_indexes"] = _meta_index_specs(meta)
+        tstate["constraints"] = _meta_named_constraint_specs(meta)
+        tables[meta.table] = tstate
 
         for info in meta.m2m.values():
             target = info.finalize()
@@ -1803,34 +2075,156 @@ def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[Operation]:
 
     for table in _topo_order([t for t in new_t if t not in old_t], new_specs):
         ts = new_t[table]
-        ops.append(CreateModelIfNotExists(table, ts["fields"], ts.get("composite_pk")))
+        ops.append(
+            CreateModelIfNotExists(
+                table,
+                ts["fields"],
+                ts.get("composite_pk"),
+                composite_indexes=ts.get("composite_indexes") or None,
+                constraints=[_constraint_from_spec(c) for c in ts.get("constraints", [])] or None,
+            )
+        )
 
     for table in new_t:
         if table not in old_t:
             continue
         old_cols, new_cols = old_specs[table]["columns"], new_specs[table]["columns"]
         old_fields, new_fields = old_t[table]["fields"], new_t[table]["fields"]
+        old_fks, new_fks = old_specs[table]["fks"], new_specs[table]["fks"]
         old_idx = set(old_specs[table]["indexes"])
         new_idx = set(new_specs[table]["indexes"])
+
+        # A column that disappears while an identical one appears is treated as a
+        # rename (RENAME COLUMN), not a destructive drop+add that would lose data.
+        renames = _detect_renames(old_cols, new_cols, old_fks, new_fks)
+        renamed_old = {old_name for old_name, _ in renames}
+        renamed_new = {new_name for _, new_name in renames}
+
         # Order matters: drop indexes before the columns they reference, and add
         # columns before indexing them (SQLite rejects the reverse).
         for col in sorted(old_idx - new_idx):
             ops.append(RemoveIndexIfExists(table, col))
+        for old_name, new_name in renames:
+            ops.append(RenameField(table, old_name, new_name))
         for col in old_cols:
-            if col not in new_cols:
+            if col not in new_cols and col not in renamed_old:
                 ops.append(RemoveFieldIfExists(table, col, old_fields[col]))
         for col in new_cols:
-            if col not in old_cols:
+            if col not in old_cols and col not in renamed_new:
                 ops.append(AddFieldIfNotExists(table, col, new_fields[col]))
-            elif _alterable(old_cols[col], new_cols[col]):
+            elif col in old_cols and _alterable(old_cols[col], new_cols[col]):
                 ops.append(AlterField(table, col, new_fields[col], old_fields[col]))
         for col in sorted(new_idx - old_idx):
             ops.append(AddIndexIfNotExists(table, col))
+
+        # Composite indexes (Meta.indexes) and named constraints (Meta.constraints).
+        ops.extend(_diff_composite_indexes(table, old_t[table], new_t[table]))
+        ops.extend(_diff_constraints(table, old_t[table], new_t[table]))
 
     for table in reversed(_topo_order([t for t in old_t if t not in new_t], old_specs)):
         ts = old_t[table]
         ops.append(DeleteModelIfExists(table, ts["fields"], ts.get("composite_pk")))
 
+    return ops
+
+
+def _detect_renames(
+    old_cols: dict[str, Any],
+    new_cols: dict[str, Any],
+    old_fks: dict[str, Any],
+    new_fks: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Pair dropped columns with added ones that have an identical definition.
+
+    A pair is only formed when the column spec **and** foreign-key spec match
+    exactly, so a column whose type also changed is not mistaken for a rename
+    (it falls back to drop+add). Matching is greedy in sorted order; ambiguous
+    same-spec columns pair arbitrarily, which is harmless since they are
+    interchangeable.
+
+    Args:
+        old_cols: Column specs before the change.
+        new_cols: Column specs after the change.
+        old_fks: Foreign-key specs before the change.
+        new_fks: Foreign-key specs after the change.
+
+    Returns:
+        A list of ``(old_name, new_name)`` rename pairs.
+    """
+    removed = [c for c in old_cols if c not in new_cols]
+    added = [c for c in new_cols if c not in old_cols]
+    pairs: list[tuple[str, str]] = []
+    taken: set[str] = set()
+    for r in sorted(removed):
+        for a in sorted(added):
+            if a in taken:
+                continue
+            if old_cols[r] == new_cols[a] and old_fks.get(r) == new_fks.get(a):
+                pairs.append((r, a))
+                taken.add(a)
+                break
+    return pairs
+
+
+def _diff_composite_indexes(
+    table: str, old_ts: dict[str, Any], new_ts: dict[str, Any]
+) -> list[Operation]:
+    """Diff ``Meta.indexes`` (composite indexes) between two table states.
+
+    Args:
+        table: The table name.
+        old_ts: Previous table state.
+        new_ts: Target table state.
+
+    Returns:
+        The composite-index add/remove operations (a column change for the same
+        index name is emitted as a drop followed by a create).
+    """
+    ops: list[Operation] = []
+    old_ci: dict[str, dict[str, Any]] = old_ts.get("composite_indexes") or {}
+    new_ci: dict[str, dict[str, Any]] = new_ts.get("composite_indexes") or {}
+    for name in sorted(old_ci):
+        if name not in new_ci or old_ci[name] != new_ci[name]:
+            spec = old_ci[name]
+            ops.append(
+                RemoveCompositeIndexIfExists(
+                    table, name, spec["columns"], condition=spec.get("condition")
+                )
+            )
+    for name in sorted(new_ci):
+        if name not in old_ci or old_ci[name] != new_ci[name]:
+            spec = new_ci[name]
+            ops.append(
+                AddCompositeIndexIfNotExists(
+                    table, name, spec["columns"], condition=spec.get("condition")
+                )
+            )
+    return ops
+
+
+def _diff_constraints(
+    table: str, old_ts: dict[str, Any], new_ts: dict[str, Any]
+) -> list[Operation]:
+    """Diff named ``Meta.constraints`` between two table states.
+
+    Args:
+        table: The table name.
+        old_ts: Previous table state.
+        new_ts: Target table state.
+
+    Returns:
+        The constraint add/remove operations (a changed spec for the same name
+        is emitted as a drop followed by an add).
+    """
+    ops: list[Operation] = []
+    old_c = {c["name"]: c for c in (old_ts.get("constraints") or [])}
+    new_c = {c["name"]: c for c in (new_ts.get("constraints") or [])}
+    for name in sorted(old_c):
+        if name not in new_c or old_c[name] != new_c[name]:
+            ops.append(RemoveConstraint(table, _constraint_from_spec(old_c[name])))
+    for name in sorted(new_c):
+        if name not in old_c or old_c[name] != new_c[name]:
+            ops.append(AddConstraint(table, _constraint_from_spec(new_c[name])))
     return ops
 
 

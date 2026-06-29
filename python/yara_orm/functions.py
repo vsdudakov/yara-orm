@@ -15,21 +15,6 @@ from typing import Any, Callable
 ColumnResolver = Callable[[str], str]
 
 
-def _literal(value: Any) -> str:
-    """Render a Python value as an inline SQL literal.
-
-    Args:
-        value: A number or string fallback value.
-
-    Returns:
-        The SQL literal text (single-quoted, with quotes escaped, for strings).
-    """
-    if isinstance(value, str):
-        escaped = value.replace("'", "''")
-        return f"'{escaped}'"
-    return str(value)
-
-
 class Function:
     """Base class for scalar SQL functions over one or more columns."""
 
@@ -43,6 +28,26 @@ class Function:
             The SQL expression text.
         """
         raise NotImplementedError
+
+    def render_params(
+        self, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+    ) -> tuple[str, int]:
+        """Render to SQL, binding any embedded literals as parameters.
+
+        The default delegates to :meth:`render` for functions that bind nothing.
+        Functions carrying a user value (e.g. :class:`Coalesce`) override this to
+        append to ``params`` rather than splice the value into the SQL text.
+
+        Args:
+            resolve: Maps a field name to its qualified SQL column reference.
+            dialect: The active dialect (provides ``placeholder``).
+            params: Bound-parameter list, extended in place.
+            idx: The next available 1-based bind-parameter index.
+
+        Returns:
+            A ``(sql, next_index)`` tuple.
+        """
+        return self.render(resolve), idx
 
 
 class _Unary(Function):
@@ -139,16 +144,22 @@ class Coalesce(Function):
         self.field = field
         self.default = default
 
-    def render(self, resolve: ColumnResolver) -> str:
-        """Render ``COALESCE(column, default)``.
+    def render_params(
+        self, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+    ) -> tuple[str, int]:
+        """Render ``COALESCE(column, ?)``, binding the fallback as a parameter.
 
         Args:
             resolve: Maps a field name to its qualified SQL column reference.
+            dialect: The active dialect (provides ``placeholder``).
+            params: Bound-parameter list, extended in place.
+            idx: The next available 1-based bind-parameter index.
 
         Returns:
-            The SQL expression text.
+            A ``(sql, next_index)`` tuple.
         """
-        return f"COALESCE({resolve(self.field)}, {_literal(self.default)})"
+        params.append(self.default)
+        return f"COALESCE({resolve(self.field)}, {dialect.placeholder(idx)})", idx + 1
 
 
 class Random(Function):

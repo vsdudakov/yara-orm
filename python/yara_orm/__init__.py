@@ -48,7 +48,7 @@ from .expressions import Case, F, RawSQL, Subquery, When
 from .functions import Coalesce, Concat, Length, Lower, Random, Trim, Upper
 from .manager import Manager
 from .migrations import CheckConstraint, MigrationManager, UniqueConstraint
-from .models import Model
+from .models import Index, Model
 from .prefetch import Prefetch
 from .queryset import Q, QuerySet
 from .signals import Signals, post_delete, post_save, pre_delete, pre_save
@@ -65,6 +65,7 @@ __all__ = [
     "YaraOrm",
     "Tortoise",
     "Model",
+    "Index",
     "QuerySet",
     "Q",
     "F",

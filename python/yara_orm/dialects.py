@@ -8,6 +8,7 @@ registering it -- the model and queryset layers never change.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from .db_defaults import DatabaseDefault
@@ -39,6 +40,9 @@ class BaseDialect:
     supports_search = False
     #: Statement prefix that returns a query plan for ``QuerySet.explain``.
     explain_prefix = "EXPLAIN "
+    #: SQL expression used for random ordering (``order_by("?")``). PostgreSQL
+    #: and SQLite both spell it ``RANDOM()``.
+    random_function = "RANDOM()"
     #: Date/time part -> the literal used inside ``EXTRACT(<part> FROM col)``.
     _extract_parts = {
         "year": "YEAR",
@@ -206,7 +210,7 @@ class BaseDialect:
             parts.append(f"DEFAULT ({field.default.to_sql(self)})")
         return " ".join(parts)
 
-    def _group_columns(self, meta: MetaInfo, names: tuple[str, ...]) -> list[str]:
+    def _group_columns(self, meta: MetaInfo, names: Sequence[str]) -> list[str]:
         """Resolve a group of field/relation names to quoted column names.
 
         Args:
@@ -247,11 +251,13 @@ class BaseDialect:
             One ``CREATE INDEX`` statement per group (possibly empty).
         """
         out = []
-        for group in meta.indexes:
-            idx_name = f"idx_{meta.table}_" + "_".join(group)
-            cols = ", ".join(self._group_columns(meta, group))
+        for index in meta.indexes:
+            idx_name = index.resolve_name(meta.table)
+            cols = ", ".join(self._group_columns(meta, index.fields))
+            where = f" WHERE {index.condition}" if index.condition else ""
             out.append(
-                f"CREATE INDEX {ine}{self.quote(idx_name)} ON {self.quote(meta.table)} ({cols})"
+                f"CREATE INDEX {ine}{self.quote(idx_name)} "
+                f"ON {self.quote(meta.table)} ({cols}){where}"
             )
         return out
 
@@ -459,6 +465,12 @@ class BaseDialect:
         out = [f"CREATE TABLE {ine}{self.quote(table)} (\n  {body}\n)"]
         for col in tspec.get("indexes", []):
             out.extend(self.render_create_index(table, col, safe))
+        for name, spec in tspec.get("composite_indexes", {}).items():
+            out.extend(
+                self.render_create_composite_index(
+                    table, name, spec["columns"], safe=safe, condition=spec.get("condition")
+                )
+            )
         return out
 
     def render_drop_table(self, table: str) -> list[str]:
@@ -631,6 +643,43 @@ class BaseDialect:
         """
         conc = "CONCURRENTLY " if concurrently and self.index_concurrently else ""
         return [f"DROP INDEX {conc}IF EXISTS {self.quote(name or f'idx_{table}_{column}')}"]
+
+    def render_create_composite_index(
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        safe: bool = True,
+        condition: str | None = None,
+    ) -> list[str]:
+        """Render a statement creating a multi-column (optionally partial) index.
+
+        Args:
+            table: The table to index.
+            columns: The ordered columns covered by the index.
+            name: The index name.
+            safe: Whether to emit an ``IF NOT EXISTS`` guard.
+            condition: Optional partial-index predicate, rendered as a trailing
+                ``WHERE`` clause; ``None`` for a full index.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        ine = "IF NOT EXISTS " if safe else ""
+        cols = ", ".join(self.quote(c) for c in columns)
+        where = f" WHERE {condition}" if condition else ""
+        return [f"CREATE INDEX {ine}{self.quote(name)} ON {self.quote(table)} ({cols}){where}"]
+
+    def render_drop_composite_index(self, name: str) -> list[str]:
+        """Render a statement dropping a named index.
+
+        Args:
+            name: The index name.
+
+        Returns:
+            The list with the drop-index statement.
+        """
+        return [f"DROP INDEX IF EXISTS {self.quote(name)}"]
 
     # -- rename / constraint rendering -----------------------------------
     def render_rename_table(self, old: str, new: str) -> list[str]:
