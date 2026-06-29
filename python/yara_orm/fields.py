@@ -589,6 +589,7 @@ class ForeignKeyField(Field):
         related_name: str | None = None,
         on_delete: str = OnDelete.CASCADE,
         source_field: str | None = None,
+        db_constraint: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the foreign key relation.
@@ -598,6 +599,9 @@ class ForeignKeyField(Field):
             related_name: Name of the reverse accessor on the target model.
             on_delete: Referential action applied on deletion.
             source_field: Target field referenced; defaults to its primary key.
+            db_constraint: Whether to emit a database ``FOREIGN KEY`` constraint
+                (set ``False`` to keep the column without enforcing referential
+                integrity at the database level).
             **kwargs: Additional options forwarded to :class:`Field`.
 
         Returns:
@@ -608,6 +612,7 @@ class ForeignKeyField(Field):
         self.related_name = related_name
         self.on_delete = on_delete
         self.source_field = source_field
+        self.db_constraint = db_constraint
 
 
 class OneToOneField(ForeignKeyField):

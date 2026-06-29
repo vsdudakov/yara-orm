@@ -38,9 +38,9 @@ from .exceptions import (
     ValidationError,
 )
 from .expressions import Case, F, RawSQL, Subquery, When
-from .functions import Coalesce, Concat, Length, Lower, Trim, Upper
+from .functions import Coalesce, Concat, Length, Lower, Random, Trim, Upper
 from .manager import Manager
-from .migrations import MigrationManager
+from .migrations import CheckConstraint, MigrationManager, UniqueConstraint
 from .models import Model
 from .prefetch import Prefetch
 from .queryset import Q, QuerySet
@@ -84,6 +84,9 @@ __all__ = [
     "Trim",
     "Concat",
     "Coalesce",
+    "Random",
+    "UniqueConstraint",
+    "CheckConstraint",
     "Prefetch",
     "validators",
     "timezone",

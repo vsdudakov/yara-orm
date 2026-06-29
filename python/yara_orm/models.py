@@ -51,6 +51,7 @@ class MetaInfo:
         ordering: list[tuple[str, bool]] | None = None,
         unique_together: list[tuple[str, ...]] | None = None,
         indexes: list[tuple[str, ...]] | None = None,
+        constraints: list[Any] | None = None,
     ) -> None:
         """Store resolved table metadata and precompute the row-decode plan.
 
@@ -68,6 +69,8 @@ class MetaInfo:
             unique_together: Groups of field names forming composite UNIQUE
                 constraints.
             indexes: Groups of field names forming composite indexes.
+            constraints: Declarative table constraints (``UniqueConstraint`` /
+                ``CheckConstraint``) from ``Meta.constraints``.
 
         Returns:
             None
@@ -76,6 +79,9 @@ class MetaInfo:
         self.ordering = ordering or []
         self.unique_together = unique_together or []
         self.indexes = indexes or []
+        #: Declarative table constraints (UniqueConstraint/CheckConstraint)
+        #: from ``Meta.constraints``; emitted by ``generate_schemas``.
+        self.constraints = constraints or []
         #: The model's manager; rebound to the declared/default one by the
         #: metaclass once the class object exists.
         self.manager: Manager = Manager()
@@ -296,6 +302,7 @@ class ModelMeta(type):
 
         unique_together = _normalize_field_groups(getattr(meta_cls, "unique_together", None))
         indexes = _normalize_field_groups(getattr(meta_cls, "indexes", None))
+        constraints = list(getattr(meta_cls, "constraints", None) or ())
 
         relations = {}
         for rel_name, fk in fk_decls.items():
@@ -316,6 +323,7 @@ class ModelMeta(type):
             ordering=ordering,
             unique_together=unique_together,
             indexes=indexes,
+            constraints=constraints,
         )
 
         # Bind the model's manager (a declared ``Meta.manager`` or the default).
@@ -631,6 +639,74 @@ class Model(metaclass=ModelMeta):
         if has_signals:
             await signals.emit_post_delete(cls, self, executor)
 
+    def clone(self, pk: Any = None) -> Model:
+        """Return an unsaved copy of this instance, ready to insert as a new row.
+
+        Copies every loaded field except the primary key, so the next ``save()``
+        inserts a fresh row. Pass ``pk`` to assign an explicit primary key.
+
+        Args:
+            pk: Optional primary key for the clone; left unset (auto-assigned on
+                save) when ``None``.
+
+        Returns:
+            A new, not-yet-persisted instance.
+        """
+        cls = type(self)
+        clone = cls.__new__(cls)
+        d = clone.__dict__
+        d["_in_db"] = False
+        pk_name = self._meta.pk_field.model_field_name
+        for field in self._meta.field_list:
+            name = field.model_field_name
+            if name != pk_name and name in self.__dict__:
+                d[name] = self.__dict__[name]
+        d[pk_name] = pk
+        return clone
+
+    @classmethod
+    def describe(cls) -> dict[str, Any]:
+        """Return a structured description of this model's schema.
+
+        Returns:
+            A mapping of the model name, table, primary key, data fields,
+            relations and ``Meta`` options — handy for introspection and tools.
+        """
+        meta = cls._meta
+
+        def field_desc(field: Field) -> dict[str, Any]:
+            # Only report JSON-friendly scalar defaults; callables/DatabaseDefault
+            # objects are described as None.
+            default = field.default
+            if not isinstance(default, (int, str, bool, float)):
+                default = None
+            return {
+                "name": field.model_field_name,
+                "db_column": field.db_column,
+                "field_type": type(field).__name__,
+                "kind": field.field_kind,
+                "pk": field.pk,
+                "null": field.null,
+                "unique": field.unique,
+                "index": field.index,
+                "default": default,
+                "description": field.description,
+            }
+
+        return {
+            "name": cls.__name__,
+            "table": meta.table,
+            "abstract": meta.abstract,
+            "description": meta.description,
+            "pk_field": meta.pk_field.model_field_name,
+            "data_fields": [field_desc(f) for f in meta.field_list],
+            "fk_fields": sorted(meta.relations),
+            "m2m_fields": sorted(meta.m2m),
+            "unique_together": [list(g) for g in meta.unique_together],
+            "indexes": [list(g) for g in meta.indexes],
+            "ordering": [("-" if desc else "") + n for n, desc in meta.ordering],
+        }
+
     # -- query entry points ----------------------------------------------
     @classmethod
     def all(cls) -> QuerySet:
@@ -702,6 +778,116 @@ class Model(metaclass=ModelMeta):
             A new ``QuerySet`` configured to select the relations.
         """
         return cls._meta.manager.get_queryset().select_related(*relations)
+
+    @classmethod
+    async def first(cls) -> Model | None:
+        """Return the first row (by default ordering), or ``None``.
+
+        Returns:
+            The first matching instance, or ``None`` when the table is empty.
+        """
+        return await cls._meta.manager.get_queryset().first()
+
+    @classmethod
+    async def last(cls) -> Model | None:
+        """Return the last row (by default ordering), or ``None``.
+
+        Returns:
+            The last matching instance, or ``None`` when the table is empty.
+        """
+        return await cls._meta.manager.get_queryset().last()
+
+    @classmethod
+    async def earliest(cls, *fields: str) -> Model | None:
+        """Return the earliest row ordered ascending by ``fields``.
+
+        Args:
+            *fields: Field names to order by; defaults to the primary key.
+
+        Returns:
+            The earliest instance, or ``None`` when there are none.
+        """
+        return await cls._meta.manager.get_queryset().earliest(*fields)
+
+    @classmethod
+    async def latest(cls, *fields: str) -> Model | None:
+        """Return the latest row ordered descending by ``fields``.
+
+        Args:
+            *fields: Field names to order by; defaults to the primary key.
+
+        Returns:
+            The latest instance, or ``None`` when there are none.
+        """
+        return await cls._meta.manager.get_queryset().latest(*fields)
+
+    @classmethod
+    async def exists(cls, **kwargs: Any) -> bool:
+        """Report whether any row matches the given lookups.
+
+        Args:
+            **kwargs: Optional field lookups to test for.
+
+        Returns:
+            ``True`` if at least one matching row exists.
+        """
+        qs = cls._meta.manager.get_queryset()
+        return await (qs.filter(**kwargs) if kwargs else qs).exists()
+
+    @classmethod
+    def distinct(cls) -> QuerySet:
+        """Return a query set selecting only distinct rows.
+
+        Returns:
+            A new ``QuerySet`` rendering ``SELECT DISTINCT``.
+        """
+        return cls._meta.manager.get_queryset().distinct()
+
+    @classmethod
+    def select_for_update(
+        cls,
+        nowait: bool = False,
+        skip_locked: bool = False,
+        of: tuple[str, ...] = (),
+    ) -> QuerySet:
+        """Return a query set that locks matched rows (``FOR UPDATE``).
+
+        Args:
+            nowait: Emit ``NOWAIT`` so a contended lock errors instead of waiting.
+            skip_locked: Emit ``SKIP LOCKED`` to skip already-locked rows.
+            of: Table/relation names to lock (``FOR UPDATE OF ...``).
+
+        Returns:
+            A new ``QuerySet`` locking the selected rows.
+        """
+        return cls._meta.manager.get_queryset().select_for_update(
+            nowait=nowait, skip_locked=skip_locked, of=of
+        )
+
+    @classmethod
+    async def values(cls, *fields: str) -> list[dict[str, Any]]:
+        """Return all rows as dicts of the requested columns.
+
+        Args:
+            *fields: Field names to select; defaults to all model fields.
+
+        Returns:
+            A list of dicts mapping each requested field name to its value.
+        """
+        return await cls._meta.manager.get_queryset().values(*fields)
+
+    @classmethod
+    async def values_list(cls, *fields: str, flat: bool = False) -> list[Any]:
+        """Return all rows as tuples (or scalars when ``flat=True``).
+
+        Args:
+            *fields: Field names to select; defaults to all model fields.
+            flat: When ``True`` return scalar values for a single field.
+
+        Returns:
+            A list of tuples, or a list of scalars when ``flat`` is ``True``.
+        """
+        return await cls._meta.manager.get_queryset().values_list(*fields, flat=flat)
 
     @classmethod
     async def raw(cls, sql: str, params: list[Any] | None = None) -> list[Model]:

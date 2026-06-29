@@ -64,6 +64,7 @@ class Author(Model):
 | `ordering`          | Default `ORDER BY` for queries that set no explicit `order_by`; see below. |
 | `unique_together`   | Composite `UNIQUE` constraint(s) over groups of field names.         |
 | `indexes`           | Composite index(es) over groups of field names.                     |
+| `constraints`       | Declarative `UniqueConstraint` / `CheckConstraint` objects; see below. |
 
 ```python
 class Booking(Model):
@@ -78,6 +79,32 @@ class Booking(Model):
 
 A field name in `unique_together` / `indexes` may be a foreign-key relation
 name; it resolves to that relation's backing column.
+
+### Declarative constraints
+
+`Meta.constraints` takes `UniqueConstraint` / `CheckConstraint` objects, emitted
+in the `CREATE TABLE` by `generate_schemas()`:
+
+```python
+from yara_orm import CheckConstraint, UniqueConstraint
+
+class Account(Model):
+    id = fields.IntField(pk=True)
+    email = fields.CharField(max_length=200)
+    balance = fields.IntField(default=0)
+
+    class Meta:
+        constraints = [
+            UniqueConstraint(fields=["email"], name="uq_account_email"),
+            CheckConstraint(check="balance >= 0", name="ck_account_balance"),
+        ]
+```
+
+### Introspection & helpers
+
+- `Model.describe()` returns a structured dict of the model's schema (table, primary key, fields, relations, `Meta` options) — handy for tooling.
+- `instance.clone()` returns an unsaved copy with no primary key, ready to `save()` as a new row (pass `clone(pk=...)` to set one).
+- All query-set terminals are also model classmethods: `await Book.first()`, `await Book.exists(...)`, `await Book.values_list("title", flat=True)`, etc.
 
 ### Default ordering
 
