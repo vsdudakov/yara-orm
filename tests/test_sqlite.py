@@ -4,6 +4,7 @@ Exercises the second database backend via a temporary SQLite file, proving the
 backend abstraction (one Rust trait + one Python dialect) works end-to-end.
 """
 
+import contextlib
 import os
 import tempfile
 import uuid
@@ -56,7 +57,8 @@ async def sqlite_orm():
     finally:
         await YaraOrm.close()
         for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(path + suffix):
+            # A sidecar may vanish between check and remove (checkpoint on close).
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(path + suffix)
 
 
