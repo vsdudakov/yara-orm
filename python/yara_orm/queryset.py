@@ -155,6 +155,7 @@ class QuerySet:
         self._annotations: dict = {}
         self._group_by: list[str] = []
         self._prefetch: list = []
+        self._select_related: list[str] = []
         self._distinct: bool = False
         self._for_update: bool = False
 
@@ -175,6 +176,7 @@ class QuerySet:
         qs._annotations = dict(self._annotations)
         qs._group_by = list(self._group_by)
         qs._prefetch = list(self._prefetch)
+        qs._select_related = list(self._select_related)
         qs._distinct = self._distinct
         qs._for_update = self._for_update
         return qs
@@ -254,6 +256,24 @@ class QuerySet:
         """
         qs = self._clone()
         qs._prefetch.extend(specs)
+        return qs
+
+    def select_related(self, *relations: str) -> QuerySet:
+        """Return a new query set that eager-loads forward FK/O2O relations.
+
+        Each named relation is joined and hydrated in the same query, so the
+        related instance is available synchronously (``obj.rel.field``) without
+        a follow-up query. Only forward foreign keys and one-to-one relations
+        are supported; use ``prefetch_related`` for reverse and m2m relations.
+
+        Args:
+            *relations: Forward relation names to join and load.
+
+        Returns:
+            A cloned ``QuerySet`` with the relations selected.
+        """
+        qs = self._clone()
+        qs._select_related.extend(relations)
         return qs
 
     def order_by(self, *fields: str) -> QuerySet:
@@ -566,12 +586,16 @@ class QuerySet:
         order = self._order or self.model._meta.ordering
         if not order:
             return ""
+        meta = self.model._meta
+        table = dialect.quote(meta.table)
         parts = []
         for name, descending in order:
             if name in self._annotations:
                 ref = dialect.quote(name)
             else:
-                ref = dialect.quote(self.model._meta.get_field(name).db_column)
+                # Qualify with the base table so ordering stays unambiguous when
+                # select_related joins a table that shares column names.
+                ref = f"{table}.{dialect.quote(meta.get_field(name).db_column)}"
             parts.append(ref + (" DESC" if descending else " ASC"))
         return " ORDER BY " + ", ".join(parts)
 
@@ -789,6 +813,8 @@ class QuerySet:
         """
         if self._annotations:
             return await self._fetch_annotated()
+        if self._select_related:
+            return await self._fetch_select_related()
         dialect = get_dialect(self.model)
         engine = get_executor(self.model)
         meta = self.model._meta
@@ -801,6 +827,69 @@ class QuerySet:
         rows = await engine.fetch_rows(sql, params)
         build = self.model._from_db_row
         instances = [build(row) for row in rows]
+        if self._prefetch:
+            # Deferred: breaks the queryset <-> prefetch import cycle.
+            from .prefetch import prefetch_instances
+
+            await prefetch_instances(instances, self._prefetch)
+        return instances
+
+    async def _fetch_select_related(self) -> list[Model]:
+        """Execute a query that joins and hydrates forward FK/O2O relations.
+
+        Each selected relation is LEFT JOINed (aliased by relation name, so
+        self-joins and repeated targets are unambiguous) and its columns are
+        decoded into a related instance cached under the instance's prefetch
+        slot — making the relation available synchronously.
+
+        Returns:
+            The model instances with each selected relation cached.
+        """
+        dialect = get_dialect(self.model)
+        engine = get_executor(self.model)
+        meta = self.model._meta
+        meta.compile(dialect)
+        q = dialect.quote
+        table = q(meta.table)
+        select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
+        joins: list[str] = []
+        specs: list[tuple[str, Any, int, int]] = []
+        offset = len(meta.field_list)
+        for rel in self._select_related:
+            if rel not in meta.relations:
+                raise FieldError(
+                    f"select_related: {rel!r} is not a forward relation of {self.model.__name__}"
+                )
+            info = meta.relations[rel]
+            target = info.resolve_target()
+            tmeta = target._meta
+            tmeta.compile(dialect)
+            alias = q(rel)
+            fk_col = q(meta.get_field(info.source_attr).db_column)
+            joins.append(
+                f" LEFT JOIN {q(tmeta.table)} AS {alias} "
+                f"ON {table}.{fk_col} = {alias}.{q(tmeta.pk_field.db_column)}"
+            )
+            select.extend(f"{alias}.{q(f.db_column)}" for f in tmeta.field_list)
+            specs.append((rel, target, offset, len(tmeta.field_list)))
+            offset += len(tmeta.field_list)
+        where, params, _ = self._compile_conditions(dialect)
+        sql = (
+            f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
+            f"{self._order_sql(dialect)}{self._tail_sql()}"
+        )
+        rows = await engine.fetch_rows(sql, params)
+        ncols = len(meta.field_list)
+        instances = []
+        for row in rows:
+            obj = self.model._from_db_row(row[:ncols])
+            cache = obj.__dict__.setdefault("_prefetch", {})
+            for rel, target, start, n in specs:
+                chunk = row[start : start + n]
+                cache[rel] = (
+                    target._from_db_row(chunk) if any(v is not None for v in chunk) else None
+                )
+            instances.append(obj)
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
             from .prefetch import prefetch_instances
