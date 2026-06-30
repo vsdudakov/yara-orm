@@ -19,7 +19,7 @@ from .fields import (
 )
 from .manager import Manager
 from .prefetch import prefetch_instances
-from .queryset import QuerySet
+from .queryset import QuerySet, QuerySetSingle
 from .relations import (
     ForwardRelationDescriptor,
     M2MDescriptor,
@@ -89,6 +89,10 @@ class MetaInfo:
         self.app: str | None = None
         self.default_connection: str | None = None
         self.fetch_db_defaults: bool = False
+        #: When ``"store"``, ``Model.__init__`` keeps unknown kwargs as plain
+        #: instance attributes (Tortoise behaviour) instead of raising; left
+        #: ``None`` (the default) yara stays strict and rejects them.
+        self.extra_kwargs: str | None = None
         #: The model's manager; rebound to the declared/default one by the
         #: metaclass once the class object exists.
         self.manager: Manager = Manager()
@@ -138,6 +142,26 @@ class MetaInfo:
             if isinstance(f, DatetimeField) and (f.auto_now or f.auto_now_add)
         ]
         self.validated_fields = [f for f in self.field_list if f.validators]
+
+    @property
+    def db_table(self) -> str:
+        """Tortoise alias for :attr:`table` (the database table name)."""
+        return self.table
+
+    @property
+    def fields_map(self) -> dict[str, Field]:
+        """Tortoise alias exposing all fields (incl. relations) by name."""
+        return {**self.fields, **{name: info.field for name, info in self.relations.items()}}
+
+    @property
+    def db_fields(self) -> set[str]:
+        """Tortoise-compat set of database column names for this model."""
+        return {f.db_column for f in self.field_list}
+
+    @property
+    def fields_db_projection(self) -> dict[str, Field]:
+        """Tortoise-compat mapping of db column name to its field."""
+        return {f.db_column: f for f in self.field_list}
 
     def get_field(self, name: str) -> Field:
         """Return the field for ``name``, treating ``"pk"`` as the primary key.
@@ -360,10 +384,21 @@ class ModelMeta(type):
         fields: dict[str, Field] = {}
         fk_decls: dict[str, ForeignKeyField] = {}
         m2m_decls: dict[str, ManyToManyField] = {}
+        # Relation/m2m declarations inherited from abstract bases. The base's
+        # fields (incl. each FK's ``<name>_id`` column) are merged below, but its
+        # FK/M2M *relations* must be re-collected here: without this a concrete
+        # subclass of an abstract base keeps the column yet loses the relation
+        # accessor, so ``create(rel=...)`` and ``await obj.rel`` break.
+        inherited_fk: dict[str, ForeignKeyField] = {}
+        inherited_m2m: dict[str, ManyToManyField] = {}
         for parent in parents:
             parent_meta: MetaInfo | None = getattr(parent, "_meta", None)
             if parent_meta is not None:
                 fields.update(parent_meta.fields)
+                for rel_name, info in parent_meta.relations.items():
+                    inherited_fk[rel_name] = cast("ForeignKeyField", info.field)
+                for rel_name, m2m_info in parent_meta.m2m.items():
+                    inherited_m2m[rel_name] = cast("ManyToManyField", m2m_info.field)
         for key, value in namespace.items():
             if isinstance(value, ManyToManyField):
                 m2m_decls[key] = value
@@ -421,6 +456,12 @@ class ModelMeta(type):
             relations[rel_name] = RelationInfo(
                 rel_name, fk, fk.model_field_name, fk.reference, fk.is_o2o
             )
+        # Relations inherited from abstract bases (not redeclared on this class).
+        for rel_name, fk in inherited_fk.items():
+            if rel_name not in relations:
+                relations[rel_name] = RelationInfo(
+                    rel_name, fk, fk.model_field_name, fk.reference, fk.is_o2o
+                )
         m2m = {}
 
         cls = cast("type[Model]", super().__new__(mcls, name, bases, namespace))
@@ -446,6 +487,7 @@ class ModelMeta(type):
         cls._meta.app = getattr(meta_cls, "app", None)
         cls._meta.default_connection = getattr(meta_cls, "default_connection", None)
         cls._meta.fetch_db_defaults = bool(getattr(meta_cls, "fetch_db_defaults", False))
+        cls._meta.extra_kwargs = getattr(meta_cls, "extra_kwargs", None)
 
         # Per-model exception subclasses so callers can `except User.DoesNotExist`.
         # They subclass the global exceptions, so `except DoesNotExist` still works.
@@ -466,7 +508,8 @@ class ModelMeta(type):
         # Install forward accessors and m2m managers as class descriptors.
         for rel_name, info in relations.items():
             setattr(cls, rel_name, ForwardRelationDescriptor(info))
-        for rel_name, mm in m2m_decls.items():
+        # Own m2m declarations plus those inherited from abstract bases.
+        for rel_name, mm in {**inherited_m2m, **m2m_decls}.items():
             info = M2MInfo(rel_name, mm, cls, mm.reference)
             m2m[rel_name] = info
             setattr(cls, rel_name, M2MDescriptor(info, pk_field.model_field_name))
@@ -529,7 +572,54 @@ class Model(metaclass=ModelMeta):
                 self.__dict__[info.source_attr] = value
 
         if kwargs:
-            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
+            if meta.extra_kwargs == "store":
+                # Tortoise stored unknown kwargs as plain attributes (factories,
+                # serializers relied on it); opt in via ``Meta.extra_kwargs``.
+                for key, value in kwargs.items():
+                    self.__dict__[key] = value
+            else:
+                raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
+
+    def __await__(self) -> Any:
+        """Make instances awaitable, yielding ``self`` (Tortoise compat).
+
+        Some Tortoise code (and test factories) did ``await Model.create(...)``
+        where ``create`` already returns an instance; awaiting the instance
+        again must be a harmless no-op that returns it.
+
+        Returns:
+            This instance.
+        """
+        yield from ()
+        return self
+
+    def __class_getitem__(cls, _item: Any) -> type:
+        """Make model classes subscriptable for annotations (no-op).
+
+        Args:
+            _item: The (ignored) type argument.
+
+        Returns:
+            The model class itself.
+        """
+        return cls
+
+    @property
+    def _saved_in_db(self) -> bool:
+        """Tortoise alias for :attr:`_in_db` (True once persisted)."""
+        return self._in_db
+
+    @_saved_in_db.setter
+    def _saved_in_db(self, value: bool) -> None:
+        """Set the persisted flag through the Tortoise-named alias.
+
+        Args:
+            value: Whether the instance is considered saved in the database.
+
+        Returns:
+            None
+        """
+        self._in_db = value
 
     async def fetch_related(self, *names: str) -> Model:
         """Populate the named relations on this instance (one query each).
@@ -1160,11 +1250,27 @@ class Model(metaclass=ModelMeta):
         return await engine.fetch_rows(sql, params)
 
     @classmethod
-    async def get(cls, **kwargs: Any) -> Model:
-        """Fetch the single instance matching the lookups.
+    def get(cls, **kwargs: Any) -> QuerySetSingle:
+        """Return a chainable, awaitable single-row result for the lookups.
+
+        ``await Model.get(id=x)`` resolves to the instance (via a fast path);
+        ``await Model.get(id=x).prefetch_related(...)`` chains like Tortoise's
+        ``QuerySetSingle`` and applies the prefetch/select before resolving.
 
         Args:
             **kwargs: Field lookups identifying exactly one row.
+
+        Returns:
+            A ``QuerySetSingle`` resolving to the matching instance.
+        """
+        return QuerySetSingle(cls.filter(**kwargs), fast=lambda: cls._get_one(kwargs))
+
+    @classmethod
+    async def _get_one(cls, kwargs: dict[str, Any]) -> Model:
+        """Fast single-row fetch used when no prefetch/select is chained.
+
+        Args:
+            kwargs: Field lookups identifying exactly one row.
 
         Returns:
             The matching model instance.

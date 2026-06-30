@@ -6,6 +6,65 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Tortoise-migration compatibility
+
+A sweep of compatibility fixes so existing Tortoise ORM projects migrate onto
+yara-orm with far fewer shims (see `MIGRATION_GAPS.md` for the full catalogue and
+the originating evidence).
+
+#### Fixed (correctness)
+
+- **`UUIDField(primary_key=True)` no longer inserts a NULL id.** The `uuid4`
+  default is now applied for the Tortoise `primary_key=` spelling, not only `pk=`.
+- **Foreign-key values coerce to the target primary key's type when bound.**
+  `ForeignKeyField`/`OneToOneField` now convert a `str` (e.g. `str(instance.id)`)
+  to the referenced pk type (e.g. `UUID`) instead of raising a binary-format
+  error; non-string and int-pk values pass through unchanged.
+- **`Meta.unique_together` is emitted by the migration autogenerator.**
+  Previously honored only by `generate_schemas`, so migrations silently dropped
+  the UNIQUE constraint; the two schema paths now agree and round-trip idempotently.
+- **Foreign-key relations declared on an abstract base are inherited by concrete
+  subclasses.** The backing `<name>_id` column was inherited but the relation
+  accessor was lost, so `create(rel=...)` failed and `await obj.rel` broke.
+- **`generate_schemas()` topologically sorts models by foreign-key dependency,**
+  so a referencing table is created after its target regardless of input order.
+- **Database errors on the manual-SQL path surface as `OperationalError`**
+  instead of a bare `RuntimeError`, so `except OperationalError` handlers keep working.
+
+#### Added
+
+- **`JSONField(encoder=..., decoder=...)`** value-transform hooks (applied on
+  write/read) for custom JSON handling such as JS-safe large integers.
+- **Tortoise-compatible manual-SQL methods** on the connection (`connections.get()`
+  / `in_transaction()` connection): `execute_query()` → `(rowcount, rows)`,
+  `execute_query_dict()` → `list[dict]`, `fetch_one()`, and `execute_script()`
+  (runs multi-statement scripts via a dollar-quote/string/comment-aware splitter).
+- **`register_query_hook()` / `clear_query_hooks()`** — opt-in pre-execute query
+  hooks (SQLCommenter/tracing/logging); zero overhead while none are registered.
+- **`YaraOrm.init(config=...)`** accepts a Tortoise-style config dict, plus
+  `YaraOrm.get_connection()` / `close_connections()` lifecycle aliases.
+- **Chainable `Model.get(...)`** returns an awaitable `QuerySetSingle` supporting
+  `.prefetch_related()` / `.select_related()`, while preserving the fast path for
+  plain `await Model.get(...)`. **`QuerySet.all()`** no-op terminator added.
+- **`QuerySet.get_parameterized_sql()`** returns `(sql, params)` for any query
+  (including grouped/annotated `values()`), so callers no longer reach into private
+  internals to wrap a query in `SELECT COUNT(*) FROM (...)`.
+- **Filtered & conditional aggregates** — `Count("x", _filter=Q(...))` renders
+  `... FILTER (WHERE ...)`, and aggregates accept an expression/`Case`
+  (`Sum(Case(...))`). **`QuerySet.using_db()`** accepts a connection object as well
+  as a name.
+- **`Value` literal expression**, **`Q.AND` / `Q.OR`** connector constants, and
+  **relation typing-hint placeholders** (`ForeignKeyRelation`, `ReverseRelation`,
+  `ManyToManyRelation`, …) re-exposed on `yara_orm.fields`.
+- **`Meta.extra_kwargs = "store"`** opt-in to keep unknown `__init__` kwargs as
+  plain attributes (Tortoise behaviour); yara stays strict by default.
+- **Model instances are awaitable** (`await instance` → the instance), and
+  **`_meta` Tortoise aliases** (`db_table`, `fields_map`, `db_fields`,
+  `fields_db_projection`), **`Field.has_db_field`**, bare **`fields.SET_NULL` /
+  `fields.CASCADE` …** constants, subscriptable field/model classes, a
+  `ManyToManyField(through_fields=...)` alias, accepted-and-ignored `blank` /
+  `max_length` field kwargs, and the `_saved_in_db` alias for `_in_db`.
+
 ## [1.1.0] - 2026-06-30
 
 ### Performance

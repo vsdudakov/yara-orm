@@ -153,6 +153,47 @@ class F(Expression):
         return render_column(self.name), idx
 
 
+class Value(Expression):
+    """A literal value usable where an expression is expected (Tortoise compat).
+
+    Tortoise wrapped literals as ``Value(0)`` in ``Case(default=...)`` and ``F``
+    arithmetic. yara already binds bare literals there, but ``Value`` keeps such
+    code importing and working unchanged: it renders as a single bound parameter.
+    """
+
+    def __init__(self, value: Any) -> None:
+        """Store the literal value to bind.
+
+        Args:
+            value: The literal value to bind when rendered.
+
+        Returns:
+            None
+        """
+        self.value = value
+
+    def resolve(
+        self,
+        render_column: ColumnRenderer,
+        dialect: BaseDialect,
+        params: list[Any],
+        idx: int,
+    ) -> tuple[str, int]:
+        """Bind the literal value and render its placeholder.
+
+        Args:
+            render_column: Maps a field name to its column reference (unused).
+            dialect: The active SQL dialect (for placeholders).
+            params: Bound-parameter list, extended in place with the value.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(placeholder_sql, next_index)`` tuple.
+        """
+        params.append(self.value)
+        return dialect.placeholder(idx), idx + 1
+
+
 class CombinedExpression(Expression):
     """An arithmetic combination of two operands (expressions or literals)."""
 

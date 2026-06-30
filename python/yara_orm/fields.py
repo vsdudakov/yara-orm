@@ -34,6 +34,24 @@ class Field:
     #: When True, the engine already returns this field's native Python type, so
     #: the read path can assign DB values directly and skip ``to_python``.
     read_identity: bool = True
+    #: Tortoise-compat flag: every concrete yara field backs a real column, so
+    #: code that branches on ``field.has_db_field`` keeps working.
+    has_db_field: bool = True
+
+    def __class_getitem__(cls, _item: Any) -> type:
+        """Make field classes subscriptable for type annotations (no-op).
+
+        Tortoise allowed annotations like ``JSONField[list[dict] | None]`` that
+        are evaluated at class-definition time; returning the class keeps those
+        annotations valid without affecting runtime behaviour.
+
+        Args:
+            _item: The (ignored) type argument.
+
+        Returns:
+            The field class itself.
+        """
+        return cls
 
     def __init__(
         self,
@@ -50,6 +68,8 @@ class Field:
         db_index: bool | None = None,
         source_field: str | None = None,
         db_default: Any = None,
+        blank: bool | None = None,
+        max_length: int | None = None,
     ) -> None:
         """Initialize the field with its column options.
 
@@ -67,6 +87,11 @@ class Field:
             source_field: Modern alias for ``db_column`` (Tortoise spelling).
             db_default: Modern alias for ``default`` (Tortoise spelling); used
                 only when ``default`` is not given.
+            blank: Tortoise form-validation flag with no DB effect; accepted and
+                ignored so existing ``blank=True`` declarations keep working.
+            max_length: Accepted and ignored on fields that have no length (e.g.
+                ``UUIDField``/``TextField``); Tortoise tolerated it. ``CharField``
+                and ``CharEnumField`` take their own ``max_length`` before this.
 
         Returns:
             None
@@ -456,7 +481,11 @@ class UUIDField(Field):
         Returns:
             None
         """
-        if pk and kwargs.get("default") is None:
+        # Honour the Tortoise ``primary_key=`` spelling too: without this, a
+        # ``UUIDField(primary_key=True)`` would skip the ``uuid4`` default and
+        # insert a NULL id (NOT-NULL violation).
+        is_pk = pk or bool(kwargs.get("primary_key"))
+        if is_pk and kwargs.get("default") is None and kwargs.get("db_default") is None:
             kwargs["default"] = _uuid.uuid4
         super().__init__(pk=pk, **kwargs)
 
@@ -475,9 +504,69 @@ class UUIDField(Field):
 
 
 class JSONField(Field):
-    """A JSON column."""
+    """A JSON column.
+
+    ``encoder``/``decoder`` are optional Python value-transform hooks (Tortoise
+    spelling): ``encoder`` runs on the Python value before it is handed to the
+    engine to serialise, and ``decoder`` runs on the value read back. Unlike
+    Tortoise — where the engine stored whatever string the encoder produced —
+    yara serialises JSON in its engine, so these are value→value transforms
+    (e.g. to make oversized integers JS-safe), not full (de)serialisers.
+    """
 
     field_kind = "json"
+    read_identity = False
+
+    def __init__(
+        self,
+        *,
+        encoder: Any = None,
+        decoder: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the JSON field with optional value-transform hooks.
+
+        Args:
+            encoder: Optional callable applied to the Python value before the
+                engine serialises it.
+            decoder: Optional callable applied to the value read back from the
+                engine.
+            **kwargs: Additional options forwarded to :class:`Field`.
+
+        Returns:
+            None
+        """
+        super().__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        # No transforms → the engine handles JSON natively on both paths.
+        self.read_identity = decoder is None
+
+    def to_db(self, value: Any) -> Any:
+        """Apply the encode hook (if any) before the engine serialises.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            The (optionally transformed) value to bind.
+        """
+        if value is None or self.encoder is None:
+            return value
+        return self.encoder(value)
+
+    def to_python(self, value: Any) -> Any:
+        """Apply the decode hook (if any) to a value read from the engine.
+
+        Args:
+            value: The value returned by the database engine.
+
+        Returns:
+            The (optionally transformed) Python value.
+        """
+        if value is None or self.decoder is None:
+            return value
+        return self.decoder(value)
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +728,50 @@ class ForeignKeyField(Field):
         self.on_delete = on_delete
         self.source_field = source_field
         self.db_constraint = db_constraint
+        #: Cached pk field of the target model, used to coerce bound values.
+        self._target_pk_field: Field | None = None
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a foreign-key value to the target primary key's type.
+
+        The metaclass uses this field as the ``<name>_id`` backing column, so a
+        value assigned as ``str`` (e.g. ``str(instance.id)``, common in Tortoise
+        code) must be coerced to the target pk's Python type (e.g. ``UUID``)
+        before binding, or the engine rejects the binary format. Non-string
+        values and int-pk targets pass through unchanged.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A value suitable for binding, coerced via the target pk field.
+        """
+        if value is None:
+            return None
+        target_pk = self._resolve_target_pk_field()
+        if target_pk is not None:
+            return target_pk.to_db(value)
+        return value
+
+    def _resolve_target_pk_field(self) -> Field | None:
+        """Resolve and cache the referenced model's primary-key field.
+
+        Returns:
+            The target model's pk field, or None if it cannot be resolved yet
+            (e.g. relations are not registered).
+        """
+        if self._target_pk_field is not None:
+            return self._target_pk_field
+        # Lazy import avoids a circular import at module load.
+        from . import registry
+        from .relations import model_name
+
+        try:
+            target = registry.get_model(model_name(self.reference))
+        except KeyError:
+            return None
+        self._target_pk_field = target._meta.pk_field
+        return self._target_pk_field
 
 
 class OneToOneField(ForeignKeyField):
@@ -679,6 +812,7 @@ class ManyToManyField(Field):
         through: str | None = None,
         forward_key: str | None = None,
         backward_key: str | None = None,
+        through_fields: tuple[str, str] | None = None,
         to: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -690,6 +824,8 @@ class ManyToManyField(Field):
             through: Name of the join table; synthesised when omitted.
             forward_key: Join-table column referencing the owning model.
             backward_key: Join-table column referencing the target model.
+            through_fields: Tortoise spelling of ``(forward_key, backward_key)``;
+                used to fill those when they are not given explicitly.
             to: Modern alias for ``reference`` (Tortoise spelling).
             **kwargs: Additional options forwarded to :class:`Field`.
 
@@ -698,6 +834,9 @@ class ManyToManyField(Field):
         """
         if to is not None:
             reference = to
+        if through_fields is not None:
+            forward_key = forward_key or through_fields[0]
+            backward_key = backward_key or through_fields[1]
         if reference is None:
             raise TypeError("ManyToManyField requires a target model (pass reference= or to=)")
         super().__init__(**kwargs)
@@ -708,7 +847,59 @@ class ManyToManyField(Field):
         self.backward_key = backward_key
 
 
+class _RelationHint:
+    """Subscriptable no-op standing in for Tortoise's relation type hints.
+
+    Tortoise annotated relation attributes as ``ForeignKeyRelation[X]`` /
+    ``ReverseRelation[X]`` etc. (evaluated at class-definition time). yara derives
+    accessors from the FK declaration, so these are annotation-only: subscripting
+    returns ``None`` so the annotation is harmless at runtime.
+    """
+
+    def __class_getitem__(cls, _item: Any) -> None:
+        """Return ``None`` for any subscription (annotation-only).
+
+        Args:
+            _item: The (ignored) type argument.
+
+        Returns:
+            None
+        """
+        return None
+
+
+# Tortoise's relation typing generics, re-exposed so existing annotations like
+# ``ForeignKeyNullableRelation[BillingPlan]`` keep importing and evaluating.
+ForeignKeyRelation = _RelationHint
+ForeignKeyNullableRelation = _RelationHint
+OneToOneRelation = _RelationHint
+OneToOneNullableRelation = _RelationHint
+ReverseRelation = _RelationHint
+ManyToManyRelation = _RelationHint
+
+
+# Tortoise exposed the on-delete actions as bare module-level names
+# (``fields.CASCADE`` / ``fields.SET_NULL`` ...). Re-expose them as aliases of
+# the ``OnDelete`` members so existing FK declarations keep working.
+CASCADE = OnDelete.CASCADE
+RESTRICT = OnDelete.RESTRICT
+SET_NULL = OnDelete.SET_NULL
+SET_DEFAULT = OnDelete.SET_DEFAULT
+NO_ACTION = OnDelete.NO_ACTION
+
+
 __all__ = [
+    "CASCADE",
+    "RESTRICT",
+    "SET_NULL",
+    "SET_DEFAULT",
+    "NO_ACTION",
+    "ForeignKeyRelation",
+    "ForeignKeyNullableRelation",
+    "OneToOneRelation",
+    "OneToOneNullableRelation",
+    "ReverseRelation",
+    "ManyToManyRelation",
     "Field",
     "SmallIntField",
     "IntField",

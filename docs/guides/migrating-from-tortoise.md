@@ -21,9 +21,9 @@ isn't mentioned here, the odds are good it works the same way — check the matc
 | --- | --- | --- |
 | Import | `from tortoise import fields, models` | `from yara_orm import fields, Model` |
 | Base class | `class User(models.Model)` | `class User(Model)` |
-| Init | `Tortoise.init(db_url=..., modules=...)` | `YaraOrm.init("postgres://…")` |
-| Create schema | `Tortoise.generate_schemas()` | `YaraOrm.generate_schemas()` |
-| Shut down | `Tortoise.close_connections()` | `YaraOrm.close()` |
+| Init | `Tortoise.init(db_url=..., modules=...)` | `YaraOrm.init("postgres://…")` (or `init(config=...)` with a Tortoise config dict) |
+| Create schema | `Tortoise.generate_schemas()` | `YaraOrm.generate_schemas()` (auto-orders FK dependencies) |
+| Shut down | `Tortoise.close_connections()` | `YaraOrm.close()` (`close_connections()` kept as an alias) |
 | Field lookups | `name__icontains=…` | `name__icontains=…` (identical) |
 | `Q` objects | `from tortoise.expressions import Q` | `from yara_orm import Q` |
 | `F` expressions | `from tortoise.expressions import F` | `from yara_orm import F` |
@@ -210,12 +210,53 @@ and constraint operations.
     live schema before applying further changes, rather than running `generate_schemas()`
     against populated tables.
 
+## 7. Compatibility helpers
+
+A range of Tortoise spellings are accepted directly so large codebases migrate with
+fewer edits:
+
+**Fields & models**
+
+- **`UUIDField(primary_key=True)`** applies the `uuid4` default (same as `pk=True`),
+  and a **foreign key set from a string** id (`obj.parent_id = str(uuid)`) is coerced
+  to the target primary key's type when bound.
+- **`JSONField(encoder=..., decoder=...)`** value-transform hooks (e.g. to keep
+  oversized integers JS-safe).
+- **`ManyToManyField(through_fields=(fwd, bwd))`** is accepted (alias of
+  `forward_key=`/`backward_key=`); bare **`fields.SET_NULL` / `fields.CASCADE` …**
+  on-delete constants exist alongside `fields.OnDelete.*`; **`blank=` / `max_length=`**
+  on length-less fields are accepted and ignored.
+- **Relation type hints** (`ForeignKeyRelation`, `ReverseRelation`,
+  `ManyToManyRelation`, …) are importable from `yara_orm.fields` for annotations.
+- A foreign key declared on an **`abstract = True` base** is inherited by concrete
+  subclasses (relation accessor included).
+- `_meta` exposes the Tortoise aliases **`db_table`**, **`fields_map`**,
+  **`db_fields`**, **`fields_db_projection`**, and fields carry **`has_db_field`**.
+- Opt into Tortoise's lenient constructor with **`Meta.extra_kwargs = "store"`** to
+  keep unknown `__init__` kwargs as attributes (yara is strict by default).
+
+**Querysets & expressions**
+
+- **`Model.get(...)`** is chainable: `await Model.get(id=x).prefetch_related(...)`
+  works, as does a plain `await Model.get(id=x)`. **`QuerySet.all()`** is a no-op
+  terminator. **`Value`** literal expressions and **`Q.AND` / `Q.OR`** constants exist.
+- Aggregates accept an **expression or `Case`** and an optional **`_filter=Q(...)`**
+  (`Count("x", _filter=Q(...))` → `... FILTER (WHERE ...)`). **`QuerySet.using_db()`**
+  accepts a connection name *or* object.
+
+**Manual SQL & lifecycle** — `connections.get()` / the `in_transaction()` connection
+expose **`execute_query()`** (`(rowcount, rows)`), **`execute_query_dict()`**,
+**`fetch_one()`** and **`execute_script()`** (multi-statement). Database errors surface
+as **`OperationalError`**. Register **`register_query_hook(fn)`** for SQLCommenter /
+tracing on every statement. See [Manual SQL](manual-sql.md).
+
 ## What to double-check
 
 - **Dotted relation targets** — rewrite `"models.Author"` to `"Author"`.
-- **The `modules` argument** — drop it; `init()` takes only a URL.
+- **The `modules` argument** — drop it; `init()` takes a URL (or `config=`).
 - **Import paths for `Q`, `F`, `in_transaction`, `atomic`** — all move to `yara_orm`.
-- **`close_connections()` → `close()`** at shutdown.
+- **`order_by("rel__col")` across a relation** is not yet supported — order on a
+  local column or sort in Python.
 - **Signals and manual SQL** — supported; see [Signals](signals.md) and
   [Manual SQL](manual-sql.md) for the exact call shapes if you relied on Tortoise's.
 

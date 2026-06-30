@@ -75,6 +75,10 @@ def _split_lookup(key: str) -> tuple[str, str]:
 class Q:
     """A tree of filter conditions combinable with ``&``, ``|`` and ``~``."""
 
+    #: Tortoise-compat connector constants; ``self.connector`` holds one of these.
+    AND = "AND"
+    OR = "OR"
+
     def __init__(
         self,
         *children: Q,
@@ -177,7 +181,7 @@ class QuerySet:
         self._for_update_of: tuple[str, ...] = ()
         self._only: tuple[str, ...] | None = None
         self._defer: frozenset[str] = frozenset()
-        self._using: str | None = None
+        self._using: str | Any | None = None
 
     # -- cloning / chaining ----------------------------------------------
     def _clone(self) -> QuerySet:
@@ -270,6 +274,18 @@ class QuerySet:
         qs = self._clone()
         qs._group_by.extend(fields)
         return qs
+
+    def all(self) -> QuerySet:
+        """Return a clone of this query set (Tortoise-compat no-op terminator).
+
+        Tortoise code frequently ends a chain with ``.all()`` (e.g.
+        ``qs.filter(...).all()``); yara query sets are already awaitable, so this
+        just returns a clone to keep those chains working unchanged.
+
+        Returns:
+            A cloned ``QuerySet`` equivalent to this one.
+        """
+        return self._clone()
 
     def prefetch_related(self, *specs: Any) -> QuerySet:
         """Return a new query set that prefetches the given relations.
@@ -389,19 +405,33 @@ class QuerySet:
         qs._for_update_of = tuple(of)
         return qs
 
-    def using_db(self, connection_name: str) -> QuerySet:
-        """Return a new query set that executes on a named connection.
+    def using_db(self, connection_name: str | Any) -> QuerySet:
+        """Return a new query set that executes on a given connection.
 
         Args:
-            connection_name: The registered connection to run statements on.
-                An active transaction still takes precedence.
+            connection_name: Either the registered connection name to run
+                statements on, or a connection/executor object (a transaction
+                wrapper or engine proxy) to run them on directly. An active
+                transaction still takes precedence.
 
         Returns:
-            A cloned ``QuerySet`` bound to the named connection.
+            A cloned ``QuerySet`` bound to the connection.
         """
         qs = self._clone()
         qs._using = connection_name
         return qs
+
+    def _using_name(self) -> str | None:
+        """Return the connection name used for dialect resolution.
+
+        A ``using_db`` connection passed as an object has no name to look up, so
+        the dialect falls back to the active transaction or the default
+        connection (the object itself is still used as the executor).
+
+        Returns:
+            The connection name string, or None when none/an object is bound.
+        """
+        return self._using if isinstance(self._using, str) else None
 
     def only(self, *fields: str) -> QuerySet:
         """Return a new query set selecting only the named columns.
@@ -1016,8 +1046,26 @@ class QuerySet:
             return agg.resolve(resolve, dialect, params, idx)
         if isinstance(agg, Function):
             return agg.render_params(resolve, dialect, params, idx)
+        # An aggregate (Count/Sum/...) over a column name, a column expression
+        # (F / arithmetic) or a Case; with an optional FILTER (WHERE ...) Q.
+        inner = agg.field
+        if isinstance(inner, Expression):
+            inner_sql, idx = inner.resolve(resolve, dialect, params, idx)
+        elif hasattr(inner, "as_sql"):
+            inner_sql, idx = inner.as_sql(self, dialect, joins, params, idx)
+        else:
+            inner_sql = resolve(inner)
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
-        return f"{agg.function}({distinct}{resolve(agg.field)})", idx
+        sql = f"{agg.function}({distinct}{inner_sql})"
+        filt = getattr(agg, "filter", None)
+        if filt is not None:
+            # Reuse the WHERE compiler so the filter's Q binds correctly and
+            # shares the surrounding statement's placeholder numbering.
+            fsql, fparams, idx = self._compile_q(filt, dialect, idx)
+            params.extend(fparams)
+            if fsql:
+                sql = f"{sql} FILTER (WHERE {fsql})"
+        return sql, idx
 
     def _resolve_column(self, field: str, dialect: BaseDialect, joins: dict[str, str]) -> str:
         """Resolve a field name to its qualified column, adding joins as needed.
@@ -1182,7 +1230,7 @@ class QuerySet:
             if self._annotations:
                 return await self._fetch_annotated()
             return await self._fetch_select_related()
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         sql, params, sel = self._plain_select_sql(dialect)
         rows = await engine.fetch_rows(sql, params)
@@ -1197,19 +1245,22 @@ class QuerySet:
             await prefetch_instances(instances, self._prefetch)
         return instances
 
-    async def _fetch_select_related(self) -> list[Model]:
-        """Execute a query that joins and hydrates forward FK/O2O relations.
+    def _select_related_plan(
+        self, dialect: BaseDialect
+    ) -> tuple[str, list[Any], list[str], dict[str, dict[str, Any]], int]:
+        """Build the ``select_related`` SELECT and its row-decoding plan.
 
-        Each selected relation is LEFT JOINed (aliased by relation name, so
-        self-joins and repeated targets are unambiguous) and its columns are
-        decoded into a related instance cached under the instance's prefetch
-        slot — making the relation available synchronously.
+        Shared by :meth:`_fetch_select_related` and
+        :meth:`get_parameterized_sql` so both render the identical statement.
+
+        Args:
+            dialect: The SQL dialect providing quoting and placeholders.
 
         Returns:
-            The model instances with each selected relation cached.
+            A ``(sql, params, order, nodes, ncols)`` tuple: the SELECT and its
+            bound params, the relation paths in join order, the per-relation
+            decode nodes and the base model's column count.
         """
-        dialect = get_dialect(self.model, using=self._using)
-        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -1224,7 +1275,14 @@ class QuerySet:
         offset = len(meta.field_list)
 
         def ensure_path(path: str) -> dict[str, Any]:
-            """Add the LEFT JOIN(s) for ``path``, recursing through its parents."""
+            """Add the LEFT JOIN(s) for ``path``, recursing through its parents.
+
+            Args:
+                path: The (possibly nested) forward-relation path to join.
+
+            Returns:
+                The decode node registered for ``path``.
+            """
             nonlocal offset
             if path in nodes:
                 return nodes[path]
@@ -1269,8 +1327,23 @@ class QuerySet:
             f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
             f"{self._order_sql(dialect)}{self._tail_sql()}"
         )
+        return sql, params, order, nodes, len(meta.field_list)
+
+    async def _fetch_select_related(self) -> list[Model]:
+        """Execute a query that joins and hydrates forward FK/O2O relations.
+
+        Each selected relation is LEFT JOINed (aliased by relation name, so
+        self-joins and repeated targets are unambiguous) and its columns are
+        decoded into a related instance cached under the instance's prefetch
+        slot — making the relation available synchronously.
+
+        Returns:
+            The model instances with each selected relation cached.
+        """
+        dialect = get_dialect(self.model, using=self._using_name())
+        engine = get_executor(self.model, using=self._using)
+        sql, params, order, nodes, ncols = self._select_related_plan(dialect)
         rows = await engine.fetch_rows(sql, params)
-        ncols = len(meta.field_list)
         instances = []
         for row in rows:
             obj = self.model._from_db_row(row[:ncols])
@@ -1298,25 +1371,27 @@ class QuerySet:
             await prefetch_instances(instances, self._prefetch)
         return instances
 
-    async def _fetch_annotated(self) -> list[Model]:
-        """Execute an annotated query and attach annotations to instances.
+    def _annotated_select_sql(self, dialect: BaseDialect) -> tuple[str, list[Any]]:
+        """Build the annotated SELECT (grouped by pk) and its bound params.
+
+        Shared by :meth:`_fetch_annotated` and :meth:`get_parameterized_sql` so
+        both render the identical statement.
+
+        Args:
+            dialect: The SQL dialect providing quoting and placeholders.
 
         Returns:
-            A list of model instances with each annotation value set as an
-            attribute, with any requested relations prefetched.
+            A ``(sql, params)`` tuple.
         """
-        dialect = get_dialect(self.model, using=self._using)
-        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
         table = q(meta.table)
         joins: dict = {}
         select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
-        annotation_names = list(self._annotations.keys())
         select_params: list[Any] = []
         idx = 1
-        for name in annotation_names:
+        for name in self._annotations:
             expr, idx = self._aggregate_expr(
                 self._annotations[name], dialect, joins, select_params, idx
             )
@@ -1330,6 +1405,20 @@ class QuerySet:
             f"{''.join(joins.values())}{where}{group}{having}"
             f"{self._order_sql(dialect)}{self._tail_sql()}"
         )
+        return sql, params
+
+    async def _fetch_annotated(self) -> list[Model]:
+        """Execute an annotated query and attach annotations to instances.
+
+        Returns:
+            A list of model instances with each annotation value set as an
+            attribute, with any requested relations prefetched.
+        """
+        dialect = get_dialect(self.model, using=self._using_name())
+        engine = get_executor(self.model, using=self._using)
+        meta = self.model._meta
+        sql, params = self._annotated_select_sql(dialect)
+        annotation_names = list(self._annotations.keys())
         rows = await engine.fetch_rows(sql, params)
         ncols = len(meta.field_list)
         instances = []
@@ -1365,7 +1454,7 @@ class QuerySet:
         Returns:
             The raw database rows for the selected columns.
         """
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
@@ -1380,23 +1469,23 @@ class QuerySet:
         )
         return await engine.fetch_rows(sql, params)
 
-    async def _values_grouped(
-        self,
-        fields: tuple[str, ...],
-        as_dict: bool,
-    ) -> list[Any]:
-        """Execute a grouped/annotated query and return plain rows.
+    def _grouped_select_sql(
+        self, dialect: BaseDialect, fields: tuple[str, ...] = ()
+    ) -> tuple[str, list[Any], list[str]]:
+        """Build the grouped/annotated SELECT, its params and column names.
+
+        Shared by :meth:`_values_grouped` and :meth:`get_parameterized_sql`. An
+        empty ``fields`` selects every group-by column and annotation (the shape
+        a wrapping ``SELECT COUNT(*) FROM (...)`` needs).
 
         Args:
+            dialect: The SQL dialect providing quoting and placeholders.
             fields: Requested field/annotation names, or empty for all.
-            as_dict: When ``True`` return dict rows, otherwise tuple rows.
 
         Returns:
-            A list of dict rows when ``as_dict`` is ``True``, otherwise a list
-            of tuple rows.
+            A ``(sql, params, names)`` tuple; ``names`` are the output column
+            names in select order.
         """
-        dialect = get_dialect(self.model, using=self._using)
-        engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -1436,6 +1525,26 @@ class QuerySet:
             f"{''.join(joins.values())}{where}{group}{having}"
             f"{self._order_sql(dialect)}{self._tail_sql()}"
         )
+        return sql, params, names
+
+    async def _values_grouped(
+        self,
+        fields: tuple[str, ...],
+        as_dict: bool,
+    ) -> list[Any]:
+        """Execute a grouped/annotated query and return plain rows.
+
+        Args:
+            fields: Requested field/annotation names, or empty for all.
+            as_dict: When ``True`` return dict rows, otherwise tuple rows.
+
+        Returns:
+            A list of dict rows when ``as_dict`` is ``True``, otherwise a list
+            of tuple rows.
+        """
+        dialect = get_dialect(self.model, using=self._using_name())
+        engine = get_executor(self.model, using=self._using)
+        sql, params, names = self._grouped_select_sql(dialect, fields)
         rows = await engine.fetch_rows(sql, params)
         if as_dict:
             return [dict(zip(names, row)) for row in rows]
@@ -1574,9 +1683,35 @@ class QuerySet:
         """
         if self._annotations or self._select_related:
             raise UnSupportedError("sql() is not supported with annotate()/select_related()")
-        dialect = get_dialect(self.model, using=self._using)
-        sql, _, _ = self._plain_select_sql(dialect)
+        sql, _ = self.get_parameterized_sql()
         return sql
+
+    def get_parameterized_sql(self) -> tuple[str, list[Any]]:
+        """Return the exact SELECT this query set runs, with its bind params.
+
+        Unlike :meth:`sql` (SQL only, and rejecting annotated queries), this
+        exposes the full ``(sql, params)`` pair for every query shape — plain,
+        ``only()``/``defer()``, ``select_related``, ``annotate`` and grouped
+        ``group_by(...).values(...)`` — built from the same compile path the
+        query set executes. Callers can wrap or inspect it (e.g.
+        ``SELECT COUNT(*) FROM (<sql>) x``) without reaching into private
+        compilers.
+
+        Returns:
+            A ``(sql, params)`` tuple; ``params`` are the bound values in
+            placeholder order.
+        """
+        dialect = get_dialect(self.model, using=self._using_name())
+        if self._group_by:
+            sql, params, _ = self._grouped_select_sql(dialect)
+            return sql, params
+        if self._annotations:
+            return self._annotated_select_sql(dialect)
+        if self._select_related:
+            sql, params, _, _, _ = self._select_related_plan(dialect)
+            return sql, params
+        sql, params, _ = self._plain_select_sql(dialect)
+        return sql, params
 
     async def explain(self) -> str:
         """Return the database's query plan for this query set.
@@ -1589,7 +1724,7 @@ class QuerySet:
         """
         if self._annotations or self._select_related:
             raise UnSupportedError("explain() is not supported with annotate()/select_related()")
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         sql, params, _ = self._plain_select_sql(dialect)
         rows = await engine.fetch_rows(f"{dialect.explain_prefix}{sql}", params)
@@ -1654,7 +1789,7 @@ class QuerySet:
         Returns:
             The number of matching rows.
         """
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
@@ -1667,7 +1802,7 @@ class QuerySet:
         Returns:
             ``True`` if at least one matching row exists.
         """
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
@@ -1680,7 +1815,7 @@ class QuerySet:
         Returns:
             The number of rows deleted.
         """
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, write=True, using=self._using)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
@@ -1696,7 +1831,7 @@ class QuerySet:
         Returns:
             The number of rows updated.
         """
-        dialect = get_dialect(self.model, using=self._using)
+        dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, write=True, using=self._using)
         meta = self.model._meta
         assignments: list[str] = []
@@ -1724,3 +1859,74 @@ class QuerySet:
         table = dialect.quote(meta.table)
         sql = f"UPDATE {table} SET {', '.join(assignments)}{where}"
         return await engine.execute(sql, params)
+
+
+class QuerySetSingle:
+    """Awaitable, chainable single-row result (Tortoise ``QuerySetSingle``).
+
+    Returned by ``Model.get(...)`` so callers can either ``await Model.get(id=x)``
+    or chain ``await Model.get(id=x).prefetch_related(...).select_related(...)``.
+    Awaiting resolves to the single matching instance (raising ``DoesNotExist`` /
+    ``MultipleObjectsReturned`` as usual).
+    """
+
+    def __init__(self, queryset: QuerySet, fast: Any = None) -> None:
+        """Wrap the query set whose single row will be awaited.
+
+        Args:
+            queryset: The query set already narrowed to the target row.
+            fast: Optional zero-arg coroutine factory resolving the row when
+                nothing is chained, preserving ``Model.get``'s fast path; it is
+                dropped once ``prefetch_related``/``select_related`` is applied.
+
+        Returns:
+            None
+        """
+        self._queryset = queryset
+        self._fast = fast
+
+    def prefetch_related(self, *specs: Any) -> QuerySetSingle:
+        """Return a single-row result that also prefetches the given relations.
+
+        Args:
+            *specs: Prefetch specifications describing relations to load.
+
+        Returns:
+            A new ``QuerySetSingle`` carrying the prefetch specs.
+        """
+        return QuerySetSingle(self._queryset.prefetch_related(*specs))
+
+    def select_related(self, *relations: str) -> QuerySetSingle:
+        """Return a single-row result that also eager-loads forward relations.
+
+        Args:
+            *relations: Forward relation names to join and load.
+
+        Returns:
+            A new ``QuerySetSingle`` carrying the selected relations.
+        """
+        return QuerySetSingle(self._queryset.select_related(*relations))
+
+    def using_db(self, connection: Any) -> QuerySetSingle:
+        """Return a single-row result bound to the given connection.
+
+        Args:
+            connection: The connection name (or object) to run the query on.
+
+        Returns:
+            A new ``QuerySetSingle`` bound to the connection.
+        """
+        return QuerySetSingle(self._queryset.using_db(connection))
+
+    def __await__(self) -> Generator[Any, None, Model]:
+        """Resolve to the single matching instance.
+
+        Uses the fast path when nothing is chained; otherwise runs the query set
+        (which applies any prefetch/select).
+
+        Returns:
+            The single matching model instance.
+        """
+        if self._fast is not None:
+            return self._fast().__await__()
+        return self._queryset.get().__await__()

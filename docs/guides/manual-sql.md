@@ -62,6 +62,15 @@ The executor exposes four async methods:
 | `await conn.fetch_all(sql, params)` | All result rows as **dict-like rows** keyed by column name. |
 | `await conn.fetch_rows(sql, params)` | All result rows as **positional rows** (what `Model.raw` consumes internally). |
 | `await conn.fetch_row(sql, params)` | A single row, or `None` when the query matches nothing. |
+| `await conn.fetch_one(sql, params)` | A single **dict** row, or `None` when nothing matches. |
+
+For projects migrating from Tortoise ORM, the executor also accepts Tortoise's
+spellings: `await conn.execute_query(sql, params)` returns a `(rowcount, rows)`
+tuple (rows as dicts), `await conn.execute_query_dict(sql, params)` returns the rows
+as dicts, and `await conn.execute_script(script)` runs a **multi-statement** script
+(it splits on `;`, leaving dollar-quoted `DO $$ … $$` blocks, string literals and
+comments intact). A database error surfaces as `OperationalError` from these methods,
+so existing `except OperationalError` handlers keep working.
 
 ```python
 conn = connections.get("default")
@@ -126,6 +135,28 @@ async with in_transaction():
 ```
 
 See [Transactions](transactions.md) for the full lifecycle and rollback semantics.
+
+## Observing queries with hooks
+
+Register a hook to observe every SQL statement before it runs — useful for query
+logging, tracing, or [SQLCommenter](https://google.github.io/sqlcommenter/)-style
+annotation. Each hook is called as `hook(sql, params)`; the return value is ignored.
+
+```python
+from yara_orm import register_query_hook, clear_query_hooks
+
+statements: list[str] = []
+register_query_hook(lambda sql, params: statements.append(sql))
+
+await Thing.all()                       # model queries fire the hook too
+await connections.get().execute("SELECT 1")
+
+clear_query_hooks()                     # back to zero overhead
+```
+
+While at least one hook is registered, both model and manual statements route through
+a proxy that invokes the hooks; with none registered there is **no overhead** — the
+hot path uses the raw engine.
 
 ## See also
 

@@ -291,6 +291,36 @@ def _meta_named_constraint_specs(meta: Any) -> list[dict[str, Any]]:
     return specs
 
 
+def _meta_unique_together_specs(meta: Any) -> list[dict[str, Any]]:
+    """Return ``UNIQUE`` constraint specs for a model's ``Meta.unique_together``.
+
+    ``generate_schemas`` renders each group as an inline ``UNIQUE (...)`` clause,
+    so the autogenerator must emit a matching constraint or the migrated schema
+    silently loses the uniqueness guarantee. Each group is given a deterministic
+    name (``uniq_<table>_<col>...``) so it routes through the same named-constraint
+    diff machinery as ``Meta.constraints`` -- recorded in table state, diffed by
+    name, and therefore idempotent across re-runs.
+
+    Args:
+        meta: The model metadata.
+
+    Returns:
+        One unique-constraint spec per ``unique_together`` group, each with a
+        generated ``name`` and the group's resolved db columns.
+    """
+    specs: list[dict[str, Any]] = []
+    for group in meta.unique_together:
+        cols = []
+        for n in group:
+            if n in meta.relations:
+                cols.append(meta.get_field(meta.relations[n].source_attr).db_column)
+            else:
+                cols.append(meta.get_field(n).db_column)
+        name = f"uniq_{meta.table}_" + "_".join(cols)
+        specs.append({"kind": "unique", "name": name, "fields": cols})
+    return specs
+
+
 def _constraint_from_spec(spec: dict[str, Any]) -> Constraint:
     """Rebuild a :class:`Constraint` object from its spec mapping.
 
@@ -1978,6 +2008,7 @@ def model_state(models: list[type[Model]] | None = None) -> dict[str, Any]:
         tstate = _new_tstate(fields, None)
         tstate["composite_indexes"] = _meta_index_specs(meta)
         tstate["constraints"] = _meta_named_constraint_specs(meta)
+        tstate["constraints"] += _meta_unique_together_specs(meta)
         tables[meta.table] = tstate
 
         for info in meta.m2m.values():
