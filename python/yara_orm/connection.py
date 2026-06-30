@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections.abc import Coroutine
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from . import _engine, registry
 from . import timezone as _tz
@@ -279,6 +279,33 @@ class _ManualSQLCompat:
         """
         for statement in _split_sql_statements(script):
             await self.execute(statement)
+
+
+@runtime_checkable
+class BaseDBAsyncClient(Protocol):
+    """Structural type for a database executor (Tortoise-compat name).
+
+    Both the pooled-connection proxy and the transaction wrapper satisfy it, so
+    Tortoise-era annotations like ``using_db: BaseDBAsyncClient | None`` keep
+    their meaning. It is the public type for objects returned by
+    ``connections.get()`` / yielded by ``in_transaction()``.
+    """
+
+    async def execute(self, sql: str, params: list[Any] | None = ...) -> Any:
+        """Execute a statement and return the driver result."""
+        ...
+
+    async def fetch_all(self, sql: str, params: list[Any] | None = ...) -> Any:
+        """Fetch rows as dicts."""
+        ...
+
+    async def fetch_row(self, sql: str, params: list[Any] | None = ...) -> Any:
+        """Fetch a single positional row, or None."""
+        ...
+
+    async def execute_query(self, sql: str, params: list[Any] | None = ...) -> Any:
+        """Run a statement and return ``(rowcount, rows)`` (Tortoise shape)."""
+        ...
 
 
 class IsolationLevel:
