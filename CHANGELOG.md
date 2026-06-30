@@ -6,6 +6,30 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-01
+
+### Added
+
+- **Reverse-FK and M2M managers chain like a queryset** — `M2MManager` gains
+  `.all()` / `.filter()` / `.order_by()` (and proxies `.limit()`,
+  `.select_related()`, `.exclude()`, `.values()`, … ), and `RelatedManager`
+  proxies the same queryset methods. So
+  `await portfolio.subscribers.all().select_related("organisation")` and
+  `await portfolio.companies.limit(10).select_related("company")` work.
+
+### Fixed
+
+- **Date/Datetime/Time fields keep the proper Python type on the instance** —
+  `create(created_at="2026-07-01T…")` now leaves a `datetime` (not the raw
+  string) on the object, so `obj.created_at.isoformat()` works after create.
+- **`JSONField` coerces `bytes` (base64) and raises a clear, path-named error**
+  for a leaf with no JSON form, instead of an opaque "value is not JSON
+  serialisable" at bind time.
+- **`exclude(col__in=Subquery(values_list))` is null-safe** — a single-column
+  membership subquery filters NULLs of its column, so a nullable column with
+  NULL rows no longer defeats the exclusion via the `NOT IN (… NULL …)` pitfall
+  (and positive `IN` results are unchanged).
+
 ## [1.5.0] - 2026-07-01
 
 ### Added
