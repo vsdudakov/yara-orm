@@ -411,6 +411,24 @@ class BooleanField(Field):
 # ---------------------------------------------------------------------------
 # Date / time
 # ---------------------------------------------------------------------------
+def _parse_iso_datetime(value: str) -> datetime:
+    """Parse an ISO-8601 string into a :class:`datetime`.
+
+    Accepts a trailing ``Z`` (UTC) by rewriting it to ``+00:00`` so it parses
+    on every supported Python version.
+
+    Args:
+        value: The ISO-8601 timestamp string.
+
+    Returns:
+        The parsed ``datetime``.
+    """
+    text = value.strip()
+    if text and text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
 class DatetimeField(Field):
     """A date-and-time column."""
 
@@ -431,17 +449,76 @@ class DatetimeField(Field):
         self.auto_now = auto_now
         self.auto_now_add = auto_now_add
 
+    def to_db(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string to a ``datetime`` before binding.
+
+        Values often arrive as ISO strings (e.g. from a JSON layer); binding
+        one verbatim would reach the engine as text and the timestamp column
+        would reject it. Non-string values (incl. a bare ``date``, which the
+        database implicitly casts) pass through unchanged.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A ``datetime`` parsed from a string; otherwise ``value`` unchanged.
+        """
+        if isinstance(value, str):
+            return _parse_iso_datetime(value)
+        return value
+
 
 class DateField(Field):
     """A calendar-date column."""
 
     field_kind = "date"
 
+    def to_db(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string (or ``datetime``) to a ``date`` for binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A ``date`` (or ``None``); other types pass through unchanged.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            # A full timestamp string ("2026-07-01T..." / "2026-07-01 ...") is
+            # parsed as a datetime first, then narrowed to its date part.
+            if "T" in text or " " in text:
+                return _parse_iso_datetime(text).date()
+            return date.fromisoformat(text)
+        return value
+
 
 class TimeField(Field):
     """A time-of-day column."""
 
     field_kind = "time"
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string (or ``datetime``) to a ``time`` for binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A ``time`` (or ``None``); other types pass through unchanged.
+        """
+        if value is None or isinstance(value, time):
+            return value
+        if isinstance(value, datetime):
+            return value.timetz()
+        if isinstance(value, str):
+            return time.fromisoformat(value.strip())
+        return value
 
 
 class TimeDeltaField(Field):

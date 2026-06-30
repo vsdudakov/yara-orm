@@ -367,6 +367,30 @@ class Index:
         """
         return self.name or (f"idx_{table}_" + "_".join(self.fields))
 
+    def get_sql(
+        self, model: type[Model], dialect: BaseDialect | None = None, safe: bool = True
+    ) -> str:
+        """Render the ``CREATE INDEX`` statement for this index on ``model``.
+
+        A convenience for introspecting the DDL an index produces. The field
+        names are resolved against ``model``'s columns and the active dialect's
+        rules (PostgreSQL-only options are dropped on SQLite).
+
+        Args:
+            model: The model class the index is declared on.
+            dialect: The dialect to render for; defaults to ``model``'s active
+                connection dialect.
+            safe: Whether to include an ``IF NOT EXISTS`` guard.
+
+        Returns:
+            The ``CREATE INDEX`` statement.
+        """
+        if dialect is None:
+            dialect = get_dialect(model)
+        meta = model._meta
+        meta.compile(dialect)
+        return dialect.render_index(meta, self, safe=safe)
+
 
 def _normalize_indexes(value: Any) -> list[Index]:
     """Normalise ``Meta.indexes`` to a list of :class:`Index` objects.
