@@ -1276,10 +1276,8 @@ class QuerySet:
             A list of model instances, with any requested relations prefetched.
         """
         if self._annotations or self._select_related:
-            if self._only is not None or self._defer:
-                raise FieldError(
-                    "only()/defer() cannot be combined with annotate()/select_related()"
-                )
+            if (self._only is not None or self._defer) and self._annotations:
+                raise FieldError("only()/defer() cannot be combined with annotate()")
             if self._annotations:
                 return await self._fetch_annotated()
             return await self._fetch_select_related()
@@ -1318,14 +1316,18 @@ class QuerySet:
         meta.compile(dialect)
         q = dialect.quote
         table = q(meta.table)
-        select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
+        # The base columns honour only()/defer() (the related tables are still
+        # loaded in full); the JOINs reference the FK columns directly, so
+        # restricting the SELECT does not affect them.
+        base_fields = self._selected_fields()
+        select = [f"{table}.{q(f.db_column)}" for f in base_fields]
         joins: list[str] = []
         # One node per (possibly nested) relation path, in join order. Each
         # records its parent path (None = base), the last segment, target model
         # and the column slice it occupies in the SELECT.
         nodes: dict[str, dict[str, Any]] = {}
         order: list[str] = []
-        offset = len(meta.field_list)
+        offset = len(base_fields)
 
         def ensure_path(path: str) -> dict[str, Any]:
             """Add the LEFT JOIN(s) for ``path``, recursing through its parents.
@@ -1380,7 +1382,7 @@ class QuerySet:
             f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
             f"{self._order_sql(dialect)}{self._tail_sql()}"
         )
-        return sql, params, order, nodes, len(meta.field_list)
+        return sql, params, order, nodes, len(base_fields)
 
     async def _fetch_select_related(self) -> list[Model]:
         """Execute a query that joins and hydrates forward FK/O2O relations.
@@ -1396,10 +1398,15 @@ class QuerySet:
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         sql, params, order, nodes, ncols = self._select_related_plan(dialect)
+        base_sel = self._selected_fields() if (self._only is not None or self._defer) else None
         rows = await engine.fetch_rows(sql, params)
         instances = []
         for row in rows:
-            obj = self.model._from_db_row(row[:ncols])
+            obj = (
+                self.model._from_db_row_fields(row[:ncols], base_sel)
+                if base_sel is not None
+                else self.model._from_db_row(row[:ncols])
+            )
             built: dict[str | None, Any] = {None: obj}
             obj.__dict__.setdefault("_prefetch", {})
             for path in order:
