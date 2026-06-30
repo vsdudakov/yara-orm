@@ -153,6 +153,17 @@ class F(Expression):
         return render_column(self.name), idx
 
 
+class Array(list):  # noqa: FURB189 - a thin marker subclass, not a full list reimpl
+    """A sequence bound as a PostgreSQL array parameter rather than JSON.
+
+    A bare ``list`` binds as a JSON value (so a ``JSONField`` round-trips), so
+    wrap a sequence in ``Array`` to bind it as a real array — e.g.
+    ``await conn.execute_query("... WHERE id = ANY($1)", [Array(ids)])`` or
+    ``Model.filter(...).update(tags=Array([...]))`` against an array column.
+    The engine reads array columns back as plain Python lists.
+    """
+
+
 class Value(Expression):
     """A literal value usable where an expression is expected (compat shim).
 

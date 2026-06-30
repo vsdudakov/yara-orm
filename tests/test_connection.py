@@ -417,3 +417,49 @@ async def test_raw_scalar_params_bind_without_cast(orm):
     assert (await conn.execute_query("SELECT $1 AS v", [code]))[1][0]["v"] == code
     assert (await conn.execute_query("SELECT $1 AS v", [1.5]))[1][0]["v"] == 1.5
     assert (await conn.execute_query("SELECT $1 AS v", [True]))[1][0]["v"] is True
+
+
+@pytest.mark.asyncio
+async def test_array_param_binds_and_round_trips(orm):
+    """
+    GIVEN a sequence wrapped in Array
+    WHEN it is bound as a PostgreSQL array parameter
+    THEN it binds/round-trips as a real array (incl. NULL elements and ANY())
+    """
+    import uuid
+
+    from yara_orm import Array
+
+    conn = connections.get()
+    ids = [uuid.uuid4(), uuid.uuid4()]
+    assert (await conn.execute_query("SELECT $1::uuid[] AS a", [Array(ids)]))[1][0]["a"] == ids
+    assert (await conn.execute_query("SELECT $1::int[] AS a", [Array([1, 2, 3])]))[1][0]["a"] == [
+        1,
+        2,
+        3,
+    ]
+    nulls = (await conn.execute_query("SELECT $1::text[] AS a", [Array(["x", None, "y"])]))[1][0][
+        "a"
+    ]
+    assert nulls == ["x", None, "y"]
+
+    await conn.execute("DROP TABLE IF EXISTS arr_t")
+    await conn.execute("CREATE TABLE arr_t (id int)")
+    await conn.execute("INSERT INTO arr_t VALUES (1), (2), (3)")
+    rows = (
+        await conn.execute_query(
+            "SELECT id FROM arr_t WHERE id = ANY($1) ORDER BY id", [Array([1, 3])]
+        )
+    )[1]
+    assert [r["id"] for r in rows] == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_bare_list_still_binds_as_json(orm):
+    """
+    GIVEN a bare Python list (no Array wrapper)
+    WHEN it is bound
+    THEN it binds as JSON (so JSONField is unaffected by array support)
+    """
+    conn = connections.get()
+    assert (await conn.execute_query("SELECT $1::jsonb AS j", [[1, 2, 3]]))[1][0]["j"] == [1, 2, 3]

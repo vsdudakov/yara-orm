@@ -26,6 +26,13 @@ All notable changes to **yara-orm** are documented here. The format is based on
   `postgresql+asyncpg://`) are normalised to `postgres://`.
 - **Positional access on raw `execute_query`/`fetch_all` rows** (`row[0]` and
   `row["col"]`), mirroring `asyncpg.Record`.
+- **`Array(...)` binds a sequence as a PostgreSQL array** (a bare `list` still
+  binds as JSON, so `JSONField` is unchanged) — e.g.
+  `execute_query("... WHERE id = ANY($1)", [Array(ids)])`. Array columns read
+  back as plain Python lists.
+- **`only()`/`defer()` compose with `select_related()`** — the base row loads
+  just the requested/non-deferred base columns while each selected relation
+  still loads in full.
 
 ### Fixed
 
