@@ -4,7 +4,20 @@ last/earliest/latest, refresh_from_db, update_from_dict, select_for_update)."""
 
 import pytest
 
-from yara_orm import FieldError, Model, Q, fields
+from yara_orm import (
+    BaseDBAsyncClient,
+    Case,
+    Count,
+    F,
+    FieldError,
+    Model,
+    Q,
+    Sum,
+    Value,
+    When,
+    connections,
+    fields,
+)
 
 
 class CvItem(Model):
@@ -25,13 +38,110 @@ class QsWidget(Model):
         table = "qs_widget"
 
 
-MODELS = [CvItem, QsWidget]
+class QsParent(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "qs_parent"
+
+
+class QsChild(Model):
+    id = fields.IntField(pk=True)
+    parent = fields.ForeignKeyField("QsParent", related_name="children")
+
+    class Meta:
+        table = "qs_child"
+
+
+class McAuthor(Model):
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "mc_author"
+
+
+class McBook(Model):
+    title = fields.CharField(max_length=50)
+    rating = fields.IntField()
+    author = fields.ForeignKeyField("McAuthor", related_name="books")
+
+    class Meta:
+        table = "mc_book"
+
+
+class ObCountry(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "ob_country"
+
+
+class ObAuthor(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=20)
+    country = fields.ForeignKeyField("ObCountry", related_name="authors")
+
+    class Meta:
+        table = "ob_author"
+
+
+class ObBook(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=20)
+    author = fields.ForeignKeyField("ObAuthor", related_name="books")
+
+    class Meta:
+        table = "ob_book"
+
+
+MODELS = [
+    CvItem,
+    QsWidget,
+    QsParent,
+    QsChild,
+    McAuthor,
+    McBook,
+    ObCountry,
+    ObAuthor,
+    ObBook,
+]
 
 
 async def _seed():
     await CvItem.create(name="alpha", value=1)
     await CvItem.create(name="Beta", value=2)
     await CvItem.create(name="gamma", value=3)
+
+
+async def _seed_books() -> tuple[McAuthor, McAuthor, McAuthor]:
+    """Create three authors; only the first two have books.
+
+    Returns:
+        The ``(ada, bob, carol)`` authors; Ada has ratings 5/4, Bob 4/2, Carol
+        none.
+    """
+    ada = await McAuthor.create(name="Ada")
+    bob = await McAuthor.create(name="Bob")
+    carol = await McAuthor.create(name="Carol")
+    await McBook.create(title="A1", rating=5, author=ada)
+    await McBook.create(title="A2", rating=4, author=ada)
+    await McBook.create(title="B1", rating=4, author=bob)
+    await McBook.create(title="B2", rating=2, author=bob)
+    return ada, bob, carol
+
+
+async def _param_sql(qs):
+    """Return ``get_parameterized_sql()`` for a query set.
+
+    Args:
+        qs: The query set to compile.
+
+    Returns:
+        The ``(sql, params)`` tuple.
+    """
+    return qs.get_parameterized_sql()
 
 
 @pytest.mark.asyncio
@@ -334,3 +444,211 @@ def test_slicing_errors():
         QsWidget.all()[-2:]
     with pytest.raises(TypeError):
         QsWidget.all()["x"]
+
+
+@pytest.mark.asyncio
+async def test_queryset_all_terminator(db):
+    """
+    GIVEN a built query set
+    WHEN ``.all()`` terminates the chain
+    THEN it returns the rows (no-op clone)
+    """
+    await QsParent.create(name="p")
+    assert len(await QsParent.filter(name="p").all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_single_select_related_and_using_db(db):
+    """
+    GIVEN a chainable ``Model.get(...)``
+    WHEN ``.select_related(...)`` and ``.using_db(...)`` are chained
+    THEN both resolve to the single instance
+    """
+    p = await QsParent.create(name="p")
+    c = await QsChild.create(parent=p)
+
+    via_select = await QsChild.get(id=c.id).select_related("parent")
+    assert via_select.id == c.id
+    via_using = await QsChild.get(id=c.id).using_db("default")
+    assert via_using.id == c.id
+
+
+@pytest.mark.asyncio
+async def test_get_parameterized_sql_annotated(db):
+    """
+    GIVEN an annotated (non-grouped) query
+    WHEN ``get_parameterized_sql()`` is called
+    THEN it returns SQL and params for the annotated SELECT
+    """
+    sql, params = await _param_sql(QsParent.annotate(n=Count("children")))
+    assert "SELECT" in sql
+    # select_related path of get_parameterized_sql.
+    sql2, _ = await _param_sql(QsChild.all().select_related("parent"))
+    assert "SELECT" in sql2
+
+
+@pytest.mark.asyncio
+async def test_aggregate_empty_filter_skips_filter_clause(db):
+    """
+    GIVEN an aggregate with an empty ``_filter=Q()``
+    WHEN the annotated query runs
+    THEN no FILTER clause is emitted and the query succeeds
+    """
+    await QsParent.create(name="p")
+    rows = await QsParent.annotate(n=Count("id", _filter=Q())).group_by("id").values("n")
+    assert rows[0]["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_order_by_middle_segment_not_relation_raises(db):
+    """
+    GIVEN an order_by path whose middle segment is a column, not a relation
+    WHEN the SQL is built
+    THEN a FieldError is raised
+    """
+    with pytest.raises(FieldError):
+        await _param_sql(QsChild.all().order_by("parent__name__nope"))
+
+
+@pytest.mark.asyncio
+async def test_get_parameterized_sql_wraps_grouped_count(db):
+    """
+    GIVEN a grouped, filtered, annotated query set
+    WHEN get_parameterized_sql() feeds a SELECT COUNT(*) FROM (...) wrapper
+    THEN the bound params carry through and the group count comes back
+    """
+    await _seed_books()
+
+    qs = McBook.filter(rating__gte=3).annotate(total=Sum("rating")).group_by("author_id")
+    sql, params = qs.get_parameterized_sql()
+
+    assert params == [3]  # the WHERE bind survived
+    assert "GROUP BY" in sql
+
+    wrapped = f"SELECT COUNT(*) FROM ({sql}) x"
+    _, rows = await connections.get().execute_query(wrapped, params)
+    # Ada (5, 4) and Bob (4) survive rating>=3; Carol has no books -> 2 groups.
+    assert next(iter(rows[0].values())) == 2
+
+
+@pytest.mark.asyncio
+async def test_filtered_aggregate_per_group(db):
+    """
+    GIVEN books grouped per author
+    WHEN a Count carries a _filter=Q(...) restricting which rows it counts
+    THEN each group's filtered count is correct alongside the plain count
+    """
+    if db != "postgres":
+        pytest.skip("FILTER (WHERE ...) is PostgreSQL-only")
+    ada, bob, _ = await _seed_books()
+
+    rows = await (
+        McBook.annotate(
+            total=Count("id"),
+            hi=Count("id", _filter=Q(rating__gte=4)),
+        )
+        .group_by("author_id")
+        .values("author_id", "total", "hi")
+    )
+    by_author = {r["author_id"]: (r["total"], r["hi"]) for r in rows}
+    assert by_author[ada.id] == (2, 2)  # ratings 5, 4 -> both >= 4
+    assert by_author[bob.id] == (2, 1)  # ratings 4, 2 -> one >= 4
+
+
+@pytest.mark.asyncio
+async def test_conditional_aggregate_over_expression(db):
+    """
+    GIVEN books grouped per author
+    WHEN a Sum wraps a Case (and an F arithmetic) expression
+    THEN the aggregate is computed over the rendered expression per group
+    """
+    ada, bob, _ = await _seed_books()
+
+    rows = await (
+        McBook.annotate(
+            weighted=Sum(Case(When(rating__gte=4, then=F("rating")), default=Value(0))),
+            bumped=Sum(F("rating") + 1),
+        )
+        .group_by("author_id")
+        .values("author_id", "weighted", "bumped")
+    )
+    by_author = {r["author_id"]: (r["weighted"], r["bumped"]) for r in rows}
+    # weighted sums rating only when >= 4: Ada 5+4=9; Bob 4+0=4.
+    assert by_author[ada.id][0] == 9
+    assert by_author[bob.id][0] == 4
+    # bumped = sum(rating + 1): Ada (5+1)+(4+1)=11; Bob (4+1)+(2+1)=8.
+    assert by_author[ada.id][1] == 11
+    assert by_author[bob.id][1] == 8
+
+
+@pytest.mark.asyncio
+async def test_using_db_accepts_connection_object(db):
+    """
+    GIVEN a connection object obtained from connections.get()
+    WHEN using_db is handed that object instead of a name
+    THEN the query runs on it and returns the expected rows
+    """
+    await _seed_books()
+
+    conn = connections.get()  # a connection/executor object, not a name
+    assert await McBook.all().using_db(conn).count() == 4
+    titles = {b.title for b in await McBook.all().using_db(conn)}
+    assert titles == {"A1", "A2", "B1", "B2"}
+
+
+@pytest.mark.asyncio
+async def test_order_by_forward_relation_column(db):
+    """
+    GIVEN books whose authors sort differently from the books themselves
+    WHEN ordering by ``author__name`` (a forward-relation column)
+    THEN rows come back ordered by the related column
+    """
+    ada = await ObAuthor.create(name="Ada", country=await ObCountry.create(name="UK"))
+    bob = await ObAuthor.create(name="Bob", country=await ObCountry.create(name="US"))
+    await ObBook.create(title="zeta", author=ada)
+    await ObBook.create(title="alpha", author=bob)
+
+    books = await ObBook.all().order_by("author__name")
+    assert [b.title for b in books] == ["zeta", "alpha"]  # Ada before Bob
+
+    desc = await ObBook.all().order_by("-author__name")
+    assert [b.title for b in desc] == ["alpha", "zeta"]
+
+
+@pytest.mark.asyncio
+async def test_order_by_multi_hop_forward_relation(db):
+    """
+    GIVEN a two-hop forward path book -> author -> country
+    WHEN ordering by ``author__country__name``
+    THEN rows are ordered by the far related column
+    """
+    uk = await ObCountry.create(name="AA")
+    us = await ObCountry.create(name="ZZ")
+    ada = await ObAuthor.create(name="Ada", country=us)
+    bob = await ObAuthor.create(name="Bob", country=uk)
+    await ObBook.create(title="from_ada", author=ada)
+    await ObBook.create(title="from_bob", author=bob)
+
+    books = await ObBook.all().order_by("author__country__name")
+    assert [b.title for b in books] == ["from_bob", "from_ada"]  # AA before ZZ
+
+
+@pytest.mark.asyncio
+async def test_order_by_reverse_relation_rejected(db):
+    """
+    GIVEN a reverse relation (one-to-many)
+    WHEN ordering by it as a relation path
+    THEN a FieldError is raised (no single orderable value)
+    """
+    with pytest.raises(FieldError):
+        await ObAuthor.all().order_by("books__title")
+
+
+@pytest.mark.asyncio
+async def test_connections_get_satisfies_base_db_async_client(orm):
+    """
+    GIVEN the public ``BaseDBAsyncClient`` executor protocol
+    WHEN the active connection is inspected
+    THEN it is a structural instance of the protocol
+    """
+    assert isinstance(connections.get(), BaseDBAsyncClient)

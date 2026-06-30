@@ -894,7 +894,10 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             The fetched row as a dict, or None.
         """
-        return await _run_query(self._tx.fetch_one, sql, params)
+        # The native transaction has no ``fetch_one``; derive it from the dict
+        # rows so the manual-SQL surface matches the pooled connection's.
+        rows = await self.fetch_all(sql, params)
+        return rows[0] if rows else None
 
     async def commit(self) -> None:
         """Commit the underlying transaction.
