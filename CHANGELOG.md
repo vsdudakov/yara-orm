@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-30
+
 ### Tortoise-migration compatibility
 
 A sweep of compatibility fixes so existing Tortoise ORM projects migrate onto
@@ -62,6 +64,9 @@ the originating evidence).
   renders `CREATE [UNIQUE] INDEX ... [USING <method>] (...) [INCLUDE (...)] [WHERE ...]`
   in both `generate_schemas` and migrations (idempotent); SQLite keeps `UNIQUE` /
   partial `WHERE` and omits `USING` / `INCLUDE`.
+- **`application_name` / server settings via the connection URL** — documented and
+  tested: `?application_name=svc&options=-c search_path=myschema` (libpq `options`),
+  alongside the existing `max_size`/`min_size`/`statement_cache_size` pool params.
 - **`Value` literal expression**, **`Q.AND` / `Q.OR`** connector constants, and
   **relation typing-hint placeholders** (`ForeignKeyRelation`, `ReverseRelation`,
   `ManyToManyRelation`, …) re-exposed on `yara_orm.fields`.

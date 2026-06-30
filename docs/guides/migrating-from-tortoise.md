@@ -246,6 +246,11 @@ fewer edits:
 - **`order_by()` traverses a forward relation** — `order_by("author__name")` (and
   multi-hop `order_by("author__country__name")`) sort by the related column.
 
+- **Pool & connection params via the URL** — `application_name` and server
+  settings carry through: `?application_name=svc&options=-c%20search_path%3Dmyschema`
+  (plus `max_size`/`min_size`/`statement_cache_size`), replacing Tortoise's
+  `credentials` `application_name` / `server_settings`.
+
 **Manual SQL & lifecycle** — `connections.get()` / the `in_transaction()` connection
 expose **`execute_query()`** (`(rowcount, rows)`), **`execute_query_dict()`**,
 **`fetch_one()`** and **`execute_script()`** (multi-statement). Database errors surface
