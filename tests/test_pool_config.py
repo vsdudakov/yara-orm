@@ -11,7 +11,7 @@ import tempfile
 
 import pytest
 
-from yara_orm import Model, YaraOrm, fields
+from yara_orm import Model, YaraOrm, connections, fields
 
 
 class PoolRow(Model):
@@ -103,3 +103,31 @@ async def test_invalid_pool_param_value_raises():
     finally:
         await YaraOrm.close()
         _cleanup(path)
+
+
+_PG_URL = os.environ.get("ORM_TEST_DB", "postgres://localhost/orm_demo")
+
+
+@pytest.mark.asyncio
+async def test_application_name_and_server_settings_via_url():
+    """
+    GIVEN a PostgreSQL URL with ?application_name= and a libpq ?options= setting
+    WHEN the ORM connects
+    THEN both take effect on the connection (Tortoise's application_name /
+        server_settings, carried through the URL alongside the pool params)
+    """
+    if not _PG_URL.startswith("postgres"):
+        pytest.skip("application_name / server_settings are PostgreSQL-specific")
+    sep = "&" if "?" in _PG_URL else "?"
+    extra = "application_name=yara_conn_test&options=-c%20search_path%3Dpublic&max_size=4"
+    await YaraOrm.init(f"{_PG_URL}{sep}{extra}")
+    try:
+        conn = connections.get()
+        [row] = await conn.fetch_all(
+            "SELECT application_name FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+        )
+        assert row["application_name"] == "yara_conn_test"
+        [sp] = await conn.fetch_all("SHOW search_path")
+        assert sp["search_path"] == "public"
+    finally:
+        await YaraOrm.close()

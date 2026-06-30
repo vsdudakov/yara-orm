@@ -51,6 +51,22 @@ await YaraOrm.init(
 | `min_size`             | `0`     | Connections pre-warmed at startup (best effort — the pool keeps no hard minimum). |
 | `statement_cache_size` | nonzero | `0` disables per-connection prepared-statement caching.                      |
 
+Standard driver parameters pass straight through to **tokio-postgres**, so
+`application_name` and server settings work via the URL too — handy when migrating
+from Tortoise's `application_name` / `server_settings` credentials:
+
+```python
+await YaraOrm.init(
+    "postgres://user:pass@host/db"
+    "?application_name=my-service"
+    # server_settings via the libpq `options` param (one `-c key=value` each):
+    "&options=-c%20search_path%3Dmyschema%20-c%20timezone%3DUTC"
+)
+```
+
+`application_name` shows up in `pg_stat_activity`; the `options` settings (e.g.
+`search_path`, `timezone`) are applied on every pooled connection.
+
 !!! warning "PgBouncer / transaction pooling"
     The PostgreSQL backend caches prepared statements per connection by default.
     Behind a **transaction-pooling** proxy such as PgBouncer, set
