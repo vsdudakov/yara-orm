@@ -6,6 +6,38 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-01
+
+### Added
+
+- **`only()` / `defer()` accept related-field paths** — `only("contact__properties")`
+  joins the relation and hydrates a *partial* related instance projecting just the
+  named column(s); `defer("contact__properties")` loads the relation with every
+  column but those. Nested paths (`contact__country__code`) work too. Naming only
+  related paths restricts the base model to its primary key.
+- **Scalar functions compose with `F` and nested functions** — `Lower(F("name"))`,
+  `Coalesce(F("at"), now)`, `Coalesce(Lower("a"), "x")` and `Concat(Lower("a"), "b")`
+  now resolve, and `Coalesce`'s fallback accepts an `F`/function as well as a literal.
+- **`Index.get_sql(model, dialect=None, safe=True)`** renders an index's
+  `CREATE INDEX` DDL for introspection (Tortoise parity); the dialect defaults to
+  the model's connection dialect.
+
+### Fixed
+
+- **`DateField` / `DatetimeField` / `TimeField` coerce ISO-8601 string input** to
+  `date`/`datetime`/`time` before binding, instead of binding text to the typed
+  column (PostgreSQL `42804`). A trailing `Z` is accepted.
+- **`Subquery()` accepts a single-column `values_list()` / `values()` projection** —
+  `id__in=Subquery(qs.values_list("col", flat=True))` now renders as a membership
+  subquery instead of raising.
+- **`LIKE` / `ILIKE` lookups on non-text columns cast the column to text** — an
+  `__icontains` / `__startswith` / … against a `uuid` or `JSONField` column emits
+  `CAST(col AS TEXT) LIKE $1` instead of failing with `operator does not exist:
+  uuid ~~* text` / `jsonb ~~ text` (`42883`).
+- **`annotate(...).values()` / `.values_list()` keep the base model columns** — a
+  pure-`annotate` projection with no explicit field list now returns the base
+  fields alongside the annotation (grouped by pk), instead of only the annotation.
+
 ## [1.4.0] - 2026-06-30
 
 ### Removed
