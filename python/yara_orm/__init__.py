@@ -19,8 +19,10 @@ from .connection import (
     IsolationLevel,
     Tortoise,
     YaraOrm,
+    clear_query_hooks,
     connections,
     in_transaction,
+    register_query_hook,
     run_async,
 )
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
@@ -44,7 +46,7 @@ from .exceptions import (
     UnSupportedError,
     ValidationError,
 )
-from .expressions import Case, F, RawSQL, Subquery, When
+from .expressions import Case, F, RawSQL, Subquery, Value, When
 from .functions import Coalesce, Concat, Length, Lower, Random, Trim, Upper
 from .manager import Manager
 from .migrations import CheckConstraint, MigrationManager, UniqueConstraint
@@ -73,6 +75,7 @@ __all__ = [
     "When",
     "RawSQL",
     "Subquery",
+    "Value",
     "Now",
     "RandomHex",
     "SqlDefault",
@@ -100,6 +103,8 @@ __all__ = [
     "timezone",
     "connections",
     "in_transaction",
+    "register_query_hook",
+    "clear_query_hooks",
     "atomic",
     "run_async",
     "IsolationLevel",

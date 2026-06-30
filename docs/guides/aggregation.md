@@ -44,11 +44,12 @@ from yara_orm import Count, Sum, Avg, Min, Max
 Every aggregate shares the same constructor:
 
 ```python
-Aggregate(field, distinct=False)
+Aggregate(field, distinct=False, _filter=None)
 ```
 
-- `field` — the name of a column (e.g. `"rating"`) or a relation (e.g. `"books"`, a reverse foreign key). When the target is a relation, the query compiler adds the necessary `JOIN` for you.
+- `field` — the name of a column (e.g. `"rating"`) or a relation (e.g. `"books"`, a reverse foreign key). When the target is a relation, the query compiler adds the necessary `JOIN` for you. It may also be a **column expression** (`F(...)` / arithmetic) or a `Case`, rendered inline (see below).
 - `distinct` — when `True`, the aggregate counts/aggregates distinct values only, compiling to `COUNT(DISTINCT ...)`.
+- `_filter` — an optional `Q` restricting which rows feed the aggregate, compiling to `... FILTER (WHERE ...)` (see [Filtered aggregates](#filtered-and-conditional-aggregates)).
 
 ```python
 # Count the distinct books linked to each author
@@ -195,6 +196,36 @@ graded = Book.annotate(
 
 # A `then` (or default) can be an F column reference, not just a literal
 bonus = Book.annotate(bonus=Case(When(rating__gte=4, then=F("rating")), default=0))
+```
+
+## Filtered and conditional aggregates
+
+Aggregates accept an optional `_filter=Q(...)` that restricts which rows feed them,
+compiling to PostgreSQL's `FILTER (WHERE ...)`. This is the clean way to count or sum
+a subset per group without a separate query:
+
+```python
+from yara_orm import Count, Sum, Q
+
+# Per author: total books, and how many are highly rated — in one pass
+report = (
+    await Author.annotate(
+        total=Count("books"),
+        top=Count("books", _filter=Q(books__rating__gte=4)),
+    )
+    .group_by("id")
+    .values("name", "total", "top")
+)
+```
+
+An aggregate can also wrap an **expression** instead of a bare column — for example a
+`Case`, so a conditional value is summed per group:
+
+```python
+from yara_orm import Case, When, Value
+
+# Sum 1 for each highly-rated book, 0 otherwise
+Book.annotate(high=Sum(Case(When(rating__gte=4, then=1), default=Value(0))))
 ```
 
 ## Raw SQL annotations
