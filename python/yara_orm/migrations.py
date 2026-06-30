@@ -252,6 +252,7 @@ def _index_spec(
     unique: bool,
     using: str | None,
     include: list[str] | None,
+    opclass: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical composite-index state spec.
 
@@ -264,6 +265,7 @@ def _index_spec(
         unique: Whether the index enforces uniqueness.
         using: Optional access method, or None.
         include: Optional covering columns, or None.
+        opclass: Optional per-column operator class, or None.
 
     Returns:
         The composite-index spec mapping.
@@ -274,6 +276,7 @@ def _index_spec(
         "unique": unique,
         "using": using,
         "include": list(include) if include else None,
+        "opclass": opclass,
     }
 
 
@@ -282,6 +285,7 @@ def _index_option_source(
     unique: bool,
     using: str | None,
     include: list[str] | None,
+    opclass: str | None = None,
 ) -> list[str]:
     """Render the non-default composite-index options as keyword-argument source.
 
@@ -290,6 +294,7 @@ def _index_option_source(
         unique: Whether the index enforces uniqueness.
         using: Optional access method, or None.
         include: Optional covering columns, or None.
+        opclass: Optional per-column operator class, or None.
 
     Returns:
         The ``key=value`` source fragments for the options that differ from their
@@ -304,6 +309,8 @@ def _index_option_source(
         args.append(f"using={using!r}")
     if include is not None:
         args.append(f"include={include!r}")
+    if opclass is not None:
+        args.append(f"opclass={opclass!r}")
     return args
 
 
@@ -345,6 +352,7 @@ def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
             index.unique,
             index.using,
             resolve(index.include) if index.include else None,
+            index.opclass,
         )
     return out
 
@@ -1352,6 +1360,7 @@ class AddCompositeIndex(Operation):
         unique: bool = False,
         using: str | None = None,
         include: list[str] | None = None,
+        opclass: str | None = None,
     ) -> None:
         """Store the index's table, name, columns and rendering options.
 
@@ -1364,6 +1373,7 @@ class AddCompositeIndex(Operation):
             using: Optional access method (``USING <method>``; PostgreSQL-only).
             include: Optional non-key covering columns (``INCLUDE (...)``;
                 PostgreSQL-only).
+            opclass: Optional per-column operator class (PostgreSQL-only).
 
         Returns:
             None
@@ -1375,6 +1385,7 @@ class AddCompositeIndex(Operation):
         self.unique = unique
         self.using = using
         self.include = list(include) if include else None
+        self.opclass = opclass
 
     def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
         """Render the ``CREATE INDEX`` statements.
@@ -1395,6 +1406,7 @@ class AddCompositeIndex(Operation):
             unique=self.unique,
             using=self.using,
             include=self.include,
+            opclass=self.opclass,
         )
 
     def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
@@ -1420,7 +1432,7 @@ class AddCompositeIndex(Operation):
         """
         idx = state["tables"][self.table].setdefault("composite_indexes", {})
         idx[self.name] = _index_spec(
-            self.columns, self.condition, self.unique, self.using, self.include
+            self.columns, self.condition, self.unique, self.using, self.include, self.opclass
         )
 
     def revert_state(self, state: dict[str, Any]) -> None:
@@ -1441,7 +1453,11 @@ class AddCompositeIndex(Operation):
             The source code constructing this operation.
         """
         args = [repr(self.table), repr(self.name), repr(self.columns)]
-        args.extend(_index_option_source(self.condition, self.unique, self.using, self.include))
+        args.extend(
+            _index_option_source(
+                self.condition, self.unique, self.using, self.include, self.opclass
+            )
+        )
         return _call(f"m.{type(self).__name__}", args)
 
 
@@ -1463,6 +1479,7 @@ class RemoveCompositeIndex(Operation):
         unique: bool = False,
         using: str | None = None,
         include: list[str] | None = None,
+        opclass: str | None = None,
     ) -> None:
         """Store the index's table, name, columns and rendering options.
 
@@ -1474,6 +1491,7 @@ class RemoveCompositeIndex(Operation):
             unique: Whether the index enforced uniqueness (used to recreate).
             using: Optional access method (used to recreate; PostgreSQL-only).
             include: Optional covering columns (used to recreate; PostgreSQL-only).
+            opclass: Optional per-column operator class (used to recreate).
 
         Returns:
             None
@@ -1485,6 +1503,7 @@ class RemoveCompositeIndex(Operation):
         self.unique = unique
         self.using = using
         self.include = list(include) if include else None
+        self.opclass = opclass
 
     def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
         """Render the ``DROP INDEX`` statements.
@@ -1516,6 +1535,7 @@ class RemoveCompositeIndex(Operation):
             unique=self.unique,
             using=self.using,
             include=self.include,
+            opclass=self.opclass,
         )
 
     def apply_state(self, state: dict[str, Any]) -> None:
@@ -1540,7 +1560,7 @@ class RemoveCompositeIndex(Operation):
         """
         idx = state["tables"][self.table].setdefault("composite_indexes", {})
         idx[self.name] = _index_spec(
-            self.columns, self.condition, self.unique, self.using, self.include
+            self.columns, self.condition, self.unique, self.using, self.include, self.opclass
         )
 
     def to_source(self) -> str:
@@ -1550,7 +1570,11 @@ class RemoveCompositeIndex(Operation):
             The source code constructing this operation.
         """
         args = [repr(self.table), repr(self.name), repr(self.columns)]
-        args.extend(_index_option_source(self.condition, self.unique, self.using, self.include))
+        args.extend(
+            _index_option_source(
+                self.condition, self.unique, self.using, self.include, self.opclass
+            )
+        )
         return _call("m.RemoveCompositeIndex", args)
 
 
@@ -2347,6 +2371,7 @@ def _diff_composite_indexes(
                     unique=spec.get("unique", False),
                     using=spec.get("using"),
                     include=spec.get("include"),
+                    opclass=spec.get("opclass"),
                 )
             )
     for name in sorted(new_ci):
@@ -2361,6 +2386,7 @@ def _diff_composite_indexes(
                     unique=spec.get("unique", False),
                     using=spec.get("using"),
                     include=spec.get("include"),
+                    opclass=spec.get("opclass"),
                 )
             )
     return ops

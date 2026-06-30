@@ -221,7 +221,17 @@ fewer edits:
   and a **foreign key set from a string** id (`obj.parent_id = str(uuid)`) is coerced
   to the target primary key's type when bound.
 - **`JSONField(encoder=..., decoder=...)`** value-transform hooks (e.g. to keep
-  oversized integers JS-safe).
+  oversized integers JS-safe). With no `encoder`, exotic Python values stored in a
+  JSON column (**UUID, `Decimal`, `datetime`/`date`/`time`, `set`, `Enum`**) are
+  coerced to JSON-native forms rather than raising, matching a Tortoise + orjson setup.
+- **`BooleanField` coerces non-bool writes** with `bool(value)` (so `1`/`0`/`"yes"`
+  round-trip), and **`Meta.extra_kwargs = "store"` is inherited** from a base/abstract
+  `Meta` by subclasses that declare their own `Meta`.
+- **`Index(..., opclass="gin_trgm_ops")`** applies a per-column operator class (e.g.
+  `gin_trgm_ops`, `jsonb_path_ops`) on PostgreSQL — dropped on SQLite — replacing
+  Tortoise's `contrib.postgres.indexes.GinIndex(opclass=...)`.
+- **`_meta.db_table` is assignable** (`Model._meta.db_table = "..."`) alongside its
+  read access.
 - **`ManyToManyField(through_fields=(fwd, bwd))`** is accepted (alias of
   `forward_key=`/`backward_key=`); bare **`fields.SET_NULL` / `fields.CASCADE` …**
   on-delete constants exist alongside `fields.OnDelete.*`; **`blank=` / `max_length=`**
@@ -237,9 +247,16 @@ fewer edits:
 
 **Querysets & expressions**
 
-- **`Model.get(...)`** is chainable: `await Model.get(id=x).prefetch_related(...)`
-  works, as does a plain `await Model.get(id=x)`. **`QuerySet.all()`** is a no-op
-  terminator. **`Value`** literal expressions and **`Q.AND` / `Q.OR`** constants exist.
+- **`Model.get(...)` and `QuerySet.first()` are chainable single-row results.**
+  `await Model.get(id=x).prefetch_related(...)` works, as does a plain
+  `await Model.get(id=x)`; `first()` awaits to the instance or `None`. Both accept
+  `.only(...)`, `.values(...)` and `.values_list(...)` so
+  `await qs.first().values("a", "b")` returns a single dict (or `None`) — Tortoise's
+  `QuerySetSingle`. **`QuerySet.all()`** is a no-op terminator. **`Value`** literal
+  expressions and **`Q.AND` / `Q.OR`** constants exist. **`Aggregate`** is importable
+  from `yara_orm` (Tortoise's `tortoise.functions.Aggregate`).
+- **Model instances compare by `(type, pk)`** — a refetched row equals one already
+  held, and `obj in [<same row>]` / set membership work (`__eq__`/`__hash__`).
 - Aggregates accept an **expression or `Case`** and an optional **`_filter=Q(...)`**
   (`Count("x", _filter=Q(...))` → `... FILTER (WHERE ...)`). **`QuerySet.using_db()`**
   accepts a connection name *or* object.

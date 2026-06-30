@@ -6,6 +6,43 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-30
+
+### More Tortoise-migration compatibility
+
+A second sweep of fixes from migrating two large Tortoise codebases (callbear and
+wiserfunding). See `MIGRATION_GAPS.md` for the full catalogue and originating evidence.
+
+#### Fixed (correctness)
+
+- **`BooleanField` coerces non-bool writes** with `bool(value)` (Tortoise
+  semantics), so a truthy/falsy non-bool (e.g. `1`, `0`, `"yes"`) round-trips
+  instead of reaching the engine as a type the boolean column rejects.
+- **`JSONField` tolerates exotic Python values** — UUID, `Decimal`, `datetime`/
+  `date`/`time`, `set`/`frozenset` and `Enum` are coerced to JSON-native forms
+  before serialisation (matching a Tortoise + orjson `default=` setup) instead of
+  raising "value is not JSON serialisable".
+- **`Meta.extra_kwargs` is inherited** from a base `Meta`, so setting
+  `extra_kwargs = "store"` once on a shared/abstract base applies to every
+  subclass that declares its own `Meta`.
+
+#### Added
+
+- **Chainable `first()` / `QuerySetSingle` projections.** `QuerySet.first()`
+  now returns a chainable single-row result (awaits to the instance or `None`),
+  and both `first()` and `Model.get(...)` accept `.only(...)`, `.values(...)` and
+  `.values_list(...)` — `await qs.first().values("a")` returns a single dict (or
+  `None`), matching Tortoise's `QuerySetSingle`.
+- **Model identity:** `__eq__`/`__hash__` compare by `(type, pk)`, so a refetched
+  row equals one already held and `obj in [<same row>]` / set membership work.
+- **Per-column index operator classes** — `Index(..., opclass="gin_trgm_ops")`
+  (and `jsonb_path_ops`, etc.) render as `(<col> <opclass>)` on PostgreSQL
+  (dropped on SQLite), through both `generate_schemas` and migrations.
+- **`MetaInfo.db_table` setter** so `Model._meta.db_table = "..."` renames the
+  table through the Tortoise alias.
+- **`Aggregate` is a top-level export** (`from yara_orm import Aggregate`),
+  matching Tortoise's `from tortoise.functions import Aggregate`.
+
 ## [1.2.0] - 2026-06-30
 
 ### Tortoise-migration compatibility

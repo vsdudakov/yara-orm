@@ -19,7 +19,7 @@ from .fields import (
 )
 from .manager import Manager
 from .prefetch import prefetch_instances
-from .queryset import QuerySet, QuerySetSingle
+from .queryset import QuerySet, QuerySetSingle, _resolve_get
 from .relations import (
     ForwardRelationDescriptor,
     M2MDescriptor,
@@ -147,6 +147,18 @@ class MetaInfo:
     def db_table(self) -> str:
         """Tortoise alias for :attr:`table` (the database table name)."""
         return self.table
+
+    @db_table.setter
+    def db_table(self, value: str) -> None:
+        """Set the database table name through the Tortoise alias.
+
+        Args:
+            value: The new table name.
+
+        Returns:
+            None
+        """
+        self.table = value
 
     @property
     def fields_map(self) -> dict[str, Field]:
@@ -301,6 +313,7 @@ class Index:
                 Index(fields=["status"], condition="status = 'active'"),
                 Index(fields=["tags"], using="gin"),
                 Index(fields=["owner_id"], unique=True, include=["email"]),
+                Index(fields=["name"], using="gin", opclass="gin_trgm_ops"),
             ]
     """
 
@@ -313,6 +326,7 @@ class Index:
         unique: bool = False,
         using: str | None = None,
         include: list[str] | None = None,
+        opclass: str | None = None,
     ) -> None:
         """Store the indexed fields and optional name/partial condition/options.
 
@@ -327,6 +341,9 @@ class Index:
                 rendered as ``USING <method>``; PostgreSQL-only.
             include: Optional non-key covering columns rendered as
                 ``INCLUDE (...)``; PostgreSQL-only.
+            opclass: Optional operator class applied to every key column
+                (e.g. ``"gin_trgm_ops"`` for trigram search or
+                ``"jsonb_path_ops"`` for JSONB containment); PostgreSQL-only.
 
         Returns:
             None
@@ -337,6 +354,7 @@ class Index:
         self.unique = unique
         self.using = using
         self.include = list(include) if include else None
+        self.opclass = opclass
 
     def resolve_name(self, table: str) -> str:
         """Return this index's name, deriving a default from ``table`` if unset.
@@ -507,7 +525,17 @@ class ModelMeta(type):
         cls._meta.app = getattr(meta_cls, "app", None)
         cls._meta.default_connection = getattr(meta_cls, "default_connection", None)
         cls._meta.fetch_db_defaults = bool(getattr(meta_cls, "fetch_db_defaults", False))
-        cls._meta.extra_kwargs = getattr(meta_cls, "extra_kwargs", None)
+        # ``extra_kwargs`` is inherited: a model that declares its own ``Meta``
+        # (without restating the option) still picks it up from a base class, so
+        # setting it once on a shared base applies to every subclass.
+        extra_kwargs = getattr(meta_cls, "extra_kwargs", None) if meta_cls is not None else None
+        if extra_kwargs is None:
+            for parent in parents:
+                parent_meta = getattr(parent, "_meta", None)
+                if parent_meta is not None and parent_meta.extra_kwargs is not None:
+                    extra_kwargs = parent_meta.extra_kwargs
+                    break
+        cls._meta.extra_kwargs = extra_kwargs
 
         # Per-model exception subclasses so callers can `except User.DoesNotExist`.
         # They subclass the global exceptions, so `except DoesNotExist` still works.
@@ -662,6 +690,35 @@ class Model(metaclass=ModelMeta):
             The current value of the primary key field.
         """
         return getattr(self, self._meta.pk_field.model_field_name)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare by model type and primary key (Tortoise identity semantics).
+
+        Two instances of the same model with the same (non-``None``) primary key
+        are equal, so a freshly fetched row compares equal to one already held
+        and ``obj in [<same row>]`` works. Instances without a primary key
+        (unsaved) are equal only to themselves.
+
+        Args:
+            other: The object to compare against.
+
+        Returns:
+            ``True`` when ``other`` is the same model with an equal primary key.
+        """
+        if self is other:
+            return True
+        if type(self) is not type(other):
+            return NotImplemented
+        own_pk = self.pk
+        return own_pk is not None and own_pk == other.pk
+
+    def __hash__(self) -> int:
+        """Hash by model type and primary key, consistent with :meth:`__eq__`.
+
+        Returns:
+            A hash over ``(type, pk)``; unsaved instances hash by ``pk=None``.
+        """
+        return hash((type(self), self.pk))
 
     @classmethod
     def _from_db_row(cls, values: list[Any]) -> Model:
@@ -1270,7 +1327,7 @@ class Model(metaclass=ModelMeta):
         return await engine.fetch_rows(sql, params)
 
     @classmethod
-    def get(cls, **kwargs: Any) -> QuerySetSingle:
+    def get(cls, **kwargs: Any) -> QuerySetSingle[Model]:
         """Return a chainable, awaitable single-row result for the lookups.
 
         ``await Model.get(id=x)`` resolves to the instance (via a fast path);
@@ -1283,7 +1340,7 @@ class Model(metaclass=ModelMeta):
         Returns:
             A ``QuerySetSingle`` resolving to the matching instance.
         """
-        return QuerySetSingle(cls.filter(**kwargs), fast=lambda: cls._get_one(kwargs))
+        return QuerySetSingle(cls.filter(**kwargs), _resolve_get, fast=lambda: cls._get_one(kwargs))
 
     @classmethod
     async def _get_one(cls, kwargs: dict[str, Any]) -> Model:
