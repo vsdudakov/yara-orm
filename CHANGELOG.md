@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-30
+
 ### Removed
 
 - **The `Tortoise` alias for `YaraOrm`** is removed; import `YaraOrm` directly.
