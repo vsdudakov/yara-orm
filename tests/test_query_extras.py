@@ -1,4 +1,4 @@
-"""Tortoise-parity query features: relation-spanning filters, extra lookups,
+"""Query features for parity with the documented behavior: relation-spanning filters, extra lookups,
 only/defer, get_or_none/get_or_create/update_or_create, sql/explain, using_db,
 select_for_update options and Subquery.
 """

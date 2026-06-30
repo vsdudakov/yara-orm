@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from yara_orm import FieldError, Model, fields, registry
+from yara_orm import FieldError, Model, connections, fields, registry
 
 
 class CvMUser(Model):
@@ -81,6 +81,21 @@ class MBLoose(Model):
         extra_kwargs = "store"
 
 
+class MBStoreBase(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        abstract = True
+        extra_kwargs = "store"
+
+
+class MBStoreChild(MBStoreBase):
+    name = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "mb_store_child"
+
+
 class CovTag(Model):
     id = fields.IntField(pk=True)
     name = fields.CharField(max_length=20)
@@ -140,6 +155,7 @@ MODELS = [
     CovItem,
     CovParent,
     CovOverride,
+    MBStoreChild,
 ]
 
 
@@ -397,10 +413,10 @@ async def test_abstract_base_fk_relation_inherited_on_subclass(db):
     assert loaded.id == org.id
 
 
-def test_meta_tortoise_aliases():
+def test_meta_aliases():
     """
     GIVEN a model with fields and a relation
-    WHEN the Tortoise ``_meta`` aliases are read
+    WHEN the ``_meta`` aliases are read
     THEN they map onto the yara equivalents
     """
     meta = MBWidget._meta
@@ -427,7 +443,7 @@ async def test_saved_in_db_alias_tracks_in_db(db):
     """
     GIVEN a freshly constructed instance
     WHEN it is inspected before and after ``save()``
-    THEN the Tortoise ``_saved_in_db`` alias mirrors ``_in_db``
+    THEN the ``_saved_in_db`` alias mirrors ``_in_db``
     """
     org = MBOrg(name="acme")
     assert org._saved_in_db is False
@@ -469,7 +485,7 @@ def test_model_is_subscriptable_for_annotations():
 async def test_get_is_chainable_with_prefetch(db):
     """
     GIVEN a parent with reverse-related children
-    WHEN ``Model.get(...).prefetch_related(...)`` is awaited (Tortoise idiom)
+    WHEN ``Model.get(...).prefetch_related(...)`` is awaited (chained idiom)
     THEN the single row is returned with the relation prefetched
     """
     org = await MBOrg.create(name="acme")
@@ -484,7 +500,7 @@ async def test_get_is_chainable_with_prefetch(db):
 def test_saved_in_db_setter():
     """
     GIVEN a model instance
-    WHEN the Tortoise ``_saved_in_db`` alias is assigned
+    WHEN the ``_saved_in_db`` alias is assigned
     THEN it writes through to ``_in_db``
     """
     obj = CovParent(name="x")
@@ -512,3 +528,139 @@ async def test_abstract_m2m_relation_inherited(db):
     tag = await CovTag.create(name="x")
     await item.tags.add(tag)
     assert {t.name for t in await item.tags} == {"x"}
+
+
+# -- model identity (__eq__ / __hash__) ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_pk_instances_compare_equal(db):
+    """
+    GIVEN a row fetched twice into separate instances
+    WHEN they are compared and tested for list/set membership
+    THEN same-model same-pk instances are equal and hash alike
+    """
+    user = await CvMUser.create(name="Ada")
+    again = await CvMUser.get(id=user.id)
+    assert user == again
+    assert again in [user]
+    assert user in {again}
+
+
+@pytest.mark.asyncio
+async def test_different_pk_and_cross_model_not_equal(db):
+    """
+    GIVEN two different rows and an unrelated model
+    WHEN they are compared
+    THEN distinct pks and cross-model instances are not equal
+    """
+    a = await CvMUser.create(name="A")
+    b = await CvMUser.create(name="B")
+    ref = await CvMRef.create()
+    assert a != b
+    assert a != ref
+    assert a != "not-a-model"
+
+
+def test_unsaved_instances_are_equal_only_to_self():
+    """
+    GIVEN two unsaved instances (no primary key)
+    WHEN they are compared
+    THEN each is equal only to itself
+    """
+    a = CvMUser(name="x")
+    b = CvMUser(name="x")
+    assert a == a
+    assert a != b
+
+
+def test_db_table_setter_renames_table():
+    """
+    GIVEN a model's _meta
+    WHEN db_table is assigned (the table-name alias)
+    THEN the underlying table name is updated
+    """
+
+    class Renamable(Model):
+        id = fields.IntField(pk=True)
+
+        class Meta:
+            abstract = True
+            table = "renamable_old"
+
+    Renamable._meta.db_table = "renamable_new"
+    assert Renamable._meta.table == "renamable_new"
+    assert Renamable._meta.db_table == "renamable_new"
+
+
+# -- extra_kwargs inheritance + update_from_dict ------------------------------
+
+
+def test_extra_kwargs_inherited_from_abstract_base():
+    """
+    GIVEN an abstract base declaring Meta.extra_kwargs = "store"
+    WHEN a concrete subclass with its own Meta is constructed with unknown kwargs
+    THEN the option is inherited and the unknown kwargs are stored, not rejected
+    """
+    assert MBStoreChild._meta.extra_kwargs == "store"
+    obj = MBStoreChild(name="x", computed="kept")
+    assert obj.computed == "kept"
+
+
+def test_update_from_dict_stores_unknown_keys_when_opted_in():
+    """
+    GIVEN a model whose Meta opts into storing unknown kwargs
+    WHEN update_from_dict receives an unknown key
+    THEN it is stored as an attribute rather than raising
+    """
+    obj = MBStoreChild(name="x")
+    obj.update_from_dict({"name": "y", "computed": "kept"})
+    assert obj.name == "y"
+    assert obj.computed == "kept"
+
+
+def test_update_from_dict_rejects_unknown_keys_by_default():
+    """
+    GIVEN a strict model (no extra_kwargs)
+    WHEN update_from_dict receives an unknown key
+    THEN it raises FieldError
+    """
+    with pytest.raises(FieldError):
+        CvMUser(name="x").update_from_dict({"nope": 1})
+
+
+# -- using_db= keyword + partial refresh_from_db ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_using_db_keyword_routes_model_ops(db):
+    """
+    GIVEN an explicit connection object
+    WHEN it is passed as using_db= to create/get/filter/save/delete
+    THEN the operations run on that connection
+    """
+    conn = connections.get("default")
+    user = await CvMUser.create(name="Ada", using_db=conn)
+    assert (await CvMUser.get(id=user.id, using_db=conn)).id == user.id
+    assert [u.id for u in await CvMUser.filter(name="Ada", using_db=conn)] == [user.id]
+    await user.save(using_db=conn)
+    await user.delete(using_db=conn)
+    assert await CvMUser.exclude(name="x", using_db=conn).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db_partial_fields(db):
+    """
+    GIVEN a stale in-memory instance
+    WHEN refresh_from_db(fields=[...]) reloads a subset
+    THEN only the named fields are refreshed from the row
+    """
+    user = await CvMUser.create(name="n1", alias="a1")
+    await CvMUser.filter(id=user.id).update(name="n2", alias="a2")
+    user.name = "stale"
+    user.alias = "stale"
+    await user.refresh_from_db(fields=["name"])
+    assert user.name == "n2"
+    assert user.alias == "stale"
+    await user.refresh_from_db()
+    assert user.alias == "a2"

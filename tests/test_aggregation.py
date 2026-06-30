@@ -98,3 +98,50 @@ async def test_avg_min_max(db):
     assert round(float(row["avg"]), 2) == 4.0
     assert row["lo"] == 3
     assert row["hi"] == 5
+
+
+@pytest.mark.asyncio
+async def test_annotated_values_list_flat_is_flattened(db):
+    """
+    GIVEN an annotated, grouped query
+    WHEN values_list(flat=True) is taken over the grouped path
+    THEN scalars are returned, not one-element tuples
+    """
+    ada = await AggAuthor.create(name="Ada")
+    await AggBook.create(title="A", rating=3, author=ada)
+    await AggBook.create(title="B", rating=5, author=ada)
+    rows = await AggBook.annotate(c=Count("id")).group_by("author_id").values_list("c", flat=True)
+    assert rows == [2]
+
+
+@pytest.mark.asyncio
+async def test_annotated_values_list_no_fields_returns_full_rows(db):
+    """
+    GIVEN an annotated, grouped query and no explicit fields
+    WHEN values_list() is taken
+    THEN the full grouped rows (group keys + annotations) are returned as tuples
+    """
+    ada = await AggAuthor.create(name="Ada")
+    await AggBook.create(title="A", rating=3, author=ada)
+    await AggBook.create(title="B", rating=5, author=ada)
+    rows = await AggBook.annotate(c=Count("id")).group_by("author_id").values_list()
+    assert rows == [(ada.id, 2)]
+
+
+@pytest.mark.asyncio
+async def test_annotated_values_list_flat_requires_single_field(db):
+    """
+    GIVEN an annotated, grouped query
+    WHEN values_list(flat=True) names more than one field
+    THEN a FieldError is raised
+    """
+    from yara_orm import FieldError
+
+    ada = await AggAuthor.create(name="Ada")
+    await AggBook.create(title="A", rating=3, author=ada)
+    with pytest.raises(FieldError):
+        await (
+            AggBook.annotate(c=Count("id"))
+            .group_by("author_id")
+            .values_list("author_id", "c", flat=True)
+        )

@@ -154,9 +154,9 @@ class F(Expression):
 
 
 class Value(Expression):
-    """A literal value usable where an expression is expected (Tortoise compat).
+    """A literal value usable where an expression is expected (compat shim).
 
-    Tortoise wrapped literals as ``Value(0)`` in ``Case(default=...)`` and ``F``
+    Some ORMs wrap literals as ``Value(0)`` in ``Case(default=...)`` and ``F``
     arithmetic. yara already binds bare literals there, but ``Value`` keeps such
     code importing and working unchanged: it renders as a single bound parameter.
     """
@@ -399,6 +399,16 @@ class Subquery:
         Returns:
             A ``(sql, next_index)`` tuple.
         """
+        if not hasattr(self.queryset, "_plain_select_sql"):
+            # Callers sometimes pass an *awaited* projection
+            # (``Subquery(qs.values_list("id", flat=True))``); yara's
+            # values_list() is terminal, so guide the caller to a lazy queryset
+            # instead of failing with an opaque 'coroutine' AttributeError.
+            raise TypeError(
+                f"Subquery() expects a QuerySet, got {type(self.queryset).__name__}; "
+                "pass a lazy queryset such as Model.filter(...).only('col') rather "
+                "than an awaited values()/values_list()."
+            )
         sub_sql, sub_params, _ = self.queryset._plain_select_sql(dialect, start=idx)
         params.extend(sub_params)
         return f"({sub_sql})", idx + len(sub_params)

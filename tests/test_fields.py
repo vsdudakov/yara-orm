@@ -1,8 +1,10 @@
 """Coverage: every field type round-trips through the engine."""
 
 import datetime as dt
+import json
 import uuid
 from decimal import Decimal
+from enum import Enum
 
 import pytest
 
@@ -83,7 +85,15 @@ class FldChild(Model):
         table = "fld_child"
 
 
-MODELS = [CvAll, CvSmallPk, CvBigPk, CompatParent, CompatChild, FldParent, FldChild]
+class FldEnc(Model):
+    id = fields.IntField(pk=True)
+    data = fields.JSONField(encoder=lambda v: json.dumps({"wrapped": v}))
+
+    class Meta:
+        table = "fld_enc"
+
+
+MODELS = [CvAll, CvSmallPk, CvBigPk, CompatParent, CompatChild, FldParent, FldChild, FldEnc]
 
 
 @pytest.mark.asyncio
@@ -179,7 +189,7 @@ def test_field_repr():
 @pytest.mark.asyncio
 async def test_uuidfield_primary_key_alias_applies_uuid4_default(db):
     """
-    GIVEN a model whose pk is declared with the Tortoise ``primary_key=True``
+    GIVEN a model whose pk is declared with the ``primary_key=True``
     WHEN a row is created without supplying an id
     THEN a ``uuid4`` default is applied instead of inserting a NULL id
     """
@@ -223,7 +233,7 @@ def test_field_has_db_field_flag():
     """
     GIVEN any concrete field
     WHEN ``has_db_field`` is read
-    THEN it is True (Tortoise-compat flag for column-backed fields)
+    THEN it is True (compat flag for column-backed fields)
     """
     assert fields.CharField(max_length=5).has_db_field is True
 
@@ -240,7 +250,7 @@ def test_field_classes_are_subscriptable_for_annotations():
 
 def test_bare_on_delete_constants_alias_ondelete_members():
     """
-    GIVEN Tortoise's bare ``fields.SET_NULL`` / ``fields.CASCADE`` names
+    GIVEN the bare ``fields.SET_NULL`` / ``fields.CASCADE`` names
     WHEN they are compared to the ``OnDelete`` members
     THEN the bare names exist and carry identical string values
     """
@@ -253,7 +263,7 @@ def test_bare_on_delete_constants_alias_ondelete_members():
 
 def test_field_accepts_and_ignores_blank_and_max_length_kwargs():
     """
-    GIVEN Tortoise kwargs with no yara effect (``blank``, ``max_length`` on a
+    GIVEN compat kwargs with no yara effect (``blank``, ``max_length`` on a
         non-length field)
     WHEN such fields are constructed
     THEN construction succeeds (the kwargs are accepted and ignored)
@@ -265,7 +275,7 @@ def test_field_accepts_and_ignores_blank_and_max_length_kwargs():
 
 def test_m2m_through_fields_alias_sets_forward_and_backward_keys():
     """
-    GIVEN a ManyToManyField declared with Tortoise's ``through_fields`` tuple
+    GIVEN a ManyToManyField declared with a ``through_fields`` tuple
     WHEN the field is constructed
     THEN ``forward_key``/``backward_key`` are filled from the tuple
     """
@@ -303,3 +313,67 @@ async def test_jsonfield_decoder_passes_through_null(db):
     p = await FldParent.create(name="p")
     c = await FldChild.create(parent=p, data=None)
     assert (await FldChild.get(id=c.id)).data is None
+
+
+@pytest.mark.asyncio
+async def test_boolean_field_coerces_non_bool_writes(db):
+    """
+    GIVEN a boolean column assigned truthy/falsy non-bool values
+    WHEN the rows are saved and read back
+    THEN the values round-trip as real booleans via bool()
+    """
+    truthy = await CvAll.create(flag="yes")
+    falsy = await CvAll.create(flag=0)
+    assert (await CvAll.get(id=truthy.id)).flag is True
+    assert (await CvAll.get(id=falsy.id)).flag is False
+
+
+@pytest.mark.asyncio
+async def test_jsonfield_serialises_exotic_python_types(db):
+    """
+    GIVEN a JSON column holding UUID/Decimal/datetime/date/set values
+    WHEN the row is saved and read back
+    THEN the values are coerced to JSON-native forms instead of raising
+    """
+    uid = uuid.uuid4()
+    payload = {
+        "uid": uid,
+        "price": Decimal("1.50"),
+        "when": dt.datetime(2026, 6, 30, 12, 0, 0),
+        "day": dt.date(2026, 6, 30),
+        "tags": {"a", "b"},
+    }
+    row = await CvAll.create(js=payload)
+    stored = (await CvAll.get(id=row.id)).js
+    assert stored["uid"] == str(uid)
+    assert stored["price"] == "1.50"
+    assert stored["when"] == "2026-06-30T12:00:00"
+    assert stored["day"] == "2026-06-30"
+    assert sorted(stored["tags"]) == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_jsonfield_encoder_returning_string_is_parsed_back(db):
+    """
+    GIVEN a JSONField whose encoder returns a serialised JSON string
+    WHEN a value is saved and read back
+    THEN the string is parsed to a native value rather than corrupting the column
+    """
+    row = await FldEnc.create(data={"x": 1})
+    assert (await FldEnc.get(id=row.id)).data == {"wrapped": {"x": 1}}
+
+
+def test_json_safe_handles_enum_and_passes_through_unknown():
+    """
+    GIVEN a plain Enum member and an unhandled object
+    WHEN _json_safe processes them
+    THEN the Enum unwraps to its value and the unknown object is returned as-is
+    """
+    from yara_orm.fields import _json_safe
+
+    class Colour(Enum):
+        RED = "red"
+
+    sentinel = object()
+    assert _json_safe(Colour.RED) == "red"
+    assert _json_safe(sentinel) is sentinel

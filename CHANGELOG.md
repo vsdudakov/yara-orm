@@ -6,6 +6,36 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed
+
+- **The `Tortoise` alias for `YaraOrm`** is removed; import `YaraOrm` directly.
+
+### Added
+
+- **`using_db=` keyword** on `create`, `save`, `delete`, `get`, `filter`,
+  `exclude`, `get_or_create`, `update_or_create` and `refresh_from_db` to target a
+  connection (alongside the existing chained `.using_db(...)`).
+- **`refresh_from_db(fields=..., using_db=...)`** — reload a subset of fields on a
+  chosen connection.
+- **Function expressions as `update()` values** — e.g.
+  `update(at=Coalesce("at", now))`.
+- **`async for` over a queryset** — `async for obj in Model.filter(...)`.
+- **Driver-qualified postgres URL schemes** (`psycopg://`, `asyncpg://`,
+  `postgresql+asyncpg://`) are normalised to `postgres://`.
+- **Positional access on raw `execute_query`/`fetch_all` rows** (`row[0]` and
+  `row["col"]`), mirroring `asyncpg.Record`.
+
+### Fixed
+
+- **`JSONField` encoder returning a string** is parsed back to a native value
+  instead of corrupting a `jsonb` column.
+- **`update_from_dict` honours `Meta.extra_kwargs = "store"`**, keeping unknown
+  keys instead of raising.
+- **`values_list(flat=True)` on the annotated/grouped path** returns scalars (and
+  the grouped `values_list` now respects the requested projection).
+- **`Subquery()` handed a non-queryset** raises a clear `TypeError` instead of an
+  opaque attribute error.
+
 ## [1.3.0] - 2026-06-30
 
 ### More Tortoise-migration compatibility

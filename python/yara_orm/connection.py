@@ -38,18 +38,21 @@ _ROUTER = None
 #: one transaction.
 _active_tx: contextvars.ContextVar = contextvars.ContextVar("orm_active_tx", default=None)
 
-#: Optional pre-execute query hooks (Tortoise had no equivalent of monkeypatching
-#: the Python query path; register a hook to observe/annotate SQL). Each hook is
+#: Optional pre-execute query hooks (register a hook to observe/annotate the SQL
+#: of the Python query path). Each hook is
 #: called as ``hook(sql, params)`` before a statement runs. Empty by default, so
 #: the hot path pays nothing and ``get_executor`` returns the raw engine.
 _QUERY_HOOKS: list = []
+
+#: URL schemes treated as PostgreSQL (driver aliases normalised to ``postgres``).
+_POSTGRES_URL_SCHEMES = frozenset({"postgres", "postgresql", "psycopg", "psycopg2", "asyncpg"})
 
 
 def register_query_hook(hook: Any) -> None:
     """Register a callable invoked as ``hook(sql, params)`` before each query.
 
-    Restores the Tortoise-era ability to wrap the query path (e.g. SQLCommenter,
-    tracing, SQL logging) that vanished when execution moved to the Rust engine.
+    Lets you wrap the query path (e.g. SQLCommenter,
+    tracing, SQL logging) even though execution happens in the Rust engine.
     While any hook is registered, model and manual statements both route through
     a proxy that calls the hooks; with none registered there is zero overhead.
 
@@ -88,8 +91,8 @@ def _run_hooks(sql: str, params: list[Any] | None) -> None:
 async def _run_query(method: Any, sql: str, params: list[Any] | None) -> Any:
     """Run one engine call: fire hooks, then translate engine errors.
 
-    The native engine raises a bare ``RuntimeError`` for SQL failures; Tortoise
-    surfaced these as ``OperationalError``, so callers' ``except OperationalError``
+    The native engine raises a bare ``RuntimeError`` for SQL failures; these are
+    surfaced as ``OperationalError``, so callers' ``except OperationalError``
     handlers (retry/translation) keep working when re-raised as one here.
 
     Args:
@@ -198,12 +201,48 @@ def _split_sql_statements(script: str) -> list[str]:
     return statements
 
 
+class Record(dict):
+    """A raw-SQL result row allowing positional **and** key access.
+
+    ``asyncpg.Record`` supports both
+    ``row["col"]`` and ``row[0]``; yara's raw rows are dicts, so this subclass
+    restores positional/slice indexing for ported code. Column names are always
+    strings, so an integer key is unambiguously positional.
+    """
+
+    def __getitem__(self, key: Any) -> Any:
+        """Return a column by name (str) or by position (int/slice).
+
+        Args:
+            key: A column name, or a positional index/slice into the row's
+                values in column order.
+
+        Returns:
+            The matching column value (or a tuple of values for a slice).
+        """
+        if isinstance(key, (int, slice)):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+def _as_records(rows: Any) -> Any:
+    """Wrap a list of dict rows as :class:`Record` for positional access.
+
+    Args:
+        rows: The rows returned by the engine (each a ``dict``).
+
+    Returns:
+        The rows as :class:`Record` instances (non-dict rows pass through).
+    """
+    return [Record(r) if isinstance(r, dict) else r for r in rows]
+
+
 class _ManualSQLCompat:
-    """Tortoise-compatible raw-SQL methods shared by manual-SQL executors.
+    """Raw-SQL compatibility methods shared by manual-SQL executors.
 
     Mixed into the pooled-connection proxy and the transaction wrapper so raw
-    SQL written for Tortoise (``execute_query`` / ``execute_query_dict`` /
-    ``execute_script``) keeps working. Implementations build on the host's
+    SQL using ``execute_query`` / ``execute_query_dict`` /
+    ``execute_script`` keeps working. Implementations build on the host's
     ``execute`` / ``fetch_all`` (both already translate engine errors).
     """
 
@@ -234,9 +273,9 @@ class _ManualSQLCompat:
     async def execute_query(
         self, sql: str, params: list[Any] | None = None
     ) -> tuple[int, list[dict[str, Any]]]:
-        """Run ``sql`` and return ``(rowcount, rows)`` (Tortoise shape).
+        """Run ``sql`` and return ``(rowcount, rows)``.
 
-        Rows are dicts, as Tortoise returned for SELECTs; ``rowcount`` is the
+        Rows are dicts, as returned for SELECTs; ``rowcount`` is the
         number of rows returned. Callers that only need the rows can unpack as
         ``_, rows = await conn.execute_query(...)``.
 
@@ -253,7 +292,7 @@ class _ManualSQLCompat:
     async def execute_query_dict(
         self, sql: str, params: list[Any] | None = None
     ) -> list[dict[str, Any]]:
-        """Run ``sql`` and return the rows as dicts (Tortoise spelling).
+        """Run ``sql`` and return the rows as dicts.
 
         Args:
             sql: The SQL statement.
@@ -267,7 +306,7 @@ class _ManualSQLCompat:
     async def execute_script(self, script: str) -> None:
         """Run a multi-statement SQL script, one statement at a time.
 
-        Tortoise's ``execute_script`` accepted whole scripts; the native engine
+        ``execute_script`` accepts whole scripts; the native engine
         runs one command per call, so the script is split (dollar-quote / string
         / comment aware) and each statement executed in order.
 
@@ -283,10 +322,10 @@ class _ManualSQLCompat:
 
 @runtime_checkable
 class BaseDBAsyncClient(Protocol):
-    """Structural type for a database executor (Tortoise-compat name).
+    """Structural type for a database executor.
 
     Both the pooled-connection proxy and the transaction wrapper satisfy it, so
-    Tortoise-era annotations like ``using_db: BaseDBAsyncClient | None`` keep
+    annotations like ``using_db: BaseDBAsyncClient | None`` keep
     their meaning. It is the public type for objects returned by
     ``connections.get()`` / yielded by ``in_transaction()``.
     """
@@ -304,7 +343,7 @@ class BaseDBAsyncClient(Protocol):
         ...
 
     async def execute_query(self, sql: str, params: list[Any] | None = ...) -> Any:
-        """Run a statement and return ``(rowcount, rows)`` (Tortoise shape)."""
+        """Run a statement and return ``(rowcount, rows)``."""
         ...
 
 
@@ -533,8 +572,8 @@ class YaraOrm:
     ) -> None:
         """Connect the default connection and resolve relations.
 
-        Pass ``db_url`` for the modern URL form, or ``config`` with a Tortoise
-        ``TORTOISE_ORM``-style dict (``{"connections": {...}, "use_tz": ...,
+        Pass ``db_url`` for the modern URL form, or ``config`` with a
+        config dict (``{"connections": {...}, "use_tz": ...,
         "timezone": ...}``) to migrate existing config-driven setups. Register
         further connections with :meth:`add_connection`.
 
@@ -544,7 +583,7 @@ class YaraOrm:
             use_tz: When True, :func:`yara_orm.timezone.now` returns timezone-aware
                 UTC datetimes (used for ``auto_now``/``auto_now_add``).
             timezone: IANA name of the timezone datetimes are presented in.
-            config: Tortoise-style config dict, as an alternative to ``db_url``.
+            config: Config dict, as an alternative to ``db_url``.
 
         Returns:
             None
@@ -556,21 +595,41 @@ class YaraOrm:
             raise ConfigurationError("YaraOrm.init requires either db_url or config=")
         global _ENGINE, _DIALECT, _ROUTER
         _tz._set_config(timezone=timezone, use_tz=use_tz)
-        _ENGINE = await _engine.connect(db_url)
+        _ENGINE = await _engine.connect(cls._normalize_url(db_url))
         _DIALECT = resolve_dialect(_ENGINE.dialect)
         _CONNECTIONS["default"] = (_ENGINE, _DIALECT)
         _ROUTER = router
         registry.resolve_relations()
 
     @staticmethod
-    def _connection_url(spec: Any) -> str:
-        """Resolve a Tortoise connection spec to a database URL.
+    def _normalize_url(db_url: str) -> str:
+        """Rewrite diff-style postgres URL schemes to ``postgres://``.
 
-        Accepts a URL string directly, or a ``{"engine", "credentials": {...}}``
-        mapping (Tortoise's structured form) which is rendered into a postgres URL.
+        Existing ``DATABASE_URI`` values often use a driver-qualified
+        scheme (``psycopg://``, ``asyncpg://``, ``postgresql+asyncpg://``); the
+        engine only understands ``postgres``/``postgresql``, so the driver alias
+        is normalised away. Non-postgres URLs (e.g. ``sqlite://``) pass through.
 
         Args:
-            spec: A URL string or a Tortoise connection mapping.
+            db_url: The connection URL as provided by the caller.
+
+        Returns:
+            The URL with a postgres-family scheme rewritten to ``postgres://``.
+        """
+        scheme, sep, rest = db_url.partition("://")
+        if sep and scheme.split("+", 1)[0].lower() in _POSTGRES_URL_SCHEMES:
+            return f"postgres://{rest}"
+        return db_url
+
+    @staticmethod
+    def _connection_url(spec: Any) -> str:
+        """Resolve a connection spec to a database URL.
+
+        Accepts a URL string directly, or a ``{"engine", "credentials": {...}}``
+        mapping (the structured form) which is rendered into a postgres URL.
+
+        Args:
+            spec: A URL string or a connection mapping.
 
         Returns:
             The database URL string.
@@ -588,10 +647,10 @@ class YaraOrm:
 
     @classmethod
     async def _init_from_config(cls, config: dict[str, Any], router: Any = None) -> None:
-        """Initialise from a Tortoise-style config dict.
+        """Initialise from a config dict.
 
         Args:
-            config: The Tortoise ``TORTOISE_ORM``-style config dict.
+            config: The config dict.
             router: Optional router selecting a connection per model.
 
         Returns:
@@ -599,7 +658,7 @@ class YaraOrm:
         """
         connections_cfg = config.get("connections", {})
         if "default" not in connections_cfg:
-            raise ConfigurationError("Tortoise config must define a 'default' connection")
+            raise ConfigurationError("config must define a 'default' connection")
         await cls.init(
             cls._connection_url(connections_cfg["default"]),
             router=router,
@@ -621,7 +680,7 @@ class YaraOrm:
         Returns:
             None
         """
-        engine = await _engine.connect(db_url)
+        engine = await _engine.connect(cls._normalize_url(db_url))
         _CONNECTIONS[name] = (engine, resolve_dialect(engine.dialect))
 
     @classmethod
@@ -639,7 +698,7 @@ class YaraOrm:
 
     @classmethod
     def get_connection(cls, name: str = "default") -> Any:
-        """Return the manual-SQL executor for ``name`` (Tortoise spelling).
+        """Return the manual-SQL executor for ``name``.
 
         Args:
             name: Connection name to look up.
@@ -651,7 +710,7 @@ class YaraOrm:
 
     @classmethod
     async def close_connections(cls) -> None:
-        """Close all connections (Tortoise alias for :meth:`close`).
+        """Close all connections (alias for :meth:`close`).
 
         Returns:
             None
@@ -745,10 +804,6 @@ class YaraOrm:
         _DIALECT = None
         _ROUTER = None
         _tz._set_config(timezone="UTC", use_tz=False)
-
-
-# Backward-compatible alias for YaraOrm.
-Tortoise = YaraOrm
 
 
 def run_async(coro: Coroutine[Any, Any, Any]) -> None:
@@ -882,10 +937,10 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             The fetched results.
         """
-        return await _run_query(self._tx.fetch_all, sql, params)
+        return _as_records(await _run_query(self._tx.fetch_all, sql, params))
 
     async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Any:
-        """Fetch a single row as a dict on the transaction (Tortoise spelling).
+        """Fetch a single row as a dict on the transaction.
 
         Args:
             sql: SQL query to execute.
@@ -917,7 +972,7 @@ class TransactionWrapper(_ManualSQLCompat):
 
 
 class _EngineProxy(_ManualSQLCompat):
-    """Wraps the native engine to add Tortoise-compat manual-SQL methods.
+    """Wraps the native engine to add compatibility manual-SQL methods.
 
     Returned by ``connections.get()`` (and by ``get_executor`` while query hooks
     are registered) so raw-SQL call sites get ``execute_query`` /
@@ -995,7 +1050,7 @@ class _EngineProxy(_ManualSQLCompat):
         Returns:
             The fetched rows as dicts.
         """
-        return await _run_query(self._engine.fetch_all, sql, params)
+        return _as_records(await _run_query(self._engine.fetch_all, sql, params))
 
     async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Any:
         """Fetch a single row as a dict on the pooled connection.
@@ -1014,7 +1069,7 @@ class _Connections:
     """Minimal ``connections``-style accessor for manual SQL.
 
     ``connections.get(name)`` returns the active executor (transaction or pool),
-    exposing ``execute`` / ``fetch_all`` / ``fetch_rows`` plus the Tortoise-compat
+    exposing ``execute`` / ``fetch_all`` / ``fetch_rows`` plus the compatibility
     ``execute_query`` / ``execute_query_dict`` / ``execute_script``.
     """
 
@@ -1026,7 +1081,7 @@ class _Connections:
 
         Returns:
             The active transaction, or a proxy over the named/default
-            connection that adds the Tortoise-compatible raw-SQL methods.
+            connection that adds the compatibility raw-SQL methods.
         """
         tx = _active_tx.get()
         if tx is not None:

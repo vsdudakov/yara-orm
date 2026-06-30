@@ -64,6 +64,7 @@ class McAuthor(Model):
 class McBook(Model):
     title = fields.CharField(max_length=50)
     rating = fields.IntField()
+    note = fields.CharField(max_length=50, null=True)
     author = fields.ForeignKeyField("McAuthor", related_name="books")
 
     class Meta:
@@ -652,3 +653,122 @@ async def test_connections_get_satisfies_base_db_async_client(orm):
     THEN it is a structural instance of the protocol
     """
     assert isinstance(connections.get(), BaseDBAsyncClient)
+
+
+# -- chainable first() / single-row projections -------------------------------
+
+
+async def _seed_mc() -> tuple[McAuthor, McBook]:
+    """Create one author with two books.
+
+    Returns:
+        The author and its first book.
+    """
+    ada = await McAuthor.create(name="Ada")
+    b1 = await McBook.create(title="B1", rating=4, author=ada)
+    await McBook.create(title="B2", rating=5, author=ada)
+    return ada, b1
+
+
+@pytest.mark.asyncio
+async def test_first_then_values_returns_single_dict(db):
+    """
+    GIVEN matching rows
+    WHEN first() is chained into values()
+    THEN a single dict (not a list) of the requested columns is returned
+    """
+    await _seed_mc()
+    assert await McBook.filter(title="B1").first().values("title") == {"title": "B1"}
+
+
+@pytest.mark.asyncio
+async def test_first_then_only_returns_single_model(db):
+    """
+    GIVEN matching rows
+    WHEN first() is chained into only()
+    THEN a single model instance restricted to those columns is returned
+    """
+    _, b1 = await _seed_mc()
+    book = await McBook.filter(title="B1").first().only("id", "title")
+    assert book is not None
+    assert book.id == b1.id
+    assert book.title == "B1"
+
+
+@pytest.mark.asyncio
+async def test_first_then_values_list_flat_returns_scalar(db):
+    """
+    GIVEN matching rows
+    WHEN first() is chained into values_list(flat=True)
+    THEN the single scalar value is returned
+    """
+    _, b1 = await _seed_mc()
+    assert await McBook.filter(title="B1").first().values_list("id", flat=True) == b1.id
+
+
+@pytest.mark.asyncio
+async def test_first_projection_on_no_match_returns_none(db):
+    """
+    GIVEN no matching row
+    WHEN first() is chained into a projection
+    THEN the result resolves to None rather than raising
+    """
+    await _seed_mc()
+    assert await McBook.filter(title="missing").first().values("title") is None
+    assert await McBook.filter(title="missing").first().only("id") is None
+    assert await McBook.filter(title="missing").first() is None
+
+
+@pytest.mark.asyncio
+async def test_get_then_values_returns_single_dict(db):
+    """
+    GIVEN exactly one matching row
+    WHEN get() is chained into values()
+    THEN a single dict is returned
+    """
+    await _seed_mc()
+    assert await McBook.get(title="B1").values("title") == {"title": "B1"}
+
+
+@pytest.mark.asyncio
+async def test_first_select_related_then_values_traverses_relation(db):
+    """
+    GIVEN a book linked to an author
+    WHEN first() eager-loads the relation and values() selects a related column
+    THEN the related value appears under the path key
+    """
+    await _seed_mc()
+    row = (
+        await McBook.filter(title="B1")
+        .first()
+        .select_related("author")
+        .values("title", "author__name")
+    )
+    assert row == {"title": "B1", "author__name": "Ada"}
+
+
+@pytest.mark.asyncio
+async def test_async_for_iterates_queryset(db):
+    """
+    GIVEN a queryset
+    WHEN iterated with async for
+    THEN each matching instance is yielded
+    """
+    await _seed_mc()
+    titles = [book.title async for book in McBook.all().order_by("title")]
+    assert titles == ["B1", "B2"]
+
+
+@pytest.mark.asyncio
+async def test_update_accepts_coalesce_function(db):
+    """
+    GIVEN a row with a NULL column
+    WHEN update() assigns a Coalesce(column, fallback) function expression
+    THEN the fallback is written rather than raising on the function value
+    """
+    from yara_orm import Coalesce
+
+    ada = await McAuthor.create(name="Ada")
+    book = await McBook.create(title="T", rating=1, note=None, author=ada)
+    await McBook.filter(id=book.id).update(note=Coalesce("note", "fallback"))
+    assert (await McBook.get(id=book.id)).note == "fallback"

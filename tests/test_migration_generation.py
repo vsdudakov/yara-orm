@@ -492,3 +492,52 @@ def test_remove_plain_composite_index_to_source_has_no_condition():
     src = m.RemoveCompositeIndex("t", "idx_t_a_b", ["a", "b"]).to_source()
     assert "condition=" not in src
     assert "idx_t_a_b" in src
+
+
+def test_index_opclass_renders_on_postgres_and_drops_on_sqlite():
+    """
+    GIVEN a composite index carrying a per-column operator class
+    WHEN it is rendered on each dialect
+    THEN PostgreSQL appends the opclass and SQLite omits it
+    """
+    from yara_orm.dialects import PostgresDialect, SqliteDialect
+
+    op = m.AddCompositeIndex("t", "idx_trgm", ["a"], using="gin", opclass="gin_trgm_ops")
+    [pg_sql] = op.forward_sql(PostgresDialect(), {})
+    assert '("a" gin_trgm_ops)' in pg_sql
+    [lite_sql] = op.forward_sql(SqliteDialect(), {})
+    assert '("a")' in lite_sql
+    assert "gin_trgm_ops" not in lite_sql
+
+
+def test_index_opclass_round_trips_through_migration_source():
+    """
+    GIVEN a composite index op with an operator class
+    WHEN it is rendered to migration source
+    THEN the opclass keyword is emitted so re-runs preserve it
+    """
+    op = m.AddCompositeIndex("t", "idx_trgm", ["a"], using="gin", opclass="gin_trgm_ops")
+    assert "opclass='gin_trgm_ops'" in op.to_source()
+
+
+def test_meta_index_opclass_emitted_in_create_table_sql():
+    """
+    GIVEN a model declaring Index(opclass=...) in Meta.indexes
+    WHEN its table DDL is generated on PostgreSQL
+    THEN the index statement carries the operator class
+    """
+    from yara_orm.dialects import PostgresDialect
+
+    # Abstract so the model is not registered globally (its index needs the
+    # pg_trgm extension, which other tests' generate_schemas() does not install).
+    class GenDoc(Model):
+        id = fields.IntField(pk=True)
+        body = fields.TextField()
+
+        class Meta:
+            abstract = True
+            table = "gen_doc"
+            indexes = [Index(fields=["body"], using="gin", opclass="gin_trgm_ops")]
+
+    sql = "\n".join(PostgresDialect().create_table_sql(GenDoc._meta))
+    assert "gin_trgm_ops" in sql

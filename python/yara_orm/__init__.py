@@ -18,7 +18,6 @@ from .aggregations import Aggregate, Avg, Count, Max, Min, Sum
 from .connection import (
     BaseDBAsyncClient,
     IsolationLevel,
-    Tortoise,
     YaraOrm,
     clear_query_hooks,
     connections,
@@ -66,7 +65,6 @@ __version__ = "1.3.0"
 
 __all__ = [
     "YaraOrm",
-    "Tortoise",
     "Model",
     "Index",
     "QuerySet",

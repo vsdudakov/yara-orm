@@ -113,7 +113,7 @@ async def test_application_name_and_server_settings_via_url():
     """
     GIVEN a PostgreSQL URL with ?application_name= and a libpq ?options= setting
     WHEN the ORM connects
-    THEN both take effect on the connection (Tortoise's application_name /
+    THEN both take effect on the connection (the application_name /
         server_settings, carried through the URL alongside the pool params)
     """
     if not _PG_URL.startswith("postgres"):

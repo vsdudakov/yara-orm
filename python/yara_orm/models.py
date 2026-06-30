@@ -90,7 +90,7 @@ class MetaInfo:
         self.default_connection: str | None = None
         self.fetch_db_defaults: bool = False
         #: When ``"store"``, ``Model.__init__`` keeps unknown kwargs as plain
-        #: instance attributes (Tortoise behaviour) instead of raising; left
+        #: instance attributes (a lenient mode) instead of raising; left
         #: ``None`` (the default) yara stays strict and rejects them.
         self.extra_kwargs: str | None = None
         #: The model's manager; rebound to the declared/default one by the
@@ -145,12 +145,12 @@ class MetaInfo:
 
     @property
     def db_table(self) -> str:
-        """Tortoise alias for :attr:`table` (the database table name)."""
+        """Alias for :attr:`table` (the database table name)."""
         return self.table
 
     @db_table.setter
     def db_table(self, value: str) -> None:
-        """Set the database table name through the Tortoise alias.
+        """Set the database table name through the alias.
 
         Args:
             value: The new table name.
@@ -162,17 +162,17 @@ class MetaInfo:
 
     @property
     def fields_map(self) -> dict[str, Field]:
-        """Tortoise alias exposing all fields (incl. relations) by name."""
+        """Alias exposing all fields (incl. relations) by name."""
         return {**self.fields, **{name: info.field for name, info in self.relations.items()}}
 
     @property
     def db_fields(self) -> set[str]:
-        """Tortoise-compat set of database column names for this model."""
+        """Set of database column names for this model."""
         return {f.db_column for f in self.field_list}
 
     @property
     def fields_db_projection(self) -> dict[str, Field]:
-        """Tortoise-compat mapping of db column name to its field."""
+        """Mapping of db column name to its field."""
         return {f.db_column: f for f in self.field_list}
 
     def get_field(self, name: str) -> Field:
@@ -621,17 +621,17 @@ class Model(metaclass=ModelMeta):
 
         if kwargs:
             if meta.extra_kwargs == "store":
-                # Tortoise stored unknown kwargs as plain attributes (factories,
-                # serializers relied on it); opt in via ``Meta.extra_kwargs``.
+                # Keep unknown kwargs as plain attributes (factories and
+                # serializers rely on it); opt in via ``Meta.extra_kwargs``.
                 for key, value in kwargs.items():
                     self.__dict__[key] = value
             else:
                 raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
 
     def __await__(self) -> Any:
-        """Make instances awaitable, yielding ``self`` (Tortoise compat).
+        """Make instances awaitable, yielding ``self``.
 
-        Some Tortoise code (and test factories) did ``await Model.create(...)``
+        Some code (and test factories) does ``await Model.create(...)``
         where ``create`` already returns an instance; awaiting the instance
         again must be a harmless no-op that returns it.
 
@@ -654,12 +654,12 @@ class Model(metaclass=ModelMeta):
 
     @property
     def _saved_in_db(self) -> bool:
-        """Tortoise alias for :attr:`_in_db` (True once persisted)."""
+        """Alias for :attr:`_in_db` (True once persisted)."""
         return self._in_db
 
     @_saved_in_db.setter
     def _saved_in_db(self, value: bool) -> None:
-        """Set the persisted flag through the Tortoise-named alias.
+        """Set the persisted flag through the alias.
 
         Args:
             value: Whether the instance is considered saved in the database.
@@ -692,7 +692,7 @@ class Model(metaclass=ModelMeta):
         return getattr(self, self._meta.pk_field.model_field_name)
 
     def __eq__(self, other: object) -> bool:
-        """Compare by model type and primary key (Tortoise identity semantics).
+        """Compare by model type and primary key (value identity semantics).
 
         Two instances of the same model with the same (non-``None``) primary key
         are equal, so a freshly fetched row compares equal to one already held
@@ -840,7 +840,7 @@ class Model(metaclass=ModelMeta):
                     continue
                 setattr(self, name, now)
 
-    async def save(self, update_fields: list[str] | None = None) -> Model:
+    async def save(self, update_fields: list[str] | None = None, using_db: Any = None) -> Model:
         """Persist this instance, emitting pre/post-save signals if registered.
 
         Args:
@@ -850,6 +850,7 @@ class Model(metaclass=ModelMeta):
                 ``auto_now`` columns are bumped only if named. Ignored when the
                 instance is being inserted (a new row needs all its columns).
                 The list is also forwarded to the save signals.
+            using_db: Optional connection name/object to run on.
 
         Returns:
             This instance.
@@ -858,7 +859,7 @@ class Model(metaclass=ModelMeta):
         created = not self._in_db
         self._run_validators()
         has_signals = signals._has_handlers(cls)
-        executor = get_executor(cls, write=True)
+        executor = get_executor(cls, write=True, using=using_db)
         if has_signals:
             await signals.emit_pre_save(cls, self, executor, update_fields)
         await self._perform_save(executor, update_fields)
@@ -963,15 +964,18 @@ class Model(metaclass=ModelMeta):
             params.append(pk_field.to_db(self.pk))
             await executor.execute(meta.update_sql, params)
 
-    async def delete(self) -> None:
+    async def delete(self, using_db: Any = None) -> None:
         """Delete this instance's row, emitting pre/post-delete signals.
+
+        Args:
+            using_db: Optional connection name/object to run on.
 
         Returns:
             None
         """
         cls = type(self)
         dialect = get_dialect(cls)
-        executor = get_executor(cls, write=True)
+        executor = get_executor(cls, write=True, using=using_db)
         meta = self._meta
         has_signals = signals._has_handlers(cls)
         if has_signals:
@@ -1098,30 +1102,34 @@ class Model(metaclass=ModelMeta):
         return cls._meta.manager.get_queryset()
 
     @classmethod
-    def filter(cls, *args: Any, **kwargs: Any) -> QuerySet:
+    def filter(cls, *args: Any, using_db: Any = None, **kwargs: Any) -> QuerySet:
         """Return a query set filtered by the given conditions.
 
         Args:
             *args: Positional filter expressions (e.g. ``Q`` objects).
+            using_db: Optional connection name/object to run on.
             **kwargs: Field lookups to filter by.
 
         Returns:
             A new ``QuerySet`` with the filters applied.
         """
-        return cls._meta.manager.get_queryset().filter(*args, **kwargs)
+        qs = cls._meta.manager.get_queryset().filter(*args, **kwargs)
+        return qs.using_db(using_db) if using_db is not None else qs
 
     @classmethod
-    def exclude(cls, *args: Any, **kwargs: Any) -> QuerySet:
+    def exclude(cls, *args: Any, using_db: Any = None, **kwargs: Any) -> QuerySet:
         """Return a query set excluding rows matching the given conditions.
 
         Args:
             *args: Positional filter expressions (e.g. ``Q`` objects).
+            using_db: Optional connection name/object to run on.
             **kwargs: Field lookups to exclude by.
 
         Returns:
             A new ``QuerySet`` with the exclusions applied.
         """
-        return cls._meta.manager.get_queryset().exclude(*args, **kwargs)
+        qs = cls._meta.manager.get_queryset().exclude(*args, **kwargs)
+        return qs.using_db(using_db) if using_db is not None else qs
 
     @classmethod
     def annotate(cls, **annotations: Any) -> QuerySet:
@@ -1327,19 +1335,22 @@ class Model(metaclass=ModelMeta):
         return await engine.fetch_rows(sql, params)
 
     @classmethod
-    def get(cls, **kwargs: Any) -> QuerySetSingle[Model]:
+    def get(cls, *, using_db: Any = None, **kwargs: Any) -> QuerySetSingle[Model]:
         """Return a chainable, awaitable single-row result for the lookups.
 
         ``await Model.get(id=x)`` resolves to the instance (via a fast path);
-        ``await Model.get(id=x).prefetch_related(...)`` chains like Tortoise's
-        ``QuerySetSingle`` and applies the prefetch/select before resolving.
+        ``await Model.get(id=x).prefetch_related(...)`` chains as a single-row
+        result and applies the prefetch/select before resolving.
 
         Args:
+            using_db: Optional connection name/object to run on.
             **kwargs: Field lookups identifying exactly one row.
 
         Returns:
             A ``QuerySetSingle`` resolving to the matching instance.
         """
+        if using_db is not None:
+            return QuerySetSingle(cls.filter(**kwargs).using_db(using_db), _resolve_get)
         return QuerySetSingle(cls.filter(**kwargs), _resolve_get, fast=lambda: cls._get_one(kwargs))
 
     @classmethod
@@ -1377,27 +1388,29 @@ class Model(metaclass=ModelMeta):
         return cls._from_db_row(rows[0]) if rows else None
 
     @classmethod
-    async def create(cls, **kwargs: Any) -> Model:
+    async def create(cls, *, using_db: Any = None, **kwargs: Any) -> Model:
         """Construct an instance from the given values and save it.
 
         Args:
+            using_db: Optional connection name/object to run on.
             **kwargs: Field values to initialise the new instance with.
 
         Returns:
             The newly created, persisted instance.
         """
         obj = cls(**kwargs)
-        await obj.save()
+        await obj.save(using_db=using_db)
         return obj
 
     @classmethod
     async def get_or_create(
-        cls, defaults: dict[str, Any] | None = None, **kwargs: Any
+        cls, defaults: dict[str, Any] | None = None, using_db: Any = None, **kwargs: Any
     ) -> tuple[Model, bool]:
         """Fetch the row matching ``kwargs`` or create it.
 
         Args:
             defaults: Extra field values used only when creating the row.
+            using_db: Optional connection name/object to run on.
             **kwargs: Lookups identifying the row and reused on creation.
 
         Returns:
@@ -1405,18 +1418,19 @@ class Model(metaclass=ModelMeta):
             row was inserted.
         """
         try:
-            return await cls.get(**kwargs), False
+            return await cls.get(using_db=using_db, **kwargs), False
         except DoesNotExist:
-            return await cls.create(**{**kwargs, **(defaults or {})}), True
+            return await cls.create(using_db=using_db, **{**kwargs, **(defaults or {})}), True
 
     @classmethod
     async def update_or_create(
-        cls, defaults: dict[str, Any] | None = None, **kwargs: Any
+        cls, defaults: dict[str, Any] | None = None, using_db: Any = None, **kwargs: Any
     ) -> tuple[Model, bool]:
         """Update the row matching ``kwargs`` with ``defaults``, or create it.
 
         Args:
             defaults: Field values to set (on update) or add (on create).
+            using_db: Optional connection name/object to run on.
             **kwargs: Lookups identifying the row and reused on creation.
 
         Returns:
@@ -1425,12 +1439,12 @@ class Model(metaclass=ModelMeta):
         """
         defaults = defaults or {}
         try:
-            obj = await cls.get(**kwargs)
+            obj = await cls.get(using_db=using_db, **kwargs)
         except DoesNotExist:
-            return await cls.create(**{**kwargs, **defaults}), True
+            return await cls.create(using_db=using_db, **{**kwargs, **defaults}), True
         if defaults:
             obj.update_from_dict(defaults)
-            await obj.save()
+            await obj.save(using_db=using_db)
         return obj, False
 
     @classmethod
@@ -1655,19 +1669,33 @@ class Model(metaclass=ModelMeta):
             total += await engine.execute(sql, params)
         return total
 
-    async def refresh_from_db(self) -> Model:
+    async def refresh_from_db(
+        self, fields: Iterable[str] | None = None, using_db: Any = None
+    ) -> Model:
         """Reload this instance's column values from the database.
 
+        Args:
+            fields: Optional field names to reload; ``None``
+                reloads every field.
+            using_db: Optional connection name/object to run on.
+
         Returns:
-            ``self``, with every field refreshed from its persisted row.
+            ``self``, with the requested fields refreshed from its persisted row.
         """
-        fresh = await type(self).get(pk=self.pk)
-        for field in self._meta.field_list:
+        meta = self._meta
+        fresh = await type(self).get(pk=self.pk, using_db=using_db)
+        targets = (
+            [meta.get_field(name) for name in fields] if fields is not None else meta.field_list
+        )
+        for field in targets:
             setattr(self, field.model_field_name, getattr(fresh, field.model_field_name))
         return self
 
     def update_from_dict(self, data: dict[str, Any]) -> Model:
         """Set attributes from ``data`` in place (without saving).
+
+        Unknown keys raise unless ``Meta.extra_kwargs == "store"``, in which case
+        they are kept as plain attributes (a lenient mode).
 
         Args:
             data: Mapping of field or relation name to its new value.
@@ -1679,6 +1707,8 @@ class Model(metaclass=ModelMeta):
         for key, value in data.items():
             if key in meta.fields or key in meta.relations:
                 setattr(self, key, value)
+            elif meta.extra_kwargs == "store":
+                self.__dict__[key] = value
             else:
                 raise FieldError(f"{type(self).__name__} has no field {key!r}")
         return self
