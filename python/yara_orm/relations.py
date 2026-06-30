@@ -391,16 +391,17 @@ class RelatedManager:
         """
         return self._qs()
 
-    def filter(self, **kwargs: Any) -> QuerySet:
+    def filter(self, *args: Any, **kwargs: Any) -> QuerySet:
         """Return a queryset further filtered by the given criteria.
 
         Args:
+            *args: ``Q`` nodes ANDed into the query.
             **kwargs: Additional filter keyword arguments.
 
         Returns:
             A queryset narrowed by both the manager and extra criteria.
         """
-        return self._qs().filter(**kwargs)
+        return self._qs().filter(*args, **kwargs)
 
     def order_by(self, *fields: str) -> QuerySet:
         """Return a queryset ordered by the given fields.
@@ -412,6 +413,27 @@ class RelatedManager:
             A queryset ordered by the given fields.
         """
         return self._qs().order_by(*fields)
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy queryset methods onto the manager's filtered queryset.
+
+        Lets the reverse manager chain like a queryset
+        (``rel.limit(10).select_related(...)`` / ``.exclude`` / ``.values`` /
+        ``.annotate`` / …) without re-declaring each method. Only consulted for
+        attributes the manager does not define itself.
+
+        Args:
+            name: The attribute being looked up.
+
+        Returns:
+            The corresponding attribute of a freshly filtered queryset.
+
+        Raises:
+            AttributeError: For private names or names the queryset lacks.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._qs(), name)
 
     async def create(self, **kwargs: Any) -> Model:
         """Create a related instance bound to the manager's criteria.
@@ -519,6 +541,62 @@ class M2MDescriptor:
         return M2MManager(self.info, instance, self.reverse)
 
 
+class _M2MMembershipSubquery:
+    """Renders ``(SELECT far FROM through WHERE near = $n)`` for an m2m manager.
+
+    Used as the value of a ``pk__in`` filter so :meth:`M2MManager.all` returns a
+    chainable :class:`~yara_orm.QuerySet` over the target model constrained to
+    the rows linked to one owning instance — without depending on a reverse
+    relation name being declared.
+    """
+
+    def __init__(self, through: str, near: str, far: str, owner_pk: Any) -> None:
+        """Store the join-table identifiers and the owning instance's pk.
+
+        Args:
+            through: The (unquoted) join-table name.
+            near: The (unquoted) join column referencing the owning instance.
+            far: The (unquoted) join column referencing the target row.
+            owner_pk: The owning instance's primary-key value to bind.
+
+        Returns:
+            None
+        """
+        self.through = through
+        self.near = near
+        self.far = far
+        self.owner_pk = owner_pk
+
+    def as_sql(
+        self,
+        queryset: Any,
+        dialect: Any,
+        joins: dict[str, str],
+        params: list[Any],
+        idx: int,
+    ) -> tuple[str, int]:
+        """Render the membership subquery, binding the owning instance's pk.
+
+        Args:
+            queryset: The owning queryset (unused; the subquery is self-contained).
+            dialect: The active SQL dialect.
+            joins: Join map (unused).
+            params: Bound-parameter list, extended in place.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, next_index)`` tuple.
+        """
+        q = dialect.quote
+        through = q(self.through)
+        params.append(self.owner_pk)
+        sql = (
+            f"(SELECT {through}.{q(self.far)} FROM {through} "
+            f"WHERE {through}.{q(self.near)} = {dialect.placeholder(idx)})"
+        )
+        return sql, idx + 1
+
+
 class M2MManager:
     """Many-to-many manager: awaitable to a list, async-iterable, mutable."""
 
@@ -617,6 +695,71 @@ class M2MManager:
             An async iterator over the related instances.
         """
         return _AsyncList(self._fetch())
+
+    def _qs(self) -> QuerySet:
+        """Build a queryset over the target rows linked to this instance.
+
+        Returns:
+            A ``QuerySet`` on the target model constrained, through the join
+            table, to the rows related to the owning instance.
+        """
+        sub = _M2MMembershipSubquery(
+            self.info.through, self.near_key, self.far_key, self.instance.pk
+        )
+        return QuerySet(self.target).filter(pk__in=sub)
+
+    def all(self) -> QuerySet:
+        """Return a chainable queryset for all related rows.
+
+        Returns:
+            A ``QuerySet`` over the related target rows (chainable with
+            ``.filter()``/``.select_related()``/``.order_by()``/…).
+        """
+        return self._qs()
+
+    def filter(self, *args: Any, **kwargs: Any) -> QuerySet:
+        """Return the related queryset further filtered by the given criteria.
+
+        Args:
+            *args: ``Q`` nodes ANDed into the query.
+            **kwargs: Additional filter keyword arguments.
+
+        Returns:
+            A queryset over the related rows narrowed by the extra criteria.
+        """
+        return self._qs().filter(*args, **kwargs)
+
+    def order_by(self, *fields: str) -> QuerySet:
+        """Return the related queryset ordered by the given fields.
+
+        Args:
+            *fields: Field names to order the related rows by.
+
+        Returns:
+            A queryset over the related rows ordered by ``fields``.
+        """
+        return self._qs().order_by(*fields)
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy queryset methods onto the related queryset.
+
+        Lets the m2m manager chain like a queryset
+        (``rel.all().select_related(...)``, ``rel.limit(...)``, ``.exclude``,
+        ``.values``, …). Only consulted for attributes the manager does not
+        define itself.
+
+        Args:
+            name: The attribute being looked up.
+
+        Returns:
+            The corresponding attribute of the related queryset.
+
+        Raises:
+            AttributeError: For private names or names the queryset lacks.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._qs(), name)
 
     async def add(self, *objects: Model | Any) -> None:
         """Add related objects to the join table.

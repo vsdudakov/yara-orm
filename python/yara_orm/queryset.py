@@ -1375,8 +1375,18 @@ class QuerySet:
         meta = self.model._meta
         meta.compile(dialect)
         joins: dict[str, str] = {}
-        cols = ", ".join(self._resolve_column(p, dialect, joins) for p in field_paths)
+        resolved = [self._resolve_column(p, dialect, joins) for p in field_paths]
+        cols = ", ".join(resolved)
         where, params, _ = self._compile_conditions(dialect, start=start)
+        if len(resolved) == 1:
+            # A single-column projection feeds an IN / NOT IN membership test
+            # (``id__in=Subquery(qs.values_list("col", flat=True))``). Excluding
+            # NULLs of that column keeps NOT IN correct — a NULL in the set makes
+            # ``x NOT IN (...)`` evaluate to UNKNOWN, dropping every row, so
+            # ``exclude(col__in=Subquery(...))`` would otherwise return nothing —
+            # without changing IN results (a NULL never matches anyway).
+            guard = f"{resolved[0]} IS NOT NULL"
+            where = f"{where} AND {guard}" if where else f" WHERE {guard}"
         table = dialect.quote(meta.table)
         distinct = "DISTINCT " if self._distinct else ""
         sql = (

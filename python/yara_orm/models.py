@@ -628,11 +628,15 @@ class Model(metaclass=ModelMeta):
 
         for name, field in meta.fields.items():
             if name in kwargs:
-                setattr(self, name, kwargs.pop(name))
+                value = kwargs.pop(name)
             elif field.db_column != name and field.db_column in kwargs:
-                setattr(self, name, kwargs.pop(field.db_column))
+                value = kwargs.pop(field.db_column)
             else:
-                setattr(self, name, field.get_default())
+                value = field.get_default()
+            # Normalise loose input (e.g. an ISO string for a date column) to the
+            # field's canonical Python type, so the in-memory attribute matches a
+            # fetched row (``create(created_at="...").created_at`` is a datetime).
+            setattr(self, name, field.to_python_value(value))
 
         for rel_name, (info, value) in rel_overrides.items():
             if value is None:
