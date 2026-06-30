@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{NoTls, Statement};
 
 use crate::backend::pool::extract_pool_params;
@@ -28,6 +28,27 @@ async fn prepare(client: &Object, sql: &str, cache: bool) -> Result<Statement, E
     } else {
         client.prepare(sql).await?
     })
+}
+
+/// Prepare `sql`, declaring each parameter's type from its Python value (so the
+/// server doesn't mis-infer it from context — e.g. a `float` compared to an
+/// `int` column). Falls back to plain `prepare` when any parameter's type is
+/// left to the server (`NULL`/JSON), since those carry no definite type here.
+async fn prepare_for(
+    client: &Object,
+    sql: &str,
+    params: &[Value],
+    cache: bool,
+) -> Result<Statement, EngineError> {
+    let types: Option<Vec<Type>> = params.iter().map(|v| v.pg_type()).collect();
+    match types {
+        Some(types) => Ok(if cache {
+            client.prepare_typed_cached(sql, &types).await?
+        } else {
+            client.prepare_typed(sql, &types).await?
+        }),
+        None => prepare(client, sql, cache).await,
+    }
 }
 
 impl PgBackend {
@@ -102,7 +123,7 @@ fn as_sql_params(params: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
 impl Backend for PgBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
         let client = self.get().await?;
-        let stmt = prepare(&client, sql, self.cache_statements).await?;
+        let stmt = prepare_for(&client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let affected = client.execute(&stmt, &bound).await?;
         Ok(affected)
@@ -110,7 +131,7 @@ impl Backend for PgBackend {
 
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
         let client = self.get().await?;
-        let stmt = prepare(&client, sql, self.cache_statements).await?;
+        let stmt = prepare_for(&client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
         rows.iter().map(decode_pg_row).collect()
@@ -122,7 +143,7 @@ impl Backend for PgBackend {
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>, EngineError> {
         let client = self.get().await?;
-        let stmt = prepare(&client, sql, self.cache_statements).await?;
+        let stmt = prepare_for(&client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
         rows.iter().map(decode_pg_row_values).collect()
@@ -187,13 +208,13 @@ struct PgTx {
 #[async_trait]
 impl TxConn for PgTx {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
-        let stmt = prepare(&self.client, sql, self.cache_statements).await?;
+        let stmt = prepare_for(&self.client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         Ok(self.client.execute(&stmt, &bound).await?)
     }
 
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
-        let stmt = prepare(&self.client, sql, self.cache_statements).await?;
+        let stmt = prepare_for(&self.client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client.query(&stmt, &bound).await?;
         rows.iter().map(decode_pg_row).collect()
@@ -204,7 +225,7 @@ impl TxConn for PgTx {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>, EngineError> {
-        let stmt = prepare(&self.client, sql, self.cache_statements).await?;
+        let stmt = prepare_for(&self.client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client.query(&stmt, &bound).await?;
         rows.iter().map(decode_pg_row_values).collect()

@@ -37,9 +37,12 @@ All notable changes to **yara-orm** are documented here. The format is based on
   the grouped `values_list` now respects the requested projection).
 - **`Subquery()` handed a non-queryset** raises a clear `TypeError` instead of an
   opaque attribute error.
-- **Raw scalar params bind without an explicit cast** — `execute_query("SELECT $1", [5])`
-  (and `uuid`/`float`/`bool`) no longer crash with a binary/text format error; a scalar is
-  encoded as text when the server types the parameter as textual/unknown.
+- **Bind parameters declare their PostgreSQL type from the Python value** (like asyncpg),
+  so the server no longer mis-infers them from context: an uncast `execute_query("SELECT $1", [5])`
+  returns the real type (not a crash), a `float` compared to an `int` column stays `float8`
+  (`filter(int_col__lte=1.5)`), and the annotated/grouped paths bind filter params correctly.
+- **`values()` on a grouped query returns only the requested fields** (consistent with
+  `values_list()`), instead of also including the group-by columns.
 
 ## [1.3.0] - 2026-06-30
 

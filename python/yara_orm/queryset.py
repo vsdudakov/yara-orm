@@ -1698,7 +1698,12 @@ class QuerySet:
             A list of dicts mapping each requested name to its value.
         """
         if self._annotations or self._group_by:
-            return await self._values_grouped(fields, as_dict=True)
+            rows = await self._values_grouped(fields, as_dict=True)
+            # The grouped SELECT also carries the group-by columns; when specific
+            # fields were requested, return only those (by name).
+            if fields:
+                return [{f: r[f] for f in fields} for r in rows]
+            return rows
         if not fields and not aliases:
             names = paths = tuple(self.model._meta.fields.keys())
         else:

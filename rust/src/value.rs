@@ -235,6 +235,29 @@ fn json_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Bound<'py
 // ---------------------------------------------------------------------------
 
 impl Value {
+    /// The PostgreSQL type to declare for this value as a bind parameter, so the
+    /// server uses it instead of inferring from context (as asyncpg does). This
+    /// keeps e.g. a `float` param `float8` when compared to an `int` column, and
+    /// lets a bare `SELECT $1` return the value's real type. `Null`/`Json` return
+    /// `None` so the server still infers them (a NULL has no type, and JSON must
+    /// match the column's `json` vs `jsonb`).
+    pub fn pg_type(&self) -> Option<Type> {
+        Some(match self {
+            Value::Bool(_) => Type::BOOL,
+            Value::Int(_) => Type::INT8,
+            Value::Float(_) => Type::FLOAT8,
+            Value::Text(_) => Type::TEXT,
+            Value::Bytes(_) => Type::BYTEA,
+            Value::Uuid(_) => Type::UUID,
+            Value::Decimal(_) => Type::NUMERIC,
+            Value::Timestamp(_) => Type::TIMESTAMP,
+            Value::TimestampTz(_) => Type::TIMESTAMPTZ,
+            Value::Date(_) => Type::DATE,
+            Value::Time(_) => Type::TIME,
+            Value::Null | Value::Json(_) => return None,
+        })
+    }
+
     /// Render this value as PostgreSQL text, for params the server typed as
     /// textual/unknown (e.g. a bare `SELECT $1` with no column context, where a
     /// binary scalar would be misread as UTF-8). Returns `None` for values that

@@ -406,12 +406,14 @@ def test_normalize_url_rewrites_postgres_aliases():
 async def test_raw_scalar_params_bind_without_cast(orm):
     """
     GIVEN raw SQL with an uncast positional parameter
-    WHEN non-string scalars (int, uuid, float, bool) are bound
-    THEN each query runs instead of crashing on a binary/text format mismatch
+    WHEN non-string scalars are bound (no ``::type`` cast)
+    THEN each binds via its declared type and round-trips with that type
     """
     import uuid
 
+    code = uuid.uuid4()
     conn = connections.get()
-    for value in (5, uuid.uuid4(), 1.5, True):
-        _, rows = await conn.execute_query("SELECT $1 AS v", [value])
-        assert len(rows) == 1
+    assert (await conn.execute_query("SELECT $1 AS v", [5]))[1][0]["v"] == 5
+    assert (await conn.execute_query("SELECT $1 AS v", [code]))[1][0]["v"] == code
+    assert (await conn.execute_query("SELECT $1 AS v", [1.5]))[1][0]["v"] == 1.5
+    assert (await conn.execute_query("SELECT $1 AS v", [True]))[1][0]["v"] is True
