@@ -775,6 +775,30 @@ async def test_update_accepts_coalesce_function(db):
 
 
 @pytest.mark.asyncio
+async def test_float_param_compares_against_int_column(db):
+    """
+    GIVEN an integer column and a float comparison literal
+    WHEN filtering int_col <= 1.5 / <= 4.5
+    THEN the float is compared as a float (not rounded or rejected)
+    """
+    await _seed_mc()  # ratings 4 and 5
+    assert await McBook.filter(rating__lte=4.5).count() == 1
+    assert await McBook.filter(rating__lte=5.5).count() == 2
+
+
+@pytest.mark.asyncio
+async def test_annotated_grouped_filter_param_binds(db):
+    """
+    GIVEN a filter param combined with an annotation and group_by
+    WHEN the grouped SELECT is built and run
+    THEN the filter param binds correctly alongside the annotation
+    """
+    await _seed_mc()
+    rows = await McBook.filter(title="B1").annotate(c=Count("id")).group_by("author_id").values("c")
+    assert rows == [{"c": 1}]
+
+
+@pytest.mark.asyncio
 async def test_values_is_awaitable_async_iterable_and_first(db):
     """
     GIVEN a projection over a queryset
