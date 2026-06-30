@@ -29,6 +29,9 @@ fn oob(v: i64, sql_type: &str) -> Box<dyn Error + Sync + Send> {
 // cached once per interpreter instead of re-imported per value.
 static UUID_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DECIMAL_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+// `yara_orm.Array` marks a sequence to bind as a PostgreSQL array (a bare list
+// binds as JSON). Resolved by import and cached like the scalar types above.
+static ARRAY_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     UUID_TYPE.import(py, "uuid", "UUID")
@@ -36,6 +39,10 @@ fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
 
 fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     DECIMAL_TYPE.import(py, "decimal", "Decimal")
+}
+
+fn array_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    ARRAY_TYPE.import(py, "yara_orm", "Array")
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +54,7 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     Json(serde_json::Value),
+    Array(Vec<Value>),
     Uuid(uuid::Uuid),
     Decimal(rust_decimal::Decimal),
     Timestamp(NaiveDateTime),
@@ -103,6 +111,15 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
             return Ok(Value::Bytes(ob.extract::<Vec<u8>>()?));
         }
         if ob.is_instance_of::<PyDict>() || ob.is_instance_of::<PyList>() {
+            // ``yara_orm.Array`` (a list subclass) binds as a PostgreSQL array;
+            // a bare list/dict binds as JSON (so ``JSONField`` round-trips).
+            if ob.is_instance(array_type(ob.py())?.as_any())? {
+                let mut items = Vec::new();
+                for item in ob.try_iter()? {
+                    items.push(item?.extract::<Value>()?);
+                }
+                return Ok(Value::Array(items));
+            }
             return Ok(Value::Json(py_to_json(ob)?));
         }
         // uuid.UUID and decimal.Decimal have no dedicated Python C-type; dispatch
@@ -189,6 +206,13 @@ impl<'py> IntoPyObject<'py> for Value {
             Value::Text(v) => v.into_pyobject(py)?.into_any(),
             Value::Bytes(v) => PyBytes::new(py, &v).into_any(),
             Value::Json(v) => json_to_py(py, &v)?,
+            Value::Array(items) => {
+                let list = PyList::empty(py);
+                for item in items {
+                    list.append(item.into_pyobject(py)?)?;
+                }
+                list.into_any()
+            }
             Value::Uuid(v) => uuid_type(py)?.call1((v.to_string(),))?.into_any(),
             Value::Decimal(v) => decimal_type(py)?.call1((v.to_string(),))?.into_any(),
             Value::Timestamp(v) => v.into_pyobject(py)?.into_any(),
@@ -254,7 +278,9 @@ impl Value {
             Value::TimestampTz(_) => Type::TIMESTAMPTZ,
             Value::Date(_) => Type::DATE,
             Value::Time(_) => Type::TIME,
-            Value::Null | Value::Json(_) => return None,
+            // Defer arrays to the server: the element type comes from the
+            // ``::type[]`` cast or the target column, not from the value alone.
+            Value::Null | Value::Json(_) | Value::Array(_) => return None,
         })
     }
 
@@ -274,7 +300,7 @@ impl Value {
             Value::TimestampTz(v) => Some(v.to_rfc3339()),
             Value::Date(v) => Some(v.format("%Y-%m-%d").to_string()),
             Value::Time(v) => Some(v.format("%H:%M:%S%.6f").to_string()),
-            Value::Null | Value::Text(_) | Value::Bytes(_) => None,
+            Value::Null | Value::Text(_) | Value::Bytes(_) | Value::Array(_) => None,
         }
     }
 }
@@ -329,6 +355,7 @@ impl ToSql for Value {
             Value::Text(v) => v.to_sql(ty, out),
             Value::Bytes(v) => v.to_sql(ty, out),
             Value::Json(v) => v.to_sql(ty, out),
+            Value::Array(items) => items.to_sql(ty, out),
             Value::Uuid(v) => v.to_sql(ty, out),
             Value::Decimal(v) => v.to_sql(ty, out),
             Value::Timestamp(v) => v.to_sql(ty, out),
@@ -384,6 +411,27 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
 // SQLite conversions
 // ---------------------------------------------------------------------------
 
+/// Convert a [`Value`] into JSON, used to store an array parameter as JSON text
+/// on SQLite (which has no array type). Element scalars map to their JSON form.
+fn value_to_json(v: Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Null | Value::Bytes(_) => J::Null,
+        Value::Bool(b) => J::Bool(b),
+        Value::Int(i) => J::from(i),
+        Value::Float(f) => J::from(f),
+        Value::Text(s) => J::String(s),
+        Value::Json(j) => j,
+        Value::Array(items) => J::Array(items.into_iter().map(value_to_json).collect()),
+        Value::Uuid(u) => J::String(u.to_string()),
+        Value::Decimal(d) => J::String(d.to_string()),
+        Value::Timestamp(t) => J::String(t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+        Value::TimestampTz(t) => J::String(t.to_rfc3339()),
+        Value::Date(d) => J::String(d.format("%Y-%m-%d").to_string()),
+        Value::Time(t) => J::String(t.format("%H:%M:%S%.6f").to_string()),
+    }
+}
+
 /// Bind an owned [`Value`] as a SQLite parameter, moving (not cloning) the
 /// `String`/`Bytes` payloads. SQLite has few storage classes, so richer types
 /// are encoded as TEXT and reconstructed on read via the declared column type
@@ -398,6 +446,10 @@ pub fn value_into_sqlite(v: Value) -> rusqlite::types::Value {
         Value::Text(s) => S::Text(s),
         Value::Bytes(b) => S::Blob(b),
         Value::Json(j) => S::Text(j.to_string()),
+        // SQLite has no array type; store as a JSON text array.
+        Value::Array(items) => S::Text(
+            serde_json::Value::Array(items.into_iter().map(value_to_json).collect()).to_string(),
+        ),
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Decimal(d) => S::Text(d.to_string()),
         Value::Timestamp(dt) => S::Text(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
@@ -523,6 +575,25 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Va
         };
     }
 
+    macro_rules! get_arr {
+        ($rust:ty, $wrap:expr) => {
+            // PostgreSQL arrays may contain NULL elements, so decode through
+            // ``Vec<Option<_>>`` and map a missing element to ``Value::Null``.
+            match row.try_get::<_, Option<Vec<Option<$rust>>>>(idx) {
+                Ok(Some(vs)) => Ok(Value::Array(
+                    vs.into_iter().map(|o| o.map($wrap).unwrap_or(Value::Null)).collect(),
+                )),
+                Ok(None) => Ok(Value::Null),
+                Err(e) => Err(EngineError::Conversion(format!(
+                    "failed to decode column {} ({}): {}",
+                    idx,
+                    ty.name(),
+                    e
+                ))),
+            }
+        };
+    }
+
     // Dispatch on the stable type OID so the compiler lowers this to a jump
     // table / binary search instead of a ~16-deep chain of `Type` equality
     // comparisons per cell. OIDs are fixed catalog values (see pg_type.dat).
@@ -543,6 +614,20 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Va
         1082 => get!(NaiveDate, Value::Date),           // DATE
         1083 => get!(NaiveTime, Value::Time),           // TIME
         2278 => Ok(Value::Null),                        // VOID (e.g. pg_sleep)
+        // Array element types (``_xxx`` OIDs), decoded to ``Value::Array``.
+        1000 => get_arr!(bool, Value::Bool),                  // _bool
+        1005 => get_arr!(i16, |v| Value::Int(v as i64)),      // _int2
+        1007 => get_arr!(i32, |v| Value::Int(v as i64)),      // _int4
+        1016 => get_arr!(i64, Value::Int),                    // _int8
+        1021 => get_arr!(f32, |v| Value::Float(v as f64)),    // _float4
+        1022 => get_arr!(f64, Value::Float),                  // _float8
+        1009 | 1015 | 1014 => get_arr!(String, Value::Text),  // _text/_varchar/_bpchar
+        2951 => get_arr!(uuid::Uuid, Value::Uuid),            // _uuid
+        1231 => get_arr!(rust_decimal::Decimal, Value::Decimal), // _numeric
+        1115 => get_arr!(NaiveDateTime, Value::Timestamp),    // _timestamp
+        1185 => get_arr!(DateTime<Utc>, Value::TimestampTz),  // _timestamptz
+        1182 => get_arr!(NaiveDate, Value::Date),             // _date
+        1183 => get_arr!(NaiveTime, Value::Time),             // _time
         _ => {
             // Genuinely unknown type: try its text representation, and if even
             // that fails we don't understand the type at all, so degrade to NULL

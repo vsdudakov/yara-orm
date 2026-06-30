@@ -46,7 +46,7 @@ from .exceptions import (
     UnSupportedError,
     ValidationError,
 )
-from .expressions import Case, F, RawSQL, Subquery, Value, When
+from .expressions import Array, Case, F, RawSQL, Subquery, Value, When
 from .functions import Coalesce, Concat, Length, Lower, Random, Trim, Upper
 from .manager import Manager
 from .migrations import CheckConstraint, MigrationManager, UniqueConstraint
@@ -75,6 +75,7 @@ __all__ = [
     "RawSQL",
     "Subquery",
     "Value",
+    "Array",
     "Now",
     "RandomHex",
     "SqlDefault",
