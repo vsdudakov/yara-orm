@@ -16,7 +16,7 @@ from .expressions import Expression
 from .functions import Function
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Generator
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 
     from .dialects import BaseDialect
     from .fields import Field
@@ -46,7 +46,7 @@ _DATE_PARTS = frozenset(
     {"year", "quarter", "month", "week", "day", "hour", "minute", "second", "microsecond"}
 )
 # Regex lookups, e.g. ``name__regex=r"^A"`` (rendered per dialect operator). The
-# ``posix_regex``/``iposix_regex`` spellings match Tortoise; they are aliases.
+# ``posix_regex``/``iposix_regex`` are accepted spellings; they are aliases.
 _REGEX_OPS = frozenset({"regex", "iregex", "posix_regex", "iposix_regex"})
 # Lookups handled by dedicated branches rather than the ``_OPERATORS`` table.
 _SPECIAL_OPS = frozenset({"in", "not_in", "isnull", "not_isnull", "range", "search", "date"})
@@ -75,7 +75,7 @@ def _split_lookup(key: str) -> tuple[str, str]:
 class Q:
     """A tree of filter conditions combinable with ``&``, ``|`` and ``~``."""
 
-    #: Tortoise-compat connector constants; ``self.connector`` holds one of these.
+    #: Connector constants; ``self.connector`` holds one of these.
     AND = "AND"
     OR = "OR"
 
@@ -276,9 +276,9 @@ class QuerySet:
         return qs
 
     def all(self) -> QuerySet:
-        """Return a clone of this query set (Tortoise-compat no-op terminator).
+        """Return a clone of this query set (a no-op chain terminator).
 
-        Tortoise code frequently ends a chain with ``.all()`` (e.g.
+        Code often ends a chain with ``.all()`` (e.g.
         ``qs.filter(...).all()``); yara query sets are already awaitable, so this
         just returns a clone to keep those chains working unchanged.
 
@@ -1495,6 +1495,18 @@ class QuerySet:
         """
         return self._fetch().__await__()
 
+    async def __aiter__(self) -> AsyncGenerator[Model, None]:
+        """Iterate the matching instances with ``async for``.
+
+        Executes the query once and yields each instance, so
+        ``async for obj in Model.filter(...)`` works like ``for obj in await ...``.
+
+        Yields:
+            Each matching model instance.
+        """
+        for obj in await self._fetch():
+            yield obj
+
     async def _fetch_columns(self, field_paths: tuple[str, ...]) -> list[Any]:
         """Fetch raw rows for the given column paths without building models.
 
@@ -1619,7 +1631,16 @@ class QuerySet:
             A list of tuples, or a list of scalars when ``flat`` is ``True``.
         """
         if self._annotations or self._group_by:
-            return await self._values_grouped(fields, as_dict=False)
+            if not fields:
+                return await self._values_grouped(fields, as_dict=False)
+            # The grouped SELECT also carries the group-by columns, so project
+            # down to exactly the requested fields (by name) before tupling.
+            dict_rows = await self._values_grouped(fields, as_dict=True)
+            if flat:
+                if len(fields) != 1:
+                    raise FieldError("flat=True requires exactly one field")
+                return [r[fields[0]] for r in dict_rows]
+            return [tuple(r[f] for f in fields) for r in dict_rows]
         paths = fields or tuple(self.model._meta.fields.keys())
         if flat:
             if len(paths) != 1:
@@ -1788,7 +1809,7 @@ class QuerySet:
 
         Awaiting it resolves to the first instance or ``None``; chaining
         ``only`` / ``values`` / ``values_list`` / ``select_related`` /
-        ``prefetch_related`` narrows that single row first (Tortoise compat).
+        ``prefetch_related`` narrows that single row first.
 
         Returns:
             A ``QuerySetSingle`` resolving to the first instance, or ``None``.
@@ -1905,6 +1926,12 @@ class QuerySet:
                     lambda n: dialect.quote(meta.get_field(n).db_column), dialect, params, idx
                 )
                 assignments.append(f"{dialect.quote(field.db_column)} = {expr_sql}")
+            elif isinstance(value, Function):
+                # Assign a function expression, e.g. ``update(at=Coalesce("at", now))``.
+                expr_sql, idx = value.render_params(
+                    lambda n: dialect.quote(meta.get_field(n).db_column), dialect, params, idx
+                )
+                assignments.append(f"{dialect.quote(field.db_column)} = {expr_sql}")
             else:
                 assignments.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
                 params.append(field.to_db(value))
@@ -1949,7 +1976,7 @@ _SingleT = TypeVar("_SingleT")
 
 
 class QuerySetSingle(Generic[_SingleT]):
-    """Awaitable, chainable single-row result (Tortoise ``QuerySetSingle``).
+    """Awaitable, chainable single-row result.
 
     Returned by ``Model.get(...)`` and ``QuerySet.first()`` so callers can either
     ``await Model.get(id=x)`` or chain
@@ -2031,7 +2058,7 @@ class QuerySetSingle(Generic[_SingleT]):
         """Return a single-row result restricted to the given columns.
 
         Args:
-            *fields: Field names to load (Tortoise's ``first().only(...)``).
+            *fields: Field names to load (as in ``first().only(...)``).
 
         Returns:
             A new ``QuerySetSingle`` projecting only ``fields``.
@@ -2042,7 +2069,7 @@ class QuerySetSingle(Generic[_SingleT]):
         """Resolve the single row as a dict of the requested columns.
 
         Args:
-            *fields: Field names/paths to select (Tortoise's ``first().values``).
+            *fields: Field names/paths to select (as in ``first().values``).
             **aliases: ``output_name=field_path`` pairs.
 
         Returns:

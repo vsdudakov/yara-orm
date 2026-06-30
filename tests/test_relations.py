@@ -256,7 +256,7 @@ async def test_forward_fk_sync_access_after_prefetch(db):
     GIVEN employees with and without a manager, fetched with prefetch_related
     WHEN the forward FK is accessed after prefetching it
     THEN it is served synchronously — obj.rel is the instance (or None), so
-    attribute access and truthiness work without awaiting (matching Tortoise),
+    attribute access and truthiness work without awaiting (matching the documented behavior),
     while an un-prefetched relation still returns the awaitable accessor
     """
     boss = await Employee.create(name="Boss")

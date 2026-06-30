@@ -259,3 +259,15 @@ def test_route_falls_back_to_default():
         assert _route(None, False) == "default"  # model is None branch
     finally:
         YaraOrm.set_router(None)
+
+
+def test_aggregate_is_top_level_export():
+    """
+    GIVEN aggregate-base imports written against the functions module
+    WHEN Aggregate is imported from yara_orm
+    THEN the top-level name resolves to the aggregation base class
+    """
+    import yara_orm
+    from yara_orm.aggregations import Aggregate
+
+    assert yara_orm.Aggregate is Aggregate

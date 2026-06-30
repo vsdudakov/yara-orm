@@ -1,4 +1,4 @@
-"""Query expressions and scalar functions (Tortoise-reference parity).
+"""Query expressions and scalar functions.
 
 Covers F() column references in filters and arithmetic updates, the DB
 functions Lower/Upper/Length/Trim/Concat/Coalesce, and Case/When and RawSQL
@@ -238,7 +238,7 @@ async def test_coalesce_numeric_default(db):
 
 def test_q_connector_constants():
     """
-    GIVEN the Tortoise ``Q.AND`` / ``Q.OR`` constants
+    GIVEN the ``Q.AND`` / ``Q.OR`` constants
     WHEN a Q node's connector is compared to them
     THEN the constants exist and match the connector strings
     """
@@ -250,7 +250,7 @@ def test_q_connector_constants():
 
 def test_relation_hint_placeholders_are_subscriptable():
     """
-    GIVEN Tortoise relation typing generics re-exposed on ``fields``
+    GIVEN relation typing generics re-exposed on ``fields``
     WHEN they are subscripted in an annotation position
     THEN subscripting succeeds (annotation-only, returns None)
     """
@@ -262,7 +262,7 @@ def test_relation_hint_placeholders_are_subscriptable():
 @pytest.mark.asyncio
 async def test_value_literal_in_case_annotation(db):
     """
-    GIVEN a Case annotation whose default is wrapped in ``Value`` (Tortoise form)
+    GIVEN a Case annotation whose default is wrapped in ``Value``
     WHEN the annotated query is evaluated
     THEN ``Value`` binds the literal and the CASE resolves correctly
     """
@@ -279,7 +279,7 @@ async def test_value_literal_in_case_annotation(db):
 async def test_await_prefetched_forward_fk(db):
     """
     GIVEN a child whose forward FK was eager-loaded via prefetch_related
-    WHEN the forward relation is awaited (Tortoise ``await self.fk`` idiom)
+    WHEN the forward relation is awaited (the ``await self.fk`` idiom)
     THEN awaiting the already-loaded relation returns the instance
     """
     p = await ExParent.create(name="root")
@@ -288,3 +288,16 @@ async def test_await_prefetched_forward_fk(db):
     [child] = await ExChild.all().prefetch_related("parent")
     loaded = await child.parent
     assert loaded.id == p.id
+
+
+@pytest.mark.asyncio
+async def test_subquery_rejects_non_queryset(db):
+    """
+    GIVEN a Subquery wrapping something that is not a lazy QuerySet
+    WHEN the owning query is executed
+    THEN a clear TypeError is raised instead of an opaque attribute error
+    """
+    from yara_orm import Subquery
+
+    with pytest.raises(TypeError, match="expects a QuerySet"):
+        await ExprRow.exclude(id__in=Subquery(object()))

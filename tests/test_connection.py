@@ -212,7 +212,7 @@ def test_split_sql_statements_quotes_comments_and_no_trailing_semicolon():
 
 def test_connection_url_from_credentials_dict():
     """
-    GIVEN a Tortoise structured connection spec (credentials dict)
+    GIVEN a structured connection spec (credentials dict)
     WHEN it is resolved to a URL
     THEN a postgres URL is built from the credentials
     """
@@ -225,7 +225,7 @@ def test_connection_url_from_credentials_dict():
 @pytest.mark.asyncio
 async def test_execute_query_returns_rowcount_and_rows(orm):
     """
-    GIVEN the Tortoise ``execute_query`` shape
+    GIVEN the ``execute_query`` shape
     WHEN a SELECT is run via the manual connection
     THEN it returns a ``(rowcount, rows)`` tuple with dict rows
     """
@@ -237,7 +237,7 @@ async def test_execute_query_returns_rowcount_and_rows(orm):
 @pytest.mark.asyncio
 async def test_execute_query_dict_and_fetch_one(orm):
     """
-    GIVEN the Tortoise ``execute_query_dict`` / ``fetch_one`` methods
+    GIVEN the ``execute_query_dict`` / ``fetch_one`` methods
     WHEN a SELECT is run via the manual connection
     THEN dict rows and a single dict row are returned
     """
@@ -269,7 +269,7 @@ async def test_sql_error_raises_operational_error(orm):
     """
     GIVEN a statement that fails in the engine (bare RuntimeError natively)
     WHEN it is run via the manual connection
-    THEN it surfaces as OperationalError (Tortoise-compatible)
+    THEN it surfaces as OperationalError
     """
     with pytest.raises(OperationalError):
         await connections.get().execute("SELECT * FROM no_such_table_xyz")
@@ -292,9 +292,9 @@ async def test_query_hook_observes_sql(orm):
 
 
 @pytest.mark.asyncio
-async def test_init_from_tortoise_config_dict():
+async def test_init_from_config_dict():
     """
-    GIVEN a Tortoise-style config dict with a default connection URL
+    GIVEN a config dict with a default connection URL
     WHEN the ORM is initialised via ``init(config=...)``
     THEN the default connection works and ``close_connections`` tears it down
     """
@@ -372,3 +372,31 @@ async def test_transaction_fetch_one_and_engine_proxy_passthrough(orm):
     async with in_transaction() as conn:
         assert await conn.fetch_one("SELECT 1 AS n") == {"n": 1}
     assert connections.get().dialect in {"postgres", "sqlite"}
+
+
+@pytest.mark.asyncio
+async def test_execute_query_rows_support_positional_access(db):
+    """
+    GIVEN a raw SQL query run through the manual-SQL connection
+    WHEN a returned row is indexed positionally and by key
+    THEN both forms work (asyncpg.Record-like), including a slice
+    """
+    star = await CvStar.create(name="Sun")
+    _, rows = await connections.get().execute_query(
+        f"SELECT id, name FROM cov_star WHERE id = {star.id}"
+    )
+    assert rows[0][0] == star.id
+    assert rows[0]["name"] == "Sun"
+    assert tuple(rows[0][0:2]) == (star.id, "Sun")
+
+
+def test_normalize_url_rewrites_postgres_aliases():
+    """
+    GIVEN driver-qualified postgres URL schemes
+    WHEN _normalize_url processes them
+    THEN postgres-family schemes become postgres:// and others pass through
+    """
+    assert YaraOrm._normalize_url("psycopg://u@h/db") == "postgres://u@h/db"
+    assert YaraOrm._normalize_url("asyncpg://u@h/db") == "postgres://u@h/db"
+    assert YaraOrm._normalize_url("postgresql+asyncpg://u@h/db") == "postgres://u@h/db"
+    assert YaraOrm._normalize_url("sqlite:///app.db") == "sqlite:///app.db"

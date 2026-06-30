@@ -1,4 +1,4 @@
-"""Tortoise reference-API parity fixes: transaction routing and keyword-only
+"""Reference-API parity fixes: transaction routing and keyword-only
 aggregate ``distinct``; ``use_tz`` init, ``F`` in annotate, ``Subquery``/``RawSQL``
 in filter, multi-level ``select_related``/``prefetch_related``; modern field
 parameter aliases, extra lookups, multi-sender signals, per-model exceptions,
@@ -63,7 +63,7 @@ class A3Book(Model):
         table = "a3_book"
 
 
-# Modern Tortoise parameter spellings.
+# Modern parameter spellings.
 class A3Modern(Model):
     id = fields.IntField(primary_key=True)
     name = fields.CharField(max_length=20, db_index=True)
@@ -179,7 +179,7 @@ async def test_multi_level_prefetch_related(db):
 
 def test_modern_field_parameters():
     """
-    GIVEN modern Tortoise parameter spellings
+    GIVEN modern parameter spellings
     WHEN a model is defined with them
     THEN they map onto the canonical field options
     """

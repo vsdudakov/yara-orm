@@ -62,7 +62,7 @@ async def test_prefetch_forward_fk(db):
     await PfBook.create(title="Y", author=a)
 
     books = await PfBook.all().prefetch_related("author").order_by("title")
-    # A prefetched forward FK is served synchronously, matching Tortoise.
+    # A prefetched forward FK is served synchronously, matching the documented behavior.
     assert books[0].author.name == "Grace"
     assert books[0].__dict__["_prefetch"]["author"].id == a.id
 

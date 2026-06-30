@@ -31,7 +31,7 @@ from yara_orm import (
 
 ## YaraOrm
 
-Entry point for connections and schema. `Tortoise` is an alias for `YaraOrm`.
+Entry point for connections and schema.
 
 | Member | Signature | Purpose |
 |--------|-----------|---------|

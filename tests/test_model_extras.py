@@ -1,5 +1,5 @@
 """Model-level query shortcuts, clone/describe, Meta.constraints, FK db_constraint,
-the Random function and the extra validators (Tortoise reference parity)."""
+the Random function and the extra validators (reference parity)."""
 
 import pytest
 

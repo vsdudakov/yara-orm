@@ -1,4 +1,4 @@
-"""Second-pass Tortoise parity gaps: Prefetch(to_attr), values()/values_list()
+"""Second-pass parity gaps: Prefetch(to_attr), values()/values_list()
 relation traversal, and bulk_create upsert (ignore_conflicts / update_fields /
 on_conflict)."""
 

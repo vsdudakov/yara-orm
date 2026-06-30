@@ -8,6 +8,7 @@ decision in the dialect layer.
 
 from __future__ import annotations
 
+import json
 import uuid as _uuid
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -34,16 +35,16 @@ class Field:
     #: When True, the engine already returns this field's native Python type, so
     #: the read path can assign DB values directly and skip ``to_python``.
     read_identity: bool = True
-    #: Tortoise-compat flag: every concrete yara field backs a real column, so
+    #: Compatibility flag: every concrete yara field backs a real column, so
     #: code that branches on ``field.has_db_field`` keeps working.
     has_db_field: bool = True
 
     def __class_getitem__(cls, _item: Any) -> type:
         """Make field classes subscriptable for type annotations (no-op).
 
-        Tortoise allowed annotations like ``JSONField[list[dict] | None]`` that
-        are evaluated at class-definition time; returning the class keeps those
-        annotations valid without affecting runtime behaviour.
+        Annotations like ``JSONField[list[dict] | None]`` are evaluated at
+        class-definition time; returning the class keeps those annotations
+        valid without affecting runtime behaviour.
 
         Args:
             _item: The (ignored) type argument.
@@ -82,21 +83,21 @@ class Field:
             db_column: Explicit column name; the metaclass fills it when blank.
             description: Human-readable comment emitted as a column COMMENT.
             validators: Validators run against the value on ``save()``.
-            primary_key: Modern alias for ``pk`` (Tortoise spelling).
-            db_index: Modern alias for ``index`` (Tortoise spelling).
-            source_field: Modern alias for ``db_column`` (Tortoise spelling).
-            db_default: Modern alias for ``default`` (Tortoise spelling); used
-                only when ``default`` is not given.
-            blank: Tortoise form-validation flag with no DB effect; accepted and
-                ignored so existing ``blank=True`` declarations keep working.
+            primary_key: Modern alias for ``pk``.
+            db_index: Modern alias for ``index``.
+            source_field: Modern alias for ``db_column``.
+            db_default: Modern alias for ``default``; used only when ``default``
+                is not given.
+            blank: Form-validation flag with no DB effect; accepted and ignored
+                so existing ``blank=True`` declarations keep working.
             max_length: Accepted and ignored on fields that have no length (e.g.
-                ``UUIDField``/``TextField``); Tortoise tolerated it. ``CharField``
-                and ``CharEnumField`` take their own ``max_length`` before this.
+                ``UUIDField``/``TextField``). ``CharField`` and ``CharEnumField``
+                take their own ``max_length`` before this.
 
         Returns:
             None
         """
-        # Accept the modern Tortoise parameter spellings as aliases.
+        # Accept the modern parameter spellings as aliases.
         if primary_key is not None:
             pk = primary_key
         if db_index is not None:
@@ -381,11 +382,11 @@ class BooleanField(Field):
     field_kind = "bool"
 
     def to_db(self, value: Any) -> Any:
-        """Coerce the Python value to a ``bool`` before binding (Tortoise compat).
+        """Coerce the Python value to a ``bool`` before binding.
 
-        Tortoise stored ``bool(value)``, so truthy non-bool inputs (``1``/``0``,
-        a non-empty string) round-tripped instead of reaching the engine as a
-        type the boolean column rejects.
+        Coerces with ``bool(value)`` so truthy non-bool inputs (``1``/``0``, a
+        non-empty string) round-trip instead of reaching the engine as a type
+        the boolean column rejects.
 
         Args:
             value: The Python value to convert.
@@ -496,7 +497,7 @@ class UUIDField(Field):
         Returns:
             None
         """
-        # Honour the Tortoise ``primary_key=`` spelling too: without this, a
+        # Honour the ``primary_key=`` spelling too: without this, a
         # ``UUIDField(primary_key=True)`` would skip the ``uuid4`` default and
         # insert a NULL id (NOT-NULL violation).
         is_pk = pk or bool(kwargs.get("primary_key"))
@@ -522,10 +523,10 @@ def _json_safe(value: Any) -> Any:
     """Recursively convert common Python types into JSON-native ones.
 
     The native engine serialises JSON itself and accepts only JSON-native
-    Python types, whereas Tortoise (through orjson with a ``default`` hook)
-    tolerated more. This mirrors that leniency for the stdlib types apps most
-    often store in a ``JSONField`` — UUIDs, ``Decimal``, dates/times, sets and
-    enums — leaving already-native values untouched.
+    Python types, whereas some serialisers (e.g. orjson with a ``default``
+    hook) tolerate more. This mirrors that leniency for the stdlib types apps
+    most often store in a ``JSONField`` — UUIDs, ``Decimal``, dates/times, sets
+    and enums — leaving already-native values untouched.
 
     Args:
         value: The Python value about to be serialised.
@@ -553,12 +554,12 @@ def _json_safe(value: Any) -> Any:
 class JSONField(Field):
     """A JSON column.
 
-    ``encoder``/``decoder`` are optional Python value-transform hooks (Tortoise
-    spelling): ``encoder`` runs on the Python value before it is handed to the
-    engine to serialise, and ``decoder`` runs on the value read back. Unlike
-    Tortoise — where the engine stored whatever string the encoder produced —
-    yara serialises JSON in its engine, so these are value→value transforms
-    (e.g. to make oversized integers JS-safe), not full (de)serialisers.
+    ``encoder``/``decoder`` are optional Python value-transform hooks:
+    ``encoder`` runs on the Python value before it is handed to the engine to
+    serialise, and ``decoder`` runs on the value read back. Rather than storing
+    whatever string the encoder produced, yara serialises JSON in its engine,
+    so these are value→value transforms (e.g. to make oversized integers
+    JS-safe), not full (de)serialisers.
     """
 
     field_kind = "json"
@@ -593,8 +594,11 @@ class JSONField(Field):
         """Apply the encode hook (if any) before the engine serialises.
 
         With no ``encoder`` the value is made JSON-safe (UUID/Decimal/datetime/
-        set/enum coerced to native types) so the same exotic values Tortoise
-        accepted do not raise on the native serialiser.
+        set/enum coerced to native types) so those exotic values do not raise
+        on the native serialiser. An ``encoder`` that returns a serialised JSON
+        *string* is parsed back to a native value (the engine serialises JSON
+        itself, so binding the string verbatim would corrupt a ``jsonb``
+        column).
 
         Args:
             value: The Python value to convert.
@@ -605,7 +609,8 @@ class JSONField(Field):
         if value is None:
             return value
         if self.encoder is not None:
-            return self.encoder(value)
+            encoded = self.encoder(value)
+            return json.loads(encoded) if isinstance(encoded, str) else encoded
         return _json_safe(value)
 
     def to_python(self, value: Any) -> Any:
@@ -759,13 +764,13 @@ class ForeignKeyField(Field):
             reference: Dotted path or name of the target model.
             related_name: Name of the reverse accessor on the target model.
             on_delete: Referential action applied on deletion.
-            source_field: Explicit name for this table's FK column (Tortoise's
-                ``source_field``); defaults to ``<name>_id``. The referenced
-                target column is always the target model's primary key.
+            source_field: Explicit name for this table's FK column; defaults to
+                ``<name>_id``. The referenced target column is always the target
+                model's primary key.
             db_constraint: Whether to emit a database ``FOREIGN KEY`` constraint
                 (set ``False`` to keep the column without enforcing referential
                 integrity at the database level).
-            to: Modern alias for ``reference`` (Tortoise spelling).
+            to: Modern alias for ``reference``.
             **kwargs: Additional options forwarded to :class:`Field`.
 
         Returns:
@@ -788,7 +793,7 @@ class ForeignKeyField(Field):
         """Coerce a foreign-key value to the target primary key's type.
 
         The metaclass uses this field as the ``<name>_id`` backing column, so a
-        value assigned as ``str`` (e.g. ``str(instance.id)``, common in Tortoise
+        value assigned as ``str`` (e.g. ``str(instance.id)``, common in caller
         code) must be coerced to the target pk's Python type (e.g. ``UUID``)
         before binding, or the engine rejects the binary format. Non-string
         values and int-pk targets pass through unchanged.
@@ -877,9 +882,9 @@ class ManyToManyField(Field):
             through: Name of the join table; synthesised when omitted.
             forward_key: Join-table column referencing the owning model.
             backward_key: Join-table column referencing the target model.
-            through_fields: Tortoise spelling of ``(forward_key, backward_key)``;
+            through_fields: Alternate spelling of ``(forward_key, backward_key)``;
                 used to fill those when they are not given explicitly.
-            to: Modern alias for ``reference`` (Tortoise spelling).
+            to: Modern alias for ``reference``.
             **kwargs: Additional options forwarded to :class:`Field`.
 
         Returns:
@@ -901,9 +906,9 @@ class ManyToManyField(Field):
 
 
 class _RelationHint:
-    """Subscriptable no-op standing in for Tortoise's relation type hints.
+    """Subscriptable no-op standing in for relation type hints.
 
-    Tortoise annotated relation attributes as ``ForeignKeyRelation[X]`` /
+    Relation attributes may be annotated as ``ForeignKeyRelation[X]`` /
     ``ReverseRelation[X]`` etc. (evaluated at class-definition time). yara derives
     accessors from the FK declaration, so these are annotation-only: subscripting
     returns ``None`` so the annotation is harmless at runtime.
@@ -921,7 +926,7 @@ class _RelationHint:
         return None
 
 
-# Tortoise's relation typing generics, re-exposed so existing annotations like
+# Relation typing generics, re-exposed so existing annotations like
 # ``ForeignKeyNullableRelation[BillingPlan]`` keep importing and evaluating.
 ForeignKeyRelation = _RelationHint
 ForeignKeyNullableRelation = _RelationHint
@@ -931,7 +936,7 @@ ReverseRelation = _RelationHint
 ManyToManyRelation = _RelationHint
 
 
-# Tortoise exposed the on-delete actions as bare module-level names
+# The on-delete actions are also exposed as bare module-level names
 # (``fields.CASCADE`` / ``fields.SET_NULL`` ...). Re-expose them as aliases of
 # the ``OnDelete`` members so existing FK declarations keep working.
 CASCADE = OnDelete.CASCADE

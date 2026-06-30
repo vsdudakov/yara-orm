@@ -102,7 +102,7 @@ def test_exception_hierarchy_parity():
     """
     GIVEN the exception classes
     WHEN their relationships are inspected
-    THEN BaseORMException aliases ORMError and the Tortoise hierarchy holds
+    THEN BaseORMException aliases ORMError and the exception hierarchy holds
     """
     assert BaseORMException is ORMError
     assert issubclass(OperationalError, ORMError)
