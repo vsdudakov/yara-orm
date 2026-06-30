@@ -396,9 +396,9 @@ class ModelMeta(type):
             if parent_meta is not None:
                 fields.update(parent_meta.fields)
                 for rel_name, info in parent_meta.relations.items():
-                    inherited_fk[rel_name] = cast("ForeignKeyField", info.field)
+                    inherited_fk[rel_name] = info.field
                 for rel_name, m2m_info in parent_meta.m2m.items():
-                    inherited_m2m[rel_name] = cast("ManyToManyField", m2m_info.field)
+                    inherited_m2m[rel_name] = m2m_info.field
         for key, value in namespace.items():
             if isinstance(value, ManyToManyField):
                 m2m_decls[key] = value
