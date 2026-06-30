@@ -8,6 +8,7 @@ decision in the dialect layer.
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid as _uuid
 from datetime import date, datetime, time, timedelta
@@ -181,6 +182,22 @@ class Field:
 
         Returns:
             The corresponding Python value.
+        """
+        return value
+
+    def to_python_value(self, value: Any) -> Any:
+        """Normalise a user-supplied value to the field's canonical Python type.
+
+        Applied when a value is assigned on the model (``Model(...)`` /
+        ``create(...)``), so the in-memory attribute matches what a fetched row
+        would hold. The default is identity; fields that accept loose input
+        (e.g. an ISO string for a date column) override it.
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            The value coerced to the field's canonical Python type.
         """
         return value
 
@@ -449,16 +466,17 @@ class DatetimeField(Field):
         self.auto_now = auto_now
         self.auto_now_add = auto_now_add
 
-    def to_db(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string to a ``datetime`` before binding.
+    def to_python_value(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string to a ``datetime``.
 
-        Values often arrive as ISO strings (e.g. from a JSON layer); binding
-        one verbatim would reach the engine as text and the timestamp column
-        would reject it. Non-string values (incl. a bare ``date``, which the
-        database implicitly casts) pass through unchanged.
+        Values often arrive as ISO strings (e.g. from a JSON layer); coercing
+        on assignment keeps the in-memory attribute a ``datetime`` (and binding
+        a string verbatim would otherwise reach the engine as text, which the
+        timestamp column rejects). Non-string values (incl. a bare ``date``,
+        which the database implicitly casts) pass through unchanged.
 
         Args:
-            value: The Python value to convert.
+            value: The value supplied by the caller.
 
         Returns:
             A ``datetime`` parsed from a string; otherwise ``value`` unchanged.
@@ -467,17 +485,28 @@ class DatetimeField(Field):
             return _parse_iso_datetime(value)
         return value
 
+    def to_db(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string to a ``datetime`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A ``datetime`` parsed from a string; otherwise ``value`` unchanged.
+        """
+        return self.to_python_value(value)
+
 
 class DateField(Field):
     """A calendar-date column."""
 
     field_kind = "date"
 
-    def to_db(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string (or ``datetime``) to a ``date`` for binding.
+    def to_python_value(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string (or ``datetime``) to a ``date``.
 
         Args:
-            value: The Python value to convert.
+            value: The value supplied by the caller.
 
         Returns:
             A ``date`` (or ``None``); other types pass through unchanged.
@@ -497,17 +526,28 @@ class DateField(Field):
             return date.fromisoformat(text)
         return value
 
+    def to_db(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string (or ``datetime``) to a ``date`` for binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A ``date`` (or ``None``); other types pass through unchanged.
+        """
+        return self.to_python_value(value)
+
 
 class TimeField(Field):
     """A time-of-day column."""
 
     field_kind = "time"
 
-    def to_db(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string (or ``datetime``) to a ``time`` for binding.
+    def to_python_value(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string (or ``datetime``) to a ``time``.
 
         Args:
-            value: The Python value to convert.
+            value: The value supplied by the caller.
 
         Returns:
             A ``time`` (or ``None``); other types pass through unchanged.
@@ -519,6 +559,17 @@ class TimeField(Field):
         if isinstance(value, str):
             return time.fromisoformat(value.strip())
         return value
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string (or ``datetime``) to a ``time`` for binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            A ``time`` (or ``None``); other types pass through unchanged.
+        """
+        return self.to_python_value(value)
 
 
 class TimeDeltaField(Field):
@@ -596,23 +647,33 @@ class UUIDField(Field):
         return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
 
 
-def _json_safe(value: Any) -> Any:
+def _json_safe(value: Any, _path: str = "<value>") -> Any:
     """Recursively convert common Python types into JSON-native ones.
 
     The native engine serialises JSON itself and accepts only JSON-native
     Python types, whereas some serialisers (e.g. orjson with a ``default``
     hook) tolerate more. This mirrors that leniency for the stdlib types apps
-    most often store in a ``JSONField`` — UUIDs, ``Decimal``, dates/times, sets
-    and enums — leaving already-native values untouched.
+    most often store in a ``JSONField`` — UUIDs, ``Decimal``, dates/times, sets,
+    enums and ``bytes`` — leaving already-native values untouched. A leaf with
+    no JSON form raises a clear :class:`FieldError` naming its location rather
+    than letting an opaque "value is not JSON serialisable" surface at bind time.
 
     Args:
         value: The Python value about to be serialised.
+        _path: The dotted/indexed location of ``value`` within the root, used
+            to name the offending leaf in the error message.
 
     Returns:
         An equivalent value built only from JSON-native types.
+
+    Raises:
+        FieldError: When a leaf value has no JSON-native representation.
     """
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
+    if isinstance(value, (bytes, bytearray)):
+        # JSON has no byte type; base64 keeps the payload reversible and ASCII.
+        return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, _uuid.UUID):
         return str(value)
     if isinstance(value, Decimal):
@@ -620,12 +681,15 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, Enum):
-        return _json_safe(value.value)
+        return _json_safe(value.value, _path)
     if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
+        return {k: _json_safe(v, f"{_path}.{k}") for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(v) for v in value]
-    return value
+        return [_json_safe(v, f"{_path}[{i}]") for i, v in enumerate(value)]
+    raise FieldError(
+        f"JSONField value at {_path} is not JSON-serialisable "
+        f"(type {type(value).__name__}); convert it before storing"
+    )
 
 
 class JSONField(Field):
