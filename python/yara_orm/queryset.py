@@ -1615,16 +1615,33 @@ class QuerySet:
             return [dict(zip(names, row)) for row in rows]
         return [tuple(row) for row in rows]
 
-    async def values_list(
-        self,
-        *fields: str,
-        flat: bool = False,
-    ) -> list[tuple[Any, ...]] | list[Any]:
+    def values_list(self, *fields: str, flat: bool = False) -> _ValuesQuery:
         """Return rows as tuples (or scalars when ``flat=True``); no model build.
+
+        The result is awaitable (``await qs.values_list(...)`` → list), async
+        iterable (``async for row in qs.values_list(...)``) and supports
+        ``.first()`` for a single row.
 
         Args:
             *fields: Field names/paths to select; a path may traverse a
                 relation (``"author__name"``). Defaults to all model fields.
+            flat: When ``True`` return scalar values for a single field.
+
+        Returns:
+            A ``_ValuesQuery`` resolving to a list of tuples, or scalars when
+            ``flat`` is ``True``.
+        """
+        return _ValuesQuery(lambda: self._values_list_impl(fields, flat))
+
+    async def _values_list_impl(
+        self,
+        fields: tuple[str, ...],
+        flat: bool,
+    ) -> list[tuple[Any, ...]] | list[Any]:
+        """Execute the ``values_list`` query and return its rows.
+
+        Args:
+            fields: Field names/paths to select; empty for all model fields.
             flat: When ``True`` return scalar values for a single field.
 
         Returns:
@@ -1650,14 +1667,32 @@ class QuerySet:
         rows = await self._fetch_columns(paths)
         return [tuple(r) for r in rows]
 
-    async def values(self, *fields: str, **aliases: str) -> list[dict[str, Any]]:
+    def values(self, *fields: str, **aliases: str) -> _ValuesQuery:
         """Return rows as dicts of the requested columns; no model build.
+
+        The result is awaitable (``await qs.values(...)`` → list), async iterable
+        (``async for row in qs.values(...)``) and supports ``.first()``.
 
         Args:
             *fields: Field names/paths to select; the dict key is the path
                 itself (a path may traverse a relation, ``"author__name"``).
             **aliases: ``output_name=field_path`` pairs, so a traversed column
                 can be given a clean key (``author_name="author__name"``).
+
+        Returns:
+            A ``_ValuesQuery`` resolving to a list of dicts mapping each
+            requested name to its value.
+        """
+        return _ValuesQuery(lambda: self._values_impl(fields, aliases))
+
+    async def _values_impl(
+        self, fields: tuple[str, ...], aliases: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """Execute the ``values`` query and return its dict rows.
+
+        Args:
+            fields: Field names/paths to select; empty for all model fields.
+            aliases: ``output_name -> field_path`` pairs.
 
         Returns:
             A list of dicts mapping each requested name to its value.
@@ -1973,6 +2008,52 @@ async def _resolve_get(queryset: QuerySet) -> Model:
 
 
 _SingleT = TypeVar("_SingleT")
+
+
+class _ValuesQuery:
+    """Awaitable, async-iterable result of ``values()`` / ``values_list()``.
+
+    ``await`` resolves to the full list of rows; ``async for`` streams them; and
+    ``first()`` returns the first row (or ``None``). Each terminal re-runs the
+    underlying query.
+    """
+
+    def __init__(self, run: Callable[[], Awaitable[list[Any]]]) -> None:
+        """Wrap the zero-arg coroutine factory that runs the projection.
+
+        Args:
+            run: A callable returning the awaitable that fetches the rows.
+
+        Returns:
+            None
+        """
+        self._run = run
+
+    def __await__(self) -> Generator[Any, None, list[Any]]:
+        """Resolve to the full list of projected rows.
+
+        Returns:
+            The list of rows.
+        """
+        return self._run().__await__()
+
+    async def __aiter__(self) -> AsyncGenerator[Any, None]:
+        """Stream the projected rows with ``async for``.
+
+        Yields:
+            Each projected row.
+        """
+        for row in await self._run():
+            yield row
+
+    async def first(self) -> Any:
+        """Return the first projected row, or ``None`` when there are none.
+
+        Returns:
+            The first row, or ``None``.
+        """
+        rows = await self._run()
+        return rows[0] if rows else None
 
 
 class QuerySetSingle(Generic[_SingleT]):
