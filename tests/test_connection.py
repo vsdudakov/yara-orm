@@ -400,3 +400,18 @@ def test_normalize_url_rewrites_postgres_aliases():
     assert YaraOrm._normalize_url("asyncpg://u@h/db") == "postgres://u@h/db"
     assert YaraOrm._normalize_url("postgresql+asyncpg://u@h/db") == "postgres://u@h/db"
     assert YaraOrm._normalize_url("sqlite:///app.db") == "sqlite:///app.db"
+
+
+@pytest.mark.asyncio
+async def test_raw_scalar_params_bind_without_cast(orm):
+    """
+    GIVEN raw SQL with an uncast positional parameter
+    WHEN non-string scalars (int, uuid, float, bool) are bound
+    THEN each query runs instead of crashing on a binary/text format mismatch
+    """
+    import uuid
+
+    conn = connections.get()
+    for value in (5, uuid.uuid4(), 1.5, True):
+        _, rows = await conn.execute_query("SELECT $1 AS v", [value])
+        assert len(rows) == 1

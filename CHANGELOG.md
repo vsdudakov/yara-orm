@@ -20,6 +20,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 - **Function expressions as `update()` values** — e.g.
   `update(at=Coalesce("at", now))`.
 - **`async for` over a queryset** — `async for obj in Model.filter(...)`.
+- **`values()` / `values_list()` are awaitable, async-iterable and `.first()`-able** —
+  `async for row in qs.values(...)` and `await qs.values(...).first()` now work.
 - **Driver-qualified postgres URL schemes** (`psycopg://`, `asyncpg://`,
   `postgresql+asyncpg://`) are normalised to `postgres://`.
 - **Positional access on raw `execute_query`/`fetch_all` rows** (`row[0]` and
@@ -35,6 +37,9 @@ All notable changes to **yara-orm** are documented here. The format is based on
   the grouped `values_list` now respects the requested projection).
 - **`Subquery()` handed a non-queryset** raises a clear `TypeError` instead of an
   opaque attribute error.
+- **Raw scalar params bind without an explicit cast** — `execute_query("SELECT $1", [5])`
+  (and `uuid`/`float`/`bool`) no longer crash with a binary/text format error; a scalar is
+  encoded as text when the server types the parameter as textual/unknown.
 
 ## [1.3.0] - 2026-06-30
 

@@ -772,3 +772,35 @@ async def test_update_accepts_coalesce_function(db):
     book = await McBook.create(title="T", rating=1, note=None, author=ada)
     await McBook.filter(id=book.id).update(note=Coalesce("note", "fallback"))
     assert (await McBook.get(id=book.id)).note == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_values_is_awaitable_async_iterable_and_first(db):
+    """
+    GIVEN a projection over a queryset
+    WHEN values() is awaited, iterated with async for, and .first() is called
+    THEN all three forms work and .first() returns the row or None
+    """
+    await _seed_mc()
+    listed = await McBook.filter(title="B1").values("title")
+    assert listed == [{"title": "B1"}]
+    streamed = [r async for r in McBook.all().order_by("title").values("title")]
+    assert streamed == [{"title": "B1"}, {"title": "B2"}]
+    assert await McBook.filter(title="B1").values("title").first() == {"title": "B1"}
+    assert await McBook.filter(title="missing").values("title").first() is None
+
+
+@pytest.mark.asyncio
+async def test_values_list_is_awaitable_async_iterable_and_first(db):
+    """
+    GIVEN a projection over a queryset
+    WHEN values_list() is awaited, iterated with async for, and .first() is called
+    THEN all three forms work and .first() returns the first tuple or None
+    """
+    await _seed_mc()
+    listed = await McBook.all().order_by("title").values_list("title", flat=True)
+    assert listed == ["B1", "B2"]
+    streamed = [t async for t in McBook.all().order_by("title").values_list("title", flat=True)]
+    assert streamed == ["B1", "B2"]
+    assert await McBook.filter(title="B1").values_list("title").first() == ("B1",)
+    assert await McBook.filter(title="missing").values_list("title").first() is None

@@ -234,12 +234,46 @@ fn json_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Bound<'py
 // Value -> SQL parameter (tokio-postgres ToSql)
 // ---------------------------------------------------------------------------
 
+impl Value {
+    /// Render this value as PostgreSQL text, for params the server typed as
+    /// textual/unknown (e.g. a bare `SELECT $1` with no column context, where a
+    /// binary scalar would be misread as UTF-8). Returns `None` for values that
+    /// are already textual or have no meaningful text form here.
+    fn as_pg_text(&self) -> Option<String> {
+        match self {
+            Value::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
+            Value::Int(v) => Some(v.to_string()),
+            Value::Float(v) => Some(v.to_string()),
+            Value::Uuid(v) => Some(v.to_string()),
+            Value::Decimal(v) => Some(v.to_string()),
+            Value::Json(v) => Some(v.to_string()),
+            Value::Timestamp(v) => Some(v.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+            Value::TimestampTz(v) => Some(v.to_rfc3339()),
+            Value::Date(v) => Some(v.format("%Y-%m-%d").to_string()),
+            Value::Time(v) => Some(v.format("%H:%M:%S%.6f").to_string()),
+            Value::Null | Value::Text(_) | Value::Bytes(_) => None,
+        }
+    }
+}
+
 impl ToSql for Value {
     fn to_sql(
         &self,
         ty: &Type,
         out: &mut tokio_postgres::types::private::BytesMut,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        // When the server inferred a textual (or unknown) type for the
+        // parameter, encode scalars as their text representation rather than the
+        // binary format the matching branch below would emit — otherwise the
+        // server reads e.g. an 8-byte int as a UTF-8 string and rejects it.
+        if matches!(
+            *ty,
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN
+        ) {
+            if let Some(text) = self.as_pg_text() {
+                return text.to_sql(ty, out);
+            }
+        }
         match self {
             Value::Null => Ok(IsNull::Yes),
             Value::Bool(v) => v.to_sql(ty, out),
