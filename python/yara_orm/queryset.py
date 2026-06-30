@@ -7,7 +7,7 @@ terminal coroutine (``get``, ``count`` ...) runs.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from . import registry
 from .connection import get_dialect, get_executor
@@ -16,7 +16,7 @@ from .expressions import Expression
 from .functions import Function
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Awaitable, Callable, Generator
 
     from .dialects import BaseDialect
     from .fields import Field
@@ -1783,15 +1783,17 @@ class QuerySet:
         rows = await engine.fetch_rows(f"{dialect.explain_prefix}{sql}", params)
         return "\n".join(" ".join(str(c) for c in row) for row in rows)
 
-    async def first(self) -> Model | None:
-        """Fetch the first matching object, if any.
+    def first(self) -> QuerySetSingle[Model | None]:
+        """Return a chainable single-row result for the first matching object.
+
+        Awaiting it resolves to the first instance or ``None``; chaining
+        ``only`` / ``values`` / ``values_list`` / ``select_related`` /
+        ``prefetch_related`` narrows that single row first (Tortoise compat).
 
         Returns:
-            The first matching model instance, or ``None`` when there are no
-            matches.
+            A ``QuerySetSingle`` resolving to the first instance, or ``None``.
         """
-        rows = await self.limit(1)._fetch()
-        return rows[0] if rows else None
+        return QuerySetSingle(self, _resolve_first)
 
     async def last(self) -> Model | None:
         """Fetch the last matching object under the current ordering.
@@ -1914,31 +1916,85 @@ class QuerySet:
         return await engine.execute(sql, params)
 
 
-class QuerySetSingle:
+async def _resolve_first(queryset: QuerySet) -> Model | None:
+    """Fetch the first row of ``queryset`` (the awaited form of ``first()``).
+
+    Args:
+        queryset: The query set to take the first row of.
+
+    Returns:
+        The first matching instance, or ``None`` when there are no matches.
+    """
+    rows = await queryset.limit(1)._fetch()
+    return rows[0] if rows else None
+
+
+async def _resolve_get(queryset: QuerySet) -> Model:
+    """Fetch the single row of ``queryset`` (the awaited form of ``get()``).
+
+    Args:
+        queryset: The query set narrowed to a single row.
+
+    Returns:
+        The single matching instance.
+
+    Raises:
+        DoesNotExist: When no row matches.
+        MultipleObjectsReturned: When more than one row matches.
+    """
+    return await queryset.get()
+
+
+_SingleT = TypeVar("_SingleT")
+
+
+class QuerySetSingle(Generic[_SingleT]):
     """Awaitable, chainable single-row result (Tortoise ``QuerySetSingle``).
 
-    Returned by ``Model.get(...)`` so callers can either ``await Model.get(id=x)``
-    or chain ``await Model.get(id=x).prefetch_related(...).select_related(...)``.
-    Awaiting resolves to the single matching instance (raising ``DoesNotExist`` /
-    ``MultipleObjectsReturned`` as usual).
+    Returned by ``Model.get(...)`` and ``QuerySet.first()`` so callers can either
+    ``await Model.get(id=x)`` or chain
+    ``await Model.get(id=x).prefetch_related(...).only(...)``. Awaiting a ``get``
+    result raises ``DoesNotExist`` / ``MultipleObjectsReturned`` as usual; a
+    ``first()`` result resolves to ``None`` when there is no match.
     """
 
-    def __init__(self, queryset: QuerySet, fast: Any = None) -> None:
+    def __init__(
+        self,
+        queryset: QuerySet,
+        resolver: Callable[[QuerySet], Awaitable[_SingleT]],
+        fast: Callable[[], Awaitable[_SingleT]] | None = None,
+    ) -> None:
         """Wrap the query set whose single row will be awaited.
 
         Args:
             queryset: The query set already narrowed to the target row.
+            resolver: Coroutine resolving the wrapped query set to a single
+                instance. ``Model.get`` passes one that raises on a missing
+                row; ``first()`` passes one that returns ``None`` instead.
             fast: Optional zero-arg coroutine factory resolving the row when
                 nothing is chained, preserving ``Model.get``'s fast path; it is
-                dropped once ``prefetch_related``/``select_related`` is applied.
+                dropped once a chaining method (``only``/``select_related``/…)
+                is applied.
 
         Returns:
             None
         """
         self._queryset = queryset
         self._fast = fast
+        self._resolver = resolver
 
-    def prefetch_related(self, *specs: Any) -> QuerySetSingle:
+    def _chain(self, queryset: QuerySet) -> QuerySetSingle[_SingleT]:
+        """Wrap ``queryset`` keeping this result's resolver (drops the fast path).
+
+        Args:
+            queryset: The further-narrowed query set to wrap.
+
+        Returns:
+            A new ``QuerySetSingle`` over ``queryset``.
+        """
+        return QuerySetSingle(queryset, resolver=self._resolver)
+
+    def prefetch_related(self, *specs: Any) -> QuerySetSingle[_SingleT]:
         """Return a single-row result that also prefetches the given relations.
 
         Args:
@@ -1947,9 +2003,9 @@ class QuerySetSingle:
         Returns:
             A new ``QuerySetSingle`` carrying the prefetch specs.
         """
-        return QuerySetSingle(self._queryset.prefetch_related(*specs))
+        return self._chain(self._queryset.prefetch_related(*specs))
 
-    def select_related(self, *relations: str) -> QuerySetSingle:
+    def select_related(self, *relations: str) -> QuerySetSingle[_SingleT]:
         """Return a single-row result that also eager-loads forward relations.
 
         Args:
@@ -1958,9 +2014,9 @@ class QuerySetSingle:
         Returns:
             A new ``QuerySetSingle`` carrying the selected relations.
         """
-        return QuerySetSingle(self._queryset.select_related(*relations))
+        return self._chain(self._queryset.select_related(*relations))
 
-    def using_db(self, connection: Any) -> QuerySetSingle:
+    def using_db(self, connection: Any) -> QuerySetSingle[_SingleT]:
         """Return a single-row result bound to the given connection.
 
         Args:
@@ -1969,17 +2025,54 @@ class QuerySetSingle:
         Returns:
             A new ``QuerySetSingle`` bound to the connection.
         """
-        return QuerySetSingle(self._queryset.using_db(connection))
+        return self._chain(self._queryset.using_db(connection))
 
-    def __await__(self) -> Generator[Any, None, Model]:
-        """Resolve to the single matching instance.
+    def only(self, *fields: str) -> QuerySetSingle[_SingleT]:
+        """Return a single-row result restricted to the given columns.
 
-        Uses the fast path when nothing is chained; otherwise runs the query set
-        (which applies any prefetch/select).
+        Args:
+            *fields: Field names to load (Tortoise's ``first().only(...)``).
 
         Returns:
-            The single matching model instance.
+            A new ``QuerySetSingle`` projecting only ``fields``.
+        """
+        return self._chain(self._queryset.only(*fields))
+
+    async def values(self, *fields: str, **aliases: str) -> dict[str, Any] | None:
+        """Resolve the single row as a dict of the requested columns.
+
+        Args:
+            *fields: Field names/paths to select (Tortoise's ``first().values``).
+            **aliases: ``output_name=field_path`` pairs.
+
+        Returns:
+            The row as a dict, or ``None`` when there is no match.
+        """
+        rows = await self._queryset.limit(1).values(*fields, **aliases)
+        return rows[0] if rows else None
+
+    async def values_list(self, *fields: str, flat: bool = False) -> tuple[Any, ...] | Any | None:
+        """Resolve the single row as a tuple (or scalar when ``flat=True``).
+
+        Args:
+            *fields: Field names/paths to select.
+            flat: When ``True`` return the single field's scalar value.
+
+        Returns:
+            The row as a tuple/scalar, or ``None`` when there is no match.
+        """
+        rows = await self._queryset.limit(1).values_list(*fields, flat=flat)
+        return rows[0] if rows else None
+
+    def __await__(self) -> Generator[Any, None, _SingleT]:
+        """Resolve to the single matching instance (or ``None`` for ``first()``).
+
+        Uses the fast path when nothing is chained; otherwise the configured
+        resolver (``first()``), falling back to ``get()`` semantics.
+
+        Returns:
+            The single matching model instance, or ``None`` for ``first()``.
         """
         if self._fast is not None:
             return self._fast().__await__()
-        return self._queryset.get().__await__()
+        return self._resolver(self._queryset).__await__()
