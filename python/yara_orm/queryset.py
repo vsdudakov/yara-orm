@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from .dialects import BaseDialect
     from .fields import Field
-    from .models import Model
+    from .models import MetaInfo, Model
 
 # op -> (sql operator, pattern builder or None). A pattern builder turns the
 # value into a LIKE/ILIKE pattern (bound as plain text); None binds via to_db.
@@ -48,6 +48,9 @@ _DATE_PARTS = frozenset(
 # Regex lookups, e.g. ``name__regex=r"^A"`` (rendered per dialect operator). The
 # ``posix_regex``/``iposix_regex`` are accepted spellings; they are aliases.
 _REGEX_OPS = frozenset({"regex", "iregex", "posix_regex", "iposix_regex"})
+# Field kinds whose column is already textual, so a LIKE/ILIKE pattern lookup
+# binds against it directly; any other kind is CAST to text first.
+_TEXT_KINDS = frozenset({"varchar", "text"})
 # Lookups handled by dedicated branches rather than the ``_OPERATORS`` table.
 _SPECIAL_OPS = frozenset({"in", "not_in", "isnull", "not_isnull", "range", "search", "date"})
 # Every recognized trailing lookup suffix.
@@ -181,6 +184,11 @@ class QuerySet:
         self._for_update_of: tuple[str, ...] = ()
         self._only: tuple[str, ...] | None = None
         self._defer: frozenset[str] = frozenset()
+        # Per-relation column projections from ``only()``/``defer()`` paths
+        # (``contact__properties``): a joined relation loads only/all-but these
+        # columns and hydrates a partial related instance. Keyed by relation path.
+        self._only_related: dict[str, tuple[str, ...]] = {}
+        self._defer_related: dict[str, frozenset[str]] = {}
         self._using: str | Any | None = None
 
     # -- cloning / chaining ----------------------------------------------
@@ -208,6 +216,8 @@ class QuerySet:
         qs._for_update_of = self._for_update_of
         qs._only = self._only
         qs._defer = self._defer
+        qs._only_related = dict(self._only_related)
+        qs._defer_related = dict(self._defer_related)
         qs._using = self._using
         return qs
 
@@ -433,26 +443,71 @@ class QuerySet:
         """
         return self._using if isinstance(self._using, str) else None
 
+    def _resolve_related_field_path(self, path: str) -> tuple[str, str]:
+        """Split a ``rel__...__col`` path into its relation path and column.
+
+        Validates that every leading segment is a forward relation and that the
+        final segment names a column on the resolved target model.
+
+        Args:
+            path: A dotted-underscore path traversing one or more forward
+                relations to a column (``"contact__properties"``).
+
+        Returns:
+            A ``(relation_path, column_name)`` tuple.
+
+        Raises:
+            FieldError: When a leading segment is not a forward relation or the
+                final segment is not a column on the target.
+        """
+        *rel_segs, col = path.split("__")
+        meta = self.model._meta
+        for seg in rel_segs:
+            if seg not in meta.relations:
+                raise FieldError(
+                    f"only()/defer(): {path!r} is not a forward-relation path of "
+                    f"{self.model.__name__}"
+                )
+            meta = meta.relations[seg].resolve_target()._meta
+        meta.get_field(col)  # validates the final column exists on the target
+        return "__".join(rel_segs), col
+
     def only(self, *fields: str) -> QuerySet:
         """Return a new query set selecting only the named columns.
 
         Instances come back partially populated; the primary key is always
         included. Reading a field that was not selected raises ``FieldError``.
 
+        A ``rel__col`` path (``only("contact__properties")``) restricts a joined
+        relation instead: the relation is loaded (like ``select_related``) but
+        only its named column(s) are projected and the related instance is
+        hydrated partially. Naming only related paths restricts the base model
+        to its primary key.
+
         Args:
-            *fields: Field names to load.
+            *fields: Field names to load; a ``rel__col`` path restricts a
+                forward relation's columns.
 
         Returns:
             A cloned ``QuerySet`` restricted to the named columns.
         """
         meta = self.model._meta
+        base: list[str] = []
+        related: dict[str, list[str]] = {}
         for name in fields:
-            meta.get_field(name)
+            if "__" in name:
+                relpath, col = self._resolve_related_field_path(name)
+                related.setdefault(relpath, []).append(col)
+            else:
+                meta.get_field(name)
+                base.append(name)
         pk_name = meta.pk_field.model_field_name
-        names = tuple(dict.fromkeys((pk_name, *fields)))  # pk first, de-duplicated
+        names = tuple(dict.fromkeys((pk_name, *base)))  # pk first, de-duplicated
         qs = self._clone()
         qs._only = names
         qs._defer = frozenset()
+        qs._only_related = {rp: tuple(dict.fromkeys(cols)) for rp, cols in related.items()}
+        qs._defer_related = {}
         return qs
 
     def defer(self, *fields: str) -> QuerySet:
@@ -461,19 +516,33 @@ class QuerySet:
         Instances come back without the deferred fields loaded; the primary key
         is never deferred. Reading a deferred field raises ``FieldError``.
 
+        A ``rel__col`` path (``defer("contact__properties")``) defers a joined
+        relation's column instead: the relation is loaded (like
+        ``select_related``) with every column except the named one(s).
+
         Args:
-            *fields: Field names to omit from the SELECT.
+            *fields: Field names to omit; a ``rel__col`` path defers a forward
+                relation's column.
 
         Returns:
             A cloned ``QuerySet`` omitting the named columns.
         """
         meta = self.model._meta
+        base: list[str] = []
+        related: dict[str, list[str]] = {}
         for name in fields:
-            meta.get_field(name)
+            if "__" in name:
+                relpath, col = self._resolve_related_field_path(name)
+                related.setdefault(relpath, []).append(col)
+            else:
+                meta.get_field(name)
+                base.append(name)
         pk_name = meta.pk_field.model_field_name
         qs = self._clone()
-        qs._defer = frozenset(f for f in fields if f != pk_name)
+        qs._defer = frozenset(f for f in base if f != pk_name)
         qs._only = None
+        qs._defer_related = {rp: frozenset(cols) for rp, cols in related.items()}
+        qs._only_related = {}
         return qs
 
     def __getitem__(self, item: slice | int) -> QuerySet | Any:
@@ -661,8 +730,15 @@ class QuerySet:
             return f"{col} {sql_op} {expr_sql}", expr_params, idx
         placeholder = dialect.placeholder(idx)
         idx += 1
-        bound = pattern(value) if pattern is not None else coerce(value)
-        return f"{col} {sql_op} {placeholder}", [bound], idx
+        if pattern is not None:
+            # LIKE/ILIKE need a text operand: a non-text column (uuid/int/...)
+            # is cast to text first, mirroring how Tortoise compiled these so an
+            # ``__icontains`` on e.g. a UUID column doesn't raise 'operator does
+            # not exist: uuid ~~* text'.
+            if field is not None and field.field_kind not in _TEXT_KINDS:
+                col = dialect.cast_text(col)
+            return f"{col} {sql_op} {placeholder}", [pattern(value)], idx
+        return f"{col} {sql_op} {placeholder}", [coerce(value)], idx
 
     def _compile_relation_lookup(
         self,
@@ -1269,14 +1345,56 @@ class QuerySet:
         prefix = self._distinct_prefix(meta.select_prefix)
         return f"{prefix}{where}{tail}", params, None
 
+    def _projection_select_sql(
+        self, field_paths: tuple[str, ...], dialect: BaseDialect, start: int = 1
+    ) -> tuple[str, list[Any], None]:
+        """Build a SELECT over the given column paths, for use as a subquery.
+
+        Mirrors :meth:`_fetch_columns` but renders without executing and
+        continues an outer query's placeholder numbering, so a ``values_list``
+        projection can be embedded in a :class:`~yara_orm.Subquery` (e.g.
+        ``id__in=Subquery(qs.values_list("col", flat=True))``).
+
+        Args:
+            field_paths: The field names/paths to select (one for an ``IN``
+                membership subquery).
+            dialect: The SQL dialect providing quoting and placeholders.
+            start: The first bind-parameter index (the outer query's next slot).
+
+        Returns:
+            A ``(sql, params, None)`` tuple matching :meth:`_plain_select_sql`.
+
+        Raises:
+            FieldError: When the projection is grouped/annotated, which has no
+                single-column form to embed as a scalar/membership subquery.
+        """
+        if self._annotations or self._group_by:
+            raise FieldError(
+                "a grouped/annotated values()/values_list() cannot be used as a Subquery"
+            )
+        meta = self.model._meta
+        meta.compile(dialect)
+        joins: dict[str, str] = {}
+        cols = ", ".join(self._resolve_column(p, dialect, joins) for p in field_paths)
+        where, params, _ = self._compile_conditions(dialect, start=start)
+        table = dialect.quote(meta.table)
+        distinct = "DISTINCT " if self._distinct else ""
+        sql = (
+            f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
+            f"{self._order_sql(dialect)}{self._tail_sql()}"
+        )
+        return sql, params, None
+
     async def _fetch(self) -> list[Model]:
         """Execute the query and build model instances from the rows.
 
         Returns:
             A list of model instances, with any requested relations prefetched.
         """
-        if self._annotations or self._select_related:
-            if (self._only is not None or self._defer) and self._annotations:
+        if self._annotations or self._select_related or self._only_related or self._defer_related:
+            if (
+                self._only is not None or self._defer or self._only_related or self._defer_related
+            ) and self._annotations:
                 raise FieldError("only()/defer() cannot be combined with annotate()")
             if self._annotations:
                 return await self._fetch_annotated()
@@ -1295,6 +1413,32 @@ class QuerySet:
 
             await prefetch_instances(instances, self._prefetch)
         return instances
+
+    def _related_projected_fields(self, path: str, tmeta: MetaInfo) -> tuple[list[Field], bool]:
+        """Resolve the columns a joined relation projects, honouring only/defer.
+
+        Args:
+            path: The relation path being joined.
+            tmeta: The target model's metadata.
+
+        Returns:
+            A ``(fields, partial)`` tuple: the projected ``Field`` objects in
+            SELECT order, and whether the projection is a restricted subset (so
+            the related instance is hydrated partially).
+        """
+        pk_name = tmeta.pk_field.model_field_name
+        if path in self._only_related:
+            names = dict.fromkeys((pk_name, *self._only_related[path]))  # pk first
+            return [tmeta.get_field(n) for n in names], True
+        if path in self._defer_related:
+            omit = self._defer_related[path]
+            kept = [
+                f
+                for f in tmeta.field_list
+                if f.model_field_name == pk_name or f.model_field_name not in omit
+            ]
+            return kept, True
+        return tmeta.field_list, False
 
     def _select_related_plan(
         self, dialect: BaseDialect
@@ -1362,20 +1506,25 @@ class QuerySet:
                 f" LEFT JOIN {q(tmeta.table)} AS {alias} "
                 f"ON {left_alias}.{fk_col} = {alias}.{q(tmeta.pk_field.db_column)}"
             )
-            select.extend(f"{alias}.{q(f.db_column)}" for f in tmeta.field_list)
+            proj_fields, partial = self._related_projected_fields(path, tmeta)
+            select.extend(f"{alias}.{q(f.db_column)}" for f in proj_fields)
             node = {
                 "parent": parent,
                 "seg": seg,
                 "target": target,
                 "offset": offset,
-                "width": len(tmeta.field_list),
+                "width": len(proj_fields),
+                "fields": proj_fields,
+                "partial": partial,
             }
             offset += node["width"]
             nodes[path] = node
             order.append(path)
             return node
 
-        for rel in self._select_related:
+        # Join every requested relation: explicit select_related paths plus any
+        # relation referenced by an only()/defer() ``rel__col`` projection.
+        for rel in (*self._select_related, *self._only_related, *self._defer_related):
             ensure_path(rel)
         where, params, _ = self._compile_conditions(dialect)
         sql = (
@@ -1416,11 +1565,12 @@ class QuerySet:
                     built[path] = None
                     continue
                 chunk = row[node["offset"] : node["offset"] + node["width"]]
-                child = (
-                    node["target"]._from_db_row(chunk)
-                    if any(v is not None for v in chunk)
-                    else None
-                )
+                if not any(v is not None for v in chunk):
+                    child = None
+                elif node["partial"]:
+                    child = node["target"]._from_db_row_fields(chunk, node["fields"])
+                else:
+                    child = node["target"]._from_db_row(chunk)
                 parent_inst.__dict__.setdefault("_prefetch", {})[node["seg"]] = child
                 built[path] = child
             instances.append(obj)
@@ -1566,19 +1716,30 @@ class QuerySet:
         select, names, group_cols = [], [], []
         requested = list(fields) if fields else None
 
-        for f in self._group_by:
-            col = f"{table}.{q(meta.get_field(f).db_column)}"
-            select.append(col)
-            names.append(f)
-            group_cols.append(col)
-        if requested:
-            for f in requested:
-                if f in self._annotations or f in names:
-                    continue
+        if requested is None and not self._group_by:
+            # Pure ``annotate(...).values()`` with no field restriction: project
+            # every base column alongside the annotations and GROUP BY the pk, so
+            # the base model's fields are returned (not just the annotations) —
+            # matching the annotated model fetch. The pk group makes the base
+            # columns functionally dependent, so they need no explicit grouping.
+            for f in meta.field_list:
+                select.append(f"{table}.{q(f.db_column)}")
+                names.append(f.model_field_name)
+            group_cols.append(f"{table}.{q(meta.pk_field.db_column)}")
+        else:
+            for f in self._group_by:
                 col = f"{table}.{q(meta.get_field(f).db_column)}"
                 select.append(col)
                 names.append(f)
                 group_cols.append(col)
+            if requested:
+                for f in requested:
+                    if f in self._annotations or f in names:
+                        continue
+                    col = f"{table}.{q(meta.get_field(f).db_column)}"
+                    select.append(col)
+                    names.append(f)
+                    group_cols.append(col)
         select_params: list[Any] = []
         idx = 1
         for name, agg in self._annotations.items():
@@ -1638,7 +1799,8 @@ class QuerySet:
             A ``_ValuesQuery`` resolving to a list of tuples, or scalars when
             ``flat`` is ``True``.
         """
-        return _ValuesQuery(lambda: self._values_list_impl(fields, flat))
+        paths = fields or tuple(self.model._meta.fields.keys())
+        return _ValuesQuery(lambda: self._values_list_impl(fields, flat), self, paths)
 
     async def _values_list_impl(
         self,
@@ -1690,7 +1852,11 @@ class QuerySet:
             A ``_ValuesQuery`` resolving to a list of dicts mapping each
             requested name to its value.
         """
-        return _ValuesQuery(lambda: self._values_impl(fields, aliases))
+        if not fields and not aliases:
+            paths: tuple[str, ...] = tuple(self.model._meta.fields.keys())
+        else:
+            paths = tuple(fields) + tuple(aliases.values())
+        return _ValuesQuery(lambda: self._values_impl(fields, aliases), self, paths)
 
     async def _values_impl(
         self, fields: tuple[str, ...], aliases: dict[str, str]
@@ -2030,16 +2196,49 @@ class _ValuesQuery:
     underlying query.
     """
 
-    def __init__(self, run: Callable[[], Awaitable[list[Any]]]) -> None:
+    def __init__(
+        self,
+        run: Callable[[], Awaitable[list[Any]]],
+        queryset: QuerySet | None = None,
+        paths: tuple[str, ...] | None = None,
+    ) -> None:
         """Wrap the zero-arg coroutine factory that runs the projection.
 
         Args:
             run: A callable returning the awaitable that fetches the rows.
+            queryset: The source query set, retained so the projection can also
+                render itself as a subquery (``Subquery(qs.values_list(...))``).
+            paths: The projected column paths, used when rendering the subquery.
 
         Returns:
             None
         """
         self._run = run
+        self._queryset = queryset
+        self._paths = paths
+
+    def _plain_select_sql(
+        self, dialect: BaseDialect, start: int = 1
+    ) -> tuple[str, list[Any], None]:
+        """Render this projection as a SELECT, for embedding as a subquery.
+
+        Lets a lazy ``values()`` / ``values_list()`` stand in for a queryset
+        inside :class:`~yara_orm.Subquery` (the ``id__in=Subquery(...)``
+        pattern), selecting exactly the projected column(s).
+
+        Args:
+            dialect: The SQL dialect providing quoting and placeholders.
+            start: The first bind-parameter index (the outer query's next slot).
+
+        Returns:
+            A ``(sql, params, None)`` tuple matching ``QuerySet._plain_select_sql``.
+
+        Raises:
+            TypeError: When this result did not capture its source query set.
+        """
+        if self._queryset is None or self._paths is None:
+            raise TypeError("this values()/values_list() result cannot be used as a Subquery")
+        return self._queryset._projection_select_sql(self._paths, dialect, start)
 
     def __await__(self) -> Generator[Any, None, list[Any]]:
         """Resolve to the full list of projected rows.

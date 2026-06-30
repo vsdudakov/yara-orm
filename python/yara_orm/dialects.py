@@ -18,7 +18,7 @@ from .registry import get_model
 
 if TYPE_CHECKING:
     from .fields import Field
-    from .models import MetaInfo
+    from .models import Index, MetaInfo
     from .relations import M2MInfo
 
 
@@ -125,6 +125,21 @@ class BaseDialect:
             A SQL expression yielding the date part (for the ``__date`` lookup).
         """
         return f"CAST({col} AS DATE)"
+
+    def cast_text(self, col: str) -> str:
+        """Render an expression casting a column to text.
+
+        Used so a ``LIKE``/``ILIKE`` lookup works against a non-text column
+        (e.g. ``uuid``), which the database would otherwise reject for lack of a
+        ``uuid ~~ text`` operator.
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the column as text.
+        """
+        return f"CAST({col} AS TEXT)"
 
     def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
         """Render an ``ON CONFLICT`` clause for ``bulk_create`` upserts.
@@ -290,6 +305,38 @@ class BaseDialect:
             f"ON {self.quote(table)}{method} ({columns_sql}){incl}{where}"
         )
 
+    def render_index(self, meta: MetaInfo, index: Index, safe: bool = True) -> str:
+        """Render the single ``CREATE INDEX`` statement for one :class:`Index`.
+
+        Resolves the index's field names to the model's columns and applies its
+        unique/partial/``USING``/``INCLUDE``/opclass options (the PostgreSQL-only
+        ones are dropped on dialects that lack them). Powers ``Index.get_sql()``
+        and the table-creation index emission.
+
+        Args:
+            meta: The owning model's metadata.
+            index: The index to render.
+            safe: Whether to emit an ``IF NOT EXISTS`` guard.
+
+        Returns:
+            The ``CREATE INDEX`` statement.
+        """
+        ine = "IF NOT EXISTS " if safe else ""
+        include_sql = ", ".join(self._group_columns(meta, index.include)) if index.include else None
+        columns = self._group_columns(meta, index.fields)
+        if index.opclass and self.index_opclass:
+            columns = [f"{col} {index.opclass}" for col in columns]
+        return self._composite_index_sql(
+            meta.table,
+            index.resolve_name(meta.table),
+            ", ".join(columns),
+            ine=ine,
+            unique=index.unique,
+            using=index.using,
+            include_sql=include_sql,
+            condition=index.condition,
+        )
+
     def _composite_index_statements(self, meta: MetaInfo, ine: str) -> list[str]:
         """Render ``CREATE INDEX`` statements for ``Meta.indexes``.
 
@@ -300,27 +347,7 @@ class BaseDialect:
         Returns:
             One ``CREATE INDEX`` statement per group (possibly empty).
         """
-        out = []
-        for index in meta.indexes:
-            include_sql = (
-                ", ".join(self._group_columns(meta, index.include)) if index.include else None
-            )
-            columns = self._group_columns(meta, index.fields)
-            if index.opclass and self.index_opclass:
-                columns = [f"{col} {index.opclass}" for col in columns]
-            out.append(
-                self._composite_index_sql(
-                    meta.table,
-                    index.resolve_name(meta.table),
-                    ", ".join(columns),
-                    ine=ine,
-                    unique=index.unique,
-                    using=index.using,
-                    include_sql=include_sql,
-                    condition=index.condition,
-                )
-            )
-        return out
+        return [self.render_index(meta, index, safe=bool(ine)) for index in meta.indexes]
 
     def create_table_sql(self, meta: MetaInfo, safe: bool = True) -> list[str]:
         """Render statements to create a model's table, indexes and comments.
