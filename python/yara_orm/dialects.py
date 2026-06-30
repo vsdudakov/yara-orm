@@ -75,6 +75,9 @@ class BaseDialect:
     #: Whether ``CREATE INDEX`` accepts non-key covering columns
     #: (``INCLUDE (...)``); PostgreSQL does, SQLite has no such syntax.
     index_include = True
+    #: Whether ``CREATE INDEX`` accepts a per-column operator class
+    #: (``col gin_trgm_ops``); PostgreSQL does, SQLite has no such syntax.
+    index_opclass = True
 
     # -- identifiers & placeholders --------------------------------------
     def quote(self, identifier: str) -> str:
@@ -302,11 +305,14 @@ class BaseDialect:
             include_sql = (
                 ", ".join(self._group_columns(meta, index.include)) if index.include else None
             )
+            columns = self._group_columns(meta, index.fields)
+            if index.opclass and self.index_opclass:
+                columns = [f"{col} {index.opclass}" for col in columns]
             out.append(
                 self._composite_index_sql(
                     meta.table,
                     index.resolve_name(meta.table),
-                    ", ".join(self._group_columns(meta, index.fields)),
+                    ", ".join(columns),
                     ine=ine,
                     unique=index.unique,
                     using=index.using,
@@ -531,6 +537,7 @@ class BaseDialect:
                     unique=spec.get("unique", False),
                     using=spec.get("using"),
                     include=spec.get("include"),
+                    opclass=spec.get("opclass"),
                 )
             )
         return out
@@ -716,6 +723,7 @@ class BaseDialect:
         unique: bool = False,
         using: str | None = None,
         include: list[str] | None = None,
+        opclass: str | None = None,
     ) -> list[str]:
         """Render a statement creating a multi-column index.
 
@@ -731,17 +739,22 @@ class BaseDialect:
                 (PostgreSQL-only; dropped on SQLite).
             include: Optional non-key covering columns rendered as
                 ``INCLUDE (...)`` (PostgreSQL-only; dropped on SQLite).
+            opclass: Optional operator class appended to every key column
+                (PostgreSQL-only; dropped on SQLite).
 
         Returns:
             The list with the create-index statement.
         """
         ine = "IF NOT EXISTS " if safe else ""
         include_sql = ", ".join(self.quote(c) for c in include) if include else None
+        key_cols = [self.quote(c) for c in columns]
+        if opclass and self.index_opclass:
+            key_cols = [f"{c} {opclass}" for c in key_cols]
         return [
             self._composite_index_sql(
                 table,
                 name,
-                ", ".join(self.quote(c) for c in columns),
+                ", ".join(key_cols),
                 ine=ine,
                 unique=unique,
                 using=using,
@@ -1014,6 +1027,7 @@ class SqliteDialect(BaseDialect):
     alter_constraint_in_place = False
     index_using = False
     index_include = False
+    index_opclass = False
 
     type_map = {
         "smallint": "INTEGER",

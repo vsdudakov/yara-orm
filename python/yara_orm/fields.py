@@ -9,7 +9,7 @@ decision in the dialect layer.
 from __future__ import annotations
 
 import uuid as _uuid
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
@@ -380,6 +380,21 @@ class BooleanField(Field):
 
     field_kind = "bool"
 
+    def to_db(self, value: Any) -> Any:
+        """Coerce the Python value to a ``bool`` before binding (Tortoise compat).
+
+        Tortoise stored ``bool(value)``, so truthy non-bool inputs (``1``/``0``,
+        a non-empty string) round-tripped instead of reaching the engine as a
+        type the boolean column rejects.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``None`` when value is ``None``, otherwise ``bool(value)``.
+        """
+        return None if value is None else bool(value)
+
     def to_python(self, value: Any) -> Any:
         """Convert a database value into a ``bool``.
 
@@ -503,6 +518,38 @@ class UUIDField(Field):
         return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively convert common Python types into JSON-native ones.
+
+    The native engine serialises JSON itself and accepts only JSON-native
+    Python types, whereas Tortoise (through orjson with a ``default`` hook)
+    tolerated more. This mirrors that leniency for the stdlib types apps most
+    often store in a ``JSONField`` — UUIDs, ``Decimal``, dates/times, sets and
+    enums — leaving already-native values untouched.
+
+    Args:
+        value: The Python value about to be serialised.
+
+    Returns:
+        An equivalent value built only from JSON-native types.
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, _uuid.UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return _json_safe(value.value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 class JSONField(Field):
     """A JSON column.
 
@@ -545,15 +592,21 @@ class JSONField(Field):
     def to_db(self, value: Any) -> Any:
         """Apply the encode hook (if any) before the engine serialises.
 
+        With no ``encoder`` the value is made JSON-safe (UUID/Decimal/datetime/
+        set/enum coerced to native types) so the same exotic values Tortoise
+        accepted do not raise on the native serialiser.
+
         Args:
             value: The Python value to convert.
 
         Returns:
             The (optionally transformed) value to bind.
         """
-        if value is None or self.encoder is None:
+        if value is None:
             return value
-        return self.encoder(value)
+        if self.encoder is not None:
+            return self.encoder(value)
+        return _json_safe(value)
 
     def to_python(self, value: Any) -> Any:
         """Apply the decode hook (if any) to a value read from the engine.

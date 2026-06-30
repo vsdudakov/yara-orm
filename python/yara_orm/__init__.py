@@ -14,7 +14,7 @@ Quick start::
 """
 
 from . import fields, migrations, timezone, validators
-from .aggregations import Avg, Count, Max, Min, Sum
+from .aggregations import Aggregate, Avg, Count, Max, Min, Sum
 from .connection import (
     BaseDBAsyncClient,
     IsolationLevel,
@@ -62,7 +62,7 @@ try:  # populated by maturin; absent only in source checkouts pre-build
 except ImportError:  # pragma: no cover
     _engine_version = "unbuilt"
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "YaraOrm",
@@ -85,6 +85,7 @@ __all__ = [
     "migrations",
     "MigrationManager",
     "Manager",
+    "Aggregate",
     "Count",
     "Sum",
     "Avg",
