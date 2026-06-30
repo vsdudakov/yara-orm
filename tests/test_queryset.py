@@ -828,3 +828,47 @@ async def test_values_list_is_awaitable_async_iterable_and_first(db):
     assert streamed == ["B1", "B2"]
     assert await McBook.filter(title="B1").values_list("title").first() == ("B1",)
     assert await McBook.filter(title="missing").values_list("title").first() is None
+
+
+@pytest.mark.asyncio
+async def test_only_restricts_base_columns_with_select_related(db):
+    """
+    GIVEN a query that eager-loads a relation and restricts base columns
+    WHEN only() names base fields alongside select_related()
+    THEN the base instance loads just those columns and the relation loads fully
+    """
+    await _seed_mc()
+    [book] = (
+        await McBook.filter(title="B1").select_related("author").only("id", "title", "author_id")
+    )
+    assert book.title == "B1"
+    assert (await book.author).name == "Ada"
+    with pytest.raises(FieldError):
+        _ = book.rating  # deferred: not in only()
+
+
+@pytest.mark.asyncio
+async def test_defer_drops_base_columns_with_select_related(db):
+    """
+    GIVEN a query that eager-loads a relation and defers a base column
+    WHEN defer() names a base field alongside select_related()
+    THEN the deferred column is omitted and the relation still loads fully
+    """
+    await _seed_mc()
+    [book] = await McBook.filter(title="B1").select_related("author").defer("rating")
+    assert book.title == "B1"
+    assert (await book.author).name == "Ada"
+    with pytest.raises(FieldError):
+        _ = book.rating  # deferred
+
+
+@pytest.mark.asyncio
+async def test_only_defer_still_rejected_with_annotate(db):
+    """
+    GIVEN only()/defer() combined with annotate()
+    WHEN the query runs
+    THEN it still raises (only the select_related combination is supported)
+    """
+    await _seed_mc()
+    with pytest.raises(FieldError):
+        await McBook.all().annotate(c=Count("id")).group_by("author_id").only("id")
