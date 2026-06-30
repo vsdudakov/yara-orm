@@ -8,10 +8,11 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from yara_orm import IntegrityError, MigrationManager, Model, YaraOrm, fields, migrations
+from yara_orm import Index, IntegrityError, MigrationManager, Model, YaraOrm, fields, migrations
 from yara_orm import migrations as m
 from yara_orm.connection import get_engine
 from yara_orm.dialects import PostgresDialect, SqliteDialect
+from yara_orm.migrations import _index_option_source, diff_states, model_state
 
 
 class MgUser(Model):
@@ -29,7 +30,54 @@ class MgPost(Model):
         table = "mg_post"
 
 
-MODELS = [MgUser, MgPost]
+class IdxThing(Model):
+    id = fields.IntField(pk=True)
+    email = fields.CharField(max_length=50)
+    name = fields.CharField(max_length=50)
+    tags = fields.JSONField()
+
+    class Meta:
+        table = "idx_thing"
+        indexes = [
+            Index(fields=["email"], unique=True),
+            Index(fields=["tags"], using="gin"),
+            Index(fields=["name"], include=["email"]),
+        ]
+
+
+class UtSlot(Model):
+    id = fields.IntField(pk=True)
+    room = fields.CharField(max_length=10)
+    hour = fields.IntField()
+
+    class Meta:
+        table = "ut_slot"
+        unique_together = ("room", "hour")
+
+
+class UtTeam(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "ut_team"
+
+
+class UtMember(Model):
+    id = fields.IntField(pk=True)
+    team = fields.ForeignKeyField("UtTeam", related_name="ut_members")
+    role = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "ut_member"
+        unique_together = ("team", "role")
+
+
+MODELS = [MgUser, MgPost, IdxThing]
+
+
+def _op_names(ops):
+    return [type(o).__name__ for o in ops]
 
 
 def _attach_field(model, name, field):
@@ -64,7 +112,7 @@ async def _drop_all():
 
 
 def _manager(tmp):
-    return MigrationManager(directory=str(tmp), app="mgtest", models=MODELS)
+    return MigrationManager(directory=str(tmp), app="mgtest", models=[MgUser, MgPost])
 
 
 @pytest.mark.asyncio
@@ -586,7 +634,7 @@ def test_sqlmigrate_unknown_name_raises(tmp_path):
     WHEN sqlmigrate is asked for an unknown name
     THEN it raises KeyError
     """
-    mgr = MigrationManager(directory=str(tmp_path), app="x", models=MODELS)
+    mgr = MigrationManager(directory=str(tmp_path), app="x", models=[MgUser, MgPost])
     mgr.make_migrations(name="initial")
     with pytest.raises(KeyError):
         mgr.sqlmigrate("9999_nope")
@@ -718,3 +766,156 @@ async def test_m2m_state_downgrade_target_and_drop_column(sqlite_empty, tmp_path
     assert reverted
     heads = {h["name"]: h["applied"] for h in await mgr.heads()}
     assert heads["0001_initial"] is True
+
+
+# -- unique_together --------------------------------------------------------
+def test_unique_together_emits_unique_constraint():
+    """
+    GIVEN a model declaring a Meta.unique_together group
+    WHEN the initial migration is diffed from an empty state
+    THEN CreateModel carries a UNIQUE constraint over the group's columns
+    """
+    ops = diff_states({"tables": {}}, model_state([UtSlot]))
+    assert _op_names(ops) == ["CreateModelIfNotExists"]
+    constraints = ops[0].constraints
+    assert [(c.name, c.fields) for c in constraints] == [
+        ("uniq_ut_slot_room_hour", ["room", "hour"])
+    ]
+
+
+def test_unique_together_resolves_relation_to_fk_column():
+    """
+    GIVEN a unique_together group naming a forward relation
+    WHEN the initial migration is diffed from an empty state
+    THEN the constraint covers the relation's resolved FK db column
+    """
+    ops = diff_states({"tables": {}}, model_state([UtTeam, UtMember]))
+    member_op = next(o for o in ops if o.table == "ut_member")
+    assert [(c.name, c.fields) for c in member_op.constraints] == [
+        ("uniq_ut_member_team_id_role", ["team_id", "role"])
+    ]
+
+
+def test_unique_together_constraint_to_source_renders_unique():
+    """
+    GIVEN the CreateModel op generated for a unique_together model
+    WHEN it is rendered to migration source
+    THEN the source reconstructs the named UniqueConstraint
+    """
+    ops = diff_states({"tables": {}}, model_state([UtSlot]))
+    source = ops[0].to_source()
+    assert "m.UniqueConstraint(fields=['room', 'hour'], name='uniq_ut_slot_room_hour')" in source
+
+
+def test_unique_together_autogenerate_is_idempotent():
+    """
+    GIVEN an initial migration generated for a unique_together model
+    WHEN its state is replayed and the model is diffed again
+    THEN no further operations are produced (the constraint round-trips)
+    """
+    target = model_state([UtSlot])
+    recorded = {"tables": {}}
+    for op in diff_states({"tables": {}}, target):
+        op.apply_state(recorded)
+    assert diff_states(recorded, model_state([UtSlot])) == []
+
+
+@pytest.mark.asyncio
+async def test_unique_together_migration_enforces_uniqueness_on_sqlite(sqlite_orm, tmp_path):
+    """
+    GIVEN a generated migration for a unique_together model applied on SQLite
+    WHEN a duplicate group value is inserted
+    THEN it raises IntegrityError while distinct values are accepted
+    """
+    mgr = MigrationManager(directory=str(tmp_path), app="ut_compat", models=[UtSlot])
+    filename = mgr.make_migrations(name="initial")
+    assert "m.UniqueConstraint" in (tmp_path / filename).read_text()
+    await mgr.upgrade()
+
+    await UtSlot.create(room="A", hour=9)
+    await UtSlot.create(room="B", hour=9)  # different room
+    await UtSlot.create(room="A", hour=10)  # different hour
+    with pytest.raises(IntegrityError):
+        await UtSlot.create(room="A", hour=9)  # duplicate (room, hour)
+
+
+# -- custom index options ---------------------------------------------------
+@pytest.mark.asyncio
+async def test_unique_composite_index_enforces_uniqueness(db):
+    """
+    GIVEN a model whose Meta.indexes declares Index(unique=True) on a column
+    WHEN the schema is generated and a duplicate value is inserted
+    THEN the second insert raises IntegrityError (uniqueness is enforced)
+    """
+    await IdxThing.create(email="a@x.io", name="Ada", tags=["x"])
+    await IdxThing.create(email="b@x.io", name="Bob", tags=["y"])  # distinct email
+    with pytest.raises(IntegrityError):
+        await IdxThing.create(email="a@x.io", name="Cara", tags=["z"])  # duplicate email
+
+
+@pytest.mark.asyncio
+async def test_using_and_include_render_in_schema_sql(db):
+    """
+    GIVEN a model declaring USING gin and INCLUDE (...) indexes
+    WHEN its PostgreSQL schema DDL is rendered (and generate_schemas applied it)
+    THEN the CREATE INDEX statements carry the USING method and INCLUDE columns
+    """
+    if db != "postgres":
+        pytest.skip("USING / INCLUDE index clauses are PostgreSQL-only")
+    sql = YaraOrm.get_schema_sql(models=[IdxThing])
+    assert "USING gin" in sql
+    assert 'INCLUDE ("email")' in sql
+    assert "CREATE UNIQUE INDEX" in sql
+
+
+@pytest.mark.asyncio
+async def test_sqlite_omits_using_and_include_but_keeps_unique(db):
+    """
+    GIVEN the same model rendered for SQLite (which has no USING/INCLUDE syntax)
+    WHEN its schema DDL is rendered (and generate_schemas applied it)
+    THEN USING/INCLUDE are dropped while CREATE UNIQUE INDEX is still emitted
+    """
+    if db != "sqlite":
+        pytest.skip("asserts the SQLite-only omission of USING / INCLUDE")
+    sql = YaraOrm.get_schema_sql(models=[IdxThing])
+    assert "USING" not in sql
+    assert "INCLUDE" not in sql
+    assert "CREATE UNIQUE INDEX" in sql
+
+
+def test_index_options_round_trip_to_source():
+    """
+    GIVEN the CreateModel op generated for a model with custom index options
+    WHEN it is rendered to migration source
+    THEN the source reconstructs each index's unique/using/include options
+    """
+    ops = diff_states({"tables": {}}, model_state([IdxThing]))
+    source = ops[0].to_source()
+    assert "'unique': True" in source
+    assert "'using': 'gin'" in source
+    assert "'include': ['email']" in source
+
+
+def test_index_options_autogenerate_is_idempotent():
+    """
+    GIVEN an initial migration generated for a model with custom index options
+    WHEN its state is replayed and the model is diffed again
+    THEN no further operations are produced (the options round-trip exactly)
+    """
+    target = model_state([IdxThing])
+    recorded = {"tables": {}}
+    for op in diff_states({"tables": {}}, target):
+        op.apply_state(recorded)
+    assert diff_states(recorded, model_state([IdxThing])) == []
+
+
+def test_index_option_source_renders_each_option():
+    """
+    GIVEN index options (unique / using / include)
+    WHEN their source fragments are rendered
+    THEN each option appears as a ``key=value`` fragment
+    """
+    args = _index_option_source(condition=None, unique=True, using="gin", include=["email"])
+    assert "unique=True" in args
+    assert "using='gin'" in args
+    assert "include=['email']" in args
