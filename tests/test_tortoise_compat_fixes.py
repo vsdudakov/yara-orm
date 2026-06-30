@@ -219,6 +219,25 @@ async def test_jsonfield_serialises_exotic_python_types(db):
     assert sorted(stored["tags"]) == ["a", "b"]
 
 
+def test_json_safe_handles_enum_and_passes_through_unknown():
+    """
+    GIVEN a plain Enum member and an unhandled object
+    WHEN _json_safe processes them
+    THEN the Enum unwraps to its (recursively safe) value and the unknown object
+        is returned unchanged for the engine to handle
+    """
+    from enum import Enum
+
+    from yara_orm.fields import _json_safe
+
+    class Colour(Enum):
+        RED = "red"
+
+    sentinel = object()
+    assert _json_safe(Colour.RED) == "red"
+    assert _json_safe(sentinel) is sentinel
+
+
 # -- inherited Meta.extra_kwargs ----------------------------------------------
 
 
