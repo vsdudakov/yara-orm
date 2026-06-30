@@ -337,7 +337,7 @@ class QuerySet:
                 continue
             descending = spec.startswith("-")
             name = spec[1:] if descending else spec
-            if name not in self._annotations:
+            if name not in self._annotations and "__" not in name:
                 self.model._meta.get_field(name)
             qs._order.append((name, descending))
         return qs
@@ -894,12 +894,65 @@ class QuerySet:
                 continue
             if name in self._annotations:
                 ref = dialect.quote(name)
+            elif "__" in name:
+                # Order across a forward relation via a correlated subquery, so
+                # no JOIN has to be threaded into the FROM clause.
+                ref = self._relation_order_ref(name, dialect)
             else:
                 # Qualify with the base table so ordering stays unambiguous when
                 # select_related joins a table that shares column names.
                 ref = f"{table}.{dialect.quote(meta.get_field(name).db_column)}"
             parts.append(ref + (" DESC" if descending else " ASC"))
         return " ORDER BY " + ", ".join(parts)
+
+    def _relation_order_ref(self, name: str, dialect: BaseDialect) -> str:
+        """Render an ``order_by`` term that walks a forward-relation path.
+
+        Builds a correlated scalar subquery ``(SELECT <col> FROM <target> ...
+        WHERE <target.pk> = <base.fk>)`` for a forward foreign-key chain such as
+        ``contact__last_call_created_at`` or ``a__b__name``. This keeps ordering
+        on a related column self-contained, so every select path supports it
+        without adding a join. Reverse-FK / M2M paths are not orderable this way.
+
+        Args:
+            name: The ``rel__...__col`` forward-relation path.
+            dialect: The SQL dialect providing identifier quoting.
+
+        Raises:
+            FieldError: When a segment is not a forward relation (e.g. a reverse
+                or many-to-many relation), which has no single orderable value.
+
+        Returns:
+            The correlated subquery SQL to use as the ``ORDER BY`` term.
+        """
+        q = dialect.quote
+        meta = self.model._meta
+        segments = name.split("__")
+        info = meta.relations.get(segments[0])
+        if info is None:
+            raise FieldError(
+                f"Cannot order by relation path {name!r}: {segments[0]!r} is not a forward relation"
+            )
+        base_fk = q(meta.get_field(info.source_attr).db_column)
+        cur_meta = info.resolve_target()._meta
+        from_table = q(cur_meta.table)
+        correlation = f"{from_table}.{q(cur_meta.pk_field.db_column)} = {q(meta.table)}.{base_fk}"
+        joins = ""
+        for seg in segments[1:-1]:
+            info = cur_meta.relations.get(seg)
+            if info is None:
+                raise FieldError(
+                    f"Cannot order by relation path {name!r}: {seg!r} is not a forward relation"
+                )
+            next_meta = info.resolve_target()._meta
+            src = q(cur_meta.get_field(info.source_attr).db_column)
+            joins += (
+                f" JOIN {q(next_meta.table)} ON {q(cur_meta.table)}.{src} = "
+                f"{q(next_meta.table)}.{q(next_meta.pk_field.db_column)}"
+            )
+            cur_meta = next_meta
+        final_col = f"{q(cur_meta.table)}.{q(cur_meta.get_field(segments[-1]).db_column)}"
+        return f"(SELECT {final_col} FROM {from_table}{joins} WHERE {correlation})"  # noqa: S608
 
     def _tail_sql(self) -> str:
         """Build the trailing ``LIMIT`` / ``OFFSET`` clause.

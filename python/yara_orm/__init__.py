@@ -16,6 +16,7 @@ Quick start::
 from . import fields, migrations, timezone, validators
 from .aggregations import Avg, Count, Max, Min, Sum
 from .connection import (
+    BaseDBAsyncClient,
     IsolationLevel,
     Tortoise,
     YaraOrm,
@@ -105,6 +106,7 @@ __all__ = [
     "in_transaction",
     "register_query_hook",
     "clear_query_hooks",
+    "BaseDBAsyncClient",
     "atomic",
     "run_async",
     "IsolationLevel",

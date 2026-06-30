@@ -246,6 +246,67 @@ def _derived_indexes(fields: dict[str, Field]) -> list[str]:
     return [c for c, f in fields.items() if f.index and not f.unique and not f.pk]
 
 
+def _index_spec(
+    columns: list[str],
+    condition: str | None,
+    unique: bool,
+    using: str | None,
+    include: list[str] | None,
+) -> dict[str, Any]:
+    """Build the canonical composite-index state spec.
+
+    Centralised so every producer (meta scan, ``CreateModel``, ``AddCompositeIndex``)
+    stores an identically-keyed dict, keeping re-run diffs idempotent.
+
+    Args:
+        columns: The ordered db columns the index covers.
+        condition: Optional partial-index predicate, or None.
+        unique: Whether the index enforces uniqueness.
+        using: Optional access method, or None.
+        include: Optional covering columns, or None.
+
+    Returns:
+        The composite-index spec mapping.
+    """
+    return {
+        "columns": list(columns),
+        "condition": condition,
+        "unique": unique,
+        "using": using,
+        "include": list(include) if include else None,
+    }
+
+
+def _index_option_source(
+    condition: str | None,
+    unique: bool,
+    using: str | None,
+    include: list[str] | None,
+) -> list[str]:
+    """Render the non-default composite-index options as keyword-argument source.
+
+    Args:
+        condition: Optional partial-index predicate, or None.
+        unique: Whether the index enforces uniqueness.
+        using: Optional access method, or None.
+        include: Optional covering columns, or None.
+
+    Returns:
+        The ``key=value`` source fragments for the options that differ from their
+        defaults (possibly empty).
+    """
+    args: list[str] = []
+    if condition is not None:
+        args.append(f"condition={condition!r}")
+    if unique:
+        args.append(f"unique={unique!r}")
+    if using is not None:
+        args.append(f"using={using!r}")
+    if include is not None:
+        args.append(f"include={include!r}")
+    return args
+
+
 def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
     """Return the composite indexes a model declares via ``Meta.indexes``.
 
@@ -257,16 +318,34 @@ def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
         matches the one :meth:`create_table_sql` generates, so migration- and
         ``generate_schemas``-built schemas stay consistent.
     """
-    out: dict[str, dict[str, Any]] = {}
-    for index in meta.indexes:
-        name = index.resolve_name(meta.table)
+
+    def resolve(names: list[str]) -> list[str]:
+        """Resolve field/forward-relation names to their db column names.
+
+        Args:
+            names: Field or forward-relation names.
+
+        Returns:
+            The corresponding db column names.
+        """
         cols = []
-        for n in index.fields:
+        for n in names:
             if n in meta.relations:
                 cols.append(meta.get_field(meta.relations[n].source_attr).db_column)
             else:
                 cols.append(meta.get_field(n).db_column)
-        out[name] = {"columns": cols, "condition": index.condition}
+        return cols
+
+    out: dict[str, dict[str, Any]] = {}
+    for index in meta.indexes:
+        name = index.resolve_name(meta.table)
+        out[name] = _index_spec(
+            resolve(index.fields),
+            index.condition,
+            index.unique,
+            index.using,
+            resolve(index.include) if index.include else None,
+        )
     return out
 
 
@@ -1265,15 +1344,26 @@ class AddCompositeIndex(Operation):
     safe = False
 
     def __init__(
-        self, table: str, name: str, columns: list[str], condition: str | None = None
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
     ) -> None:
-        """Store the index's table, name, covered columns and partial predicate.
+        """Store the index's table, name, columns and rendering options.
 
         Args:
             table: Name of the table to index.
             name: The index name.
             columns: The ordered columns the index covers.
             condition: Optional partial-index predicate (raw SQL ``WHERE``).
+            unique: Whether the index enforces uniqueness.
+            using: Optional access method (``USING <method>``; PostgreSQL-only).
+            include: Optional non-key covering columns (``INCLUDE (...)``;
+                PostgreSQL-only).
 
         Returns:
             None
@@ -1282,6 +1372,9 @@ class AddCompositeIndex(Operation):
         self.name = name
         self.columns = list(columns)
         self.condition = condition
+        self.unique = unique
+        self.using = using
+        self.include = list(include) if include else None
 
     def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
         """Render the ``CREATE INDEX`` statements.
@@ -1294,7 +1387,14 @@ class AddCompositeIndex(Operation):
             The SQL statements that create the index.
         """
         return dialect.render_create_composite_index(
-            self.table, self.name, self.columns, safe=self.safe, condition=self.condition
+            self.table,
+            self.name,
+            self.columns,
+            safe=self.safe,
+            condition=self.condition,
+            unique=self.unique,
+            using=self.using,
+            include=self.include,
         )
 
     def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
@@ -1319,7 +1419,9 @@ class AddCompositeIndex(Operation):
             None
         """
         idx = state["tables"][self.table].setdefault("composite_indexes", {})
-        idx[self.name] = {"columns": list(self.columns), "condition": self.condition}
+        idx[self.name] = _index_spec(
+            self.columns, self.condition, self.unique, self.using, self.include
+        )
 
     def revert_state(self, state: dict[str, Any]) -> None:
         """Remove the composite index from the schema state.
@@ -1339,8 +1441,7 @@ class AddCompositeIndex(Operation):
             The source code constructing this operation.
         """
         args = [repr(self.table), repr(self.name), repr(self.columns)]
-        if self.condition is not None:
-            args.append(f"condition={self.condition!r}")
+        args.extend(_index_option_source(self.condition, self.unique, self.using, self.include))
         return _call(f"m.{type(self).__name__}", args)
 
 
@@ -1354,15 +1455,25 @@ class RemoveCompositeIndex(Operation):
     """Drop a multi-column index (keeping its definition so it can be reversed)."""
 
     def __init__(
-        self, table: str, name: str, columns: list[str], condition: str | None = None
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
     ) -> None:
-        """Store the index's table, name, covered columns and partial predicate.
+        """Store the index's table, name, columns and rendering options.
 
         Args:
             table: Name of the table.
             name: The index name.
             columns: The columns the index covered (used to recreate on reverse).
             condition: Optional partial-index predicate (used to recreate).
+            unique: Whether the index enforced uniqueness (used to recreate).
+            using: Optional access method (used to recreate; PostgreSQL-only).
+            include: Optional covering columns (used to recreate; PostgreSQL-only).
 
         Returns:
             None
@@ -1371,6 +1482,9 @@ class RemoveCompositeIndex(Operation):
         self.name = name
         self.columns = list(columns)
         self.condition = condition
+        self.unique = unique
+        self.using = using
+        self.include = list(include) if include else None
 
     def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
         """Render the ``DROP INDEX`` statements.
@@ -1395,7 +1509,13 @@ class RemoveCompositeIndex(Operation):
             The SQL statements that create the index back.
         """
         return dialect.render_create_composite_index(
-            self.table, self.name, self.columns, condition=self.condition
+            self.table,
+            self.name,
+            self.columns,
+            condition=self.condition,
+            unique=self.unique,
+            using=self.using,
+            include=self.include,
         )
 
     def apply_state(self, state: dict[str, Any]) -> None:
@@ -1419,7 +1539,9 @@ class RemoveCompositeIndex(Operation):
             None
         """
         idx = state["tables"][self.table].setdefault("composite_indexes", {})
-        idx[self.name] = {"columns": list(self.columns), "condition": self.condition}
+        idx[self.name] = _index_spec(
+            self.columns, self.condition, self.unique, self.using, self.include
+        )
 
     def to_source(self) -> str:
         """Render this operation as Python source for a migration file.
@@ -1428,8 +1550,7 @@ class RemoveCompositeIndex(Operation):
             The source code constructing this operation.
         """
         args = [repr(self.table), repr(self.name), repr(self.columns)]
-        if self.condition is not None:
-            args.append(f"condition={self.condition!r}")
+        args.extend(_index_option_source(self.condition, self.unique, self.using, self.include))
         return _call("m.RemoveCompositeIndex", args)
 
 
@@ -2219,7 +2340,13 @@ def _diff_composite_indexes(
             spec = old_ci[name]
             ops.append(
                 RemoveCompositeIndexIfExists(
-                    table, name, spec["columns"], condition=spec.get("condition")
+                    table,
+                    name,
+                    spec["columns"],
+                    condition=spec.get("condition"),
+                    unique=spec.get("unique", False),
+                    using=spec.get("using"),
+                    include=spec.get("include"),
                 )
             )
     for name in sorted(new_ci):
@@ -2227,7 +2354,13 @@ def _diff_composite_indexes(
             spec = new_ci[name]
             ops.append(
                 AddCompositeIndexIfNotExists(
-                    table, name, spec["columns"], condition=spec.get("condition")
+                    table,
+                    name,
+                    spec["columns"],
+                    condition=spec.get("condition"),
+                    unique=spec.get("unique", False),
+                    using=spec.get("using"),
+                    include=spec.get("include"),
                 )
             )
     return ops

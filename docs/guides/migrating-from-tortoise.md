@@ -243,6 +243,8 @@ fewer edits:
 - Aggregates accept an **expression or `Case`** and an optional **`_filter=Q(...)`**
   (`Count("x", _filter=Q(...))` → `... FILTER (WHERE ...)`). **`QuerySet.using_db()`**
   accepts a connection name *or* object.
+- **`order_by()` traverses a forward relation** — `order_by("author__name")` (and
+  multi-hop `order_by("author__country__name")`) sort by the related column.
 
 **Manual SQL & lifecycle** — `connections.get()` / the `in_transaction()` connection
 expose **`execute_query()`** (`(rowcount, rows)`), **`execute_query_dict()`**,
@@ -255,8 +257,8 @@ tracing on every statement. See [Manual SQL](manual-sql.md).
 - **Dotted relation targets** — rewrite `"models.Author"` to `"Author"`.
 - **The `modules` argument** — drop it; `init()` takes a URL (or `config=`).
 - **Import paths for `Q`, `F`, `in_transaction`, `atomic`** — all move to `yara_orm`.
-- **`order_by("rel__col")` across a relation** is not yet supported — order on a
-  local column or sort in Python.
+- **`order_by("rel__col")`** works for **forward** relations; ordering by a
+  **reverse / many-to-many** relation raises (it has no single orderable value).
 - **Signals and manual SQL** — supported; see [Signals](signals.md) and
   [Manual SQL](manual-sql.md) for the exact call shapes if you relied on Tortoise's.
 

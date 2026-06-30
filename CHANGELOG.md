@@ -53,6 +53,15 @@ the originating evidence).
   `... FILTER (WHERE ...)`, and aggregates accept an expression/`Case`
   (`Sum(Case(...))`). **`QuerySet.using_db()`** accepts a connection object as well
   as a name.
+- **`order_by()` across a forward relation** — `order_by("author__name")` and
+  multi-hop `order_by("author__country__name")` sort by the related column (via a
+  correlated subquery); reverse/M2M paths raise.
+- **`BaseDBAsyncClient`** is exported as a runtime-checkable executor `Protocol`
+  for typing `using_db` / connection handles.
+- **Custom index options on `Meta.indexes`** — `Index(unique=..., using=..., include=...)`
+  renders `CREATE [UNIQUE] INDEX ... [USING <method>] (...) [INCLUDE (...)] [WHERE ...]`
+  in both `generate_schemas` and migrations (idempotent); SQLite keeps `UNIQUE` /
+  partial `WHERE` and omits `USING` / `INCLUDE`.
 - **`Value` literal expression**, **`Q.AND` / `Q.OR`** connector constants, and
   **relation typing-hint placeholders** (`ForeignKeyRelation`, `ReverseRelation`,
   `ManyToManyRelation`, …) re-exposed on `yara_orm.fields`.

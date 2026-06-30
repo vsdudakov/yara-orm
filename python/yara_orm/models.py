@@ -286,14 +286,22 @@ def _normalize_field_groups(value: Any) -> list[tuple[str, ...]]:
 class Index:
     """A secondary index declared in ``Meta.indexes``.
 
-    Beyond a plain column group it can carry an explicit ``name`` and a partial
-    ``condition`` (a raw SQL predicate), rendering ``CREATE INDEX ... WHERE
-    <condition>``. Both PostgreSQL and SQLite support partial indexes.
+    Beyond a plain column group it can carry an explicit ``name``, a partial
+    ``condition`` (a raw SQL predicate, rendered as ``WHERE <condition>``), a
+    ``unique`` flag (``CREATE UNIQUE INDEX``), an access ``using`` method
+    (``USING gin``/``gist``/``btree``) and ``include`` covering columns
+    (``INCLUDE (...)``). Both PostgreSQL and SQLite support unique and partial
+    indexes; ``using``/``include`` are PostgreSQL-only and are silently omitted
+    on SQLite (which has no such syntax).
 
     Example::
 
         class Meta:
-            indexes = [Index(fields=["status"], condition="status = 'active'")]
+            indexes = [
+                Index(fields=["status"], condition="status = 'active'"),
+                Index(fields=["tags"], using="gin"),
+                Index(fields=["owner_id"], unique=True, include=["email"]),
+            ]
     """
 
     def __init__(
@@ -302,14 +310,23 @@ class Index:
         fields: list[str],
         name: str | None = None,
         condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
     ) -> None:
-        """Store the indexed fields and optional name/partial condition.
+        """Store the indexed fields and optional name/partial condition/options.
 
         Args:
             fields: Field (or forward-relation) names the index covers.
             name: Explicit index name; defaults to ``idx_<table>_<fields>``.
             condition: Optional partial-index predicate (raw SQL); ``None`` for a
                 full index.
+            unique: Whether to render ``CREATE UNIQUE INDEX`` (enforcing
+                uniqueness over the covered columns).
+            using: Optional access method (e.g. ``"gin"``/``"gist"``/``"btree"``)
+                rendered as ``USING <method>``; PostgreSQL-only.
+            include: Optional non-key covering columns rendered as
+                ``INCLUDE (...)``; PostgreSQL-only.
 
         Returns:
             None
@@ -317,6 +334,9 @@ class Index:
         self.fields = list(fields)
         self.name = name
         self.condition = condition
+        self.unique = unique
+        self.using = using
+        self.include = list(include) if include else None
 
     def resolve_name(self, table: str) -> str:
         """Return this index's name, deriving a default from ``table`` if unset.

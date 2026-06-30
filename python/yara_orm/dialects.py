@@ -69,6 +69,12 @@ class BaseDialect:
     #: Whether named constraints can be added/dropped/renamed with ``ALTER TABLE``
     #: (PostgreSQL); SQLite has no such syntax.
     alter_constraint_in_place = True
+    #: Whether ``CREATE INDEX`` accepts an access method (``USING gin``/``gist``/
+    #: ``btree``); PostgreSQL does, SQLite has no such syntax.
+    index_using = True
+    #: Whether ``CREATE INDEX`` accepts non-key covering columns
+    #: (``INCLUDE (...)``); PostgreSQL does, SQLite has no such syntax.
+    index_include = True
 
     # -- identifiers & placeholders --------------------------------------
     def quote(self, identifier: str) -> str:
@@ -240,6 +246,47 @@ class BaseDialect:
         """
         return [f"UNIQUE ({', '.join(self._group_columns(meta, g))})" for g in meta.unique_together]
 
+    def _composite_index_sql(
+        self,
+        table: str,
+        name: str,
+        columns_sql: str,
+        *,
+        ine: str = "",
+        unique: bool = False,
+        using: str | None = None,
+        include_sql: str | None = None,
+        condition: str | None = None,
+    ) -> str:
+        """Render a single (optionally unique/partial/covering) ``CREATE INDEX``.
+
+        ``USING`` and ``INCLUDE`` are PostgreSQL-only and are silently dropped on
+        dialects whose ``index_using``/``index_include`` flags are unset, keeping
+        the emitted SQL valid on SQLite.
+
+        Args:
+            table: The table to index.
+            name: The index name.
+            columns_sql: The already-quoted, comma-joined key columns.
+            ine: The ``IF NOT EXISTS`` guard fragment (or empty).
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Optional access method rendered as ``USING <method>``.
+            include_sql: Optional already-quoted, comma-joined covering columns
+                rendered as ``INCLUDE (...)``.
+            condition: Optional partial-index predicate rendered as ``WHERE``.
+
+        Returns:
+            The single ``CREATE INDEX`` statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        method = f" USING {using}" if using and self.index_using else ""
+        incl = f" INCLUDE ({include_sql})" if include_sql and self.index_include else ""
+        where = f" WHERE {condition}" if condition else ""
+        return (
+            f"CREATE {uniq}INDEX {ine}{self.quote(name)} "
+            f"ON {self.quote(table)}{method} ({columns_sql}){incl}{where}"
+        )
+
     def _composite_index_statements(self, meta: MetaInfo, ine: str) -> list[str]:
         """Render ``CREATE INDEX`` statements for ``Meta.indexes``.
 
@@ -252,12 +299,20 @@ class BaseDialect:
         """
         out = []
         for index in meta.indexes:
-            idx_name = index.resolve_name(meta.table)
-            cols = ", ".join(self._group_columns(meta, index.fields))
-            where = f" WHERE {index.condition}" if index.condition else ""
+            include_sql = (
+                ", ".join(self._group_columns(meta, index.include)) if index.include else None
+            )
             out.append(
-                f"CREATE INDEX {ine}{self.quote(idx_name)} "
-                f"ON {self.quote(meta.table)} ({cols}){where}"
+                self._composite_index_sql(
+                    meta.table,
+                    index.resolve_name(meta.table),
+                    ", ".join(self._group_columns(meta, index.fields)),
+                    ine=ine,
+                    unique=index.unique,
+                    using=index.using,
+                    include_sql=include_sql,
+                    condition=index.condition,
+                )
             )
         return out
 
@@ -468,7 +523,14 @@ class BaseDialect:
         for name, spec in tspec.get("composite_indexes", {}).items():
             out.extend(
                 self.render_create_composite_index(
-                    table, name, spec["columns"], safe=safe, condition=spec.get("condition")
+                    table,
+                    name,
+                    spec["columns"],
+                    safe=safe,
+                    condition=spec.get("condition"),
+                    unique=spec.get("unique", False),
+                    using=spec.get("using"),
+                    include=spec.get("include"),
                 )
             )
         return out
@@ -651,8 +713,11 @@ class BaseDialect:
         columns: list[str],
         safe: bool = True,
         condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
     ) -> list[str]:
-        """Render a statement creating a multi-column (optionally partial) index.
+        """Render a statement creating a multi-column index.
 
         Args:
             table: The table to index.
@@ -661,14 +726,29 @@ class BaseDialect:
             safe: Whether to emit an ``IF NOT EXISTS`` guard.
             condition: Optional partial-index predicate, rendered as a trailing
                 ``WHERE`` clause; ``None`` for a full index.
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Optional access method rendered as ``USING <method>``
+                (PostgreSQL-only; dropped on SQLite).
+            include: Optional non-key covering columns rendered as
+                ``INCLUDE (...)`` (PostgreSQL-only; dropped on SQLite).
 
         Returns:
             The list with the create-index statement.
         """
         ine = "IF NOT EXISTS " if safe else ""
-        cols = ", ".join(self.quote(c) for c in columns)
-        where = f" WHERE {condition}" if condition else ""
-        return [f"CREATE INDEX {ine}{self.quote(name)} ON {self.quote(table)} ({cols}){where}"]
+        include_sql = ", ".join(self.quote(c) for c in include) if include else None
+        return [
+            self._composite_index_sql(
+                table,
+                name,
+                ", ".join(self.quote(c) for c in columns),
+                ine=ine,
+                unique=unique,
+                using=using,
+                include_sql=include_sql,
+                condition=condition,
+            )
+        ]
 
     def render_drop_composite_index(self, name: str) -> list[str]:
         """Render a statement dropping a named index.
@@ -932,6 +1012,8 @@ class SqliteDialect(BaseDialect):
     alter_column_in_place = False
     rename_index_in_place = False
     alter_constraint_in_place = False
+    index_using = False
+    index_include = False
 
     type_map = {
         "smallint": "INTEGER",
