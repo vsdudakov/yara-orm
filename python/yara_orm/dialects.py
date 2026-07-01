@@ -148,6 +148,22 @@ class BaseDialect:
             parts.append(f"{'->>' if i == last else '->'} {self._literal(key)}")
         return " ".join(parts)
 
+    def json_contains_sql(self, col: str, placeholder: str) -> str:
+        """Render a JSON containment test (``__contains`` on a ``JSONField``).
+
+        The default is the PostgreSQL ``@>`` operator; the bound value is a JSON
+        string cast to ``jsonb``, so an object subset, an array element, or an
+        array-of-objects subset all match.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            placeholder: The bound-parameter placeholder for the JSON value.
+
+        Returns:
+            A boolean SQL expression testing containment.
+        """
+        return f"{col} @> {placeholder}::jsonb"
+
     def cast_text(self, col: str) -> str:
         """Render an expression casting a column to text.
 
@@ -1080,6 +1096,18 @@ class SqliteDialect(BaseDialect):
             return col
         path = "$." + ".".join(keys)
         return f"json_extract({col}, {self._literal(path)})"
+
+    def json_contains_sql(self, col: str, placeholder: str) -> str:
+        """SQLite has no JSON containment operator; reject ``__contains`` on JSON.
+
+        Args:
+            col: The already-qualified JSON column reference (unused).
+            placeholder: The bound-parameter placeholder (unused).
+
+        Raises:
+            UnSupportedError: Always — use PostgreSQL for JSON ``@>`` containment.
+        """
+        raise UnSupportedError("SQLite does not support JSON __contains (@>)")
 
     # SQLite has no ``IF [NOT] EXISTS`` on ADD/DROP COLUMN, no ``CONCURRENTLY``,
     # no in-place ``ALTER COLUMN`` (a column change needs a table rebuild), no

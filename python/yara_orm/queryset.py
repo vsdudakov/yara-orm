@@ -7,6 +7,7 @@ terminal coroutine (``get``, ``count`` ...) runs.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from . import registry
@@ -621,11 +622,15 @@ class QuerySet:
         base, op = _split_lookup(key)
 
         # A multi-segment path is either a JSON-column key path
-        # (``data__key``/``data__a__b`` on a JSONField) or a relation traversal
-        # (``author__name``) compiled as a correlated membership subquery.
+        # (``data__key``/``data__a__b`` on a JSONField), a JSON ``__filter`` dict,
+        # or a relation traversal (``author__name``) compiled as a subquery.
         if "__" in base:
             first = meta.fields.get(base.split("__", 1)[0])
             if first is not None and first.field_kind == "json":
+                # ``data__filter={"a__b__op": v, ...}`` — nested JSON-path
+                # conditions ANDed together (Tortoise JSON ``__filter``).
+                if op == "exact" and base.endswith("__filter") and isinstance(value, dict):
+                    return self._compile_json_filter(base[: -len("__filter")], value, dialect, idx)
                 return self._compile_json_path(base, op, value, dialect, idx)
             return self._compile_relation_lookup(base, op, value, dialect, idx)
 
@@ -676,6 +681,15 @@ class QuerySet:
             return (f"{col} IS NULL" if value else f"{col} IS NOT NULL"), [], idx
         if op == "not_isnull":
             return (f"{col} IS NOT NULL" if value else f"{col} IS NULL"), [], idx
+        if op == "contains" and field is not None and field.field_kind == "json":
+            # JSON ``__contains`` is structural containment (``@>``), not a text
+            # LIKE: it matches an object subset, an array element, or an
+            # array-of-objects subset. The value is bound as JSON text and cast.
+            return (
+                dialect.json_contains_sql(col, dialect.placeholder(idx)),
+                [json.dumps(value)],
+                idx + 1,
+            )
         if hasattr(value, "as_sql"):
             # A Subquery / RawSQL / Case used as the comparison value.
             vparams: list[Any] = []
@@ -701,7 +715,13 @@ class QuerySet:
                 holes.append(dialect.placeholder(idx))
                 params.append(coerce(item.pk if _is_model(item) else item))
                 idx += 1
-            return f"{col} {membership} ({', '.join(holes)})", params, idx
+            clause = f"{col} {membership} ({', '.join(holes)})"
+            if op == "not_in":
+                # ``NOT IN`` drops NULL rows (``NULL NOT IN (...)`` is UNKNOWN);
+                # keep them, matching Tortoise, so a nullable column's NULL rows
+                # are not silently excluded from a negative filter.
+                clause = f"({clause} OR {col} IS NULL)"
+            return clause, params, idx
         if op == "range":
             lo, hi = value
             p1, p2 = dialect.placeholder(idx), dialect.placeholder(idx + 1)
@@ -748,7 +768,13 @@ class QuerySet:
             if field is not None and field.field_kind not in _TEXT_KINDS:
                 col = dialect.cast_text(col)
             return f"{col} {sql_op} {placeholder}", [pattern(value)], idx
-        return f"{col} {sql_op} {placeholder}", [coerce(value)], idx
+        clause = f"{col} {sql_op} {placeholder}"
+        if op == "not":
+            # ``!=`` drops NULL rows (``NULL != x`` is UNKNOWN); keep them,
+            # matching Tortoise, so a nullable column's NULL rows survive a
+            # ``__not`` filter (a NULL default is not silently excluded).
+            clause = f"({clause} OR {col} IS NULL)"
+        return clause, [coerce(value)], idx
 
     def _compile_reverse_exists(
         self,
@@ -818,6 +844,38 @@ class QuerySet:
         # The extracted value has no backing scalar field, so bind the value
         # as-is (text comparison) — pass ``field=None``.
         return self._compile_field_op(expr, None, op, value, dialect, idx)
+
+    def _compile_json_filter(
+        self,
+        json_base: str,
+        conditions: dict[str, Any],
+        dialect: BaseDialect,
+        idx: int,
+    ) -> tuple[str, list[Any], int]:
+        """Compile a JSON ``__filter`` dict into ANDed key-path conditions.
+
+        Each ``"key__nested__op": value`` entry becomes a JSON key-path lookup on
+        the column (``json_base->...->>'key' <op> value``); the entries are ANDed
+        (Tortoise's JSON ``__filter``). E.g. ``audit_log_meta__filter={
+        "status__not": "resolved", "task_name__icontains": part}``.
+
+        Args:
+            json_base: The JSON column path the filter applies to.
+            conditions: ``path__op -> value`` entries to AND together.
+            dialect: The SQL dialect providing quoting and placeholders.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, params, next_index)`` tuple.
+        """
+        clauses, params = [], []
+        for key, value in conditions.items():
+            sql, p, idx = self._compile_lookup(f"{json_base}__{key}", value, dialect, idx)
+            clauses.append(f"({sql})")
+            params.extend(p)
+        if not clauses:
+            return "1 = 1", [], idx  # an empty filter matches everything
+        return " AND ".join(clauses), params, idx
 
     def _compile_relation_lookup(
         self,
@@ -1816,8 +1874,11 @@ class QuerySet:
                 names.append(f.model_field_name)
             group_cols.append(f"{table}.{q(meta.pk_field.db_column)}")
         else:
+            # ``_resolve_column`` handles both own columns and forward-relation
+            # paths (``bearworks_disposition__user_defined``), adding the needed
+            # LEFT JOIN, so group_by()/values() can reference related columns.
             for f in self._group_by:
-                col = f"{table}.{q(meta.get_field(f).db_column)}"
+                col = self._resolve_column(f, dialect, joins)
                 select.append(col)
                 names.append(f)
                 group_cols.append(col)
@@ -1825,7 +1886,7 @@ class QuerySet:
                 for f in requested:
                     if f in self._annotations or f in names:
                         continue
-                    col = f"{table}.{q(meta.get_field(f).db_column)}"
+                    col = self._resolve_column(f, dialect, joins)
                     select.append(col)
                     names.append(f)
                     group_cols.append(col)
@@ -1960,12 +2021,19 @@ class QuerySet:
             A list of dicts mapping each requested name to its value.
         """
         if self._annotations or self._group_by:
-            rows = await self._values_grouped(fields, as_dict=True)
-            # The grouped SELECT also carries the group-by columns; when specific
-            # fields were requested, return only those (by name).
-            if fields:
-                return [{f: r[f] for f in fields} for r in rows]
-            return rows
+            # Select the requested fields plus any alias source paths (which may
+            # traverse a relation), then remap to the requested output names.
+            sources = fields + tuple(aliases.values())
+            rows = await self._values_grouped(sources, as_dict=True)
+            if not sources:
+                return rows
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = {f: r[f] for f in fields}
+                for out_name, src in aliases.items():
+                    d[out_name] = r[src]
+                out.append(d)
+            return out
         if not fields and not aliases:
             names = paths = tuple(self.model._meta.fields.keys())
         else:

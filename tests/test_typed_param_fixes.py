@@ -76,12 +76,14 @@ MODELS = [TpThing, TpReport, TpEvent, TpRun, TpDoc, TpJson]
 async def test_pattern_lookups_on_json_column(db):
     """
     GIVEN a JSON column
-    WHEN filtering with contains/icontains/startswith/endswith
+    WHEN filtering with icontains/startswith/endswith (text patterns)
     THEN the column is cast to text and the serialized JSON matches
+
+    (``__contains`` on a JSON column is structural containment, ``@>`` — see the
+    dedicated JSON containment tests — not a text pattern.)
     """
     await TpJson.create(properties={"email": "alice@example.com"})
     assert await TpJson.filter(properties__icontains="ALICE").count() == 1
-    assert await TpJson.filter(properties__contains="alice").count() == 1
     assert await TpJson.filter(properties__startswith="{").count() == 1
     assert await TpJson.filter(properties__endswith="}").count() == 1
     assert await TpJson.filter(properties__icontains="nobody").count() == 0
