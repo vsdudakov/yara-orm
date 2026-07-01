@@ -3,8 +3,8 @@
 Exercises Count/Sum/Avg/Min/Max with distinct and FILTER (Q), grouping on a
 plain column, HAVING via ``.filter(annotation__...)``, multiple annotations,
 aggregating over a related column, ordering by an annotation, empty groups, and
-the forward-relation group_by path (which is broken on PostgreSQL when combined
-with an order_by on the same path — see the xfail below).
+the forward-relation group_by path (including ordering by that same path, which
+resolves via the shared LEFT JOIN rather than a correlated subquery).
 """
 
 import pytest
@@ -179,6 +179,20 @@ async def test_group_by_plain_column(db):
     )
     by_genre = {r["genre"]: (r["n"], r["total"]) for r in rows}
     assert by_genre == {"drama": (2, 60), "sci-fi": (2, 40)}
+
+
+@pytest.mark.asyncio
+async def test_grouped_random_ordering(db):
+    """
+    GIVEN a grouped/aggregated query ordered randomly
+    WHEN order_by("?") is applied to the groups
+    THEN it runs (RANDOM()) and returns one row per group
+    """
+    await _seed()
+    rows = (
+        await AggghBook.annotate(n=Count("id")).group_by("genre").order_by("?").values("genre", "n")
+    )
+    assert {r["genre"] for r in rows} == {"drama", "sci-fi"}
 
 
 @pytest.mark.asyncio
@@ -424,11 +438,6 @@ async def test_group_by_forward_relation_path_no_order(db):
     assert by_name == {"Ada": 3, "Bob": 1}
 
 
-@pytest.mark.xfail(
-    reason="BUG: group_by(relation path) + order_by(same path) emits a correlated "
-    "subquery over the ungrouped FK, invalid under PG GROUP BY (42803)",
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_group_by_forward_relation_path_ordered(db):
     """

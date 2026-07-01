@@ -1433,6 +1433,12 @@ class Model(metaclass=ModelMeta):
         idx = 1
         for key, value in kwargs.items():
             field = meta.get_field(key)
+            if value is None:
+                # ``field=None`` is NULL identity, not ``col = NULL`` (always
+                # UNKNOWN); mirror the QuerySet builder so get()/get_or_create
+                # match existing NULL rows instead of inserting duplicates.
+                clauses.append(f"{dialect.quote(field.db_column)} IS NULL")
+                continue
             clauses.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
             params.append(field.to_db(value))
             idx += 1

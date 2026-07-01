@@ -96,6 +96,10 @@ class BaseDialect:
         "second": "SECOND",
         "microsecond": "MICROSECONDS",
     }
+    #: Whether ``OFFSET`` requires a preceding ``LIMIT`` (SQLite does; a bare
+    #: ``OFFSET`` is a syntax error there, so an offset-only slice needs
+    #: ``LIMIT -1``). PostgreSQL accepts ``OFFSET`` alone.
+    offset_requires_limit = False
     #: Whether ``ADD COLUMN`` / ``DROP COLUMN`` accept an ``IF [NOT] EXISTS``
     #: guard (PostgreSQL does; SQLite has no such syntax).
     column_if_exists = True
@@ -1248,6 +1252,7 @@ class SqliteDialect(BaseDialect):
     # SQLite has no ``IF [NOT] EXISTS`` on ADD/DROP COLUMN, no ``CONCURRENTLY``,
     # no in-place ``ALTER COLUMN`` (a column change needs a table rebuild), no
     # ``ALTER INDEX ... RENAME``, and no ``ALTER TABLE ... CONSTRAINT`` syntax.
+    offset_requires_limit = True
     column_if_exists = False
     index_concurrently = False
     alter_column_in_place = False

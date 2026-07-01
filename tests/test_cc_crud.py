@@ -281,10 +281,6 @@ async def test_slice_limit_only(db):
     assert [t.value for t in head] == [0, 1]
 
 
-@pytest.mark.xfail(
-    reason="BUG: offset-only slice emits OFFSET with no LIMIT -> SQLite syntax error",
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_slice_offset_only(db):
     """
@@ -422,11 +418,6 @@ async def test_count_and_exists_on_empty(db):
 # -- get_or_create / update_or_create corner cases ---------------------------
 
 
-@pytest.mark.xfail(
-    reason="BUG: equality lookup value=None compiles to `col = NULL` (never true) "
-    "instead of `col IS NULL`, so get_or_create inserts a duplicate NULL row",
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_get_or_create_matches_on_null_lookup(db):
     """
@@ -441,10 +432,6 @@ async def test_get_or_create_matches_on_null_lookup(db):
     assert await CcThing.filter(value__isnull=True).count() == 1
 
 
-@pytest.mark.xfail(
-    reason="BUG: equality-to-None compiles to `col = NULL`; should be `col IS NULL`",
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_filter_equality_none_matches_null_rows(db):
     """

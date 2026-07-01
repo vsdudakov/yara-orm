@@ -253,13 +253,6 @@ async def test_select_related_unknown_deep_path_raises(db):
         await RlBook.select_related("author__name")  # name is a column, not a relation
 
 
-@pytest.mark.xfail(
-    reason="BUG: order_by across a self-FK related column builds a correlated "
-    "subquery that references the target table unaliased (== base table for a "
-    "self-FK), so the correlation `target.pk = base.fk` collapses to `t.id = "
-    "t.manager_id` within a single row and the ordering is wrong.",
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_select_related_self_fk_order_by_related(db):
     """
