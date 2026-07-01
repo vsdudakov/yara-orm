@@ -455,11 +455,22 @@ async def test_array_param_binds_and_round_trips(orm):
 
 
 @pytest.mark.asyncio
-async def test_bare_list_still_binds_as_json(orm):
+async def test_raw_list_param_binds_as_array(orm):
     """
-    GIVEN a bare Python list (no Array wrapper)
-    WHEN it is bound
-    THEN it binds as JSON (so JSONField is unaffected by array support)
+    GIVEN a bare Python list bound as a raw-SQL parameter
+    WHEN it is used with an array context (asyncpg-style)
+    THEN it encodes as a PostgreSQL array, while a dict still binds as JSON and a
+    JSON array is bound via a JSON string
     """
     conn = connections.get()
-    assert (await conn.execute_query("SELECT $1::jsonb AS j", [[1, 2, 3]]))[1][0]["j"] == [1, 2, 3]
+    # A bare list now binds as an array (matching asyncpg), so ANY()/unnest work.
+    rows = await conn.execute_query_dict("SELECT unnest($1::int[]) AS x", [[1, 2, 3]])
+    assert [r["x"] for r in rows] == [1, 2, 3]
+    # A dict still binds as JSON (dicts have no array interpretation).
+    assert (await conn.execute_query("SELECT $1::jsonb AS j", [{"a": 1}]))[1][0]["j"] == {"a": 1}
+    # A JSON array in a raw query is passed as a JSON string.
+    assert (await conn.execute_query("SELECT $1::jsonb AS j", ["[1, 2, 3]"]))[1][0]["j"] == [
+        1,
+        2,
+        3,
+    ]

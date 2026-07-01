@@ -237,6 +237,42 @@ def _as_records(rows: Any) -> Any:
     return [Record(r) if isinstance(r, dict) else r for r in rows]
 
 
+def _arrayify(value: Any) -> Any:
+    """Bind a raw-SQL ``list``/``tuple`` parameter as a PostgreSQL array.
+
+    A bare list otherwise binds as JSON (so a ``JSONField`` round-trips), but in
+    a raw query ``WHERE col = ANY($1)`` / ``unnest($1::int[])`` the caller means
+    a real array — matching asyncpg, which binds lists to arrays natively. Lists
+    and tuples are wrapped in :class:`~yara_orm.Array` (recursively, so nested
+    lists become multi-dimensional arrays); element types (UUID/Decimal/date/…)
+    are coerced by the engine's array encoder. ``str``/``bytes``/``dict`` and an
+    already-``Array`` value pass through unchanged.
+
+    Args:
+        value: A single raw-SQL bind parameter.
+
+    Returns:
+        The value, with lists/tuples wrapped as ``Array``.
+    """
+    from .expressions import Array
+
+    if isinstance(value, Array) or not isinstance(value, (list, tuple)):
+        return value
+    return Array(_arrayify(v) for v in value)
+
+
+def _arrayify_params(params: list[Any] | None) -> list[Any] | None:
+    """Apply :func:`_arrayify` to every raw-SQL bind parameter.
+
+    Args:
+        params: The raw-SQL bind parameters, or None.
+
+    Returns:
+        The parameters with list/tuple values wrapped as arrays, or None.
+    """
+    return None if params is None else [_arrayify(p) for p in params]
+
+
 class _ManualSQLCompat:
     """Raw-SQL compatibility methods shared by manual-SQL executors.
 
@@ -937,7 +973,7 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             The fetched results.
         """
-        return _as_records(await _run_query(self._tx.fetch_all, sql, params))
+        return _as_records(await _run_query(self._tx.fetch_all, sql, _arrayify_params(params)))
 
     async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Any:
         """Fetch a single row as a dict on the transaction.
@@ -1050,7 +1086,7 @@ class _EngineProxy(_ManualSQLCompat):
         Returns:
             The fetched rows as dicts.
         """
-        return _as_records(await _run_query(self._engine.fetch_all, sql, params))
+        return _as_records(await _run_query(self._engine.fetch_all, sql, _arrayify_params(params)))
 
     async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Any:
         """Fetch a single row as a dict on the pooled connection.
