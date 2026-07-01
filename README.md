@@ -228,14 +228,15 @@ slowdown factor (>1 means Yara ORM is faster). Full methodology in
 
 | operation     | yara-orm | vs Tortoise | vs SQLAlchemy | vs Pony |
 |---------------|---------:|------------:|--------------:|--------:|
-| bulk_insert   | 11.0 ms  | 2.1×        | 6.2×          | 18.7×   |
-| single_insert | 33.4 ms  | 2.5×        | 4.7×          |  1.8×   |
-| fetch_all     |  3.4 ms  | 4.7×        | 3.5×          |  8.9×   |
-| count         |  0.3 ms  | 2.1×        | 3.2×          |  1.7×   |
-| filter        |  2.2 ms  | 4.1×        | 10.0×         |  7.9×   |
-| get_by_pk     | 62.5 ms  | 3.1×        | 4.7×          |  1.3×   |
-| update        |  3.4 ms  | 1.1×        | 1.2×          | 36.5×   |
-| delete        |  0.7 ms  | 1.3×        | 1.6×          | 134.0×  |
+| bulk_insert   | 18.5 ms  | 1.3×        | 3.9×          | 12.1×   |
+| single_insert | 33.7 ms  | 2.5×        | 4.7×          |  1.8×   |
+| fetch_all     |  3.8 ms  | 4.6×        | 6.1×          |  9.4×   |
+| count         |  0.3 ms  | 1.7×        | 3.0×          |  1.4×   |
+| group_by      |  0.8 ms  | 1.4×        | 2.0×          |  2.9×   |
+| filter        |  2.3 ms  | 4.1×        | 3.6×          |  7.8×   |
+| get_by_pk     | 65.8 ms  | 3.1×        | 4.7×          |  1.3×   |
+| update        |  3.4 ms  | 1.1×        | 1.2×          | 35.0×   |
+| delete        |  0.7 ms  | 1.2×        | 1.5×          | 130.2×  |
 
 Speed comes from the Rust hot path, **positional row decoding** (no per-row dict
 or column-name allocation), **compiled-SQL + prepared-statement caching**, and

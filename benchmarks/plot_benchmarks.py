@@ -29,16 +29,17 @@ OPERATIONS = [
     "single_insert",
     "fetch_all",
     "count",
+    "group_by",
     "filter",
     "get_by_pk",
     "update",
     "delete",
 ]
 TIMES_MS = {
-    "yara-orm": [11.0, 33.4, 3.4, 0.3, 2.2, 62.5, 3.4, 0.7],
-    "tortoise": [24.2, 79.5, 16.1, 0.5, 8.4, 193.6, 3.4, 0.8],
-    "sqlalchemy": [66.6, 151.3, 11.8, 0.9, 19.9, 294.3, 3.8, 1.0],
-    "pony": [218.2, 59.7, 30.4, 0.5, 16.0, 82.5, 119.5, 90.7],
+    "yara-orm": [18.5, 33.7, 3.8, 0.3, 0.8, 2.3, 65.8, 3.4, 0.7],
+    "tortoise": [24.7, 82.7, 17.5, 0.6, 1.1, 9.3, 204.4, 3.7, 0.9],
+    "sqlalchemy": [72.5, 157.7, 23.2, 1.0, 1.6, 8.2, 306.9, 4.1, 1.1],
+    "pony": [223.4, 61.0, 35.7, 0.5, 2.4, 17.8, 84.6, 120.7, 95.1],
 }
 
 # yara-orm in brand deep-purple, competitors in muted greys so the winner pops.
