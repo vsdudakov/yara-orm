@@ -2317,11 +2317,11 @@ def _detect_renames(
         A list of ``(old_name, new_name)`` rename pairs.
     """
     removed = [c for c in old_cols if c not in new_cols]
-    added = [c for c in new_cols if c not in old_cols]
+    added_sorted = sorted(c for c in new_cols if c not in old_cols)
     pairs: list[tuple[str, str]] = []
     taken: set[str] = set()
     for r in sorted(removed):
-        for a in sorted(added):
+        for a in added_sorted:
             if a in taken:
                 continue
             if old_cols[r] == new_cols[a] and old_fks.get(r) == new_fks.get(a):
@@ -2462,24 +2462,58 @@ class MigrationManager:
         spec.loader.exec_module(module)
         return module
 
-    def _load_all(self) -> list[tuple[str, type[Migration]]]:
+    def _load_all(self, files: list[Path] | None = None) -> list[tuple[str, type[Migration]]]:
         """Import every migration file in order and return its ``Migration``.
+
+        Args:
+            files: Pre-listed migration files to import, so a caller that already
+                scanned the directory does not scan it again. Defaults to
+                ``_migration_files()``.
 
         Returns:
             Pairs of migration name and its ``Migration`` class.
         """
-        return [(p.stem, self._load_module(p).Migration) for p in self._migration_files()]
+        files = self._migration_files() if files is None else files
+        return [(p.stem, self._load_module(p).Migration) for p in files]
 
-    def _next_number(self) -> int:
+    def _next_number(self, files: list[Path] | None = None) -> int:
         """Compute the next migration number.
+
+        Args:
+            files: Pre-listed migration files (avoids a redundant directory
+                scan). Defaults to ``_migration_files()``.
 
         Returns:
             One greater than the highest existing number, or 1 if none.
         """
-        files = self._migration_files()
+        files = self._migration_files() if files is None else files
         if not files:
             return 1
         return _file_number(files[-1].name) + 1
+
+    def _replay(
+        self,
+        applied: set[str] | None = None,
+        loaded: list[tuple[str, type[Migration]]] | None = None,
+    ) -> dict[str, Any]:
+        """Rebuild schema state by replaying migrations' ``apply_state``.
+
+        Args:
+            applied: When given, replay only migrations whose name is in this
+                set; otherwise replay every migration on disk.
+            loaded: Pre-loaded ``(name, Migration)`` pairs to replay, so a caller
+                that already imported the migrations (``upgrade``/``downgrade``)
+                does not re-``exec`` every file. Defaults to ``_load_all()``.
+
+        Returns:
+            The replayed schema state.
+        """
+        state: dict[str, Any] = {"tables": {}}
+        for name, migration in loaded if loaded is not None else self._load_all():
+            if applied is None or name in applied:
+                for op in migration.operations:
+                    op.apply_state(state)
+        return state
 
     def _recorded_state(self) -> dict[str, Any]:
         """Replay all on-disk migrations to rebuild the recorded schema state.
@@ -2487,11 +2521,7 @@ class MigrationManager:
         Returns:
             The schema state implied by the existing migration files.
         """
-        state: dict[str, Any] = {"tables": {}}
-        for _, migration in self._load_all():
-            for op in migration.operations:
-                op.apply_state(state)
-        return state
+        return self._replay()
 
     def _running_state(self, applied: set[str]) -> dict[str, Any]:
         """Rebuild the schema state implied by the already-applied migrations.
@@ -2502,12 +2532,7 @@ class MigrationManager:
         Returns:
             The schema state with only applied migrations replayed.
         """
-        state: dict[str, Any] = {"tables": {}}
-        for name, migration in self._load_all():
-            if name in applied:
-                for op in migration.operations:
-                    op.apply_state(state)
-        return state
+        return self._replay(applied)
 
     # -- commands ---------------------------------------------------------
     def init(self) -> None:
@@ -2532,11 +2557,12 @@ class MigrationManager:
             The new migration filename, or None when there are no changes.
         """
         self.init()
-        files = self._migration_files()
-        operations = [] if empty else diff_states(self._recorded_state(), model_state(self.models))
+        files = self._migration_files()  # single directory scan, reused below
+        recorded = self._replay(loaded=self._load_all(files))
+        operations = [] if empty else diff_states(recorded, model_state(self.models))
         if not operations and not empty:
             return None
-        number = self._next_number()
+        number = self._next_number(files)
         label = name or ("initial" if not files else "auto")
         filename = f"{number:04d}_{label}.py"
         dependencies = [files[-1].stem] if files else []
@@ -2665,9 +2691,14 @@ class MigrationManager:
         """
         applied = await self._applied()
         dialect = get_dialect()
-        state = self._running_state(set(applied))
+        loaded = self._load_all()  # imported once; reused for state replay + apply
+        state = self._replay(set(applied), loaded)
+        table = dialect.quote(MIGRATION_TABLE)
+        cols = ", ".join(dialect.quote(c) for c in ("app", "name", "applied_at"))
+        holes = ", ".join(dialect.placeholder(i) for i in (1, 2, 3))
+        insert_sql = f"INSERT INTO {table} ({cols}) VALUES ({holes})"
         done = []
-        for name, migration in self._load_all():
+        for name, migration in loaded:
             if name in applied:
                 continue
             async with self._maybe_txn(migration.atomic):
@@ -2678,13 +2709,7 @@ class MigrationManager:
                     for sql in op.forward_sql(dialect, state):
                         await engine.execute(sql)
                     op.apply_state(state)
-                table = dialect.quote(MIGRATION_TABLE)
-                cols = ", ".join(dialect.quote(c) for c in ("app", "name", "applied_at"))
-                holes = ", ".join(dialect.placeholder(i) for i in (1, 2, 3))
-                await engine.execute(
-                    f"INSERT INTO {table} ({cols}) VALUES ({holes})",
-                    [self.app, name, datetime.now(timezone.utc)],
-                )
+                await engine.execute(insert_sql, [self.app, name, datetime.now(timezone.utc)])
             done.append(name)
             if target and name == target:
                 break
@@ -2701,8 +2726,9 @@ class MigrationManager:
             The names of the migrations reverted.
         """
         applied = await self._applied()
-        migrations = dict(self._load_all())
-        state = self._running_state(set(applied))
+        loaded = self._load_all()  # imported once; reused for state replay + revert
+        migrations = dict(loaded)
+        state = self._replay(set(applied), loaded)
         if target is not None:
             to_revert = [n for n in applied if _num(n) > _num(target)]
         else:
