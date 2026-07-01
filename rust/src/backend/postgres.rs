@@ -2,6 +2,8 @@
 
 use async_trait::async_trait;
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
+use postgres_native_tls::MakeTlsConnector;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{Kind, ToSql, Type};
 use tokio_postgres::{NoTls, Statement};
 
@@ -12,6 +14,25 @@ use crate::value::{decode_pg_row, decode_pg_row_values, Row, Value};
 
 /// Default pool size when the URL does not specify `max_size`.
 const DEFAULT_MAX_SIZE: usize = 16;
+
+/// The password embedded in a `scheme://user:password@host...` URL, if present.
+fn url_password(url: &str) -> Option<&str> {
+    let authority = url.split_once("://")?.1.split(['/', '?']).next()?;
+    let userinfo = authority.rsplit_once('@')?.0;
+    match userinfo.split_once(':') {
+        Some((_, pass)) if !pass.is_empty() => Some(pass),
+        _ => None,
+    }
+}
+
+/// Redact the connection URL's password (if any) from an error message, so a
+/// driver/config error surfaced to Python cannot leak the credential.
+fn redact(msg: String, url: &str) -> String {
+    match url_password(url) {
+        Some(pw) => msg.replace(pw, "***"),
+        None => msg,
+    }
+}
 
 pub struct PgBackend {
     pool: Pool,
@@ -65,12 +86,23 @@ impl PgBackend {
         let (clean_url, params) = extract_pool_params(url)?;
         let pg_config: tokio_postgres::Config = clean_url
             .parse()
-            .map_err(|e: tokio_postgres::Error| EngineError::Config(e.to_string()))?;
+            .map_err(|e: tokio_postgres::Error| EngineError::Config(redact(e.to_string(), url)))?;
 
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
+        // Honour `sslmode` with a real TLS connector: `require`/`verify-ca`/
+        // `verify-full` now actually encrypt (and native-tls verifies the cert
+        // against the OS trust store) instead of silently running in plaintext.
+        // `disable` opts out; `prefer` (the libpq default) attempts TLS and
+        // falls back to plaintext when the server has no SSL.
+        let mgr = if pg_config.get_ssl_mode() == SslMode::Disable {
+            Manager::from_config(pg_config, NoTls, mgr_config)
+        } else {
+            let connector = native_tls::TlsConnector::new()
+                .map_err(|e| EngineError::Config(redact(e.to_string(), url)))?;
+            Manager::from_config(pg_config, MakeTlsConnector::new(connector), mgr_config)
+        };
         let max_size = params.max_size.unwrap_or(DEFAULT_MAX_SIZE);
         let pool = Pool::builder(mgr)
             .max_size(max_size)
@@ -89,7 +121,7 @@ impl PgBackend {
                 })
             }))
             .build()
-            .map_err(|e| EngineError::Config(e.to_string()))?;
+            .map_err(|e| EngineError::Config(redact(e.to_string(), url)))?;
 
         // Pre-warm connections: always at least one (so we fail fast on an
         // unreachable database / bad credentials), and up to `min_size` so the
@@ -101,13 +133,13 @@ impl PgBackend {
             held.push(
                 pool.get()
                     .await
-                    .map_err(|e| EngineError::Connection(e.to_string()))?,
+                    .map_err(|e| EngineError::Connection(redact(e.to_string(), url)))?,
             );
         }
         held[0]
             .simple_query("SELECT 1")
             .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
+            .map_err(|e| EngineError::Connection(redact(e.to_string(), url)))?;
         drop(held); // return the warmed connections to the pool as idle
 
         Ok(Self {
@@ -265,5 +297,34 @@ impl TxConn for PgTx {
             .batch_execute(&format!("ROLLBACK TO SAVEPOINT {name}"))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{redact, url_password};
+
+    #[test]
+    fn url_password_is_extracted_only_when_present() {
+        assert_eq!(url_password("postgres://u:pw@h/db"), Some("pw"));
+        assert_eq!(
+            url_password("postgres://u:pw@h:5432/db?sslmode=require"),
+            Some("pw")
+        );
+        // Password may itself contain a colon; the userinfo splits on the first.
+        assert_eq!(url_password("postgres://u:a:b@h/db"), Some("a:b"));
+        assert_eq!(url_password("postgres://u@h/db"), None); // user, no password
+        assert_eq!(url_password("postgres://h/db"), None); // no userinfo
+    }
+
+    #[test]
+    fn redact_hides_the_password_in_messages() {
+        let url = "postgres://u:sup3rsecret@h/db";
+        let msg = "auth failed for postgres://u:sup3rsecret@h/db".to_string();
+        let out = redact(msg, url);
+        assert!(!out.contains("sup3rsecret"));
+        assert!(out.contains("***"));
+        // Nothing to redact when the URL carries no password.
+        assert_eq!(redact("boom".to_string(), "postgres://h/db"), "boom");
     }
 }
