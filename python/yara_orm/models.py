@@ -1553,6 +1553,141 @@ class Model(metaclass=ModelMeta):
         return obj, False
 
     @classmethod
+    async def _existing_by_key(
+        cls, records: list[dict[str, Any]], key_fields: tuple[str, ...]
+    ) -> dict[tuple, Model]:
+        """Return ``{key_tuple: instance}`` for records that already exist.
+
+        Fetches candidates in a single query (the first key field's ``__in``) and
+        matches the full key tuple in memory, so a composite key still costs one
+        round-trip.
+
+        Args:
+            records: The records whose keys to look up.
+            key_fields: The field names forming the natural key.
+
+        Returns:
+            A mapping of key tuple to the existing instance.
+        """
+        first = key_fields[0]
+        values = list({rec[first] for rec in records})
+        wanted = {tuple(rec[f] for f in key_fields) for rec in records}
+        out: dict[tuple, Model] = {}
+        for obj in await cls.filter(**{f"{first}__in": values}):
+            key = tuple(getattr(obj, f) for f in key_fields)
+            if key in wanted:
+                out[key] = obj
+        return out
+
+    @classmethod
+    async def bulk_get_or_create(
+        cls,
+        records: Iterable[dict[str, Any]],
+        key_fields: Iterable[str],
+        defaults: dict[str, Any] | None = None,
+        batch_size: int = 500,
+    ) -> list[tuple[Model, bool]]:
+        """Fetch or create many rows in as few queries as possible.
+
+        Existing rows are matched by ``key_fields`` in one query; the missing ones
+        are inserted with a single ``bulk_create``. A key repeated within the
+        batch resolves to the same instance (created once).
+
+        Args:
+            records: One mapping of field values per row (the key values plus any
+                values used only when creating).
+            key_fields: The field names identifying an existing row.
+            defaults: Extra field values applied only to newly created rows.
+            batch_size: Maximum rows per INSERT statement for the created rows.
+
+        Returns:
+            A ``(instance, created)`` tuple per input record, in input order.
+        """
+        records = list(records)
+        keys = tuple(key_fields)
+        if not keys:
+            raise ValueError("bulk_get_or_create requires at least one key field")
+        if not records:
+            return []
+        defaults = defaults or {}
+        existing = await cls._existing_by_key(records, keys)
+        results: list[tuple[Model, bool]] = []
+        to_create: list[Model] = []
+        for rec in records:
+            key = tuple(rec[f] for f in keys)
+            found = existing.get(key)
+            if found is not None:
+                results.append((found, False))
+            else:
+                obj = cls(**{**rec, **defaults})
+                existing[key] = obj  # dedupe repeats of a new key within the batch
+                to_create.append(obj)
+                results.append((obj, True))
+        if to_create:
+            await cls.bulk_create(to_create, batch_size=batch_size)
+        return results
+
+    @classmethod
+    async def bulk_update_or_create(
+        cls,
+        records: Iterable[dict[str, Any]],
+        key_fields: Iterable[str],
+        update_fields: Iterable[str] | None = None,
+        batch_size: int = 500,
+    ) -> list[tuple[Model, bool]]:
+        """Update existing rows (matched by ``key_fields``) or create missing ones.
+
+        Existing rows are fetched in one query and updated with a single
+        ``bulk_update``; missing rows are inserted with one ``bulk_create``.
+
+        Args:
+            records: One mapping of field values per row.
+            key_fields: The field names identifying an existing row.
+            update_fields: Field names to overwrite on existing rows; defaults to
+                every non-key field present in the records.
+            batch_size: Maximum rows per statement for the created/updated rows.
+
+        Returns:
+            A ``(instance, created)`` tuple per input record, in input order.
+        """
+        records = list(records)
+        keys = tuple(key_fields)
+        if not keys:
+            raise ValueError("bulk_update_or_create requires at least one key field")
+        if not records:
+            return []
+        updates = (
+            list(update_fields)
+            if update_fields is not None
+            else [f for f in records[0] if f not in keys]
+        )
+        existing = await cls._existing_by_key(records, keys)
+        pending: dict[tuple, Model] = {}  # new keys created in this batch
+        results: list[tuple[Model, bool]] = []
+        to_create: list[Model] = []
+        to_update: dict[int, Model] = {}  # id(obj) -> obj, deduped
+        for rec in records:
+            key = tuple(rec[f] for f in keys)
+            found = existing.get(key)
+            if found is not None:
+                found.update_from_dict({f: rec[f] for f in updates if f in rec})
+                to_update[id(found)] = found
+                results.append((found, False))
+            elif key in pending:
+                results.append((pending[key], False))  # duplicate of an in-batch create
+            else:
+                obj = cls(**rec)
+                pending[key] = obj
+                to_create.append(obj)
+                results.append((obj, True))
+        if to_create:
+            await cls.bulk_create(to_create, batch_size=batch_size)
+        if to_update:
+            # bulk_update no-ops when ``updates`` is empty (all fields are keys).
+            await cls.bulk_update(list(to_update.values()), fields=updates, batch_size=batch_size)
+        return results
+
+    @classmethod
     async def in_bulk(cls, id_list: Iterable[Any], field_name: str = "pk") -> dict[Any, Model]:
         """Fetch instances keyed by ``field_name`` for the given values.
 
