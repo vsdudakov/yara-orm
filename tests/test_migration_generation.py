@@ -494,6 +494,36 @@ def test_remove_plain_composite_index_to_source_has_no_condition():
     assert "idx_t_a_b" in src
 
 
+def test_reversible_op_pairs_preserve_forward_backward_and_guards():
+    """
+    GIVEN the Add/Remove operation pairs built on the shared _ReversibleOp base
+    WHEN their forward/backward SQL is rendered on PostgreSQL
+    THEN each Remove is the exact inverse of its Add, and the IF [NOT] EXISTS
+         guards land on the same side they did before the refactor
+    """
+    from yara_orm.dialects import PostgresDialect
+
+    pg = PostgresDialect()
+    st: dict = {"tables": {}}
+
+    # A Remove op's forward is its Add counterpart's backward (true inverse).
+    add_f = m.AddField("t", "c", fields.IntField())
+    rem_f = m.RemoveField("t", "c", fields.IntField())
+    assert rem_f.forward_sql(pg, st) == add_f.backward_sql(pg, st)
+    assert rem_f.backward_sql(pg, st) == add_f.forward_sql(pg, st)
+
+    # The forward guard follows the op's own action: RemoveFieldIfExists guards
+    # the DROP, but recreating on reverse (ADD) is unguarded.
+    rem_if = m.RemoveFieldIfExists("t", "c", fields.IntField())
+    assert "DROP COLUMN IF EXISTS" in rem_if.forward_sql(pg, st)[0]
+    assert "IF NOT EXISTS" not in rem_if.backward_sql(pg, st)[0]
+
+    # The subtle historical asymmetry: a composite index recreated on reverse
+    # keeps IF NOT EXISTS, but a single-column index recreated on reverse does not.
+    assert "IF NOT EXISTS" in m.RemoveCompositeIndex("t", "i", ["a"]).backward_sql(pg, st)[0]
+    assert "IF NOT EXISTS" not in m.RemoveIndex("t", "c").backward_sql(pg, st)[0]
+
+
 def test_remove_composite_index_if_exists_round_trips_to_its_own_class():
     """
     GIVEN a RemoveCompositeIndexIfExists operation (as diff_states emits)

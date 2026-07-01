@@ -655,6 +655,93 @@ class Operation:
         raise NotImplementedError
 
 
+class _ReversibleOp(Operation):
+    """Base for a paired ``Add``/``Remove`` operation.
+
+    A subclass implements the forward primitives once — ``_do_sql`` (the
+    create/add action), ``_undo_sql`` (the drop/remove action) and the two state
+    transitions ``_do_state``/``_undo_state`` — plus ``__init__`` and
+    ``to_source``. The ``Remove`` side sets ``_reverse = True`` to run the same
+    primitives backwards, so the SQL and state logic is single-sourced instead of
+    mirrored across two near-identical classes.
+
+    The ``safe`` (``IF [NOT] EXISTS``) guard always applies to the operation's
+    own *forward* action; the reverse SQL uses ``_backward_safe`` (constant per
+    pair, so e.g. a composite index recreated on reverse keeps its guard).
+    """
+
+    #: ``IF [NOT] EXISTS`` guard on the forward action.
+    safe = False
+    #: Guard passed to the reverse SQL (recreation/removal); constant per pair.
+    _backward_safe = False
+    #: Whether this op is the reverse (``Remove``) side of the pair.
+    _reverse = False
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the forward SQL: the reverse primitive when ``_reverse``.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that apply the operation.
+        """
+        prim = self._undo_sql if self._reverse else self._do_sql
+        return prim(dialect, self.safe)
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the reverse SQL: the forward primitive when ``_reverse``.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The SQL statements that revert the operation.
+        """
+        prim = self._do_sql if self._reverse else self._undo_sql
+        return prim(dialect, self._backward_safe)
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Evolve the state forward (the ``_undo`` transition when ``_reverse``).
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        (self._undo_state if self._reverse else self._do_state)(state)
+
+    def revert_state(self, state: dict[str, Any]) -> None:
+        """Evolve the state backward (the ``_do`` transition when ``_reverse``).
+
+        Args:
+            state: Mutable schema state to update in place.
+
+        Returns:
+            None
+        """
+        (self._do_state if self._reverse else self._undo_state)(state)
+
+    def _do_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:  # pragma: no cover - abstract
+        """Render the create/add action's SQL."""
+        raise NotImplementedError
+
+    def _undo_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:  # pragma: no cover
+        """Render the drop/remove action's SQL."""
+        raise NotImplementedError
+
+    def _do_state(self, state: dict[str, Any]) -> None:  # pragma: no cover - abstract
+        """Apply the create/add action to the schema state."""
+        raise NotImplementedError
+
+    def _undo_state(self, state: dict[str, Any]) -> None:  # pragma: no cover - abstract
+        """Apply the drop/remove action to the schema state."""
+        raise NotImplementedError
+
+
 class CreateModel(Operation):
     """Create a table from a field set (columns, pk, foreign keys, indexes)."""
 
@@ -857,19 +944,16 @@ class DeleteModelIfExists(DeleteModel):
     """Idempotent :class:`DeleteModel` (drop already guards with ``IF EXISTS``)."""
 
 
-class AddField(Operation):
-    """Add a column to a table from a field object."""
-
-    #: Whether the rendered ``ADD COLUMN`` carries an ``IF NOT EXISTS`` guard.
-    safe = False
+class _FieldColumnOp(_ReversibleOp):
+    """Shared add/drop-column primitives for :class:`AddField`/:class:`RemoveField`."""
 
     def __init__(self, table: str, name: str, field: Field) -> None:
-        """Store the column to add.
+        """Store the column and the field describing it.
 
         Args:
             table: Name of the table to alter.
-            name: Name of the column to add.
-            field: The field describing the new column.
+            name: Name of the column.
+            field: The field describing the column (used to recreate on reverse).
 
         Returns:
             None
@@ -878,32 +962,32 @@ class AddField(Operation):
         self.name = name
         self.field = field
 
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _do_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the ``ADD COLUMN`` statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Whether to emit the ``IF NOT EXISTS`` guard.
 
         Returns:
             The SQL statements that add the column.
         """
-        return dialect.render_add_column(self.table, self.name, _column_spec(self.field), self.safe)
+        return dialect.render_add_column(self.table, self.name, _column_spec(self.field), safe)
 
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _undo_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the ``DROP COLUMN`` statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Whether to emit the ``IF EXISTS`` guard.
 
         Returns:
             The SQL statements that drop the column.
         """
-        return dialect.render_drop_column(self.table, self.name)
+        return dialect.render_drop_column(self.table, self.name, safe)
 
-    def apply_state(self, state: dict[str, Any]) -> None:
-        """Record the new column in the schema state.
+    def _do_state(self, state: dict[str, Any]) -> None:
+        """Record the column in the schema state.
 
         Args:
             state: Mutable schema state to update in place.
@@ -913,7 +997,7 @@ class AddField(Operation):
         """
         state["tables"][self.table]["fields"][self.name] = self.field
 
-    def revert_state(self, state: dict[str, Any]) -> None:
+    def _undo_state(self, state: dict[str, Any]) -> None:
         """Remove the column from the schema state.
 
         Args:
@@ -934,6 +1018,10 @@ class AddField(Operation):
             f"m.{type(self).__name__}",
             [repr(self.table), repr(self.name), _field_source(self.field)],
         )
+
+
+class AddField(_FieldColumnOp):
+    """Add a column to a table from a field object."""
 
 
 class AddFieldIfNotExists(AddField):
@@ -942,83 +1030,10 @@ class AddFieldIfNotExists(AddField):
     safe = True
 
 
-class RemoveField(Operation):
+class RemoveField(_FieldColumnOp):
     """Drop a column, keeping its field so the operation can be reversed."""
 
-    #: Whether the rendered ``DROP COLUMN`` carries an ``IF EXISTS`` guard.
-    safe = False
-
-    def __init__(self, table: str, name: str, field: Field) -> None:
-        """Store the column to drop.
-
-        Args:
-            table: Name of the table to alter.
-            name: Name of the column to drop.
-            field: The field describing the column, used to recreate on reverse.
-
-        Returns:
-            None
-        """
-        self.table = table
-        self.name = name
-        self.field = field
-
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the ``DROP COLUMN`` statements.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that drop the column.
-        """
-        return dialect.render_drop_column(self.table, self.name, self.safe)
-
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the ``ADD COLUMN`` statements that restore the column.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that add the column back.
-        """
-        return dialect.render_add_column(self.table, self.name, _column_spec(self.field))
-
-    def apply_state(self, state: dict[str, Any]) -> None:
-        """Remove the column from the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        state["tables"][self.table]["fields"].pop(self.name, None)
-
-    def revert_state(self, state: dict[str, Any]) -> None:
-        """Restore the column in the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        state["tables"][self.table]["fields"][self.name] = self.field
-
-    def to_source(self) -> str:
-        """Render this operation as Python source for a migration file.
-
-        Returns:
-            The source code constructing this operation.
-        """
-        return _call(
-            f"m.{type(self).__name__}",
-            [repr(self.table), repr(self.name), _field_source(self.field)],
-        )
+    _reverse = True
 
 
 class RemoveFieldIfExists(RemoveField):
@@ -1135,22 +1150,20 @@ class AlterField(Operation):
         )
 
 
-class AddIndex(Operation):
-    """Create an index on a single column of a table."""
+class _SingleColumnIndexOp(_ReversibleOp):
+    """Shared create/drop-index primitives for :class:`AddIndex`/:class:`RemoveIndex`."""
 
-    #: Whether the rendered ``CREATE INDEX`` carries an ``IF NOT EXISTS`` guard.
-    safe = False
-    #: Whether the index is built ``CONCURRENTLY`` (PostgreSQL, non-atomic).
+    #: Whether the index is built/dropped ``CONCURRENTLY`` (PostgreSQL, non-atomic).
     concurrently = False
-    #: Whether the index is ``UNIQUE``.
+    #: Whether the index is ``UNIQUE`` (only meaningful on the create side).
     unique = False
 
     def __init__(self, table: str, column: str) -> None:
-        """Store the table and column to index.
+        """Store the table and indexed column.
 
         Args:
-            table: Name of the table to index.
-            column: Name of the column to index.
+            table: Name of the table.
+            column: Name of the indexed column.
 
         Returns:
             None
@@ -1158,37 +1171,33 @@ class AddIndex(Operation):
         self.table = table
         self.column = column
 
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _do_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the ``CREATE INDEX`` statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Whether to emit the ``IF NOT EXISTS`` guard.
 
         Returns:
             The SQL statements that create the index.
         """
         return dialect.render_create_index(
-            self.table,
-            self.column,
-            safe=self.safe,
-            unique=self.unique,
-            concurrently=self.concurrently,
+            self.table, self.column, safe=safe, unique=self.unique, concurrently=self.concurrently
         )
 
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the ``DROP INDEX`` statements.
+    def _undo_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
+        """Render the ``DROP INDEX`` statements (always ``IF EXISTS``).
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Unused; the drop is inherently idempotent.
 
         Returns:
             The SQL statements that drop the index.
         """
         return dialect.render_drop_index(self.table, self.column, concurrently=self.concurrently)
 
-    def apply_state(self, state: dict[str, Any]) -> None:
+    def _do_state(self, state: dict[str, Any]) -> None:
         """Record the index in the schema state.
 
         Args:
@@ -1201,7 +1210,7 @@ class AddIndex(Operation):
         if self.column not in idx:
             idx.append(self.column)
 
-    def revert_state(self, state: dict[str, Any]) -> None:
+    def _undo_state(self, state: dict[str, Any]) -> None:
         """Remove the index from the schema state.
 
         Args:
@@ -1221,6 +1230,10 @@ class AddIndex(Operation):
             The source code constructing this operation.
         """
         return _call(f"m.{type(self).__name__}", [repr(self.table), repr(self.column)])
+
+
+class AddIndex(_SingleColumnIndexOp):
+    """Create an index on a single column of a table."""
 
 
 class AddIndexIfNotExists(AddIndex):
@@ -1244,84 +1257,10 @@ class AddUniqueIndexConcurrently(AddIndex):
     unique = True
 
 
-class RemoveIndex(Operation):
+class RemoveIndex(_SingleColumnIndexOp):
     """Drop an index from a single column of a table."""
 
-    #: Whether the index is dropped ``CONCURRENTLY`` (PostgreSQL, non-atomic).
-    concurrently = False
-
-    def __init__(self, table: str, column: str) -> None:
-        """Store the table and column whose index to drop.
-
-        Args:
-            table: Name of the table.
-            column: Name of the indexed column.
-
-        Returns:
-            None
-        """
-        self.table = table
-        self.column = column
-
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the ``DROP INDEX`` statements.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that drop the index.
-        """
-        return dialect.render_drop_index(self.table, self.column, concurrently=self.concurrently)
-
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the ``CREATE INDEX`` statements that restore the index.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that recreate the index.
-        """
-        return dialect.render_create_index(
-            self.table, self.column, safe=False, concurrently=self.concurrently
-        )
-
-    def apply_state(self, state: dict[str, Any]) -> None:
-        """Remove the index from the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        idx = state["tables"][self.table].get("indexes", [])
-        if self.column in idx:
-            idx.remove(self.column)
-
-    def revert_state(self, state: dict[str, Any]) -> None:
-        """Restore the index in the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        idx = state["tables"][self.table].setdefault("indexes", [])
-        if self.column not in idx:
-            idx.append(self.column)
-
-    def to_source(self) -> str:
-        """Render this operation as Python source for a migration file.
-
-        Returns:
-            The source code constructing this operation.
-        """
-        return _call(f"m.{type(self).__name__}", [repr(self.table), repr(self.column)])
+    _reverse = True
 
 
 class RemoveIndexIfExists(RemoveIndex):
@@ -1334,11 +1273,15 @@ class RemoveIndexConcurrently(RemoveIndex):
     concurrently = True
 
 
-class AddCompositeIndex(Operation):
-    """Create a multi-column index (from ``Meta.indexes``)."""
+class _CompositeIndexOp(_ReversibleOp):
+    """Shared create/drop primitives for the multi-column index pair.
 
-    #: Whether the rendered ``CREATE INDEX`` carries an ``IF NOT EXISTS`` guard.
-    safe = False
+    ``_backward_safe`` is ``True`` so recreating the index on reverse keeps its
+    ``IF NOT EXISTS`` guard (the historical behaviour of the create renderer's
+    default).
+    """
+
+    _backward_safe = True
 
     def __init__(
         self,
@@ -1354,7 +1297,7 @@ class AddCompositeIndex(Operation):
         """Store the index's table, name, columns and rendering options.
 
         Args:
-            table: Name of the table to index.
+            table: Name of the table.
             name: The index name.
             columns: The ordered columns the index covers.
             condition: Optional partial-index predicate (raw SQL ``WHERE``).
@@ -1376,12 +1319,12 @@ class AddCompositeIndex(Operation):
         self.include = list(include) if include else None
         self.opclass = opclass
 
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _do_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the ``CREATE INDEX`` statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Whether to emit the ``IF NOT EXISTS`` guard.
 
         Returns:
             The SQL statements that create the index.
@@ -1390,7 +1333,7 @@ class AddCompositeIndex(Operation):
             self.table,
             self.name,
             self.columns,
-            safe=self.safe,
+            safe=safe,
             condition=self.condition,
             unique=self.unique,
             using=self.using,
@@ -1398,19 +1341,19 @@ class AddCompositeIndex(Operation):
             opclass=self.opclass,
         )
 
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _undo_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the ``DROP INDEX`` statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Unused; the drop guards ``IF EXISTS`` itself.
 
         Returns:
             The SQL statements that drop the index.
         """
         return dialect.render_drop_composite_index(self.name)
 
-    def apply_state(self, state: dict[str, Any]) -> None:
+    def _do_state(self, state: dict[str, Any]) -> None:
         """Record the composite index in the schema state.
 
         Args:
@@ -1424,7 +1367,7 @@ class AddCompositeIndex(Operation):
             self.columns, self.condition, self.unique, self.using, self.include, self.opclass
         )
 
-    def revert_state(self, state: dict[str, Any]) -> None:
+    def _undo_state(self, state: dict[str, Any]) -> None:
         """Remove the composite index from the schema state.
 
         Args:
@@ -1448,6 +1391,10 @@ class AddCompositeIndex(Operation):
             )
         )
         return _call(f"m.{type(self).__name__}", args)
+
+
+class AddCompositeIndex(_CompositeIndexOp):
+    """Create a multi-column index (from ``Meta.indexes``)."""
 
 
 class AddCompositeIndexIfNotExists(AddCompositeIndex):
@@ -1456,115 +1403,10 @@ class AddCompositeIndexIfNotExists(AddCompositeIndex):
     safe = True
 
 
-class RemoveCompositeIndex(Operation):
+class RemoveCompositeIndex(_CompositeIndexOp):
     """Drop a multi-column index (keeping its definition so it can be reversed)."""
 
-    def __init__(
-        self,
-        table: str,
-        name: str,
-        columns: list[str],
-        condition: str | None = None,
-        unique: bool = False,
-        using: str | None = None,
-        include: list[str] | None = None,
-        opclass: str | None = None,
-    ) -> None:
-        """Store the index's table, name, columns and rendering options.
-
-        Args:
-            table: Name of the table.
-            name: The index name.
-            columns: The columns the index covered (used to recreate on reverse).
-            condition: Optional partial-index predicate (used to recreate).
-            unique: Whether the index enforced uniqueness (used to recreate).
-            using: Optional access method (used to recreate; PostgreSQL-only).
-            include: Optional covering columns (used to recreate; PostgreSQL-only).
-            opclass: Optional per-column operator class (used to recreate).
-
-        Returns:
-            None
-        """
-        self.table = table
-        self.name = name
-        self.columns = list(columns)
-        self.condition = condition
-        self.unique = unique
-        self.using = using
-        self.include = list(include) if include else None
-        self.opclass = opclass
-
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the ``DROP INDEX`` statements.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that drop the index.
-        """
-        return dialect.render_drop_composite_index(self.name)
-
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the statements that recreate the index.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that create the index back.
-        """
-        return dialect.render_create_composite_index(
-            self.table,
-            self.name,
-            self.columns,
-            condition=self.condition,
-            unique=self.unique,
-            using=self.using,
-            include=self.include,
-            opclass=self.opclass,
-        )
-
-    def apply_state(self, state: dict[str, Any]) -> None:
-        """Remove the composite index from the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        state["tables"][self.table].get("composite_indexes", {}).pop(self.name, None)
-
-    def revert_state(self, state: dict[str, Any]) -> None:
-        """Restore the composite index in the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        idx = state["tables"][self.table].setdefault("composite_indexes", {})
-        idx[self.name] = _index_spec(
-            self.columns, self.condition, self.unique, self.using, self.include, self.opclass
-        )
-
-    def to_source(self) -> str:
-        """Render this operation as Python source for a migration file.
-
-        Returns:
-            The source code constructing this operation.
-        """
-        args = [repr(self.table), repr(self.name), repr(self.columns)]
-        args.extend(
-            _index_option_source(
-                self.condition, self.unique, self.using, self.include, self.opclass
-            )
-        )
-        return _call(f"m.{type(self).__name__}", args)
+    _reverse = True
 
 
 class RemoveCompositeIndexIfExists(RemoveCompositeIndex):
@@ -1781,16 +1623,16 @@ class RenameIndex(Operation):
 
 
 # -- constraint operations (hand-written; SQLite raises UnSupportedError) ----
-class AddConstraint(Operation):
-    """Add a unique or check constraint to a table."""
+class _ConstraintOp(_ReversibleOp):
+    """Shared add/drop primitives for :class:`AddConstraint`/:class:`RemoveConstraint`."""
 
     def __init__(self, table: str, constraint: Constraint) -> None:
-        """Store the table and the constraint to add.
+        """Store the table and the constraint definition.
 
         Args:
-            table: The table to constrain.
+            table: The constrained table.
             constraint: The constraint definition (must be named to be
-                reversible).
+                reversible; kept so the reverse can recreate it).
 
         Returns:
             None
@@ -1798,31 +1640,31 @@ class AddConstraint(Operation):
         self.table = table
         self.constraint = constraint
 
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _do_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the add-constraint statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Unused; constraints carry no ``IF [NOT] EXISTS`` guard.
 
         Returns:
             The SQL statements that add the constraint.
         """
         return dialect.render_add_constraint(self.table, self.constraint.to_spec())
 
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+    def _undo_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the drop-constraint statements.
 
         Args:
             dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
+            safe: Unused; constraints carry no ``IF [NOT] EXISTS`` guard.
 
         Returns:
             The SQL statements that drop the constraint.
         """
         return dialect.render_drop_constraint(self.table, cast(str, self.constraint.name))
 
-    def apply_state(self, state: dict[str, Any]) -> None:
+    def _do_state(self, state: dict[str, Any]) -> None:
         """Record the constraint in the schema state.
 
         Args:
@@ -1833,7 +1675,7 @@ class AddConstraint(Operation):
         """
         state["tables"][self.table].setdefault("constraints", []).append(self.constraint.to_spec())
 
-    def revert_state(self, state: dict[str, Any]) -> None:
+    def _undo_state(self, state: dict[str, Any]) -> None:
         """Remove the constraint from the schema state.
 
         Args:
@@ -1853,81 +1695,17 @@ class AddConstraint(Operation):
         Returns:
             The source code constructing this operation.
         """
-        return _call("m.AddConstraint", [repr(self.table), self.constraint.to_source()])
+        return _call(f"m.{type(self).__name__}", [repr(self.table), self.constraint.to_source()])
 
 
-class RemoveConstraint(Operation):
+class AddConstraint(_ConstraintOp):
+    """Add a unique or check constraint to a table."""
+
+
+class RemoveConstraint(_ConstraintOp):
     """Drop a constraint, keeping its definition so it can be reversed."""
 
-    def __init__(self, table: str, constraint: Constraint) -> None:
-        """Store the table and the constraint to drop.
-
-        Args:
-            table: The constrained table.
-            constraint: The constraint definition, used to recreate on reverse.
-
-        Returns:
-            None
-        """
-        self.table = table
-        self.constraint = constraint
-
-    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the drop-constraint statements.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that drop the constraint.
-        """
-        return dialect.render_drop_constraint(self.table, cast(str, self.constraint.name))
-
-    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
-        """Render the statements that recreate the constraint.
-
-        Args:
-            dialect: Active dialect used to render SQL.
-            state: Current schema state (unused).
-
-        Returns:
-            The SQL statements that add the constraint back.
-        """
-        return dialect.render_add_constraint(self.table, self.constraint.to_spec())
-
-    def apply_state(self, state: dict[str, Any]) -> None:
-        """Remove the constraint from the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        cons = state["tables"][self.table].get("constraints", [])
-        state["tables"][self.table]["constraints"] = [
-            c for c in cons if c.get("name") != self.constraint.name
-        ]
-
-    def revert_state(self, state: dict[str, Any]) -> None:
-        """Restore the constraint in the schema state.
-
-        Args:
-            state: Mutable schema state to update in place.
-
-        Returns:
-            None
-        """
-        state["tables"][self.table].setdefault("constraints", []).append(self.constraint.to_spec())
-
-    def to_source(self) -> str:
-        """Render this operation as Python source for a migration file.
-
-        Returns:
-            The source code constructing this operation.
-        """
-        return _call("m.RemoveConstraint", [repr(self.table), self.constraint.to_source()])
+    _reverse = True
 
 
 class RenameConstraint(Operation):
