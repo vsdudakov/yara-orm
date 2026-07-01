@@ -1493,7 +1493,7 @@ class QuerySet:
         sql, params, sel = self._plain_select_sql(dialect)
         rows = await engine.fetch_rows(sql, params)
         if sel is not None:
-            instances = [self.model._from_db_row_fields(row, sel) for row in rows]
+            instances = self.model._from_db_rows_fields(rows, sel)
         else:
             instances = self.model._from_db_rows(rows)
         if self._prefetch:

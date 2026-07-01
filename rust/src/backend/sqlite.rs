@@ -273,11 +273,7 @@ impl Backend for SqliteBackend {
         Ok(rows)
     }
 
-    async fn execute_many(
-        &self,
-        sql: &str,
-        rows: &[Vec<Value>],
-    ) -> Result<Vec<Row>, EngineError> {
+    async fn execute_many(&self, sql: &str, rows: &[Vec<Value>]) -> Result<Vec<Row>, EngineError> {
         let obj = self.obj().await?;
         let (sql, rows, cache) = (sql.to_string(), rows.to_vec(), self.cache_statements);
         obj.interact(move |conn| sql_execute_many(conn, &sql, rows, cache))

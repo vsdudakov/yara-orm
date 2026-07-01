@@ -6,6 +6,31 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mixing a UUID param with an array param in one statement** no longer corrupts
+  the binary encoding (`22P03`). Each param's known type is declared and
+  array/JSON/NULL params get OID 0 (server-inferred) — instead of dropping every
+  declaration when one param is an array, which made a `::uuid`-cast text param
+  be re-inferred as `uuid` and mis-encoded. A string element inside a `::uuid[]`
+  array is also parsed to uuid at bind.
+
+### Changed
+
+- **`JSONField` value coercion moved into the Rust engine** — the
+  UUID/Decimal/datetime/bytes/set/enum → JSON conversion now happens in a single
+  native pass at bind time (previously a Python `_json_safe` pre-walk ran on every
+  JSON write). A value with no JSON form now raises `TypeError` at save time
+  rather than a path-named `FieldError` from `to_db`.
+
+### Performance
+
+- **`DecimalField` reads skip a redundant `Decimal(str(...))` round-trip** on
+  PostgreSQL (the engine already returns a native `Decimal`); SQLite still
+  reconstructs from text.
+- **`only()`/`defer()` partial reads reuse a cached decode plan** and a batch
+  hydration path, instead of recomputing the per-field plan for every row.
+
 ## [1.7.0] - 2026-07-01
 
 ### Added

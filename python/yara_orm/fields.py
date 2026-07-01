@@ -8,7 +8,6 @@ decision in the dialect layer.
 
 from __future__ import annotations
 
-import base64
 import json
 import uuid as _uuid
 from datetime import date, datetime, time, timedelta
@@ -312,7 +311,10 @@ class DecimalField(Field):
     """A fixed-precision decimal column."""
 
     field_kind = "decimal"
-    # Engine returns a float for our MVP NUMERIC mapping; convert on read.
+    # PostgreSQL returns a native ``Decimal`` (NUMERIC), so the read-path
+    # ``to_python`` short-circuits it; SQLite stores decimals as text (VARCHAR
+    # affinity keeps them exact), so there ``to_python`` reconstructs the
+    # ``Decimal`` from the string — hence not read-identity.
     read_identity = False
 
     def __init__(self, max_digits: int = 12, decimal_places: int = 2, **kwargs: Any) -> None:
@@ -349,13 +351,19 @@ class DecimalField(Field):
     def to_python(self, value: Any) -> Any:
         """Convert a database value into a ``Decimal``.
 
+        A value already decoded as a ``Decimal`` by the engine (PostgreSQL
+        NUMERIC) is returned unchanged, skipping a redundant ``str`` round-trip;
+        a text value (SQLite) is reconstructed exactly.
+
         Args:
             value: The value returned by the database engine.
 
         Returns:
             The value as a ``Decimal``, or ``None``.
         """
-        return None if value is None else Decimal(str(value))
+        if value is None or isinstance(value, Decimal):
+            return value
+        return Decimal(str(value))
 
 
 # ---------------------------------------------------------------------------
@@ -647,51 +655,6 @@ class UUIDField(Field):
         return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
 
 
-def _json_safe(value: Any, _path: str = "<value>") -> Any:
-    """Recursively convert common Python types into JSON-native ones.
-
-    The native engine serialises JSON itself and accepts only JSON-native
-    Python types, whereas some serialisers (e.g. orjson with a ``default``
-    hook) tolerate more. This mirrors that leniency for the stdlib types apps
-    most often store in a ``JSONField`` — UUIDs, ``Decimal``, dates/times, sets,
-    enums and ``bytes`` — leaving already-native values untouched. A leaf with
-    no JSON form raises a clear :class:`FieldError` naming its location rather
-    than letting an opaque "value is not JSON serialisable" surface at bind time.
-
-    Args:
-        value: The Python value about to be serialised.
-        _path: The dotted/indexed location of ``value`` within the root, used
-            to name the offending leaf in the error message.
-
-    Returns:
-        An equivalent value built only from JSON-native types.
-
-    Raises:
-        FieldError: When a leaf value has no JSON-native representation.
-    """
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, (bytes, bytearray)):
-        # JSON has no byte type; base64 keeps the payload reversible and ASCII.
-        return base64.b64encode(bytes(value)).decode("ascii")
-    if isinstance(value, _uuid.UUID):
-        return str(value)
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
-    if isinstance(value, Enum):
-        return _json_safe(value.value, _path)
-    if isinstance(value, dict):
-        return {k: _json_safe(v, f"{_path}.{k}") for k, v in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(v, f"{_path}[{i}]") for i, v in enumerate(value)]
-    raise FieldError(
-        f"JSONField value at {_path} is not JSON-serialisable "
-        f"(type {type(value).__name__}); convert it before storing"
-    )
-
-
 class JSONField(Field):
     """A JSON column.
 
@@ -734,12 +697,13 @@ class JSONField(Field):
     def to_db(self, value: Any) -> Any:
         """Apply the encode hook (if any) before the engine serialises.
 
-        With no ``encoder`` the value is made JSON-safe (UUID/Decimal/datetime/
-        set/enum coerced to native types) so those exotic values do not raise
-        on the native serialiser. An ``encoder`` that returns a serialised JSON
-        *string* is parsed back to a native value (the engine serialises JSON
-        itself, so binding the string verbatim would corrupt a ``jsonb``
-        column).
+        With no ``encoder`` the value is bound as-is: the engine's JSON encoder
+        coerces the exotic stdlib types apps store in a ``JSONField``
+        (UUID/Decimal/datetime/date/time/bytes/set/enum) to their JSON form in a
+        single native pass — no Python pre-walk. An ``encoder`` that returns a
+        serialised JSON *string* is parsed back to a native value (the engine
+        serialises JSON itself, so binding the string verbatim would corrupt a
+        ``jsonb`` column).
 
         Args:
             value: The Python value to convert.
@@ -752,7 +716,7 @@ class JSONField(Field):
         if self.encoder is not None:
             encoded = self.encoder(value)
             return json.loads(encoded) if isinstance(encoded, str) else encoded
-        return _json_safe(value)
+        return value
 
     def to_python(self, value: Any) -> Any:
         """Apply the decode hook (if any) to a value read from the engine.
