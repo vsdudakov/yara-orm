@@ -6,8 +6,31 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-07-01
+
+### Added
+
+- **JSON `__contains` containment** (`@>`) on a `JSONField` — matches an object
+  subset, an array element, or an array-of-objects subset
+  (`Model.filter(tags__contains=[{"name": "vip"}])`). PostgreSQL only.
+- **JSON `__filter` lookup** — `col__filter={"path__op": value, ...}` applies each
+  entry as a JSON key-path condition on the column and ANDs them (Tortoise's JSON
+  `__filter`), e.g. `audit_log_meta__filter={"status__not": "resolved"}`.
+- **`group_by()` / `values()` / `values_list()` accept forward-relation paths** —
+  `group_by("author__country")`, `values(country="author__country")` — the
+  related table is joined automatically.
+
 ### Fixed
 
+- **`__not` / `__not_in` keep NULL rows** (Tortoise semantics) — they compile to
+  `(col != v OR col IS NULL)` / `(col NOT IN (...) OR col IS NULL)` so a nullable
+  column's `NULL` rows are not silently dropped from a negative filter.
+- **Integer columns accept string values** — `filter(id__in={"1", "2"})` /
+  `filter(id="3")` coerce the strings to `int` before binding, avoiding
+  'operator does not exist: integer = text' (42883).
+- **`bulk_update` bumps `auto_now` columns** — an `updated_at`-style column is set
+  to now and written even when not listed in `fields` (bulk_create already
+  applied `auto_now`/`auto_now_add`).
 - **Mixing a UUID param with an array param in one statement** no longer corrupts
   the binary encoding (`22P03`). Each param's known type is declared and
   array/JSON/NULL params get OID 0 (server-inferred) — instead of dropping every
