@@ -81,3 +81,5 @@ jobs:
         with:
           packages-dir: dist
           password: ${{ secrets.PYPI_TOKEN }}
+          # Don't fail a re-run/re-tag when a version is already on PyPI.
+          skip-existing: true
