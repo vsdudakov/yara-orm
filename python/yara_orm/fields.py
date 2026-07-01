@@ -865,6 +865,20 @@ class OnDelete:
     NO_ACTION = "NO ACTION"
 
 
+#: The accepted ``ON DELETE`` actions. ``on_delete`` is interpolated into DDL
+#: verbatim (a referential action is not a bindable value), so it is validated
+#: against this closed set to keep arbitrary SQL out of the ``FOREIGN KEY`` clause.
+_ON_DELETE_ACTIONS = frozenset(
+    {
+        OnDelete.CASCADE,
+        OnDelete.RESTRICT,
+        OnDelete.SET_NULL,
+        OnDelete.SET_DEFAULT,
+        OnDelete.NO_ACTION,
+    }
+)
+
+
 class ForeignKeyField(Field):
     """A foreign key to another model.
 
@@ -914,7 +928,14 @@ class ForeignKeyField(Field):
         super().__init__(**kwargs)
         self.reference = reference
         self.related_name = related_name
-        self.on_delete = on_delete
+        # Normalise case/whitespace ("set null" -> "SET NULL") and reject anything
+        # outside the closed set: on_delete is spliced into DDL, not bound.
+        normalized_on_delete = " ".join(str(on_delete).upper().split())
+        if normalized_on_delete not in _ON_DELETE_ACTIONS:
+            raise ValueError(
+                f"invalid on_delete {on_delete!r}; expected one of {sorted(_ON_DELETE_ACTIONS)}"
+            )
+        self.on_delete = normalized_on_delete
         self.source_field = source_field
         self.db_constraint = db_constraint
         #: Cached pk field of the target model, used to coerce bound values.

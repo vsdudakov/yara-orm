@@ -260,6 +260,21 @@ def test_bare_on_delete_constants_alias_ondelete_members():
     assert fields.NO_ACTION == fields.OnDelete.NO_ACTION
 
 
+def test_foreign_key_on_delete_is_validated_against_closed_set():
+    """
+    GIVEN a ForeignKeyField (on_delete is spliced into DDL, not bound)
+    WHEN it is constructed with a value outside the OnDelete set
+    THEN it raises ValueError; valid values (any case/spacing) are normalised
+    """
+    with pytest.raises(ValueError, match="invalid on_delete"):
+        fields.ForeignKeyField("Target", on_delete="CASCADE); DROP TABLE t; --")
+    # Canonical members pass; case/whitespace variants normalise to the keyword.
+    assert (
+        fields.ForeignKeyField("Target", on_delete=fields.OnDelete.SET_NULL).on_delete == "SET NULL"
+    )
+    assert fields.ForeignKeyField("Target", on_delete="set null").on_delete == "SET NULL"
+
+
 def test_field_accepts_and_ignores_blank_and_max_length_kwargs():
     """
     GIVEN compat kwargs with no yara effect (``blank``, ``max_length`` on a
