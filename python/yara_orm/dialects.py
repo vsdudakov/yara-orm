@@ -8,6 +8,7 @@ registering it -- the model and queryset layers never change.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,41 @@ if TYPE_CHECKING:
 #: Memoised identifier -> quoted identifier, shared by every dialect (both quote
 #: identically). Bounded by the set of table/column names in the schema.
 _QUOTE_CACHE: dict[str, str] = {}
+
+#: Index access methods accepted for ``USING <method>`` (a closed keyword set)
+#: and the safe shape of an operator-class identifier. Both are spliced into
+#: index DDL verbatim (they cannot be bound), so they are validated to keep
+#: arbitrary SQL out of ``CREATE INDEX``.
+_INDEX_METHODS = frozenset({"btree", "hash", "gist", "gin", "spgist", "brin"})
+_OPCLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def _validate_index_using(using: str | None) -> None:
+    """Reject an index access method outside the known set.
+
+    Args:
+        using: The ``USING`` method, or None.
+
+    Raises:
+        ValueError: When ``using`` is not a recognised access method.
+    """
+    if using is not None and using.lower() not in _INDEX_METHODS:
+        raise ValueError(
+            f"invalid index method {using!r}; expected one of {sorted(_INDEX_METHODS)}"
+        )
+
+
+def _validate_index_opclass(opclass: str | None) -> None:
+    """Reject an operator class that is not a plain (optionally qualified) identifier.
+
+    Args:
+        opclass: The operator-class name, or None.
+
+    Raises:
+        ValueError: When ``opclass`` is not a safe identifier.
+    """
+    if opclass is not None and not _OPCLASS_RE.match(opclass):
+        raise ValueError(f"invalid index opclass {opclass!r}: expected a plain identifier")
 
 
 class BaseDialect:
@@ -356,6 +392,7 @@ class BaseDialect:
         Returns:
             The single ``CREATE INDEX`` statement.
         """
+        _validate_index_using(using)
         uniq = "UNIQUE " if unique else ""
         method = f" USING {using}" if using and self.index_using else ""
         incl = f" INCLUDE ({include_sql})" if include_sql and self.index_include else ""
@@ -384,6 +421,7 @@ class BaseDialect:
         ine = "IF NOT EXISTS " if safe else ""
         include_sql = ", ".join(self._group_columns(meta, index.include)) if index.include else None
         columns = self._group_columns(meta, index.fields)
+        _validate_index_opclass(index.opclass)
         if index.opclass and self.index_opclass:
             columns = [f"{col} {index.opclass}" for col in columns]
         return self._composite_index_sql(
@@ -851,6 +889,7 @@ class BaseDialect:
         ine = "IF NOT EXISTS " if safe else ""
         include_sql = ", ".join(self.quote(c) for c in include) if include else None
         key_cols = [self.quote(c) for c in columns]
+        _validate_index_opclass(opclass)
         if opclass and self.index_opclass:
             key_cols = [f"{c} {opclass}" for c in key_cols]
         return [

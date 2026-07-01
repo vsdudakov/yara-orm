@@ -191,6 +191,30 @@ async def test_raw_sql_annotation(db):
     assert r.dbl == 42
 
 
+@pytest.mark.asyncio
+async def test_raw_sql_binds_params_instead_of_interpolating(db):
+    """
+    GIVEN a RawSQL fragment with ``?`` markers and matching params
+    WHEN it is used as an annotation
+    THEN each marker binds as a parameter (values never touch the SQL text)
+    """
+    await ExprRow.create(first="x", a=5)
+    [r] = await ExprRow.annotate(shifted=RawSQL("a + ? * ?", [10, 2]))
+    assert r.shifted == 25
+
+
+def test_raw_sql_param_count_mismatch_raises():
+    """
+    GIVEN a RawSQL fragment whose ``?`` count differs from its params
+    WHEN it is compiled
+    THEN a clear ValueError is raised (no silent mis-binding)
+    """
+    from yara_orm.dialects import PostgresDialect
+
+    with pytest.raises(ValueError, match="placeholder"):
+        RawSQL("a + ?", [1, 2]).as_sql(None, PostgresDialect(), {}, [], 1)
+
+
 def test_f_operators_build_expressions():
     """
     GIVEN an F column reference

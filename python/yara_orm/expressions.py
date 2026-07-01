@@ -422,18 +422,27 @@ class Subquery:
 
 
 class RawSQL:
-    """A raw SQL fragment spliced into an annotation, verbatim."""
+    """A raw SQL fragment spliced into an annotation.
 
-    def __init__(self, sql: str) -> None:
-        """Store the raw SQL fragment.
+    Prefer the parameterised form: write ``?`` markers in ``sql`` and pass their
+    values as ``params`` — each ``?`` becomes a bound placeholder, so untrusted
+    values never touch the SQL text. Values interpolated into ``sql`` directly
+    (no ``params``) are the caller's responsibility and must already be trusted.
+    """
+
+    def __init__(self, sql: str, params: list[Any] | None = None) -> None:
+        """Store the raw SQL fragment and any positional bind values.
 
         Args:
-            sql: The SQL expression text (no bound parameters).
+            sql: The SQL expression text. Each ``?`` is a positional placeholder
+                filled from ``params`` (bound, not interpolated).
+            params: Values to bind for the ``?`` markers, in order.
 
         Returns:
             None
         """
         self.sql = sql
+        self.params = list(params) if params else []
 
     def as_sql(
         self,
@@ -443,16 +452,33 @@ class RawSQL:
         params: list[Any],
         idx: int,
     ) -> tuple[str, int]:
-        """Return the raw fragment unchanged.
+        """Render the fragment, binding ``?`` markers as parameters.
 
         Args:
             queryset: The owning queryset (unused).
-            dialect: The active SQL dialect (unused).
+            dialect: The active SQL dialect (for placeholder rendering).
             joins: Join map (unused).
-            params: Bound-parameter list (unused).
+            params: Bound-parameter list, extended in place with ``self.params``.
             idx: The next available bind-parameter index.
 
         Returns:
-            A ``(sql, idx)`` tuple.
+            A ``(sql, next_index)`` tuple.
+
+        Raises:
+            ValueError: When the ``?`` marker count does not match ``params``.
         """
-        return self.sql, idx
+        if not self.params:
+            return self.sql, idx
+        segments = self.sql.split("?")
+        expected = len(segments) - 1
+        if expected != len(self.params):
+            raise ValueError(
+                f"RawSQL has {expected} '?' placeholder(s) but {len(self.params)} param(s)"
+            )
+        out = [segments[0]]
+        for segment, value in zip(segments[1:], self.params):
+            out.append(dialect.placeholder(idx))
+            params.append(value)
+            idx += 1
+            out.append(segment)
+        return "".join(out), idx

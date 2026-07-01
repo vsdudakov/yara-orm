@@ -34,6 +34,35 @@ def test_base_dialect_rejects_backend_specific_query_sql(render):
         render()
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"using": "btree); DROP TABLE t; --"},
+        {"opclass": "gin_trgm_ops); DROP TABLE t; --"},
+        {"opclass": "a b"},
+    ],
+)
+def test_composite_index_rejects_unsafe_using_and_opclass(kwargs):
+    """
+    GIVEN a composite index with a crafted USING method or operator class
+    WHEN it is rendered (these tokens are spliced into DDL, not bound)
+    THEN it raises ValueError instead of emitting the injected SQL
+    """
+    with pytest.raises(ValueError):
+        PG.render_create_composite_index("t", "idx", ["a"], **kwargs)
+
+
+def test_composite_index_accepts_known_using_and_plain_opclass():
+    """
+    GIVEN a composite index with a valid access method and operator class
+    WHEN it is rendered on PostgreSQL
+    THEN both are emitted unchanged
+    """
+    [sql] = PG.render_create_composite_index("t", "idx", ["a"], using="gin", opclass="gin_trgm_ops")
+    assert "USING gin" in sql
+    assert "gin_trgm_ops" in sql
+
+
 def test_base_dialect_json_extract_with_no_keys_returns_column():
     """
     GIVEN the BaseDialect JSON extractor with an empty key path
@@ -41,6 +70,7 @@ def test_base_dialect_json_extract_with_no_keys_returns_column():
     THEN it returns the column unchanged (no backend syntax needed)
     """
     assert BaseDialect().json_extract_sql('"c"', []) == '"c"'
+
 
 INT = {
     "kind": "int",
