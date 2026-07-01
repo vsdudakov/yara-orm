@@ -130,6 +130,56 @@ await Tag.filter(books__title="Dune")
 
 Each relation hop compiles to a membership subquery, so spanning works at any depth (and across self-relations) without duplicating rows.
 
+An `isnull` lookup on a **reverse relation** filters on the *existence* of related
+rows rather than a column value — it compiles to `EXISTS` / `NOT EXISTS`:
+
+```python
+# Authors with NO related books at all -> NOT EXISTS (...)
+await Author.filter(books__isnull=True)
+
+# Authors that have at least one related book -> EXISTS (...)
+await Author.filter(books__isnull=False)
+```
+
+This complements the reverse field traversal above: `Author.filter(books__rating__gte=5)`
+matches on a related column, while `books__isnull` matches on whether any related
+row exists.
+
+### Subquery as a filter value
+
+Pass a lazy single-column projection wrapped in `Subquery` as the right-hand side
+of a lookup to correlate against another query without materialising it:
+
+```python
+from yara_orm import Subquery
+
+# Books whose author appears in a set computed by another query
+await Book.filter(
+    author_id__in=Subquery(
+        Author.filter(name__startswith="A").values_list("id", flat=True)
+    )
+)
+
+# The same inside exclude()
+await Book.exclude(
+    author_id__in=Subquery(
+        Author.filter(name__startswith="A").values_list("id", flat=True)
+    )
+)
+
+# A scalar subquery compared for equality
+await Book.filter(author_id=Subquery(Author.filter(name="Ada").values_list("id", flat=True)))
+```
+
+!!! note "`exclude(col__in=Subquery(...))` is NULL-safe"
+    A single-column `values_list` subquery drops `NULL`s, so `exclude(col__in=Subquery(...))`
+    excludes exactly the intended rows rather than collapsing to no matches on a
+    `NOT IN` over a set containing `NULL`.
+
+!!! warning "Pass the lazy queryset, not an awaited result"
+    Wrap the queryset itself — `Subquery(qs.values_list(...))`. Passing an
+    already-awaited (non-lazy) projection raises a guiding `TypeError`.
+
 ## Loading a subset of columns: `only()` / `defer()`
 
 Fetch model instances carrying only some columns. The primary key is always loaded; reading a column that was not fetched raises `FieldError` (re-fetch without deferring it to read it).
@@ -139,7 +189,26 @@ authors = await Author.all().only("name")        # SELECT id, name
 authors = await Author.all().defer("bio")         # everything except bio
 ```
 
-For plain dict/tuple projections that skip model construction entirely, prefer [`values()` / `values_list()`](#projections-values-and-values_list). `only()`/`defer()` cannot be combined with `annotate()` or `select_related()`.
+Both accept `__`-separated **related-field paths**, in which case they compose
+with `select_related()` — the relation is joined and hydrated as a *partial*
+related instance:
+
+```python
+# Join `author` and hydrate it with just its `name` column
+await Book.all().only("title", "author__name")
+
+# Load the related `author` with every column except `name`
+await Book.all().defer("author__name")
+
+# Nested paths span multiple hops
+await Book.all().only("author__country__code")
+```
+
+Naming **only** related paths (no base column) restricts the base model to its
+primary key, loading the joined relation partially. This is why `only()` /
+`defer()` work with `select_related()`, but they **cannot** be combined with
+`annotate()`. For plain dict/tuple projections that skip model construction
+entirely, prefer [`values()` / `values_list()`](#projections-values-and-values_list).
 
 ## Inspecting a query: `sql()` / `explain()`
 
@@ -401,6 +470,26 @@ await Book.filter(rating__gt=F("rating"))
 ```
 
 `F` supports `+`, `-`, `*` and `/`, with the column on either side (`F("a") + 1`, `10 - F("a")`).
+
+Beyond bare `F` arithmetic, an `update()` value may be any SQL expression — a
+scalar function, a `Case`, or an `Array` — so the new value is computed in the
+database:
+
+```python
+from yara_orm import Case, When, Array
+from yara_orm.functions import Coalesce
+
+# Fill in a column only where it is currently NULL (function over F + a fallback)
+await Book.all().update(rating=Coalesce(F("rating"), 0))
+
+# Set a column conditionally per row
+await Book.all().update(
+    rating=Case(When(rating__gte=4, then=5), default=0)
+)
+
+# Bind a Python sequence to a PostgreSQL array column
+await Book.all().update(labels=Array([1, 2, 3]))   # `labels` is a PG array column
+```
 
 ## See also
 

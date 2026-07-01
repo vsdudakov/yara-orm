@@ -118,6 +118,79 @@ uses `?1, ?2, ...`. Use the form that matches the backend you connected to.
     placeholder so the driver binds it. String interpolation opens you to **SQL
     injection** and breaks on quoting, `NULL`, and type coercion.
 
+## Binding lists as PostgreSQL arrays
+
+A bare Python `list` (or `tuple`) passed as a raw-SQL param binds as a PostgreSQL
+**array** (asyncpg-style), coercing element types as needed (`UUID`, `Decimal`,
+`date`, …). Reference it with `ANY($n)` or `unnest($n::type[])`:
+
+```python
+conn = connections.get("default")
+
+# The bare list [1, 2, 3] binds as an int[] array
+rows = await conn.execute_query(
+    "SELECT * FROM m_thing WHERE id = ANY($1)",
+    [[1, 2, 3]],
+)
+
+# unnest a bound array
+rows = await conn.execute_query(
+    "SELECT * FROM unnest($1::int[]) AS id",
+    [[1, 2, 3]],
+)
+```
+
+!!! warning "A bare list is an array, not JSON"
+    This is a change from older behaviour: a bare list is now an **array** bind, so
+    to bind a JSON value in a raw query pass a `dict` or a JSON string instead — a
+    Python list is not treated as JSON here.
+
+### Forcing array binding with `Array`
+
+Wrap a sequence in `Array` to mark it explicitly as an array parameter — useful
+for clarity or when the value could otherwise be ambiguous. Array columns read
+back as plain Python lists.
+
+```python
+from yara_orm import Array
+
+ids = [1, 2, 3]
+rows = await conn.execute_query(
+    "SELECT * FROM m_thing WHERE id = ANY($1)",
+    [Array(ids)],
+)
+```
+
+## Positional and named row access
+
+Rows returned by `execute_query` / `fetch_all` support **both** positional and
+named indexing (`asyncpg.Record` parity), so you can read a column by ordinal or
+by name off the same row:
+
+```python
+rows = await conn.fetch_all("SELECT id, name FROM m_thing ORDER BY id")
+row = rows[0]
+row[0]         # positional access -> the id
+row["name"]    # named access -> the name
+```
+
+## Inspecting a query's exact SQL and params
+
+`QuerySet.get_parameterized_sql()` returns the `(sql, params)` pair for **any**
+query shape — plain, `only()`/`defer()`, `select_related`, `annotate`, and grouped
+`values()` — built from the same compile path the query set executes. It is the
+public way to inspect the exact statement and bind values without reaching into
+internals, complementing [`.sql()` / `.explain()`](querying.md#inspecting-a-query-sql-explain):
+
+```python
+sql, params = Book.filter(rating__gte=4).get_parameterized_sql()
+
+# Works for grouped/annotated projections too
+sql, params = (
+    Author.annotate(n=Count("books")).group_by("id").values("id", "n")
+).get_parameterized_sql()
+```
+
 ## Manual SQL inside a transaction
 
 When you are inside an `in_transaction()` block, `connections.get` and `Model.raw`

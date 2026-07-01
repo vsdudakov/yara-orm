@@ -125,9 +125,17 @@ await author.books.filter(rating__gte=5).count()
 new_book = await author.books.create(title="Second Foundation")
 ```
 
-`.all()`, `.filter(...)` and `.order_by(...)` each return a full queryset scoped
-to the parent, so you can chain further (`.count()`, `.order_by(...)`, and so on)
-before awaiting. `.create(**kwargs)` sets the foreign key for you.
+The manager proxies the **full queryset API** scoped to the parent — `.all()`,
+`.filter()`, `.exclude()`, `.order_by()`, `.limit()`, `.select_related()`,
+`.values()`, `.annotate()`, `.count()`, and so on — each returning a queryset you
+can chain further before awaiting. `.create(**kwargs)` sets the foreign key for
+you.
+
+```python
+# Reverse FK: page and join in one chained expression
+await author.books.limit(10).select_related("author")
+await author.books.exclude(title__startswith="Draft").order_by("-id").values("title")
+```
 
 ### On-delete actions
 
@@ -220,11 +228,17 @@ async for tag in book.tags:              # async iteration
 await book.tags.remove(classic)          # unlink specific rows
 await book.tags.clear()                  # unlink everything
 
-# Querying methods mirror the reverse manager:
+# Querying methods mirror the reverse manager — the full chainable queryset API:
 await book.tags.all()
 await book.tags.filter(name="sci-fi")
 await book.tags.order_by("name")
+await book.tags.limit(10).exclude(name="draft").values("name")
 ```
+
+Both the reverse-FK and many-to-many managers proxy the queryset API, so
+`.all()`, `.filter()`, `.exclude()`, `.order_by()`, `.limit()`,
+`.select_related()`, `.values()` and `.annotate()` all chain off the related
+manager the same way they do off a model queryset.
 
 `add()` and `remove()` accept model instances or raw primary key values. `add()`
 inserts join rows idempotently (`ON CONFLICT DO NOTHING`), and `clear()` removes
@@ -277,6 +291,20 @@ await book.fetch_related("author", "tags")
 
 author = book.author                    # cached forward FK -> synchronous
 tags = await book.tags                  # cached m2m manager -> awaited
+```
+
+To prefetch relations across a **list** of already-loaded instances in one batch,
+use the `Model.fetch_for_list(instances, *relations)` classmethod. It caches each
+named relation on every instance (one query per relation) and returns the same
+list:
+
+```python
+books = await Book.all()
+await Book.fetch_for_list(books, "author", "tags")
+
+for book in books:
+    print(book.author.name)             # cached forward FK -> synchronous
+    print(await book.tags)              # cached m2m manager -> awaited
 ```
 
 Both work across forward foreign keys, one-to-one relations, reverse managers,

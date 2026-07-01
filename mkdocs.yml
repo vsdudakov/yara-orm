@@ -101,6 +101,7 @@ nav:
   - Guides:
       - Models & fields: guides/models-and-fields.md
       - Querying: guides/querying.md
+      - Working with JSON: guides/json-fields.md
       - Relations: guides/relations.md
       - Aggregation & grouping: guides/aggregation.md
       - Transactions: guides/transactions.md

@@ -95,6 +95,16 @@ for author in await Author.annotate(book_count=Count("books")):
     # [{"name": "Ada", "book_count": 2}, {"name": "Bob", "book_count": 1}, ...]
     ```
 
+!!! note "`annotate(...).values()` with no field list keeps the base columns"
+    Calling `.values()` with **no** explicit fields on a pure `annotate` query
+    returns the base model's columns alongside the annotation, grouped by the
+    primary key:
+
+    ```python
+    rows = await Author.annotate(n=Count("books")).values()
+    # [{"id": 1, "name": "Ada", "n": 2}, {"id": 2, "name": "Bob", "n": 1}, ...]
+    ```
+
 ## Grouping with `group_by`
 
 `.group_by(*fields)` groups the result rows by the given columns. Combine it with an annotation and a projection to produce one aggregated row per group:
@@ -177,7 +187,42 @@ for book in await Book.annotate(slug=Lower("title"), n=Length("title")):
     print(book.slug, book.n)
 ```
 
-`Concat` renders with the portable `||` operator, so it behaves the same on PostgreSQL and SQLite. `Coalesce`'s second argument is a literal fallback used when the column is `NULL`.
+`Concat` renders with the portable `||` operator, so it behaves the same on PostgreSQL and SQLite.
+
+### Composing scalar functions
+
+Scalar functions accept `F` references and other expressions as arguments, and they
+**nest**, so you can build compound expressions:
+
+```python
+from yara_orm import F, Lower, Coalesce, Concat
+
+Lower(F("name"))                       # LOWER(name) via an F reference
+Coalesce(F("published_at"), now)       # fall back to a value expression
+Coalesce(Lower("title"), "untitled")  # a function as the first argument
+Concat(Lower("title"), "!")            # nest a function inside Concat
+```
+
+`Coalesce`'s fallback is not limited to a literal — it may be an `F` reference or
+another function too:
+
+```python
+Coalesce(F("nickname"), Upper("name"))
+```
+
+### `Random()`
+
+`Random()` renders `RANDOM()`. Used as an annotation it gives each row a random
+value you can then order by:
+
+```python
+from yara_orm.functions import Random
+
+await Book.annotate(r=Random()).order_by("r").limit(1)   # one random book
+```
+
+The `order_by("?")` shortcut documented in [Querying](querying.md#ordering) is the
+concise form of the same idea.
 
 ## Conditional expressions: `Case` / `When`
 
@@ -227,6 +272,27 @@ from yara_orm import Case, When, Value
 # Sum 1 for each highly-rated book, 0 otherwise
 Book.annotate(high=Sum(Case(When(rating__gte=4, then=1), default=Value(0))))
 ```
+
+`Value(x)` wraps a Python literal so it can stand where an **expression** is
+expected — for example a `Case` default (`default=Value(0)`) or an operand in `F`
+arithmetic — making the intent explicit and unambiguous.
+
+## Subquery annotations
+
+A `Subquery` can also be an annotation value, embedding a correlated scalar query
+as a computed column:
+
+```python
+from yara_orm import Subquery
+
+# Annotate each author with the id of a matching book, computed by a subquery
+await Author.annotate(
+    first_book_id=Subquery(Book.filter(rating__gte=4).values_list("id", flat=True))
+)
+```
+
+See [Querying](querying.md#subquery-as-a-filter-value) for using `Subquery` as a
+filter value.
 
 ## Raw SQL annotations
 

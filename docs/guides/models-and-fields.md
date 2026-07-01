@@ -108,6 +108,16 @@ class Job(Model):
 Partial indexes are supported on both PostgreSQL and SQLite, and the condition
 round-trips through [migrations](migrations.md).
 
+To introspect the DDL an `Index` produces, call
+`index.get_sql(model, dialect=None, safe=True)`. It renders the `CREATE INDEX`
+statement for the index on `model`; `dialect` defaults to the model's active
+connection dialect, and `safe=True` adds an `IF NOT EXISTS` guard:
+
+```python
+idx = Index(fields=["priority"], name="idx_active_priority", condition="status = 'active'")
+print(idx.get_sql(Job))          # "CREATE INDEX IF NOT EXISTS idx_active_priority ON ..."
+```
+
 ### Declarative constraints
 
 `Meta.constraints` takes `UniqueConstraint` / `CheckConstraint` objects, emitted
@@ -211,6 +221,13 @@ default automatically; see [Primary keys](#primary-keys) below.
     Set `auto_now_add=True` to stamp the row once at creation, or `auto_now=True`
     to refresh the value on every `save()`. In the canonical `Author` model,
     `created_at` uses `auto_now_add=True`.
+
+!!! note "ISO-8601 string input is coerced"
+    `DateField`, `DatetimeField` and `TimeField` accept ISO-8601 **string** input
+    (a trailing `Z` is accepted) and coerce it to a real `date` / `datetime` /
+    `time`. So after `await Event.create(created_at="2026-07-01T12:00:00+00:00")`
+    the instance attribute is a genuine `datetime` object — `created_at.isoformat()`
+    works without a reload.
 
 ## Common keyword arguments
 
