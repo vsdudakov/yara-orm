@@ -30,6 +30,13 @@ rust_decimal = { version = "1.42", features = ["db-tokio-postgres"] }
 deadpool-sqlite = "0.13.0"
 rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
 
+# On Linux, native-tls uses OpenSSL. Build a vendored copy (compiled from source)
+# so the wheel does not require a system OpenSSL in the manylinux build image or
+# on the user's machine. macOS (Security.framework) and Windows (SChannel) use
+# their own TLS backends and pull in no OpenSSL, so this is Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
