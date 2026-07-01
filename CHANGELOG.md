@@ -6,6 +6,27 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-01
+
+### Added
+
+- **Filter across reverse FK relations by `related_name`** — a bare reverse
+  relation with `__isnull` compiles to a correlated `[NOT] EXISTS`
+  (`Portfolio.filter(alerts__isnull=True)` = "has no alerts"), and field
+  traversal (`alerts__status="open"`) works.
+- **JSON key-path lookups on `JSONField`** — `data__key`, nested `data__a__b`,
+  and with operators (`data__key__contains=...`, `data__missing__isnull=True`).
+  Rendered per dialect (PostgreSQL `->`/`->>`, SQLite `json_extract`).
+
+### Changed
+
+- **A bare `list`/`tuple` raw-SQL parameter now binds as a PostgreSQL array**
+  (asyncpg-style), so `execute_query("... WHERE id = ANY($1)", [ids])` and
+  `unnest($1::int[])` work with plain lists and coerce element types
+  (UUID/Decimal/date/…). Previously a bare list bound as JSON in raw queries; to
+  bind JSON in a raw query, pass a dict or a JSON string. The ORM path
+  (`JSONField`) is unaffected — its lists still round-trip as JSON.
+
 ## [1.6.0] - 2026-07-01
 
 ### Added
