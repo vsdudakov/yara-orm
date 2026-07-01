@@ -283,6 +283,40 @@ def test_m2m_through_fields_alias_sets_forward_and_backward_keys():
     assert m2m.backward_key == "bwd"
 
 
+class FzThing(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "fz_thing"
+
+
+class FzTag(Model):
+    id = fields.IntField(pk=True)
+    things = fields.ManyToManyField(
+        "FzThing",
+        related_name="tags",
+        through="fz_join",
+        forward_key="thing_id",
+        backward_key="tag_id",
+    )
+
+    class Meta:
+        table = "fz_tag"
+
+
+def test_m2m_finalize_keeps_explicit_names_and_is_idempotent():
+    """
+    GIVEN an m2m relation declared with explicit through/forward/backward keys
+    WHEN its info is finalized (and finalized again)
+    THEN the explicit names are kept (no defaulting) and the second call is a no-op
+    """
+    info = FzTag.things.info
+    assert info.finalize() is FzThing
+    assert (info.through, info.forward_key, info.backward_key) == ("fz_join", "thing_id", "tag_id")
+    # Second call short-circuits on the _finalized guard, returning the same target.
+    assert info.finalize() is FzThing
+
+
 def test_jsonfield_to_python_without_decoder_returns_value():
     """
     GIVEN a JSONField with no decoder

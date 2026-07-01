@@ -7,11 +7,40 @@ exercised on both dialects to lock in the capability-flag behaviour.
 
 import pytest
 
-from yara_orm.dialects import PostgresDialect, SqliteDialect
+from yara_orm.dialects import BaseDialect, PostgresDialect, SqliteDialect
 from yara_orm.exceptions import UnSupportedError
 
 PG = PostgresDialect()
 LITE = SqliteDialect()
+BASE = BaseDialect()
+
+
+@pytest.mark.parametrize(
+    "render",
+    [
+        lambda: BASE.date_part_sql("year", '"c"'),
+        lambda: BASE.truncate_date_sql('"c"'),
+        lambda: BASE.json_extract_sql('"c"', ["k"]),
+        lambda: BASE.json_contains_sql('"c"', "$1"),
+    ],
+)
+def test_base_dialect_rejects_backend_specific_query_sql(render):
+    """
+    GIVEN the backend-agnostic BaseDialect (no concrete backend)
+    WHEN a backend-specific query renderer (date part / date trunc / JSON) runs
+    THEN it raises UnSupportedError so a new dialect must override it
+    """
+    with pytest.raises(UnSupportedError):
+        render()
+
+
+def test_base_dialect_json_extract_with_no_keys_returns_column():
+    """
+    GIVEN the BaseDialect JSON extractor with an empty key path
+    WHEN rendered
+    THEN it returns the column unchanged (no backend syntax needed)
+    """
+    assert BaseDialect().json_extract_sql('"c"', []) == '"c"'
 
 INT = {
     "kind": "int",

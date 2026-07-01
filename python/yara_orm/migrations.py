@@ -2293,25 +2293,6 @@ class MigrationManager:
                     op.apply_state(state)
         return state
 
-    def _recorded_state(self) -> dict[str, Any]:
-        """Replay all on-disk migrations to rebuild the recorded schema state.
-
-        Returns:
-            The schema state implied by the existing migration files.
-        """
-        return self._replay()
-
-    def _running_state(self, applied: set[str]) -> dict[str, Any]:
-        """Rebuild the schema state implied by the already-applied migrations.
-
-        Args:
-            applied: Names of migrations recorded as applied.
-
-        Returns:
-            The schema state with only applied migrations replayed.
-        """
-        return self._replay(applied)
-
     # -- commands ---------------------------------------------------------
     def init(self) -> None:
         """Create the migrations directory and its ``__init__.py`` if missing.
