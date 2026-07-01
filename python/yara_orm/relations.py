@@ -361,7 +361,93 @@ class ReverseOneToOne:
         return await self.model.get_or_none(**{self.source_attr: self.pk})
 
 
-class RelatedManager:
+class _ChainableManager:
+    """Shared awaitable/chainable surface for the relation managers.
+
+    Subclasses provide ``_qs()`` (the base queryset over the related rows) and
+    ``_as_list()`` (resolve to a list, honouring any prefetch cache); this base
+    supplies the queryset-proxy surface so both managers await to a list,
+    async-iterate, and chain (``.filter``/``.order_by``/``.limit``/…) like a
+    queryset without re-declaring each method.
+    """
+
+    def _qs(self) -> QuerySet:  # pragma: no cover - abstract
+        """Return the base queryset over the related rows."""
+        raise NotImplementedError
+
+    async def _as_list(self) -> list[Model]:  # pragma: no cover - abstract
+        """Resolve the related rows to a list, serving the prefetch cache."""
+        raise NotImplementedError
+
+    def __await__(self) -> Generator[Any, None, list[Model]]:
+        """Await the related rows, serving the cache when prefetched.
+
+        Returns:
+            A generator yielding the list of related instances.
+        """
+        return self._as_list().__await__()
+
+    def __aiter__(self) -> _AsyncList:
+        """Iterate asynchronously over the related rows.
+
+        Returns:
+            An async iterator over the related instances.
+        """
+        return _AsyncList(self._as_list())
+
+    def all(self) -> QuerySet:
+        """Return a chainable queryset for all related rows.
+
+        Returns:
+            A queryset filtered to the related rows.
+        """
+        return self._qs()
+
+    def filter(self, *args: Any, **kwargs: Any) -> QuerySet:
+        """Return the related queryset further filtered by the given criteria.
+
+        Args:
+            *args: ``Q`` nodes ANDed into the query.
+            **kwargs: Additional filter keyword arguments.
+
+        Returns:
+            A queryset over the related rows narrowed by the extra criteria.
+        """
+        return self._qs().filter(*args, **kwargs)
+
+    def order_by(self, *fields: str) -> QuerySet:
+        """Return the related queryset ordered by the given fields.
+
+        Args:
+            *fields: Field names to order the related rows by.
+
+        Returns:
+            A queryset over the related rows ordered by ``fields``.
+        """
+        return self._qs().order_by(*fields)
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy queryset methods onto the related queryset.
+
+        Lets a manager chain like a queryset (``rel.limit(10).select_related(…)``
+        / ``.exclude`` / ``.values`` / ``.annotate`` / …) without re-declaring
+        each method. Only consulted for attributes the manager does not define.
+
+        Args:
+            name: The attribute being looked up.
+
+        Returns:
+            The corresponding attribute of a freshly filtered queryset.
+
+        Raises:
+            AttributeError: For private names or names the queryset lacks.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._qs(), name)
+
+
+class RelatedManager(_ChainableManager):
     """Reverse-FK manager: awaitable to a list, chainable, async-iterable."""
 
     def __init__(
@@ -401,74 +487,6 @@ class RelatedManager:
         if self._cached is not _MISSING:
             return self._cached
         return await self._qs()._fetch()
-
-    def __await__(self) -> Generator[Any, None, list[Model]]:
-        """Await the related rows, serving the cache when prefetched.
-
-        Returns:
-            A generator yielding the list of related instances.
-        """
-        return self._as_list().__await__()
-
-    def __aiter__(self) -> _AsyncList:
-        """Iterate asynchronously over the related rows.
-
-        Returns:
-            An async iterator over the related instances.
-        """
-        return _AsyncList(self._as_list())
-
-    def all(self) -> QuerySet:
-        """Return a queryset for all related rows.
-
-        Returns:
-            A queryset filtered by the manager's criteria.
-        """
-        return self._qs()
-
-    def filter(self, *args: Any, **kwargs: Any) -> QuerySet:
-        """Return a queryset further filtered by the given criteria.
-
-        Args:
-            *args: ``Q`` nodes ANDed into the query.
-            **kwargs: Additional filter keyword arguments.
-
-        Returns:
-            A queryset narrowed by both the manager and extra criteria.
-        """
-        return self._qs().filter(*args, **kwargs)
-
-    def order_by(self, *fields: str) -> QuerySet:
-        """Return a queryset ordered by the given fields.
-
-        Args:
-            *fields: Field names to order the related rows by.
-
-        Returns:
-            A queryset ordered by the given fields.
-        """
-        return self._qs().order_by(*fields)
-
-    def __getattr__(self, name: str) -> Any:
-        """Proxy queryset methods onto the manager's filtered queryset.
-
-        Lets the reverse manager chain like a queryset
-        (``rel.limit(10).select_related(...)`` / ``.exclude`` / ``.values`` /
-        ``.annotate`` / …) without re-declaring each method. Only consulted for
-        attributes the manager does not define itself.
-
-        Args:
-            name: The attribute being looked up.
-
-        Returns:
-            The corresponding attribute of a freshly filtered queryset.
-
-        Raises:
-            AttributeError: For private names or names the queryset lacks.
-        """
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return getattr(self._qs(), name)
 
     async def create(self, **kwargs: Any) -> Model:
         """Create a related instance bound to the manager's criteria.
@@ -632,7 +650,7 @@ class _M2MMembershipSubquery:
         return sql, idx + 1
 
 
-class M2MManager:
+class M2MManager(_ChainableManager):
     """Many-to-many manager: awaitable to a list, async-iterable, mutable."""
 
     def __init__(self, info: M2MInfo, instance: Model, reverse: bool) -> None:
@@ -700,7 +718,7 @@ class M2MManager:
             cache[key] = entry
         return entry
 
-    async def _fetch(self) -> list[Model]:
+    async def _as_list(self) -> list[Model]:
         """Fetch related rows through the join table, using the cache if set.
 
         Returns:
@@ -715,22 +733,6 @@ class M2MManager:
         rows = await engine.fetch_rows(self._sql(dialect)["fetch"], [self.instance.pk])
         return self.target._from_db_rows(rows)
 
-    def __await__(self) -> Generator[Any, None, list[Model]]:
-        """Await the related rows through the join table.
-
-        Returns:
-            A generator yielding the list of related instances.
-        """
-        return self._fetch().__await__()
-
-    def __aiter__(self) -> _AsyncList:
-        """Iterate asynchronously over the related rows.
-
-        Returns:
-            An async iterator over the related instances.
-        """
-        return _AsyncList(self._fetch())
-
     def _qs(self) -> QuerySet:
         """Build a queryset over the target rows linked to this instance.
 
@@ -742,59 +744,6 @@ class M2MManager:
             self.info.through, self.near_key, self.far_key, self.instance.pk
         )
         return QuerySet(self.target).filter(pk__in=sub)
-
-    def all(self) -> QuerySet:
-        """Return a chainable queryset for all related rows.
-
-        Returns:
-            A ``QuerySet`` over the related target rows (chainable with
-            ``.filter()``/``.select_related()``/``.order_by()``/…).
-        """
-        return self._qs()
-
-    def filter(self, *args: Any, **kwargs: Any) -> QuerySet:
-        """Return the related queryset further filtered by the given criteria.
-
-        Args:
-            *args: ``Q`` nodes ANDed into the query.
-            **kwargs: Additional filter keyword arguments.
-
-        Returns:
-            A queryset over the related rows narrowed by the extra criteria.
-        """
-        return self._qs().filter(*args, **kwargs)
-
-    def order_by(self, *fields: str) -> QuerySet:
-        """Return the related queryset ordered by the given fields.
-
-        Args:
-            *fields: Field names to order the related rows by.
-
-        Returns:
-            A queryset over the related rows ordered by ``fields``.
-        """
-        return self._qs().order_by(*fields)
-
-    def __getattr__(self, name: str) -> Any:
-        """Proxy queryset methods onto the related queryset.
-
-        Lets the m2m manager chain like a queryset
-        (``rel.all().select_related(...)``, ``rel.limit(...)``, ``.exclude``,
-        ``.values``, …). Only consulted for attributes the manager does not
-        define itself.
-
-        Args:
-            name: The attribute being looked up.
-
-        Returns:
-            The corresponding attribute of the related queryset.
-
-        Raises:
-            AttributeError: For private names or names the queryset lacks.
-        """
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return getattr(self._qs(), name)
 
     async def add(self, *objects: Model | Any) -> None:
         """Add related objects to the join table.
