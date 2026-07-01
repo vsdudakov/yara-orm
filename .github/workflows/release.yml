@@ -39,19 +39,7 @@ jobs:
           command: build
           target: ${{ matrix.platform.target }}
           args: --release --out dist --interpreter python${{ matrix.python-version }}
-          # manylinux_2_28 (AlmaLinux 8) has live package repos, unlike the EOL
-          # CentOS 7 manylinux2014 whose dead yum mirrors made the perl-IPC-Cmd
-          # install below (needed by the vendored OpenSSL Configure) silently fail.
-          manylinux: "2_28"
-          # The Linux TLS backend builds a vendored OpenSSL from source, whose
-          # Configure script needs Perl's IPC::Cmd (absent from some manylinux
-          # images). No-op on macOS/Windows (they use their platform TLS).
-          before-script-linux: |
-            if command -v yum >/dev/null 2>&1; then
-              yum install -y perl-IPC-Cmd perl-Data-Dumper || true
-            elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update && apt-get install -y perl || true
-            fi
+          manylinux: auto
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}-${{ matrix.python-version }}

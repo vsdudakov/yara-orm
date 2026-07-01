@@ -16,9 +16,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
   against the OS trust store, `disable` opts out, and `prefer` (the default)
   tries TLS and falls back to plaintext only when the server offers no SSL.
   **Behaviour change:** a `require`-mode connection to a server without SSL now
-  fails instead of silently downgrading to plaintext. Linux wheels bundle a
-  vendored OpenSSL, so no system OpenSSL is required at build or run time (macOS
-  and Windows use their platform TLS backends).
+  fails instead of silently downgrading to plaintext. TLS uses pure-Rust rustls
+  (ring), so wheels need no system OpenSSL at build or run time on any platform.
 - **`RawSQL` can be parameterised** — `RawSQL("expr ?", [value])` binds each `?`
   marker as a parameter, so untrusted values no longer have to be interpolated
   into the SQL text. The no-argument form is unchanged (verbatim, caller-trusted).

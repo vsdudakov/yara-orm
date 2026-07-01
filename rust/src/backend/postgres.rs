@@ -1,11 +1,13 @@
 //! PostgreSQL backend built on tokio-postgres + deadpool connection pooling.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
-use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{Kind, ToSql, Type};
 use tokio_postgres::{NoTls, Statement};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::backend::pool::extract_pool_params;
 use crate::backend::{Backend, TxConn};
@@ -14,6 +16,23 @@ use crate::value::{decode_pg_row, decode_pg_row_values, Row, Value};
 
 /// Default pool size when the URL does not specify `max_size`.
 const DEFAULT_MAX_SIZE: usize = 16;
+
+/// Build a rustls TLS connector: server certs are verified against the OS trust
+/// store, using the pure-Rust `ring` crypto provider (no system OpenSSL).
+fn make_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert); // ignore individual malformed OS certs
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| EngineError::Config(e.to_string()))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(MakeRustlsConnect::new(config))
+}
 
 /// The password embedded in a `scheme://user:password@host...` URL, if present.
 fn url_password(url: &str) -> Option<&str> {
@@ -91,17 +110,15 @@ impl PgBackend {
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        // Honour `sslmode` with a real TLS connector: `require`/`verify-ca`/
-        // `verify-full` now actually encrypt (and native-tls verifies the cert
-        // against the OS trust store) instead of silently running in plaintext.
-        // `disable` opts out; `prefer` (the libpq default) attempts TLS and
-        // falls back to plaintext when the server has no SSL.
+        // Honour `sslmode` with a real (rustls) TLS connector: `require`/
+        // `verify-ca`/`verify-full` actually encrypt and verify the cert against
+        // the OS trust store instead of silently running in plaintext. `disable`
+        // opts out; `prefer` (the libpq default) attempts TLS and falls back to
+        // plaintext when the server has no SSL.
         let mgr = if pg_config.get_ssl_mode() == SslMode::Disable {
             Manager::from_config(pg_config, NoTls, mgr_config)
         } else {
-            let connector = native_tls::TlsConnector::new()
-                .map_err(|e| EngineError::Config(redact(e.to_string(), url)))?;
-            Manager::from_config(pg_config, MakeTlsConnector::new(connector), mgr_config)
+            Manager::from_config(pg_config, make_tls_connector()?, mgr_config)
         };
         let max_size = params.max_size.unwrap_or(DEFAULT_MAX_SIZE);
         let pool = Pool::builder(mgr)
