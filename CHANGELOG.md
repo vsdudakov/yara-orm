@@ -6,6 +6,57 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-07-01
+
+### Security
+
+- **TLS for PostgreSQL is honoured from `sslmode`.** Connections now negotiate
+  TLS through a native connector chosen by the URL's `sslmode`: `require` /
+  `verify-ca` / `verify-full` actually encrypt and verify the server certificate
+  against the OS trust store, `disable` opts out, and `prefer` (the default)
+  tries TLS and falls back to plaintext only when the server offers no SSL.
+  **Behaviour change:** a `require`-mode connection to a server without SSL now
+  fails instead of silently downgrading to plaintext.
+- **`RawSQL` can be parameterised** — `RawSQL("expr ?", [value])` binds each `?`
+  marker as a parameter, so untrusted values no longer have to be interpolated
+  into the SQL text. The no-argument form is unchanged (verbatim, caller-trusted).
+- **`ForeignKeyField.on_delete` is validated** against the `OnDelete` actions
+  (it is spliced into DDL, not bound); an unknown action raises `ValueError`.
+  Values are normalised (`"set null"` → `"SET NULL"`).
+- **Index `using` / `opclass` are validated** — a known access method and a plain
+  (optionally schema-qualified) identifier — before being spliced into
+  `CREATE INDEX`.
+- **Connection credentials are redacted** from config/connection error messages,
+  so a driver error surfaced to Python cannot leak the password.
+
+### Fixed
+
+- **`Q` OR-groups keep their parentheses.** `filter(Q(a) | Q(b), c=v)` and a
+  chained `.filter(Q(a) | Q(b))` now compile to `(a OR b) AND c` instead of
+  `a OR (b AND c)`, so keyword filters are no longer swallowed into one OR branch
+  (a WHERE-precedence corruption).
+- **Text columns accept a non-string scalar** — a `CharField`/`TextField`
+  filtered or populated with a non-bool `int` binds as text, avoiding
+  `operator does not exist: character varying = bigint`.
+- **`SmallIntField` reads back as `int`** (it had no `to_python`).
+- **`RemoveCompositeIndexIfExists` round-trips to its own class** in generated
+  migration source (it previously serialised as the base `RemoveCompositeIndex`).
+- **`CommaSeparatedIntegerListValidator` rejects multi-dash tokens** such as
+  `"--5"`.
+- **`connections.get()` fallback no longer double-wraps the engine**, so query
+  hooks fire once (not twice) for raw SQL on that path.
+
+### Changed
+
+- Internal refactors with no API change: single-sourced relation-name resolution,
+  integer/temporal field base classes, unified expression/function operand
+  rendering, a shared chainable relation-manager base, and a `_ReversibleOp` base
+  that collapses the migration Add/Remove operation pairs.
+- Performance: memoised the per-lookup `relations` import and `dialect.quote()`,
+  cached relation-target resolution, and removed redundant migration-file
+  re-reads and directory scans. Benchmarks remain fastest-in-class across insert,
+  read, filter, get, update and delete versus Tortoise, SQLAlchemy and Pony.
+
 ## [1.8.0] - 2026-07-01
 
 ### Added
