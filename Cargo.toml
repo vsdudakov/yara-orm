@@ -18,8 +18,10 @@ tokio-postgres = { version = "0.7", features = [
     "with-serde_json-1",
 ] }
 deadpool-postgres = "0.14"
-native-tls = "0.2"
-postgres-native-tls = "0.5"
+# Pure-Rust TLS (no system OpenSSL / perl, so manylinux wheels build cleanly).
+tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 async-trait = "0.1"
 thiserror = "2"
 serde_json = "1"
@@ -29,13 +31,6 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 rust_decimal = { version = "1.42", features = ["db-tokio-postgres"] }
 deadpool-sqlite = "0.13.0"
 rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
-
-# On Linux, native-tls uses OpenSSL. Build a vendored copy (compiled from source)
-# so the wheel does not require a system OpenSSL in the manylinux build image or
-# on the user's machine. macOS (Security.framework) and Windows (SChannel) use
-# their own TLS backends and pull in no OpenSSL, so this is Linux-only.
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
 
 [profile.release]
 opt-level = 3
