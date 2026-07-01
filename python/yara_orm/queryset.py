@@ -731,6 +731,13 @@ class QuerySet:
             return (f"{col} IS NULL" if value else f"{col} IS NOT NULL"), [], idx
         if op == "not_isnull":
             return (f"{col} IS NOT NULL" if value else f"{col} IS NULL"), [], idx
+        if value is None and op in ("exact", "not"):
+            # ``field=None`` / ``field__not=None`` mean NULL identity, not a bind:
+            # ``col = NULL`` / ``col != NULL`` are always UNKNOWN and match no rows,
+            # so compile them to ``IS NULL`` / ``IS NOT NULL`` (Django/Tortoise
+            # semantics). Without this, ``get_or_create(field=None)`` never matches
+            # and re-inserts a duplicate NULL row on every call.
+            return (f"{col} IS NULL" if op == "exact" else f"{col} IS NOT NULL"), [], idx
         if op == "contains" and field is not None and field.field_kind == "json":
             # JSON ``__contains`` is structural containment (``@>``), not a text
             # LIKE: it matches an object subset, an array element, or an
@@ -1179,6 +1186,42 @@ class QuerySet:
             parts.append(ref + (" DESC" if descending else " ASC"))
         return " ORDER BY " + ", ".join(parts)
 
+    def _grouped_order_sql(self, dialect: BaseDialect, joins: dict[str, str]) -> str:
+        """Build ``ORDER BY`` for a grouped/annotated SELECT, reusing its joins.
+
+        A grouped query already LEFT JOINs any forward-relation group-by column,
+        so ordering references that joined column (via ``_resolve_column``, which
+        shares the ``joins`` dict) instead of a correlated subquery. The subquery
+        form would reference the ungrouped foreign-key column and be rejected
+        under ``GROUP BY`` on PostgreSQL (42803).
+
+        Args:
+            dialect: The SQL dialect providing quoting.
+            joins: The grouped query's join map, extended in place if an ordering
+                relation path needs a join not already present.
+
+        Returns:
+            The ``ORDER BY`` clause, or an empty string when no ordering is set.
+        """
+        order = self._order or self.model._meta.ordering
+        if not order:
+            return ""
+        meta = self.model._meta
+        table = dialect.quote(meta.table)
+        parts = []
+        for name, descending in order:
+            if name == "?":
+                parts.append(dialect.random_function)
+                continue
+            if name in self._annotations:
+                ref = dialect.quote(name)
+            elif "__" in name:
+                ref = self._resolve_column(name, dialect, joins)
+            else:
+                ref = f"{table}.{dialect.quote(meta.get_field(name).db_column)}"
+            parts.append(ref + (" DESC" if descending else " ASC"))
+        return " ORDER BY " + ", ".join(parts)
+
     def _relation_order_ref(self, name: str, dialect: BaseDialect) -> str:
         """Render an ``order_by`` term that walks a forward-relation path.
 
@@ -1209,35 +1252,52 @@ class QuerySet:
             )
         base_fk = q(meta.get_field(info.source_attr).db_column)
         cur_meta = info.resolve_target()._meta
-        from_table = q(cur_meta.table)
-        correlation = f"{from_table}.{q(cur_meta.pk_field.db_column)} = {q(meta.table)}.{base_fk}"
+        # Alias every table *inside* the subquery. For a self-relation the target
+        # table equals the base table, so an unaliased ``target.pk = base.fk``
+        # would bind both sides to the inner row and stop correlating to the outer
+        # row (arbitrary ordering); a distinct alias keeps the correlation to the
+        # outer ``meta.table``.
+        cur_alias = "_ord0"
+        from_table = f"{q(cur_meta.table)} AS {q(cur_alias)}"
+        correlation = f"{q(cur_alias)}.{q(cur_meta.pk_field.db_column)} = {q(meta.table)}.{base_fk}"
         joins = ""
-        for seg in segments[1:-1]:
+        for depth, seg in enumerate(segments[1:-1], start=1):
             info = cur_meta.relations.get(seg)
             if info is None:
                 raise FieldError(
                     f"Cannot order by relation path {name!r}: {seg!r} is not a forward relation"
                 )
             next_meta = info.resolve_target()._meta
+            next_alias = f"_ord{depth}"
             src = q(cur_meta.get_field(info.source_attr).db_column)
             joins += (
-                f" JOIN {q(next_meta.table)} ON {q(cur_meta.table)}.{src} = "
-                f"{q(next_meta.table)}.{q(next_meta.pk_field.db_column)}"
+                f" JOIN {q(next_meta.table)} AS {q(next_alias)} ON {q(cur_alias)}.{src} = "
+                f"{q(next_alias)}.{q(next_meta.pk_field.db_column)}"
             )
-            cur_meta = next_meta
-        final_col = f"{q(cur_meta.table)}.{q(cur_meta.get_field(segments[-1]).db_column)}"
+            cur_meta, cur_alias = next_meta, next_alias
+        final_col = f"{q(cur_alias)}.{q(cur_meta.get_field(segments[-1]).db_column)}"
         return f"(SELECT {final_col} FROM {from_table}{joins} WHERE {correlation})"  # noqa: S608
 
-    def _tail_sql(self) -> str:
+    def _tail_sql(self, dialect: BaseDialect) -> str:
         """Build the trailing ``LIMIT`` / ``OFFSET`` clause.
+
+        Args:
+            dialect: The active dialect (some require a ``LIMIT`` before
+                ``OFFSET``).
 
         Returns:
             The ``LIMIT``/``OFFSET`` fragment, or an empty string when neither
             is set.
         """
         tail = ""
-        if self._limit is not None:
-            tail += f" LIMIT {int(self._limit)}"
+        limit = self._limit
+        if limit is None and self._offset is not None and dialect.offset_requires_limit:
+            # SQLite rejects ``OFFSET`` without a preceding ``LIMIT``; ``-1`` is
+            # its "no limit" sentinel, so an offset-only slice (``qs[3:]``) stays
+            # valid. PostgreSQL accepts a bare ``OFFSET`` and skips this.
+            limit = -1
+        if limit is not None:
+            tail += f" LIMIT {int(limit)}"
         if self._offset is not None:
             tail += f" OFFSET {int(self._offset)}"
         return tail
@@ -1528,7 +1588,7 @@ class QuerySet:
         meta = self.model._meta
         meta.compile(dialect)
         where, params, _ = self._compile_conditions(dialect, start=start)
-        tail = f"{self._order_sql(dialect)}{self._tail_sql()}{self._lock_sql(dialect)}"
+        tail = f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{self._lock_sql(dialect)}"
         if self._only is not None or self._defer:
             sel = self._selected_fields()
             cols = ", ".join(dialect.quote(f.db_column) for f in sel)
@@ -1583,7 +1643,7 @@ class QuerySet:
         distinct = "DISTINCT " if self._distinct else ""
         sql = (
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql()}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
         )
         return sql, params, None
 
@@ -1731,7 +1791,7 @@ class QuerySet:
         where, params, _ = self._compile_conditions(dialect)
         sql = (
             f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql()}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
         )
         return sql, params, order, nodes, len(base_fields)
 
@@ -1815,7 +1875,7 @@ class QuerySet:
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"
             f"{''.join(joins.values())}{where}{group}{having}"
-            f"{self._order_sql(dialect)}{self._tail_sql()}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
         )
         return sql, params
 
@@ -1889,7 +1949,7 @@ class QuerySet:
         distinct = "DISTINCT " if self._distinct else ""
         sql = (
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql()}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
         )
         return await engine.fetch_rows(sql, params)
 
@@ -1956,12 +2016,14 @@ class QuerySet:
 
         where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
+        # Build ORDER BY before the FROM joins are interpolated below, so any
+        # relation path it resolves can register its (shared) join in time.
+        order = self._grouped_order_sql(dialect, joins)
         params = select_params + wparams + hparams
         group = (" GROUP BY " + ", ".join(group_cols)) if group_cols else ""
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"
-            f"{''.join(joins.values())}{where}{group}{having}"
-            f"{self._order_sql(dialect)}{self._tail_sql()}"
+            f"{''.join(joins.values())}{where}{group}{having}{order}{self._tail_sql(dialect)}"
         )
         return sql, params, names
 
