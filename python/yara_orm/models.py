@@ -221,6 +221,24 @@ class MetaInfo:
         except KeyError as exc:
             raise FieldError(f"Field {name!r} does not exist on this model") from exc
 
+    def resolve_writable_field(self, name: str) -> Field:
+        """Resolve a field or forward-relation name to its writable column field.
+
+        A forward-relation name (``author``) maps to the local foreign-key column
+        field (``author_id``); any other name resolves as a plain field. The
+        write paths (partial ``save``, ``bulk_create``, ``bulk_update``) share
+        this so a relation name in ``update_fields``/column lists targets the
+        underlying FK column.
+
+        Args:
+            name: A model field name or a forward-relation name.
+
+        Returns:
+            The ``Field`` whose ``db_column`` the write should target.
+        """
+        info = self.relations.get(name)
+        return self.get_field(info.source_attr if info is not None else name)
+
     def compile(self, dialect: BaseDialect) -> None:
         """Build and cache dialect-specific SQL once (idempotent per dialect).
 
@@ -1032,10 +1050,7 @@ class Model(metaclass=ModelMeta):
             resolved: list[Field] = []
             seen: set[str] = set()
             for name in update_fields:
-                if name in meta.relations:
-                    field = meta.get_field(meta.relations[name].source_attr)
-                else:
-                    field = meta.get_field(name)  # raises FieldError if unknown
+                field = meta.resolve_writable_field(name)  # raises if unknown
                 if field is pk_field or field.db_column in seen:
                     continue
                 seen.add(field.db_column)
@@ -1603,9 +1618,7 @@ class Model(metaclass=ModelMeta):
 
         def column_of(name: str) -> str:
             """Resolve a field/relation name to its database column."""
-            if name in meta.relations:
-                return meta.get_field(meta.relations[name].source_attr).db_column
-            return meta.get_field(name).db_column
+            return meta.resolve_writable_field(name).db_column
 
         upsert = ignore_conflicts or update_fields is not None
         conflict_sql = ""
@@ -1726,10 +1739,10 @@ class Model(metaclass=ModelMeta):
         pk_field = meta.pk_field
         q = dialect.quote
         table = q(meta.table)
+        # (name, writable field, is_relation) — the relation-ness is fixed per
+        # target, so resolve it once here instead of per object in the batch loop.
         targets = [
-            (name, meta.get_field(meta.relations[name].source_attr))
-            if name in meta.relations
-            else (name, meta.get_field(name))
+            (name, meta.resolve_writable_field(name), name in meta.relations)
             for name in field_names
         ]
         total = 0
@@ -1738,11 +1751,11 @@ class Model(metaclass=ModelMeta):
             params: list[Any] = []
             idx = 1
             set_parts = []
-            for name, field in targets:
+            for name, field, is_rel in targets:
                 whens = []
                 for obj in batch:
                     value = getattr(obj, name)
-                    if name in meta.relations and hasattr(value, "pk"):
+                    if is_rel and hasattr(value, "pk"):
                         value = value.pk
                     whens.append(
                         f"WHEN {dialect.placeholder(idx)} THEN {dialect.placeholder(idx + 1)}"
