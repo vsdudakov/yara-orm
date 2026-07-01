@@ -401,9 +401,7 @@ async def test_grouped_empty_table(db):
     WHEN a grouped aggregate query runs over the empty table
     THEN no group rows are produced
     """
-    rows = (
-        await AggghBook.annotate(n=Count("id")).group_by("author_id").values("author_id", "n")
-    )
+    rows = await AggghBook.annotate(n=Count("id")).group_by("author_id").values("author_id", "n")
     assert rows == []
 
 
@@ -430,9 +428,7 @@ async def test_group_by_forward_relation_path_no_order(db):
     """
     await _seed()
     rows = (
-        await AggghBook.annotate(n=Count("id"))
-        .group_by("author__name")
-        .values("author__name", "n")
+        await AggghBook.annotate(n=Count("id")).group_by("author__name").values("author__name", "n")
     )
     by_name = {r["author__name"]: r["n"] for r in rows}
     assert by_name == {"Ada": 3, "Bob": 1}
