@@ -494,6 +494,16 @@ def test_remove_plain_composite_index_to_source_has_no_condition():
     assert "idx_t_a_b" in src
 
 
+def test_remove_composite_index_if_exists_round_trips_to_its_own_class():
+    """
+    GIVEN a RemoveCompositeIndexIfExists operation (as diff_states emits)
+    WHEN it is rendered to migration source
+    THEN it serializes back as its own class, not the base RemoveCompositeIndex
+    """
+    src = m.RemoveCompositeIndexIfExists("t", "idx_t_a_b", ["a", "b"]).to_source()
+    assert src.startswith("m.RemoveCompositeIndexIfExists(")
+
+
 def test_index_opclass_renders_on_postgres_and_drops_on_sqlite():
     """
     GIVEN a composite index carrying a per-column operator class

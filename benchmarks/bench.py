@@ -69,18 +69,30 @@ def ours_url() -> str:
     return URL
 
 
+def _pg_userinfo(p: dict) -> str:
+    """Render ``user`` or ``user:password`` for a libpq-style URL.
+
+    The password must survive into the competitor URLs: in CI PostgreSQL
+    requires ``postgres:postgres`` auth, so dropping it (as an earlier
+    ``{user}@{host}`` form did) makes Tortoise/SQLAlchemy fail with
+    'password authentication failed' while yara-orm — which uses the full URL
+    verbatim — connects fine, producing a bogus one-sided benchmark.
+    """
+    return f"{p['user']}:{p['password']}" if p["password"] else p["user"]
+
+
 def tortoise_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite://{SQLITE_DIR}/bench_tortoise.db"
     p = pg_parts(URL)
-    return f"asyncpg://{p['user']}@{p['host']}:{p['port']}/{p['database']}"
+    return f"asyncpg://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
 
 
 def sqla_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite+aiosqlite:///{SQLITE_DIR}/bench_sqla.db"
     p = pg_parts(URL)
-    return f"postgresql+asyncpg://{p['user']}@{p['host']}:{p['port']}/{p['database']}"
+    return f"postgresql+asyncpg://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
 
 
 class _Stopwatch:

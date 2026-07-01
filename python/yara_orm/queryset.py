@@ -58,6 +58,29 @@ _SPECIAL_OPS = frozenset({"in", "not_in", "isnull", "not_isnull", "range", "sear
 _LOOKUPS = frozenset(_OPERATORS) | _DATE_PARTS | _REGEX_OPS | _SPECIAL_OPS
 
 
+_relations_mod: Any = None
+
+
+def _rel() -> Any:
+    """Return the ``relations`` module, imported lazily and memoised.
+
+    ``relations`` imports ``queryset`` at module load, so ``queryset`` cannot
+    import it at top level. By the time any query compiles at runtime the module
+    is fully loaded; this accessor pays the import machinery once instead of on
+    every lookup/join/relation compilation (the compile hot path re-ran a
+    ``from .relations import ...`` statement per condition).
+
+    Returns:
+        The imported ``relations`` module.
+    """
+    global _relations_mod
+    if _relations_mod is None:
+        from . import relations
+
+        _relations_mod = relations
+    return _relations_mod
+
+
 def _split_lookup(key: str) -> tuple[str, str]:
     """Split a filter key into its field path and lookup operator.
 
@@ -615,8 +638,10 @@ class QuerySet:
             A ``(sql, params, next_index)`` tuple holding the condition SQL,
             its bound parameters and the updated parameter index.
         """
-        # Deferred: breaks the queryset <-> relations import cycle.
-        from .relations import M2MDescriptor, ReverseFKDescriptor
+        # Lazily imported (breaks the queryset <-> relations import cycle);
+        # memoised so this is not a per-lookup import statement.
+        rel = _rel()
+        M2MDescriptor, ReverseFKDescriptor = rel.M2MDescriptor, rel.ReverseFKDescriptor
 
         meta = self.model._meta
         base, op = _split_lookup(key)
@@ -796,8 +821,8 @@ class QuerySet:
         Returns:
             A ``(sql, params, next_index)`` tuple.
         """
-        # Deferred: breaks the queryset <-> relations import cycle.
-        from .relations import model_name
+        # Lazily imported (breaks the queryset <-> relations import cycle).
+        model_name = _rel().model_name
 
         descriptor = getattr(self.model, base)
         source = registry.get_model(model_name(descriptor.source_reference))
@@ -903,8 +928,13 @@ class QuerySet:
             A ``(sql, params, next_index)`` tuple holding the membership
             condition SQL, its bound parameters and the updated index.
         """
-        # Deferred: breaks the queryset <-> relations import cycle.
-        from .relations import M2MDescriptor, ReverseFKDescriptor, model_name
+        # Lazily imported (breaks the queryset <-> relations import cycle).
+        rel = _rel()
+        M2MDescriptor, ReverseFKDescriptor, model_name = (
+            rel.M2MDescriptor,
+            rel.ReverseFKDescriptor,
+            rel.model_name,
+        )
 
         seg, _, rest = base.partition("__")
         inner_key = rest if op == "exact" else f"{rest}__{op}"
@@ -1078,7 +1108,13 @@ class QuerySet:
         for node in self._conditions:
             sub, p, idx = self._compile_q(node, dialect, idx)
             if sub:
-                parts.append(sub)
+                # Each top-level condition is AND-joined with the others, so it
+                # must be parenthesised: an OR-group (``Q(a) | Q(b)``) or a
+                # chained ``.filter()`` compiles to ``a OR b`` and, left bare,
+                # the tighter-binding AND would swallow the following conditions
+                # into its right branch (``a OR (b AND c)``) — corrupting the
+                # WHERE. Mirror the wrapping already done for child nodes.
+                parts.append(f"({sub})")
                 params.extend(p)
         where = (" WHERE " + " AND ".join(parts)) if parts else ""
         return where, params, idx
@@ -1230,8 +1266,13 @@ class QuerySet:
         Returns:
             The ``_meta`` object of the joined target model.
         """
-        # Deferred: breaks the queryset <-> relations import cycle.
-        from .relations import M2MDescriptor, ReverseFKDescriptor, model_name
+        # Lazily imported (breaks the queryset <-> relations import cycle).
+        _relmod = _rel()
+        M2MDescriptor, ReverseFKDescriptor, model_name = (
+            _relmod.M2MDescriptor,
+            _relmod.ReverseFKDescriptor,
+            _relmod.model_name,
+        )
 
         q = dialect.quote
         meta = self.model._meta
