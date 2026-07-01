@@ -36,10 +36,12 @@ jobs:
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         env:
-          # Cross-compiling the Linux aarch64 wheel, ring's ARM assembly aborts
-          # with 'ARM assembler must define __ARM_ARCH' because the cross-gcc
-          # doesn't set it; -march=armv8-a defines it. No effect on other targets.
-          CFLAGS_aarch64_unknown_linux_gnu: "-march=armv8-a"
+          # Cross-compiling the Linux aarch64 wheel, ring's hand-written ARM
+          # assembly aborts with '#error "ARM assembler must define __ARM_ARCH"'
+          # because this cross toolchain's gcc doesn't predefine it for .S files
+          # (and -march alone doesn't reach the assembler preprocessor); define it
+          # explicitly. No effect on the other targets.
+          CFLAGS_aarch64_unknown_linux_gnu: "-march=armv8-a -D__ARM_ARCH=8"
         with:
           command: build
           target: ${{ matrix.platform.target }}
