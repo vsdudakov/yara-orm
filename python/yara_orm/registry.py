@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .exceptions import ConfigurationError
+
 if TYPE_CHECKING:
     from .models import Model
 
@@ -77,6 +79,31 @@ def clear() -> None:
 _RESOLVED = {"done": False}
 
 
+def _check_related_name(related_name: str, target: type[Model], source: str) -> None:
+    """Reject a ``related_name`` that collides with a real attribute on the target.
+
+    A reverse accessor is installed on the target under ``related_name``; if that
+    name is already a column, forward relation or m2m field on the target, the
+    reverse accessor would be silently dropped (the existing attribute wins),
+    giving a wrong/absent reverse relation with no error. Surface it instead.
+
+    Args:
+        related_name: The reverse-accessor name to install.
+        target: The model the reverse accessor is installed on.
+        source: The source model name (for the error message).
+
+    Raises:
+        ConfigurationError: When ``related_name`` clashes with a declared
+            column, forward relation or m2m field on ``target``.
+    """
+    tmeta = target._meta
+    if related_name in tmeta.fields or related_name in tmeta.relations or related_name in tmeta.m2m:
+        raise ConfigurationError(
+            f"related_name {related_name!r} on {source} conflicts with an existing "
+            f"field/relation named {related_name!r} on {target.__name__}"
+        )
+
+
 def resolve_relations() -> None:
     """Install reverse FK/O2O/M2M accessors on target models.
 
@@ -89,15 +116,17 @@ def resolve_relations() -> None:
         meta = model._meta
         # Forward FK/O2O: install reverse manager on the target.
         for info in meta.relations.values():
-            if not info.field.related_name:
+            related_name = info.field.related_name
+            if not related_name:
                 continue
             target = info.resolve_target()
-            if not hasattr(target, info.field.related_name):
+            _check_related_name(related_name, target, model.__name__)
+            if not hasattr(target, related_name):
                 setattr(
                     target,
-                    info.field.related_name,
+                    related_name,
                     ReverseFKDescriptor(
-                        info.field.related_name,
+                        related_name,
                         model.__name__,
                         info.source_attr,
                         info.is_o2o,
@@ -106,10 +135,14 @@ def resolve_relations() -> None:
         # M2M: finalise keys and install reverse manager on the target.
         for info in meta.m2m.values():
             target = info.finalize()
-            if info.field.related_name and not hasattr(target, info.field.related_name):
+            related_name = info.field.related_name
+            if not related_name:
+                continue
+            _check_related_name(related_name, target, model.__name__)
+            if not hasattr(target, related_name):
                 setattr(
                     target,
-                    info.field.related_name,
+                    related_name,
                     M2MDescriptor(info, target._meta.pk_field.model_field_name, reverse=True),
                 )
     _RESOLVED["done"] = True
