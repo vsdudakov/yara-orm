@@ -10,10 +10,10 @@ see the [guides](guides/models-and-fields.md).
 
 ```python
 from yara_orm import (
-    YaraOrm, Tortoise, Model, Index, QuerySet, Q, F, fields, migrations,
-    Count, Sum, Avg, Min, Max,
-    Lower, Upper, Length, Trim, Concat, Coalesce,
-    Case, When, RawSQL, Prefetch, Manager,
+    YaraOrm, Model, Index, QuerySet, Q, F, fields, migrations,
+    Count, Sum, Avg, Min, Max, Aggregate,
+    Lower, Upper, Length, Trim, Concat, Coalesce, Random,
+    Case, When, RawSQL, Subquery, Value, Array, Prefetch, Manager,
     Now, RandomHex, SqlDefault, DatabaseDefault,
     connections, in_transaction, atomic,
     pre_save, post_save, pre_delete, post_delete,
@@ -125,21 +125,30 @@ slicing (`qs[start:stop]`).
 **`F`** references a column for filters and arithmetic updates, e.g. `update(n=F("n") + 1)`
 or `filter(a__gt=F("b"))`.
 
-**Lookups:** `exact` (default), `not`, `gt`, `gte`, `lt`, `lte`, `in`, `isnull`, `contains`,
-`icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`.
+**Lookups:** `exact` (default), `iexact`, `not`, `gt`, `gte`, `lt`, `lte`, `in`,
+`not_in`, `range`, `isnull`, `not_isnull`, `contains`, `icontains`, `startswith`,
+`istartswith`, `endswith`, `iendswith`, `date`, the date-parts (`year`, `quarter`,
+`month`, `week`, `day`, `hour`, `minute`, `second`, `microsecond`), and the
+PostgreSQL-only `regex` / `iregex` (aliases `posix_regex` / `iposix_regex`) and
+`search`. See [Querying](guides/querying.md#field-lookups-with-__) for the full
+table with per-lookup SQL and examples.
 
 ## Aggregations & functions
 
-`Count`, `Sum`, `Avg`, `Min`, `Max` — each constructed as `Agg(field, distinct=False)`.
-Scalar functions `Lower`, `Upper`, `Length`, `Trim`, `Concat`, `Coalesce`, plus `Case`/`When`
-and `RawSQL`, are also usable as `annotate()` expressions. See
-[Aggregation & grouping](guides/aggregation.md).
+`Count`, `Sum`, `Avg`, `Min`, `Max` — each constructed as `Agg(field, distinct=False)`
+(`Aggregate` is their shared base). Scalar functions `Lower`, `Upper`, `Length`,
+`Trim`, `Concat`, `Coalesce`, `Random`, plus `Case`/`When`, `RawSQL`, `Subquery`
+(embed a lazy single-column query as a value), `Value` (a literal wrapper) and
+`Array` (bind a sequence as a PostgreSQL array) are also usable as `annotate()` /
+`update()` expressions. See [Aggregation & grouping](guides/aggregation.md).
 
 ## Relations
 
 `Prefetch(relation, queryset=...)` customizes a prefetch. Forward FK access is awaitable;
 reverse and many-to-many managers support `await`, `async for`, `.add/.remove/.clear`
-(m2m), `.filter`, `.order_by`. See [Relations](guides/relations.md).
+(m2m), and proxy the full chainable queryset API — `.all()`, `.filter()`,
+`.exclude()`, `.order_by()`, `.limit()`, `.select_related()`, `.values()`,
+`.annotate()`, and so on. See [Relations](guides/relations.md).
 
 ## Signals
 
