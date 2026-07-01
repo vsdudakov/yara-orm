@@ -18,6 +18,8 @@ tokio-postgres = { version = "0.7", features = [
     "with-serde_json-1",
 ] }
 deadpool-postgres = "0.14"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
 async-trait = "0.1"
 thiserror = "2"
 serde_json = "1"
