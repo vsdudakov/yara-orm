@@ -619,6 +619,31 @@ class QuerySet:
         """
         return f"{dialect.quote(self.model._meta.table)}.{dialect.quote(field.db_column)}"
 
+    @staticmethod
+    def _forward_join(
+        cur_table: str, cur_meta: MetaInfo, info: Any, dialect: BaseDialect
+    ) -> tuple[MetaInfo, str]:
+        """Build the ``LEFT JOIN`` from ``cur_table`` across a forward relation.
+
+        Shared by the join-based relation resolvers (``_resolve_column``,
+        ``_add_relation_join``) so the forward-FK join shape is defined once.
+
+        Args:
+            cur_table: The already-quoted table the join starts from.
+            cur_meta: The metadata of the model owning ``info``.
+            info: The forward ``RelationInfo`` to traverse.
+            dialect: The SQL dialect providing identifier quoting.
+
+        Returns:
+            A ``(target_meta, join_sql)`` tuple.
+        """
+        q = dialect.quote
+        tmeta = info.resolve_target()._meta
+        src = q(cur_meta.get_field(info.source_attr).db_column)
+        ttable = q(tmeta.table)
+        join = f" LEFT JOIN {ttable} ON {cur_table}.{src} = {ttable}.{q(tmeta.pk_field.db_column)}"
+        return tmeta, join
+
     def _compile_lookup(
         self,
         key: str,
@@ -1280,13 +1305,7 @@ class QuerySet:
         pk = q(meta.pk_field.db_column)
 
         if rel in meta.relations:
-            info = meta.relations[rel]
-            tmeta = info.resolve_target()._meta
-            joins[rel] = (
-                f" LEFT JOIN {q(tmeta.table)} ON {table}."
-                f"{q(meta.get_field(info.source_attr).db_column)} = "
-                f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
-            )
+            tmeta, joins[rel] = self._forward_join(table, meta, meta.relations[rel], dialect)
             return tmeta
 
         descriptor = getattr(self.model, rel, None)
@@ -1412,12 +1431,7 @@ class QuerySet:
             if info is not None:
                 # Forward relation: chain a LEFT JOIN to its target table.
                 chain = f"{chain}__{seg}" if chain else seg
-                tmeta = info.resolve_target()._meta
-                src = q(cur_meta.get_field(info.source_attr).db_column)
-                joins[chain] = (
-                    f" LEFT JOIN {q(tmeta.table)} ON {cur_table}.{src} = "
-                    f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
-                )
+                tmeta, joins[chain] = self._forward_join(cur_table, cur_meta, info, dialect)
                 cur_meta, cur_table = tmeta, q(tmeta.table)
                 if last:
                     return f"{cur_table}.{q(cur_meta.pk_field.db_column)}"

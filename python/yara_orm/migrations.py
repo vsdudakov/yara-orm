@@ -335,13 +335,7 @@ def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
         Returns:
             The corresponding db column names.
         """
-        cols = []
-        for n in names:
-            if n in meta.relations:
-                cols.append(meta.get_field(meta.relations[n].source_attr).db_column)
-            else:
-                cols.append(meta.get_field(n).db_column)
-        return cols
+        return [meta.resolve_writable_field(n).db_column for n in names]
 
     out: dict[str, dict[str, Any]] = {}
     for index in meta.indexes:
@@ -397,12 +391,7 @@ def _meta_unique_together_specs(meta: Any) -> list[dict[str, Any]]:
     """
     specs: list[dict[str, Any]] = []
     for group in meta.unique_together:
-        cols = []
-        for n in group:
-            if n in meta.relations:
-                cols.append(meta.get_field(meta.relations[n].source_attr).db_column)
-            else:
-                cols.append(meta.get_field(n).db_column)
+        cols = [meta.resolve_writable_field(n).db_column for n in group]
         name = f"uniq_{meta.table}_" + "_".join(cols)
         specs.append({"kind": "unique", "name": name, "fields": cols})
     return specs
