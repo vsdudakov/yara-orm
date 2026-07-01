@@ -25,25 +25,31 @@ PostgreSQL 18, Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower is bet
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
 |---------------|---------:|---------:|-----------:|------:|
-| bulk_insert   |     11.5 |     23.1 |       67.5 | 208.4 |
-| single_insert |     32.8 |     80.4 |      153.3 |  59.1 |
-| fetch_all     |      3.5 |     16.0 |       12.2 |  30.4 |
-| count         |      0.4 |      0.5 |        1.2 |   0.5 |
-| filter        |      2.2 |      8.5 |       20.5 |  15.4 |
-| get_by_pk     |     63.2 |    194.4 |      292.8 |  82.7 |
-| update        |      3.3 |      3.4 |        4.1 | 117.8 |
+| bulk_insert   |     18.5 |     24.7 |       72.5 | 223.4 |
+| single_insert |     33.7 |     82.7 |      157.7 |  61.0 |
+| fetch_all     |      3.8 |     17.5 |       23.2 |  35.7 |
+| count         |      0.3 |      0.6 |        1.0 |   0.5 |
+| group_by      |      0.8 |      1.1 |        1.6 |   2.4 |
+| filter        |      2.3 |      9.3 |        8.2 |  17.8 |
+| get_by_pk     |     65.8 |    204.4 |      306.9 |  84.6 |
+| update        |      3.4 |      3.7 |        4.1 | 120.7 |
+| delete        |      0.7 |      0.9 |        1.1 |  95.1 |
+
+`group_by` is a `GROUP BY … COUNT/SUM … HAVING` aggregate query.
 
 **Speedup vs Yara ORM** (competitor time ÷ yara-orm time; >1 means Yara ORM is faster):
 
 | operation     | tortoise | sqlalchemy |  pony |
 |---------------|---------:|-----------:|------:|
-| bulk_insert   |    2.0×  |      5.9×  | 18.1× |
-| single_insert |    2.4×  |      4.7×  |  1.8× |
-| fetch_all     |    4.5×  |      3.5×  |  8.6× |
-| count         |    1.5×  |      3.1×  |  1.3× |
-| filter        |    3.9×  |      9.5×  |  7.2× |
-| get_by_pk     |    3.1×  |      4.6×  |  1.3× |
-| update        |    1.0×  |      1.3×  | 35.7× |
+| bulk_insert   |    1.3×  |      3.9×  | 12.1× |
+| single_insert |    2.5×  |      4.7×  |  1.8× |
+| fetch_all     |    4.6×  |      6.1×  |  9.4× |
+| count         |    1.7×  |      3.0×  |  1.4× |
+| group_by      |    1.4×  |      2.0×  |  2.9× |
+| filter        |    4.1×  |      3.6×  |  7.8× |
+| get_by_pk     |    3.1×  |      4.7×  |  1.3× |
+| update        |    1.1×  |      1.2×  | 35.0× |
+| delete        |    1.2×  |      1.5×  | 130.2× |
 
 Yara ORM is fastest on every operation in this configuration. `get_by_pk` and
 `single_insert` are latency-bound (one sequential round-trip per call) and sit near the raw
