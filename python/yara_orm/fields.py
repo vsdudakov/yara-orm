@@ -244,130 +244,67 @@ def _str_to_db(value: Any) -> Any:
     return str(value) if isinstance(value, int) and not isinstance(value, bool) else value
 
 
-class SmallIntField(Field):
+class _IntegerField(Field):
+    """Shared base for the integer column types.
+
+    Centralises the primary-key auto-increment wiring and the ``int`` coercion
+    both directions (numeric string in, ``int`` out); concrete subclasses only
+    set their ``field_kind``.
+    """
+
+    def __init__(self, *, pk: bool = False, **kwargs: Any) -> None:
+        """Initialize the field, enabling auto-increment for primary keys.
+
+        Args:
+            pk: Whether this column is the primary key.
+            **kwargs: Additional options forwarded to :class:`Field`.
+
+        Returns:
+            None
+        """
+        super().__init__(pk=pk, **kwargs)
+        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
+            self.auto_increment = True
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a numeric string to ``int`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``int(value)`` for a string, otherwise ``value`` unchanged.
+        """
+        return _int_to_db(value)
+
+    def to_python(self, value: Any) -> Any:
+        """Convert a database value into an ``int``.
+
+        Args:
+            value: The value returned by the database engine.
+
+        Returns:
+            The value as an ``int``, or ``None``.
+        """
+        return None if value is None else int(value)
+
+
+class SmallIntField(_IntegerField):
     """A small integer column."""
 
     field_kind = "smallint"
 
-    def __init__(self, *, pk: bool = False, **kwargs: Any) -> None:
-        """Initialize the field, enabling auto-increment for primary keys.
 
-        Args:
-            pk: Whether this column is the primary key.
-            **kwargs: Additional options forwarded to :class:`Field`.
-
-        Returns:
-            None
-        """
-        super().__init__(pk=pk, **kwargs)
-        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
-            self.auto_increment = True
-
-    def to_db(self, value: Any) -> Any:
-        """Coerce a numeric string to ``int`` before binding.
-
-        Args:
-            value: The Python value to convert.
-
-        Returns:
-            ``int(value)`` for a string, otherwise ``value`` unchanged.
-        """
-        return _int_to_db(value)
-
-    def to_python(self, value: Any) -> Any:
-        """Convert a database value into an ``int``.
-
-        Args:
-            value: The value returned by the database engine.
-
-        Returns:
-            The value as an ``int``, or ``None``.
-        """
-        return None if value is None else int(value)
-
-
-class IntField(Field):
+class IntField(_IntegerField):
     """A standard integer column."""
 
     field_kind = "int"
 
-    def __init__(self, *, pk: bool = False, **kwargs: Any) -> None:
-        """Initialize the field, enabling auto-increment for primary keys.
 
-        Args:
-            pk: Whether this column is the primary key.
-            **kwargs: Additional options forwarded to :class:`Field`.
-
-        Returns:
-            None
-        """
-        super().__init__(pk=pk, **kwargs)
-        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
-            self.auto_increment = True
-
-    def to_db(self, value: Any) -> Any:
-        """Coerce a numeric string to ``int`` before binding.
-
-        Args:
-            value: The Python value to convert.
-
-        Returns:
-            ``int(value)`` for a string, otherwise ``value`` unchanged.
-        """
-        return _int_to_db(value)
-
-    def to_python(self, value: Any) -> Any:
-        """Convert a database value into an ``int``.
-
-        Args:
-            value: The value returned by the database engine.
-
-        Returns:
-            The value as an ``int``, or ``None``.
-        """
-        return None if value is None else int(value)
-
-
-class BigIntField(Field):
+class BigIntField(_IntegerField):
     """A 64-bit integer column."""
 
     field_kind = "bigint"
-
-    def __init__(self, *, pk: bool = False, **kwargs: Any) -> None:
-        """Initialize the field, enabling auto-increment for primary keys.
-
-        Args:
-            pk: Whether this column is the primary key.
-            **kwargs: Additional options forwarded to :class:`Field`.
-
-        Returns:
-            None
-        """
-        super().__init__(pk=pk, **kwargs)
-        if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
-            self.auto_increment = True
-
-    def to_db(self, value: Any) -> Any:
-        """Coerce a numeric string to ``int`` before binding.
-
-        Args:
-            value: The Python value to convert.
-
-        Returns:
-            ``int(value)`` for a string, otherwise ``value`` unchanged.
-        """
-        return _int_to_db(value)
-
-    def to_python(self, value: Any) -> Any:
-        """Convert a database value into an ``int``.
-
-        Args:
-            value: The value returned by the database engine.
-
-        Returns:
-            The value as an ``int``, or ``None``.
-        """
-        return None if value is None else int(value)
 
 
 class FloatField(Field):
@@ -556,7 +493,27 @@ def _parse_iso_datetime(value: str) -> datetime:
     return datetime.fromisoformat(text)
 
 
-class DatetimeField(Field):
+class _TemporalField(Field):
+    """Shared base for date/time columns.
+
+    Assignment coercion and bind coercion are the same for these types, so
+    ``to_db`` delegates to ``to_python_value`` once here; subclasses only define
+    ``to_python_value``.
+    """
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce the value the same way assignment does before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            The value coerced by ``to_python_value``.
+        """
+        return self.to_python_value(value)
+
+
+class DatetimeField(_TemporalField):
     """A date-and-time column."""
 
     field_kind = "datetime"
@@ -595,19 +552,8 @@ class DatetimeField(Field):
             return _parse_iso_datetime(value)
         return value
 
-    def to_db(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string to a ``datetime`` before binding.
 
-        Args:
-            value: The Python value to convert.
-
-        Returns:
-            A ``datetime`` parsed from a string; otherwise ``value`` unchanged.
-        """
-        return self.to_python_value(value)
-
-
-class DateField(Field):
+class DateField(_TemporalField):
     """A calendar-date column."""
 
     field_kind = "date"
@@ -636,19 +582,8 @@ class DateField(Field):
             return date.fromisoformat(text)
         return value
 
-    def to_db(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string (or ``datetime``) to a ``date`` for binding.
 
-        Args:
-            value: The Python value to convert.
-
-        Returns:
-            A ``date`` (or ``None``); other types pass through unchanged.
-        """
-        return self.to_python_value(value)
-
-
-class TimeField(Field):
+class TimeField(_TemporalField):
     """A time-of-day column."""
 
     field_kind = "time"
@@ -669,17 +604,6 @@ class TimeField(Field):
         if isinstance(value, str):
             return time.fromisoformat(value.strip())
         return value
-
-    def to_db(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string (or ``datetime``) to a ``time`` for binding.
-
-        Args:
-            value: The Python value to convert.
-
-        Returns:
-            A ``time`` (or ``None``); other types pass through unchanged.
-        """
-        return self.to_python_value(value)
 
 
 class TimeDeltaField(Field):
