@@ -292,12 +292,8 @@ def _render_value(
     Returns:
         A ``(sql, next_index)`` tuple.
     """
-    if isinstance(value, Expression):
-        return value.resolve(
-            lambda name: queryset._resolve_column(name, dialect, joins), dialect, params, idx
-        )
-    params.append(value)
-    return dialect.placeholder(idx), idx + 1
+    render_column = lambda name: queryset._resolve_column(name, dialect, joins)  # noqa: E731
+    return _resolve_operand(value, render_column, dialect, params, idx)
 
 
 class When:
