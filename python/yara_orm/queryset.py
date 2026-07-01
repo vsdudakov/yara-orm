@@ -615,19 +615,29 @@ class QuerySet:
             its bound parameters and the updated parameter index.
         """
         # Deferred: breaks the queryset <-> relations import cycle.
-        from .relations import M2MDescriptor
+        from .relations import M2MDescriptor, ReverseFKDescriptor
 
         meta = self.model._meta
         base, op = _split_lookup(key)
 
-        # A multi-segment path (``author__name``) traverses one or more
-        # relations; compile it as a correlated membership subquery.
+        # A multi-segment path is either a JSON-column key path
+        # (``data__key``/``data__a__b`` on a JSONField) or a relation traversal
+        # (``author__name``) compiled as a correlated membership subquery.
         if "__" in base:
+            first = meta.fields.get(base.split("__", 1)[0])
+            if first is not None and first.field_kind == "json":
+                return self._compile_json_path(base, op, value, dialect, idx)
             return self._compile_relation_lookup(base, op, value, dialect, idx)
 
         descriptor = getattr(self.model, base, None)
         if base in meta.m2m or isinstance(descriptor, M2MDescriptor):
             return self._compile_m2m_lookup(base, op, value, dialect, idx)
+
+        # A bare reverse-FK related_name with an ``isnull`` test asks whether a
+        # related row exists (``Portfolio.filter(alerts__isnull=True)`` = "has no
+        # alerts"); compile it as a correlated [NOT] EXISTS.
+        if isinstance(descriptor, ReverseFKDescriptor) and op in ("isnull", "not_isnull"):
+            return self._compile_reverse_exists(base, op, value, dialect, idx)
 
         if base in meta.relations:
             field = meta.get_field(meta.relations[base].source_attr)
@@ -739,6 +749,75 @@ class QuerySet:
                 col = dialect.cast_text(col)
             return f"{col} {sql_op} {placeholder}", [pattern(value)], idx
         return f"{col} {sql_op} {placeholder}", [coerce(value)], idx
+
+    def _compile_reverse_exists(
+        self,
+        base: str,
+        op: str,
+        value: Any,
+        dialect: BaseDialect,
+        idx: int,
+    ) -> tuple[str, list[Any], int]:
+        """Compile a reverse-FK ``isnull`` test into a correlated EXISTS.
+
+        Args:
+            base: The reverse-relation ``related_name`` on this model.
+            op: ``"isnull"`` or ``"not_isnull"``.
+            value: The truthiness selecting presence vs absence of a related row.
+            dialect: The SQL dialect providing quoting and placeholders.
+            idx: The next available bind-parameter index (unchanged; no binds).
+
+        Returns:
+            A ``(sql, params, next_index)`` tuple.
+        """
+        # Deferred: breaks the queryset <-> relations import cycle.
+        from .relations import model_name
+
+        descriptor = getattr(self.model, base)
+        source = registry.get_model(model_name(descriptor.source_reference))
+        smeta = source._meta
+        q = dialect.quote
+        meta = self.model._meta
+        outer = f"{q(meta.table)}.{q(meta.pk_field.db_column)}"
+        child = q(smeta.table)
+        sub = f"SELECT 1 FROM {child} WHERE {child}.{q(descriptor.source_attr)} = {outer}"
+        # isnull=True / not_isnull=False -> no related row -> NOT EXISTS.
+        absent = (op == "isnull") == bool(value)
+        keyword = "NOT EXISTS" if absent else "EXISTS"
+        return f"{keyword} ({sub})", [], idx
+
+    def _compile_json_path(
+        self,
+        base: str,
+        op: str,
+        value: Any,
+        dialect: BaseDialect,
+        idx: int,
+    ) -> tuple[str, list[Any], int]:
+        """Compile a JSON key-path lookup (``data__key``/``data__a__b``).
+
+        The leading segment names a ``JSONField`` and the remaining segments are
+        object keys extracted (as text) via the dialect's JSON operator, then
+        compared with the usual field operators (``exact``/``contains``/
+        ``isnull``/…).
+
+        Args:
+            base: The ``jsonfield__key...`` path.
+            op: The trailing lookup operator.
+            value: The comparison value.
+            dialect: The SQL dialect providing quoting and placeholders.
+            idx: The next available bind-parameter index.
+
+        Returns:
+            A ``(sql, params, next_index)`` tuple.
+        """
+        segments = base.split("__")
+        field = self.model._meta.get_field(segments[0])
+        col = self._qualified(dialect, field)
+        expr = dialect.json_extract_sql(col, segments[1:])
+        # The extracted value has no backing scalar field, so bind the value
+        # as-is (text comparison) — pass ``field=None``.
+        return self._compile_field_op(expr, None, op, value, dialect, idx)
 
     def _compile_relation_lookup(
         self,

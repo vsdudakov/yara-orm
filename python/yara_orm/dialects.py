@@ -126,6 +126,28 @@ class BaseDialect:
         """
         return f"CAST({col} AS DATE)"
 
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render extraction of a JSON key path from a column, as text.
+
+        The default is the PostgreSQL form: chain ``->`` for every key but the
+        last and ``->>`` for the last, so the result is text (comparable with a
+        bound string). With no keys the column itself is returned.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            A SQL expression yielding the addressed value as text.
+        """
+        if not keys:
+            return col
+        parts = [col]
+        last = len(keys) - 1
+        for i, key in enumerate(keys):
+            parts.append(f"{'->>' if i == last else '->'} {self._literal(key)}")
+        return " ".join(parts)
+
     def cast_text(self, col: str) -> str:
         """Render an expression casting a column to text.
 
@@ -1043,6 +1065,21 @@ class SqliteDialect(BaseDialect):
             ``date(col)`` for the ``__date`` lookup.
         """
         return f"date({col})"
+
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render a JSON key-path extraction using SQLite's ``json_extract``.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            ``json_extract(col, '$.a.b')`` (the column itself with no keys).
+        """
+        if not keys:
+            return col
+        path = "$." + ".".join(keys)
+        return f"json_extract({col}, {self._literal(path)})"
 
     # SQLite has no ``IF [NOT] EXISTS`` on ADD/DROP COLUMN, no ``CONCURRENTLY``,
     # no in-place ``ALTER COLUMN`` (a column change needs a table rebuild), no
