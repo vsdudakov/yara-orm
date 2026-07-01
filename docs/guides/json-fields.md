@@ -102,12 +102,49 @@ await Event.filter(payload__missing__isnull=True)       # key absent or JSON nul
 
 ## Full-text search across the whole document
 
-A pattern lookup on the `JSONField` itself (no key path) searches the serialised
-JSON — the column is cast to text automatically, so `ILIKE` works against `JSONB`:
+A **case-insensitive / pattern** lookup on the `JSONField` itself (no key path)
+searches the serialised JSON — the column is cast to text automatically, so
+`ILIKE` works against `JSONB`:
 
 ```python
 await Event.filter(payload__icontains="signup")   # CAST(payload AS TEXT) ILIKE '%signup%'
 ```
+
+## Containment: `__contains` (PostgreSQL)
+
+`__contains` on the `JSONField` itself is **structural containment** (`@>`), not
+a text search — it matches an object subset, an array element, or an
+array-of-objects subset:
+
+```python
+await Event.filter(payload__contains={"kind": "signup"})    # object subset
+await Event.filter(payload__contains={"tags": ["a"]})       # array-element subset
+# array of objects (e.g. a related JSON column)
+await Call.filter(contact__tags__contains=[{"name": "vip"}])
+```
+
+!!! note
+    `@>` is PostgreSQL-only; `__contains` on a JSON column raises `UnSupportedError`
+    on SQLite. (A key-path `payload__key__contains="x"` is still a text `LIKE` on
+    the extracted value.)
+
+## JSON-path filtering: `__filter`
+
+`__filter` takes a dict of `path__op: value` entries and ANDs them, each resolved
+as a key-path condition on the column (Tortoise's JSON `__filter`):
+
+```python
+await Task.filter(hubspot_task_data__filter={
+    "properties__hs_task_subject__in": ["Call", "Email"],
+})
+await Log.filter(audit_log_meta__filter={
+    "status__not": "resolved",
+    "task_name__icontains": "sync",
+})
+```
+
+Each entry supports the usual lookups (`exact`, `in`, `not`, `icontains`, …); the
+values compare as text, as with any key path.
 
 ## Updating
 

@@ -67,13 +67,13 @@ Append a double-underscore suffix to a field name to choose how it is compared. 
 | --- | --- | --- |
 | `exact` (default) | `=` | `Book.filter(title="Dune")` |
 | `iexact` | case-insensitive `=` | `Author.filter(name__iexact="ada")` |
-| `not` | `!=` | `Book.filter(rating__not=0)` |
+| `not` | `!= … OR IS NULL` | `Book.filter(rating__not=0)` |
 | `gt` | `>` | `Book.filter(rating__gt=4)` |
 | `gte` | `>=` | `Book.filter(rating__gte=4)` |
 | `lt` | `<` | `Book.filter(rating__lt=2)` |
 | `lte` | `<=` | `Book.filter(rating__lte=2)` |
 | `in` | `IN (...)` | `Author.filter(name__in=["Ada", "Bob"])` |
-| `not_in` | `NOT IN (...)` | `Author.filter(name__not_in=["Ada"])` |
+| `not_in` | `NOT IN (...) OR IS NULL` | `Author.filter(name__not_in=["Ada"])` |
 | `range` | `BETWEEN a AND b` | `Book.filter(rating__range=(3, 5))` |
 | `isnull` | `IS NULL` / `IS NOT NULL` | `Author.filter(name__isnull=True)` |
 | `not_isnull` | `IS NOT NULL` / `IS NULL` | `Author.filter(name__not_isnull=True)` |
@@ -103,8 +103,25 @@ await Book.filter(title__startswith="The")
 await Book.filter(title__icontains="ocean")
 ```
 
+!!! note "`__not` / `__not_in` keep NULL rows"
+    A negative filter also matches `NULL` rows (Tortoise semantics):
+    `__not` compiles to `(col != v OR col IS NULL)` and `__not_in` to
+    `(col NOT IN (...) OR col IS NULL)`. Plain SQL `!=` / `NOT IN` would drop
+    `NULL`s (a `NULL != v` is unknown), so a nullable column's `NULL` rows are
+    kept rather than silently vanishing from the result.
+
+!!! tip "Values are coerced to the column type"
+    Filter values are coerced through the field before binding — e.g. an integer
+    column filtered with strings (`id__in={"1", "2"}`, a `str(ext_id)` from an
+    external system) binds as `int`, and an ISO date string binds as a `date`.
+
 !!! note "Case-insensitive lookups across dialects"
     The `i*` lookups (`icontains`, `istartswith`, `iendswith`) use `ILIKE` on PostgreSQL. On SQLite they fall back to `LIKE`, which is already case-insensitive for ASCII — so the behaviour is consistent: a case-insensitive match on either backend.
+
+!!! note "`__contains` on a JSON column is containment"
+    For a text column `__contains` is a `LIKE '%v%'` substring match (the table
+    above). For a [`JSONField`](json-fields.md) it is structural containment
+    (`@>`) instead — see [Working with JSON](json-fields.md#containment-__contains-postgresql).
 
 !!! warning "PostgreSQL-only lookups"
     `regex`, `iregex` (and their `posix_regex`/`iposix_regex` aliases) and `search` are implemented for PostgreSQL only; on SQLite they raise `UnSupportedError`. The `microsecond` date part is likewise PostgreSQL-only.

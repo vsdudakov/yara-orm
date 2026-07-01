@@ -129,6 +129,20 @@ rows = (
     )
     ```
 
+!!! tip "Grouping and projecting across a relation"
+    `group_by()`, `values()` and `values_list()` accept `__`-separated
+    forward-relation paths — the related table is joined automatically — and
+    `values()` can alias them to clean output keys:
+
+    ```python
+    rows = (
+        await Book.annotate(n=Count("id"))
+        .group_by("author__country", "author__name")
+        .order_by("-n")
+        .values(country="author__country", author="author__name", n="n")
+    )
+    ```
+
 ## Filtering annotations → HAVING
 
 `yara_orm` decides between `WHERE` and `HAVING` by what you filter on:
