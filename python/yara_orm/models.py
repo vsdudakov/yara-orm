@@ -115,6 +115,36 @@ class MetaInfo:
         # keyed by ``(dialect, ordered db columns)``. A given column set always
         # maps to the same SQL, so entries never need invalidating.
         self._partial_update_cache: dict[tuple[str, tuple[str, ...]], str] = {}
+        # Memoised partial read-hydration plans for ``only()``/``defer()``,
+        # keyed by the ordered selected field names, so a partial SELECT reuses
+        # the same ``(names, active_decoders)`` split as the full-row fast path.
+        self._partial_plan_cache: dict[tuple[str, ...], tuple[list[str], list[tuple]]] = {}
+
+    def partial_decode_plan(self, fields: list[Field]) -> tuple[list[str], list[tuple]]:
+        """Return the cached ``(names, active_decoders)`` plan for a subset.
+
+        Mirrors :meth:`_build_decode_plan` for an ``only()``/``defer()`` column
+        subset: the attr names (assigned in one ``dict.update``) and the index/
+        name/converter triples for the columns that need a Python decoder.
+
+        Args:
+            fields: The selected fields, in SELECT column order.
+
+        Returns:
+            A ``(names, active_decoders)`` tuple.
+        """
+        key = tuple(f.model_field_name for f in fields)
+        plan = self._partial_plan_cache.get(key)
+        if plan is None:
+            names = [f.model_field_name for f in fields]
+            active = [
+                (i, f.model_field_name, f.to_python)
+                for i, f in enumerate(fields)
+                if not f.read_identity
+            ]
+            plan = (names, active)
+            self._partial_plan_cache[key] = plan
+        return plan
 
     def _build_decode_plan(self) -> None:
         """Precompute the fast-path row-hydration plan from ``self.decoders``.
@@ -813,7 +843,9 @@ class Model(metaclass=ModelMeta):
 
         Powers ``only()`` / ``defer()``: only ``fields`` are set, so reading any
         other column raises ``FieldError`` (via the field descriptor) rather
-        than returning a stale or wrong value.
+        than returning a stale or wrong value. Uses the cached partial decode
+        plan (:meth:`MetaInfo.partial_decode_plan`) so the per-field
+        read-identity branch is resolved once, not per row.
 
         Args:
             values: Raw column values in ``fields`` order.
@@ -822,15 +854,45 @@ class Model(metaclass=ModelMeta):
         Returns:
             A new, partially-populated instance marked as already persisted.
         """
+        names, active = cls._meta.partial_decode_plan(fields)
         obj = cls.__new__(cls)
         d = obj.__dict__
         d["_in_db"] = True
-        for field, value in zip(fields, values):
-            decode = None if field.read_identity else field.to_python
-            d[field.model_field_name] = (
-                value if (decode is None or value is None) else decode(value)
-            )
+        d.update(zip(names, values))
+        for i, name, decode in active:
+            value = values[i]
+            if value is not None:
+                d[name] = decode(value)
         return obj
+
+    @classmethod
+    def _from_db_rows_fields(cls, rows: list[list[Any]], fields: list[Field]) -> list[Model]:
+        """Build partially-populated instances for many rows (batch fast path).
+
+        The ``only()``/``defer()`` counterpart of :meth:`_from_db_rows`: the
+        cached decode plan and ``__new__`` are resolved once for the batch.
+
+        Args:
+            rows: Raw column-value lists in ``fields`` order.
+            fields: The selected fields, matching the SELECT column order.
+
+        Returns:
+            The hydrated, partially-populated instances.
+        """
+        names, active = cls._meta.partial_decode_plan(fields)
+        new = cls.__new__
+        out: list[Model] = []
+        for values in rows:
+            obj = new(cls)
+            d = obj.__dict__
+            d["_in_db"] = True
+            d.update(zip(names, values))
+            for i, name, decode in active:
+                value = values[i]
+                if value is not None:
+                    d[name] = decode(value)
+            out.append(obj)
+        return out
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         """Return a debugging representation showing the type and primary key.

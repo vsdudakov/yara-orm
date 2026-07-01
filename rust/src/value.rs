@@ -8,12 +8,13 @@ use std::error::Error;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::prelude::*;
-use pyo3::types::{
-    PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
-};
-use pyo3::Borrowed;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyType;
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyFrozenSet, PyInt, PyList,
+    PySet, PyString, PyTime, PyTuple,
+};
+use pyo3::Borrowed;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
 use crate::error::EngineError;
@@ -32,6 +33,8 @@ static DECIMAL_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 // `yara_orm.Array` marks a sequence to bind as a PostgreSQL array (a bare list
 // binds as JSON). Resolved by import and cached like the scalar types above.
 static ARRAY_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+// `enum.Enum` base, to coerce enum members inside a JSON value (their `.value`).
+static ENUM_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     UUID_TYPE.import(py, "uuid", "UUID")
@@ -43,6 +46,36 @@ fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
 
 fn array_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     ARRAY_TYPE.import(py, "yara_orm", "Array")
+}
+
+fn enum_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    ENUM_TYPE.import(py, "enum", "Enum")
+}
+
+/// Standard base64 (with padding), matching Python's `base64.b64encode`. Used to
+/// represent `bytes` inside a JSON value (JSON has no byte type).
+fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((n >> 18) & 63) as usize] as char);
+        out.push(CHARS[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            CHARS[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            CHARS[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +201,27 @@ fn py_to_json(ob: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     if ob.is_instance_of::<PyString>() {
         return Ok(serde_json::Value::String(ob.extract::<String>()?));
     }
-    if ob.is_instance_of::<PyList>() {
+    // ``bytes``/``bytearray`` have no JSON form; base64 keeps them reversible.
+    if ob.is_instance_of::<PyBytes>() || ob.is_instance_of::<PyByteArray>() {
+        return Ok(serde_json::Value::String(base64_encode(
+            &ob.extract::<Vec<u8>>()?,
+        )));
+    }
+    // ``datetime``/``date``/``time`` (datetime subclasses date) -> ISO string.
+    if ob.is_instance_of::<PyDateTime>()
+        || ob.is_instance_of::<PyDate>()
+        || ob.is_instance_of::<PyTime>()
+    {
+        return Ok(serde_json::Value::String(
+            ob.call_method0("isoformat")?.extract::<String>()?,
+        ));
+    }
+    // list / tuple / set / frozenset -> JSON array.
+    if ob.is_instance_of::<PyList>()
+        || ob.is_instance_of::<PyTuple>()
+        || ob.is_instance_of::<PySet>()
+        || ob.is_instance_of::<PyFrozenSet>()
+    {
         let mut arr = Vec::new();
         for item in ob.try_iter()? {
             arr.push(py_to_json(&item?)?);
@@ -183,9 +236,20 @@ fn py_to_json(ob: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         }
         return Ok(serde_json::Value::Object(map));
     }
-    Err(pyo3::exceptions::PyTypeError::new_err(
-        "value is not JSON serialisable",
-    ))
+    // ``uuid.UUID`` / ``decimal.Decimal`` -> their string form; ``enum`` -> its
+    // ``.value`` (recursed). These have no dedicated C-type, so dispatch against
+    // the cached type objects (mirrors the Python `_json_safe` this replaced).
+    let py = ob.py();
+    if ob.is_instance(uuid_type(py)?.as_any())? || ob.is_instance(decimal_type(py)?.as_any())? {
+        return Ok(serde_json::Value::String(ob.str()?.to_string()));
+    }
+    if ob.is_instance(enum_type(py)?.as_any())? {
+        return py_to_json(&ob.getattr("value")?);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "value of type {} is not JSON serialisable",
+        ob.get_type().name()?
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +416,16 @@ impl ToSql for Value {
                 },
                 _ => v.to_sql(ty, out),
             },
-            Value::Text(v) => v.to_sql(ty, out),
+            Value::Text(v) => {
+                // A string bound where the server expects a uuid — e.g. an
+                // element of a ``::uuid[]`` array, whose element type is UUID —
+                // is parsed and encoded as uuid binary, since a raw string would
+                // be rejected as an "improper binary format".
+                if *ty == Type::UUID {
+                    return uuid::Uuid::parse_str(v)?.to_sql(ty, out);
+                }
+                v.to_sql(ty, out)
+            }
             Value::Bytes(v) => v.to_sql(ty, out),
             Value::Json(v) => v.to_sql(ty, out),
             Value::Array(items) => items.to_sql(ty, out),
@@ -402,7 +475,10 @@ impl<'py> IntoPyObject<'py> for PyRow {
 pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
     let mut out = Row::with_capacity(row.columns().len());
     for (idx, col) in row.columns().iter().enumerate() {
-        out.push((col.name().to_string(), decode_pg_cell(row, idx, col.type_())?));
+        out.push((
+            col.name().to_string(),
+            decode_pg_cell(row, idx, col.type_())?,
+        ));
     }
     Ok(out)
 }
@@ -501,7 +577,11 @@ pub fn decode_sqlite(decl: &str, vr: rusqlite::types::ValueRef) -> Value {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
                 return Value::TimestampTz(dt.with_timezone(&chrono::Utc));
             }
-            for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+            for fmt in [
+                "%Y-%m-%d %H:%M:%S%.f",
+                "%Y-%m-%dT%H:%M:%S%.f",
+                "%Y-%m-%d %H:%M:%S",
+            ] {
                 if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&s, fmt) {
                     return Value::Timestamp(ndt);
                 }
@@ -581,7 +661,9 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Va
             // ``Vec<Option<_>>`` and map a missing element to ``Value::Null``.
             match row.try_get::<_, Option<Vec<Option<$rust>>>>(idx) {
                 Ok(Some(vs)) => Ok(Value::Array(
-                    vs.into_iter().map(|o| o.map($wrap).unwrap_or(Value::Null)).collect(),
+                    vs.into_iter()
+                        .map(|o| o.map($wrap).unwrap_or(Value::Null))
+                        .collect(),
                 )),
                 Ok(None) => Ok(Value::Null),
                 Err(e) => Err(EngineError::Conversion(format!(
@@ -598,36 +680,36 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Va
     // table / binary search instead of a ~16-deep chain of `Type` equality
     // comparisons per cell. OIDs are fixed catalog values (see pg_type.dat).
     match ty.oid() {
-        16 => get!(bool, Value::Bool),                  // BOOL
-        21 => get!(i16, |v| Value::Int(v as i64)),      // INT2
-        23 => get!(i32, |v| Value::Int(v as i64)),      // INT4
-        20 => get!(i64, Value::Int),                    // INT8
-        700 => get!(f32, |v| Value::Float(v as f64)),   // FLOAT4
-        701 => get!(f64, Value::Float),                 // FLOAT8
-        25 | 1043 | 1042 | 19 => get!(String, Value::Text), // TEXT/VARCHAR/BPCHAR/NAME
-        17 => get!(Vec<u8>, Value::Bytes),              // BYTEA
-        114 | 3802 => get!(serde_json::Value, Value::Json), // JSON/JSONB
-        2950 => get!(uuid::Uuid, Value::Uuid),          // UUID
+        16 => get!(bool, Value::Bool),                       // BOOL
+        21 => get!(i16, |v| Value::Int(v as i64)),           // INT2
+        23 => get!(i32, |v| Value::Int(v as i64)),           // INT4
+        20 => get!(i64, Value::Int),                         // INT8
+        700 => get!(f32, |v| Value::Float(v as f64)),        // FLOAT4
+        701 => get!(f64, Value::Float),                      // FLOAT8
+        25 | 1043 | 1042 | 19 => get!(String, Value::Text),  // TEXT/VARCHAR/BPCHAR/NAME
+        17 => get!(Vec<u8>, Value::Bytes),                   // BYTEA
+        114 | 3802 => get!(serde_json::Value, Value::Json),  // JSON/JSONB
+        2950 => get!(uuid::Uuid, Value::Uuid),               // UUID
         1700 => get!(rust_decimal::Decimal, Value::Decimal), // NUMERIC
-        1114 => get!(NaiveDateTime, Value::Timestamp),  // TIMESTAMP
-        1184 => get!(DateTime<Utc>, Value::TimestampTz), // TIMESTAMPTZ
-        1082 => get!(NaiveDate, Value::Date),           // DATE
-        1083 => get!(NaiveTime, Value::Time),           // TIME
-        2278 => Ok(Value::Null),                        // VOID (e.g. pg_sleep)
+        1114 => get!(NaiveDateTime, Value::Timestamp),       // TIMESTAMP
+        1184 => get!(DateTime<Utc>, Value::TimestampTz),     // TIMESTAMPTZ
+        1082 => get!(NaiveDate, Value::Date),                // DATE
+        1083 => get!(NaiveTime, Value::Time),                // TIME
+        2278 => Ok(Value::Null),                             // VOID (e.g. pg_sleep)
         // Array element types (``_xxx`` OIDs), decoded to ``Value::Array``.
-        1000 => get_arr!(bool, Value::Bool),                  // _bool
-        1005 => get_arr!(i16, |v| Value::Int(v as i64)),      // _int2
-        1007 => get_arr!(i32, |v| Value::Int(v as i64)),      // _int4
-        1016 => get_arr!(i64, Value::Int),                    // _int8
-        1021 => get_arr!(f32, |v| Value::Float(v as f64)),    // _float4
-        1022 => get_arr!(f64, Value::Float),                  // _float8
-        1009 | 1015 | 1014 => get_arr!(String, Value::Text),  // _text/_varchar/_bpchar
-        2951 => get_arr!(uuid::Uuid, Value::Uuid),            // _uuid
+        1000 => get_arr!(bool, Value::Bool),             // _bool
+        1005 => get_arr!(i16, |v| Value::Int(v as i64)), // _int2
+        1007 => get_arr!(i32, |v| Value::Int(v as i64)), // _int4
+        1016 => get_arr!(i64, Value::Int),               // _int8
+        1021 => get_arr!(f32, |v| Value::Float(v as f64)), // _float4
+        1022 => get_arr!(f64, Value::Float),             // _float8
+        1009 | 1015 | 1014 => get_arr!(String, Value::Text), // _text/_varchar/_bpchar
+        2951 => get_arr!(uuid::Uuid, Value::Uuid),       // _uuid
         1231 => get_arr!(rust_decimal::Decimal, Value::Decimal), // _numeric
-        1115 => get_arr!(NaiveDateTime, Value::Timestamp),    // _timestamp
-        1185 => get_arr!(DateTime<Utc>, Value::TimestampTz),  // _timestamptz
-        1182 => get_arr!(NaiveDate, Value::Date),             // _date
-        1183 => get_arr!(NaiveTime, Value::Time),             // _time
+        1115 => get_arr!(NaiveDateTime, Value::Timestamp), // _timestamp
+        1185 => get_arr!(DateTime<Utc>, Value::TimestampTz), // _timestamptz
+        1182 => get_arr!(NaiveDate, Value::Date),        // _date
+        1183 => get_arr!(NaiveTime, Value::Time),        // _time
         _ => {
             // Genuinely unknown type: try its text representation, and if even
             // that fails we don't understand the type at all, so degrade to NULL

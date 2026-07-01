@@ -33,11 +33,7 @@ pub trait Backend: Send + Sync {
     /// connection. Returns the first result row of each execution (empty when a
     /// statement returns nothing), preserving input order. This is the fast
     /// path for bulk inserts with `RETURNING`.
-    async fn execute_many(
-        &self,
-        sql: &str,
-        rows: &[Vec<Value>],
-    ) -> Result<Vec<Row>, EngineError>;
+    async fn execute_many(&self, sql: &str, rows: &[Vec<Value>]) -> Result<Vec<Row>, EngineError>;
 
     /// Short dialect identifier (e.g. `"postgres"`); the Python layer uses this
     /// to pick a SQL dialect for query generation.

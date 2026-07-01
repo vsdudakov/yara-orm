@@ -4,7 +4,6 @@ import datetime as dt
 import json
 import uuid
 from decimal import Decimal
-from enum import Enum
 
 import pytest
 
@@ -361,25 +360,3 @@ async def test_jsonfield_encoder_returning_string_is_parsed_back(db):
     """
     row = await FldEnc.create(data={"x": 1})
     assert (await FldEnc.get(id=row.id)).data == {"wrapped": {"x": 1}}
-
-
-def test_json_safe_handles_enum_coerces_bytes_and_raises_on_unknown():
-    """
-    GIVEN a plain Enum member, a bytes value and an unhandled object
-    WHEN _json_safe processes them
-    THEN the Enum unwraps, bytes become base64, and an unknown leaf raises a
-    FieldError naming its location
-    """
-    import base64
-
-    from yara_orm.exceptions import FieldError
-    from yara_orm.fields import _json_safe
-
-    class Colour(Enum):
-        RED = "red"
-
-    assert _json_safe(Colour.RED) == "red"
-    assert _json_safe({"b": b"hi"}) == {"b": base64.b64encode(b"hi").decode()}
-
-    with pytest.raises(FieldError, match=r"data\.bad"):
-        _json_safe({"data": {"bad": object()}})

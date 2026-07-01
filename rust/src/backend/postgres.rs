@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{Kind, ToSql, Type};
 use tokio_postgres::{NoTls, Statement};
 
 use crate::backend::pool::extract_pool_params;
@@ -30,25 +30,34 @@ async fn prepare(client: &Object, sql: &str, cache: bool) -> Result<Statement, E
     })
 }
 
+/// The unspecified parameter type (OID 0): tells the server to infer *this*
+/// parameter's type from context, per the Parse-message protocol. Used for
+/// values with no definite type here (arrays, JSON, NULL).
+fn unspecified_type() -> Type {
+    Type::new(String::new(), 0, Kind::Simple, String::new())
+}
+
 /// Prepare `sql`, declaring each parameter's type from its Python value (so the
 /// server doesn't mis-infer it from context — e.g. a `float` compared to an
-/// `int` column). Falls back to plain `prepare` when any parameter's type is
-/// left to the server (`NULL`/JSON), since those carry no definite type here.
+/// `int` column). A value with no definite type here (array/JSON/NULL) is given
+/// OID 0 so the server infers *that one* from context, without dropping the
+/// declared types of the others — otherwise a `::uuid`-cast text param mixed
+/// with an array would be re-inferred as `uuid` and mis-encoded (22P03).
 async fn prepare_for(
     client: &Object,
     sql: &str,
     params: &[Value],
     cache: bool,
 ) -> Result<Statement, EngineError> {
-    let types: Option<Vec<Type>> = params.iter().map(|v| v.pg_type()).collect();
-    match types {
-        Some(types) => Ok(if cache {
-            client.prepare_typed_cached(sql, &types).await?
-        } else {
-            client.prepare_typed(sql, &types).await?
-        }),
-        None => prepare(client, sql, cache).await,
-    }
+    let types: Vec<Type> = params
+        .iter()
+        .map(|v| v.pg_type().unwrap_or_else(unspecified_type))
+        .collect();
+    Ok(if cache {
+        client.prepare_typed_cached(sql, &types).await?
+    } else {
+        client.prepare_typed(sql, &types).await?
+    })
 }
 
 impl PgBackend {
@@ -149,11 +158,7 @@ impl Backend for PgBackend {
         rows.iter().map(decode_pg_row_values).collect()
     }
 
-    async fn execute_many(
-        &self,
-        sql: &str,
-        rows: &[Vec<Value>],
-    ) -> Result<Vec<Row>, EngineError> {
+    async fn execute_many(&self, sql: &str, rows: &[Vec<Value>]) -> Result<Vec<Row>, EngineError> {
         let client = self.get().await?;
         let stmt = prepare(&client, sql, self.cache_statements).await?;
 
@@ -242,7 +247,9 @@ impl TxConn for PgTx {
     }
 
     async fn savepoint(&self, name: &str) -> Result<(), EngineError> {
-        self.client.batch_execute(&format!("SAVEPOINT {name}")).await?;
+        self.client
+            .batch_execute(&format!("SAVEPOINT {name}"))
+            .await?;
         Ok(())
     }
 

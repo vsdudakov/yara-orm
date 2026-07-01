@@ -84,6 +84,33 @@ async def test_raw_uuid_list_any_filter(db):
 
 
 @pytest.mark.asyncio
+async def test_uuid_and_array_params_mixed(db):
+    """
+    GIVEN a statement binding both a UUID param and an array param
+    WHEN executed in either order (uuid + int[], text + uuid[], int[] + uuid)
+    THEN the mixed binary encoding is correct (no 22P03)
+    """
+    if db == "sqlite":
+        pytest.skip("PostgreSQL arrays / ::uuid casts are not available on SQLite")
+    import uuid
+
+    conn = connections.get()
+    u = str(uuid.uuid4())
+
+    r1 = await conn.execute_query_dict("SELECT $1::uuid AS u, $2::int[] AS a", [u, [1, 2]])
+    assert r1[0]["a"] == [1, 2]
+    assert str(r1[0]["u"]) == u
+
+    r2 = await conn.execute_query_dict("SELECT $1::text AS s, $2::uuid[] AS a", ["hi", [u]])
+    assert r2[0]["s"] == "hi"
+    assert str(r2[0]["a"][0]) == u
+
+    r3 = await conn.execute_query_dict("SELECT $1::int[] AS a, $2::uuid AS u", [[1, 2], u])
+    assert r3[0]["a"] == [1, 2]
+    assert str(r3[0]["u"]) == u
+
+
+@pytest.mark.asyncio
 async def test_reverse_relation_isnull(db):
     """
     GIVEN portfolios, one with an alert and one without

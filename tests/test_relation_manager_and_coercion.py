@@ -15,7 +15,6 @@ import datetime as dt
 import pytest
 
 from yara_orm import Model, Subquery, fields
-from yara_orm.exceptions import FieldError
 
 
 class RmOrg(Model):
@@ -198,25 +197,51 @@ async def test_create_from_iso_string_keeps_datetime_on_instance(db):
 
 
 @pytest.mark.asyncio
-async def test_jsonfield_coerces_bytes(db):
+async def test_jsonfield_coerces_exotic_types(db):
     """
-    GIVEN a JSON column holding a bytes value
+    GIVEN a JSON column holding bytes/UUID/Decimal/datetime/enum/set values
     WHEN the row is stored and re-read
-    THEN the bytes round-trip as a base64 string
+    THEN the engine coerces each to its JSON form and it round-trips
     """
-    d = await RmDoc.create(props={"blob": b"hello", "n": 1})
-    got = await RmDoc.get(id=d.id)
-    assert got.props == {"blob": base64.b64encode(b"hello").decode(), "n": 1}
+    import datetime as dt
+    import uuid
+    from decimal import Decimal
+    from enum import Enum
+
+    class Colour(Enum):
+        RED = "red"
+
+    u = uuid.uuid4()
+    d = await RmDoc.create(
+        props={
+            "blob": b"hello",
+            "u": u,
+            "price": Decimal("12.34"),
+            "when": dt.datetime(2026, 7, 1, 12, 0, 0),
+            "colour": Colour.RED,
+            "tags": {1, 2, 3},
+            "n": 1,
+        }
+    )
+    got = (await RmDoc.get(id=d.id)).props
+    assert got["blob"] == base64.b64encode(b"hello").decode()
+    assert got["u"] == str(u)
+    assert got["price"] == "12.34"
+    assert got["when"] == "2026-07-01T12:00:00"
+    assert got["colour"] == "red"
+    assert sorted(got["tags"]) == [1, 2, 3]
+    assert got["n"] == 1
 
 
-def test_jsonfield_raises_clear_error_on_unknown_leaf():
+@pytest.mark.asyncio
+async def test_jsonfield_unserialisable_value_raises(db):
     """
-    GIVEN a JSON value containing an unserialisable nested object
-    WHEN it is prepared for binding
-    THEN a FieldError names the offending path
+    GIVEN a JSON value containing an object with no JSON form
+    WHEN it is stored
+    THEN the engine rejects it at bind time
     """
-    with pytest.raises(FieldError, match=r"meta\.obj"):
-        fields.JSONField().to_db({"meta": {"obj": object()}})
+    with pytest.raises(TypeError):
+        await RmDoc.create(props={"bad": object()})
 
 
 @pytest.mark.asyncio
