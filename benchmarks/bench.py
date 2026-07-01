@@ -33,6 +33,13 @@ HALF = N // 2
 NOW = datetime.now(timezone.utc)
 NOW_NAIVE = datetime.now()
 
+#: Categories the rows are spread across for the aggregate benchmark
+#: (``GROUP BY cat`` with ``COUNT``/``SUM`` and a ``HAVING`` threshold) and the
+#: threshold itself — a group passes when it holds more than TH rows (all do
+#: under the even spread, so the HAVING clause is still evaluated each run).
+CATS = 20
+TH = (N // CATS) // 2
+
 
 #: Which database to benchmark: "postgres" (default) or "sqlite".
 BACKEND = os.environ.get("BENCH_BACKEND", "postgres")
@@ -109,12 +116,14 @@ class _Stopwatch:
 # ---------------------------------------------------------------------------
 async def run_ours() -> dict:
     from yara_orm import Model, YaraOrm, fields
+    from yara_orm.aggregations import Count, Sum
     from yara_orm.connection import get_engine
 
     class BOurs(Model):
         id = fields.IntField(pk=True)
         name = fields.CharField(max_length=50)
         value = fields.IntField()
+        cat = fields.IntField()  # low-cardinality group key for the aggregate op
         created = fields.DatetimeField(auto_now_add=True)
 
         class Meta:
@@ -127,10 +136,21 @@ async def run_ours() -> dict:
 
     res: dict = {}
 
-    objs = [BOurs(name=f"n{i}", value=i) for i in range(N)]
+    objs = [BOurs(name=f"n{i}", value=i, cat=i % CATS) for i in range(N)]
     with _Stopwatch() as sw:
         await BOurs.bulk_create(objs)
     res["bulk_insert"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        agg = await (
+            BOurs.annotate(n=Count("id"), s=Sum("value"))
+            .group_by("cat")
+            .filter(n__gt=TH)
+            .order_by("cat")
+            .values("cat", "n", "s")
+        )
+    res["group_by"] = sw.elapsed
+    assert len(agg) == CATS
 
     with _Stopwatch() as sw:
         rows = await BOurs.all()
@@ -162,7 +182,7 @@ async def run_ours() -> dict:
     await engine.execute(clear_sql("bench_ours"))
     with _Stopwatch() as sw:
         for i in range(S):
-            await BOurs.create(name=f"s{i}", value=i)
+            await BOurs.create(name=f"s{i}", value=i, cat=i % CATS)
     res["single_insert"] = sw.elapsed
 
     await YaraOrm.close()
@@ -176,12 +196,15 @@ async def run_ours() -> dict:
 # model must live at module scope (not inside the runner function).
 try:
     from tortoise import fields as tfields
+    from tortoise.functions import Count as TCount
+    from tortoise.functions import Sum as TSum
     from tortoise.models import Model as TModel
 
     class BTort(TModel):
         id = tfields.IntField(pk=True)
         name = tfields.CharField(max_length=50)
         value = tfields.IntField()
+        cat = tfields.IntField()
         created = tfields.DatetimeField(auto_now_add=True)
 
         class Meta:
@@ -201,10 +224,21 @@ async def run_tortoise() -> dict:
 
     res: dict = {}
 
-    objs = [BTort(name=f"n{i}", value=i) for i in range(N)]
+    objs = [BTort(name=f"n{i}", value=i, cat=i % CATS) for i in range(N)]
     with _Stopwatch() as sw:
         await BTort.bulk_create(objs)
     res["bulk_insert"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        agg = await (
+            BTort.annotate(n=TCount("id"), s=TSum("value"))
+            .group_by("cat")
+            .filter(n__gt=TH)
+            .order_by("cat")
+            .values("cat", "n", "s")
+        )
+    res["group_by"] = sw.elapsed
+    assert len(agg) == CATS
 
     with _Stopwatch() as sw:
         rows = await BTort.all()
@@ -236,7 +270,7 @@ async def run_tortoise() -> dict:
     await conn.execute_query(clear_sql("bench_tortoise"))
     with _Stopwatch() as sw:
         for i in range(S):
-            await BTort.create(name=f"s{i}", value=i)
+            await BTort.create(name=f"s{i}", value=i, cat=i % CATS)
     res["single_insert"] = sw.elapsed
 
     await Tortoise.close_connections()
@@ -256,12 +290,32 @@ def run_pony() -> dict:
         id = pony.PrimaryKey(int, auto=True)
         name = pony.Required(str)
         value = pony.Required(int)
+        cat = pony.Required(int)
         created = pony.Optional(datetime)
 
+    # Drop any leftover table BEFORE pony maps/creates it, so a table from an
+    # earlier run with a different schema (e.g. before the ``cat`` column) is
+    # rebuilt — mirroring how the other ORMs drop their table at the top of a run.
     if BACKEND == "sqlite":
+        import contextlib
+
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(f"{SQLITE_DIR}/bench_pony.db")
         db.bind(provider="sqlite", filename=f"{SQLITE_DIR}/bench_pony.db", create_db=True)
     else:
+        import psycopg2
+
         parts = pg_parts(URL)
+        conn = psycopg2.connect(
+            host=parts["host"],
+            port=parts["port"],
+            user=parts["user"],
+            password=parts["password"],
+            dbname=parts["database"],
+        )
+        conn.autocommit = True
+        conn.cursor().execute(drop_sql("bench_pony"))
+        conn.close()
         bind_kwargs = {
             "provider": "postgres",
             "user": parts["user"],
@@ -274,20 +328,23 @@ def run_pony() -> dict:
         db.bind(**bind_kwargs)
     db.generate_mapping(create_tables=True)
 
-    with pony.db_session:
-        db.execute(clear_sql("bench_pony"))
-        if BACKEND == "sqlite":
-            # DELETE doesn't reset AUTOINCREMENT; clear the sequence so ids
-            # restart at 1 each run (Postgres uses TRUNCATE ... RESTART IDENTITY).
-            db.execute("DELETE FROM sqlite_sequence WHERE name = 'bench_pony'")
-
     res: dict = {}
 
     with _Stopwatch() as sw:
         with pony.db_session:
             for i in range(N):
-                BPony(name=f"n{i}", value=i, created=NOW_NAIVE)
+                BPony(name=f"n{i}", value=i, cat=i % CATS, created=NOW_NAIVE)
     res["bulk_insert"] = sw.elapsed
+
+    try:
+        with _Stopwatch() as sw:
+            with pony.db_session:
+                pony.select(
+                    (p.cat, pony.count(p), pony.sum(p.value)) for p in BPony
+                ).filter(lambda cat, cnt, total: cnt > TH).order_by(1)[:]
+        res["group_by"] = sw.elapsed
+    except Exception:  # noqa: BLE001 - Pony's group-by/HAVING dialecting is finicky
+        pass  # leave group_by unset -> reported as "-" without losing the other ops
 
     with _Stopwatch() as sw:
         with pony.db_session:
@@ -329,7 +386,7 @@ def run_pony() -> dict:
     with _Stopwatch() as sw:
         for i in range(S):
             with pony.db_session:
-                BPony(name=f"s{i}", value=i, created=NOW_NAIVE)
+                BPony(name=f"s{i}", value=i, cat=i % CATS, created=NOW_NAIVE)
     res["single_insert"] = sw.elapsed
 
     db.disconnect()
@@ -354,6 +411,7 @@ try:
         id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
         name: Mapped[str] = mapped_column(String(50))
         value: Mapped[int] = mapped_column(Integer)
+        cat: Mapped[int] = mapped_column(Integer)
         created: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 except ImportError:  # pragma: no cover
@@ -371,12 +429,24 @@ async def run_sqlalchemy() -> dict:
 
     res: dict = {}
 
-    objs = [BAlc(name=f"n{i}", value=i, created=NOW) for i in range(N)]
+    objs = [BAlc(name=f"n{i}", value=i, cat=i % CATS, created=NOW) for i in range(N)]
     with _Stopwatch() as sw:
         async with Session() as s:
             s.add_all(objs)
             await s.commit()
     res["bulk_insert"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        async with Session() as s:
+            stmt = (
+                select(BAlc.cat, func.count(BAlc.id), func.sum(BAlc.value))
+                .group_by(BAlc.cat)
+                .having(func.count(BAlc.id) > TH)
+                .order_by(BAlc.cat)
+            )
+            agg = (await s.execute(stmt)).all()
+    res["group_by"] = sw.elapsed
+    assert len(agg) == CATS
 
     with _Stopwatch() as sw:
         async with Session() as s:
@@ -419,7 +489,7 @@ async def run_sqlalchemy() -> dict:
     with _Stopwatch() as sw:
         for i in range(S):
             async with Session() as s:
-                s.add(BAlc(name=f"s{i}", value=i, created=NOW))
+                s.add(BAlc(name=f"s{i}", value=i, cat=i % CATS, created=NOW))
                 await s.commit()
     res["single_insert"] = sw.elapsed
 
@@ -435,6 +505,7 @@ OPS = [
     ("single_insert", S, "rows"),
     ("fetch_all", N, "rows"),
     ("count", N, "rows"),
+    ("group_by", CATS, "groups"),
     ("filter", N - HALF, "rows"),
     ("get_by_pk", GETS, "queries"),
     ("update", HALF, "rows"),
