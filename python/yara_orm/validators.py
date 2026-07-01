@@ -201,7 +201,10 @@ class CommaSeparatedIntegerListValidator(Validator):
         parts = str(value).split(",")
         for part in parts:
             token = part.strip()
-            if not (token.lstrip("-").isdigit() and token not in ("", "-")):
+            # A single optional leading sign then digits; ``lstrip("-")`` used to
+            # accept ``"--5"`` (it strips every leading dash) — reject that here.
+            body = token[1:] if token[:1] == "-" else token
+            if not (body.isdigit() and body):
                 raise ValidationError(f"{value!r} is not a comma-separated list of integers")
 
 

@@ -22,6 +22,11 @@ if TYPE_CHECKING:
     from .relations import M2MInfo
 
 
+#: Memoised identifier -> quoted identifier, shared by every dialect (both quote
+#: identically). Bounded by the set of table/column names in the schema.
+_QUOTE_CACHE: dict[str, str] = {}
+
+
 class BaseDialect:
     """Base class rendering backend-agnostic SQL for a database dialect."""
 
@@ -83,13 +88,21 @@ class BaseDialect:
     def quote(self, identifier: str) -> str:
         """Quote a SQL identifier, escaping embedded quote characters.
 
+        The result depends only on the identifier (both current dialects
+        double-quote), so it is memoised in a shared cache: the SQL compilers
+        re-quote the same fixed set of table/column names thousands of times per
+        query build, and the identifier set is small and bounded.
+
         Args:
             identifier: The identifier (table or column name) to quote.
 
         Returns:
             The double-quoted, escaped identifier.
         """
-        return '"{}"'.format(identifier.replace('"', '""'))
+        quoted = _QUOTE_CACHE.get(identifier)
+        if quoted is None:
+            quoted = _QUOTE_CACHE[identifier] = '"{}"'.format(identifier.replace('"', '""'))
+        return quoted
 
     def placeholder(self, index: int) -> str:
         """Render a bound-parameter placeholder for the given position.

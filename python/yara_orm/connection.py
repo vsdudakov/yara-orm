@@ -221,7 +221,14 @@ class Record(dict):
             The matching column value (or a tuple of values for a slice).
         """
         if isinstance(key, (int, slice)):
-            return tuple(self.values())[key]
+            # Cache the values tuple: a result row is not mutated, so reading it
+            # positionally (row[0], row[1], ...) would otherwise rebuild the
+            # whole tuple on every access — O(n) per read, O(n^2) per row.
+            values = getattr(self, "_values", None)
+            if values is None:
+                values = tuple(self.values())
+                self._values = values
+            return values[key]
         return super().__getitem__(key)
 
 
@@ -1124,7 +1131,10 @@ class _Connections:
             return tx
         if name in _CONNECTIONS:
             return _EngineProxy(_CONNECTIONS[name][0])
-        return _EngineProxy(get_executor())
+        # Wrap the raw default engine, not get_executor(): the latter already
+        # returns an _EngineProxy while query hooks are registered, which would
+        # double-wrap and fire the hooks twice for raw SQL on this path.
+        return _EngineProxy(get_engine())
 
 
 connections = _Connections()

@@ -1575,7 +1575,7 @@ class RemoveCompositeIndex(Operation):
                 self.condition, self.unique, self.using, self.include, self.opclass
             )
         )
-        return _call("m.RemoveCompositeIndex", args)
+        return _call(f"m.{type(self).__name__}", args)
 
 
 class RemoveCompositeIndexIfExists(RemoveCompositeIndex):

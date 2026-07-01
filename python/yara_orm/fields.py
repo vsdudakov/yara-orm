@@ -225,6 +225,25 @@ def _int_to_db(value: Any) -> Any:
     return int(value) if isinstance(value, str) else value
 
 
+def _str_to_db(value: Any) -> Any:
+    """Coerce a non-string scalar to ``str`` before binding to a text column.
+
+    The mirror of :func:`_int_to_db`: a ``varchar``/``text`` column filtered or
+    populated with an ``int`` (``email__in=[101, "rep@x.com"]``, a numeric code
+    stored as text) binds as ``str`` rather than an integer — otherwise
+    PostgreSQL rejects it with 'operator does not exist: character varying =
+    bigint'. ``bool`` (an ``int`` subclass), ``F``/``None`` and everything else
+    pass through unchanged.
+
+    Args:
+        value: The Python value about to be bound.
+
+    Returns:
+        ``str(value)`` for a non-bool ``int``, otherwise ``value`` unchanged.
+    """
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else value
+
+
 class SmallIntField(Field):
     """A small integer column."""
 
@@ -254,6 +273,17 @@ class SmallIntField(Field):
             ``int(value)`` for a string, otherwise ``value`` unchanged.
         """
         return _int_to_db(value)
+
+    def to_python(self, value: Any) -> Any:
+        """Convert a database value into an ``int``.
+
+        Args:
+            value: The value returned by the database engine.
+
+        Returns:
+            The value as an ``int``, or ``None``.
+        """
+        return None if value is None else int(value)
 
 
 class IntField(Field):
@@ -438,11 +468,33 @@ class CharField(Field):
         self.max_length = max_length
         self.type_params = {"max_length": max_length}
 
+    def to_db(self, value: Any) -> Any:
+        """Coerce a non-string scalar (e.g. ``int``) to ``str`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``str(value)`` for a non-bool ``int``, otherwise ``value`` unchanged.
+        """
+        return _str_to_db(value)
+
 
 class TextField(Field):
     """An unbounded text column."""
 
     field_kind = "text"
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a non-string scalar (e.g. ``int``) to ``str`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``str(value)`` for a non-bool ``int``, otherwise ``value`` unchanged.
+        """
+        return _str_to_db(value)
 
 
 class BinaryField(Field):

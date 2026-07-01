@@ -64,14 +64,22 @@ class RelationInfo:
         self.source_attr = source_attr  # e.g. "tournament_id"
         self.reference = reference
         self.is_o2o = is_o2o
+        self._target: type[Model] | None = None
 
     def resolve_target(self) -> type[Model]:
-        """Resolve the target model class for this relation.
+        """Resolve (and memoise) the target model class for this relation.
+
+        Called on every forward-relation join compilation and relation access;
+        the reference is fixed once models are registered, so the resolved class
+        is cached after the first lookup.
 
         Returns:
             The model class referenced by this relation.
         """
-        return registry.get_model(model_name(self.reference))
+        target = self._target
+        if target is None:
+            target = self._target = registry.get_model(model_name(self.reference))
+        return target
 
 
 class M2MInfo:
@@ -103,22 +111,33 @@ class M2MInfo:
         self.through: str = field.through or ""
         self.forward_key: str = field.forward_key or ""  # -> target pk
         self.backward_key: str = field.backward_key or ""  # -> owner pk
+        self._target: type[Model] | None = None
+        self._finalized = False
 
     def resolve_target(self) -> type[Model]:
-        """Resolve the target model class for this relation.
+        """Resolve (and memoise) the target model class for this relation.
 
         Returns:
             The model class referenced by this relation.
         """
-        return registry.get_model(model_name(self.reference))
+        target = self._target
+        if target is None:
+            target = self._target = registry.get_model(model_name(self.reference))
+        return target
 
     def finalize(self) -> type[Model]:
         """Fill in defaulted table / key names once both models are known.
+
+        Idempotent and cheap to re-call: ``M2MManager`` finalises on every
+        ``obj.rel`` access, so once the defaults are filled the name-building is
+        skipped.
 
         Returns:
             The resolved target model class.
         """
         target = self.resolve_target()
+        if self._finalized:
+            return target
         owner_name = self.owner.__name__.lower()
         target_name = target.__name__.lower()
         if not self.through:
@@ -127,6 +146,7 @@ class M2MInfo:
             self.backward_key = f"{owner_name}_id"
         if not self.forward_key:
             self.forward_key = f"{target_name}_id"
+        self._finalized = True
         return target
 
 
@@ -255,6 +275,21 @@ class ReverseFKDescriptor:
         self.source_reference = source_reference
         self.source_attr = source_attr
         self.is_o2o = is_o2o
+        self._source: type[Model] | None = None
+
+    def _resolve_source(self) -> type[Model]:
+        """Resolve (and memoise) the source model of this reverse relation.
+
+        ``__get__`` runs on every ``obj.related_set`` access; the source model
+        is fixed once registered, so it is looked up once and cached.
+
+        Returns:
+            The source model class.
+        """
+        source = self._source
+        if source is None:
+            source = self._source = registry.get_model(model_name(self.source_reference))
+        return source
 
     def __get__(
         self, instance: Model | None, owner: type[Model] | None
@@ -271,7 +306,7 @@ class ReverseFKDescriptor:
         """
         if instance is None:
             return self
-        source = registry.get_model(model_name(self.source_reference))
+        source = self._resolve_source()
         cached = (instance.__dict__.get("_prefetch") or {}).get(self.name, _MISSING)
         if self.is_o2o:
             return ReverseOneToOne(source, self.source_attr, instance.pk, cached)
