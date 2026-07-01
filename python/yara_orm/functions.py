@@ -17,22 +17,30 @@ from .expressions import Expression
 ColumnResolver = Callable[[str], str]
 
 
-def _render_column_operand(
-    operand: Any, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+def _render_operand(
+    operand: Any,
+    resolve: ColumnResolver,
+    dialect: Any,
+    params: list[Any],
+    idx: int,
+    *,
+    str_is_column: bool,
 ) -> tuple[str, int]:
-    """Render a function's column operand to SQL.
+    """Render a function operand to SQL.
 
-    A plain ``str`` names a column; an :class:`~yara_orm.expressions.F` (or any
-    :class:`Expression`) and a nested :class:`Function` render themselves, so
-    functions compose with ``F`` and with one another (e.g.
-    ``Coalesce(F("at"), now)``).
+    An :class:`~yara_orm.expressions.F` (or any :class:`Expression`) and a nested
+    :class:`Function` render themselves, so functions compose with ``F`` and with
+    one another (e.g. ``Coalesce(F("at"), now)``). A plain value is a column name
+    when ``str_is_column`` is set (the usual operand), otherwise bound as a
+    parameter — a literal fallback such as :class:`Coalesce`'s default.
 
     Args:
-        operand: A field name, an ``Expression``/``F``, or a nested ``Function``.
+        operand: A field name/literal, an ``Expression``/``F``, or a ``Function``.
         resolve: Maps a field name to its qualified SQL column reference.
         dialect: The active dialect (provides ``placeholder``).
         params: Bound-parameter list, extended in place.
         idx: The next available 1-based bind-parameter index.
+        str_is_column: Whether a plain value names a column (else bind it).
 
     Returns:
         A ``(sql, next_index)`` tuple.
@@ -41,32 +49,8 @@ def _render_column_operand(
         return operand.resolve(resolve, dialect, params, idx)
     if isinstance(operand, Function):
         return operand.render_params(resolve, dialect, params, idx)
-    return resolve(operand), idx
-
-
-def _render_value_operand(
-    operand: Any, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
-) -> tuple[str, int]:
-    """Render a function's value operand (a literal fallback) to SQL.
-
-    Like :func:`_render_column_operand` but a plain value (including a ``str``)
-    is bound as a parameter rather than treated as a column — used for the
-    fallback of :class:`Coalesce`, where a bare string is a literal default.
-
-    Args:
-        operand: A literal value, an ``Expression``/``F``, or a ``Function``.
-        resolve: Maps a field name to its qualified SQL column reference.
-        dialect: The active dialect (provides ``placeholder``).
-        params: Bound-parameter list, extended in place.
-        idx: The next available 1-based bind-parameter index.
-
-    Returns:
-        A ``(sql, next_index)`` tuple.
-    """
-    if isinstance(operand, Expression):
-        return operand.resolve(resolve, dialect, params, idx)
-    if isinstance(operand, Function):
-        return operand.render_params(resolve, dialect, params, idx)
+    if str_is_column:
+        return resolve(operand), idx
     params.append(operand)
     return dialect.placeholder(idx), idx + 1
 
@@ -148,7 +132,9 @@ class _Unary(Function):
             A ``(sql, next_index)`` tuple.
         """
         if isinstance(self.field, (Expression, Function)):
-            inner, idx = _render_column_operand(self.field, resolve, dialect, params, idx)
+            inner, idx = _render_operand(
+                self.field, resolve, dialect, params, idx, str_is_column=True
+            )
             return f"{self.function}({inner})", idx
         return self.render(resolve), idx
 
@@ -220,7 +206,7 @@ class Concat(Function):
             return self.render(resolve), idx
         parts = []
         for field in self.fields:
-            sql, idx = _render_column_operand(field, resolve, dialect, params, idx)
+            sql, idx = _render_operand(field, resolve, dialect, params, idx, str_is_column=True)
             parts.append(sql)
         return "(" + " || ".join(parts) + ")", idx
 
@@ -261,8 +247,12 @@ class Coalesce(Function):
         Returns:
             A ``(sql, next_index)`` tuple.
         """
-        field_sql, idx = _render_column_operand(self.field, resolve, dialect, params, idx)
-        default_sql, idx = _render_value_operand(self.default, resolve, dialect, params, idx)
+        field_sql, idx = _render_operand(
+            self.field, resolve, dialect, params, idx, str_is_column=True
+        )
+        default_sql, idx = _render_operand(
+            self.default, resolve, dialect, params, idx, str_is_column=False
+        )
         return f"COALESCE({field_sql}, {default_sql})", idx
 
 
