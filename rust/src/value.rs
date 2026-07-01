@@ -24,6 +24,13 @@ fn oob(v: i64, sql_type: &str) -> Box<dyn Error + Sync + Send> {
     format!("integer {v} is out of range for {sql_type} column").into()
 }
 
+// Text wire formats shared by every encoder (pg-text, JSON, SQLite), so the
+// timestamp/date/time representation cannot drift between the paths. `TimestampTz`
+// uses RFC 3339 directly (`to_rfc3339`), so it needs no format string here.
+const FMT_TIMESTAMP: &str = "%Y-%m-%d %H:%M:%S%.6f";
+const FMT_DATE: &str = "%Y-%m-%d";
+const FMT_TIME: &str = "%H:%M:%S%.6f";
+
 // `uuid.UUID` and `decimal.Decimal` have no dedicated Python C-type, so they are
 // resolved by import. They are returned on essentially every row (UUID primary
 // keys) and bound on every `WHERE id = ?`, so the type objects are imported and
@@ -360,10 +367,10 @@ impl Value {
             Value::Uuid(v) => Some(v.to_string()),
             Value::Decimal(v) => Some(v.to_string()),
             Value::Json(v) => Some(v.to_string()),
-            Value::Timestamp(v) => Some(v.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+            Value::Timestamp(v) => Some(v.format(FMT_TIMESTAMP).to_string()),
             Value::TimestampTz(v) => Some(v.to_rfc3339()),
-            Value::Date(v) => Some(v.format("%Y-%m-%d").to_string()),
-            Value::Time(v) => Some(v.format("%H:%M:%S%.6f").to_string()),
+            Value::Date(v) => Some(v.format(FMT_DATE).to_string()),
+            Value::Time(v) => Some(v.format(FMT_TIME).to_string()),
             Value::Null | Value::Text(_) | Value::Bytes(_) | Value::Array(_) => None,
         }
     }
@@ -501,10 +508,10 @@ fn value_to_json(v: Value) -> serde_json::Value {
         Value::Array(items) => J::Array(items.into_iter().map(value_to_json).collect()),
         Value::Uuid(u) => J::String(u.to_string()),
         Value::Decimal(d) => J::String(d.to_string()),
-        Value::Timestamp(t) => J::String(t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+        Value::Timestamp(t) => J::String(t.format(FMT_TIMESTAMP).to_string()),
         Value::TimestampTz(t) => J::String(t.to_rfc3339()),
-        Value::Date(d) => J::String(d.format("%Y-%m-%d").to_string()),
-        Value::Time(t) => J::String(t.format("%H:%M:%S%.6f").to_string()),
+        Value::Date(d) => J::String(d.format(FMT_DATE).to_string()),
+        Value::Time(t) => J::String(t.format(FMT_TIME).to_string()),
     }
 }
 
@@ -528,10 +535,10 @@ pub fn value_into_sqlite(v: Value) -> rusqlite::types::Value {
         ),
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Decimal(d) => S::Text(d.to_string()),
-        Value::Timestamp(dt) => S::Text(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+        Value::Timestamp(dt) => S::Text(dt.format(FMT_TIMESTAMP).to_string()),
         Value::TimestampTz(dt) => S::Text(dt.to_rfc3339()),
-        Value::Date(d) => S::Text(d.format("%Y-%m-%d").to_string()),
-        Value::Time(t) => S::Text(t.format("%H:%M:%S%.6f").to_string()),
+        Value::Date(d) => S::Text(d.format(FMT_DATE).to_string()),
+        Value::Time(t) => S::Text(t.format(FMT_TIME).to_string()),
     }
 }
 
