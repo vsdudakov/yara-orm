@@ -119,63 +119,72 @@ class BaseDialect:
     def date_part_sql(self, part: str, col: str) -> str:
         """Render an expression extracting a date/time part from a column.
 
+        Backend-specific; concrete dialects override this.
+
         Args:
             part: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
             col: The already-qualified column reference.
 
+        Raises:
+            UnSupportedError: On a dialect that does not implement it.
+
         Returns:
-            A SQL expression yielding the integer part (e.g. ``EXTRACT(...)``).
+            A SQL expression yielding the integer part.
         """
-        return f"EXTRACT({self._extract_parts[part]} FROM {col})"
+        raise UnSupportedError(f"{self.name} does not support date-part extraction")
 
     def truncate_date_sql(self, col: str) -> str:
         """Render an expression truncating a datetime column to a date.
 
+        Backend-specific; concrete dialects override this.
+
         Args:
             col: The already-qualified column reference.
+
+        Raises:
+            UnSupportedError: On a dialect that does not implement it.
 
         Returns:
             A SQL expression yielding the date part (for the ``__date`` lookup).
         """
-        return f"CAST({col} AS DATE)"
+        raise UnSupportedError(f"{self.name} does not support the __date lookup")
 
     def json_extract_sql(self, col: str, keys: list[str]) -> str:
         """Render extraction of a JSON key path from a column, as text.
 
-        The default is the PostgreSQL form: chain ``->`` for every key but the
-        last and ``->>`` for the last, so the result is text (comparable with a
-        bound string). With no keys the column itself is returned.
+        Backend-specific; concrete dialects override this. With no keys the
+        column itself is returned.
 
         Args:
             col: The already-qualified JSON column reference.
             keys: The object keys to traverse (outermost first).
+
+        Raises:
+            UnSupportedError: On a dialect that does not implement it.
 
         Returns:
             A SQL expression yielding the addressed value as text.
         """
         if not keys:
             return col
-        parts = [col]
-        last = len(keys) - 1
-        for i, key in enumerate(keys):
-            parts.append(f"{'->>' if i == last else '->'} {self._literal(key)}")
-        return " ".join(parts)
+        raise UnSupportedError(f"{self.name} does not support JSON key-path lookups")
 
     def json_contains_sql(self, col: str, placeholder: str) -> str:
         """Render a JSON containment test (``__contains`` on a ``JSONField``).
 
-        The default is the PostgreSQL ``@>`` operator; the bound value is a JSON
-        string cast to ``jsonb``, so an object subset, an array element, or an
-        array-of-objects subset all match.
+        Backend-specific; concrete dialects override this.
 
         Args:
             col: The already-qualified JSON column reference.
             placeholder: The bound-parameter placeholder for the JSON value.
 
+        Raises:
+            UnSupportedError: On a dialect that does not implement it.
+
         Returns:
             A boolean SQL expression testing containment.
         """
-        return f"{col} @> {placeholder}::jsonb"
+        raise UnSupportedError(f"{self.name} does not support JSON containment")
 
     def cast_text(self, col: str) -> str:
         """Render an expression casting a column to text.
@@ -411,7 +420,9 @@ class BaseDialect:
             The list of SQL statements creating the table.
         """
         lines = [self.column_sql(f) for f in meta.fields.values()]
-        lines.append(f"PRIMARY KEY ({self.quote(meta.pk_field.db_column)})")
+        pk_line = self._pk_line(meta)
+        if pk_line:
+            lines.append(pk_line)
 
         for field in meta.fields.values():
             if isinstance(field, ForeignKeyField) and field.db_constraint:
@@ -444,6 +455,20 @@ class BaseDialect:
         # Comments from `description=` and a model's `Meta.table_description`.
         statements.extend(self._comment_sql(meta))
         return statements
+
+    def _pk_line(self, meta: MetaInfo) -> str | None:
+        """Return the table-level ``PRIMARY KEY (...)`` clause, or None.
+
+        A dialect that renders the primary key inline on the column (SQLite's
+        ``INTEGER PRIMARY KEY``) returns None to omit the separate clause.
+
+        Args:
+            meta: The model metadata describing the table.
+
+        Returns:
+            The ``PRIMARY KEY (...)`` clause, or None to omit it.
+        """
+        return f"PRIMARY KEY ({self.quote(meta.pk_field.db_column)})"
 
     def _comment_sql(self, meta: MetaInfo) -> list[str]:
         """Render ``COMMENT ON`` statements for a table and its columns.
@@ -997,6 +1022,65 @@ class PostgresDialect(BaseDialect):
     regex_ops = {"regex": "~", "iregex": "~*", "posix_regex": "~", "iposix_regex": "~*"}
     supports_search = True
 
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render ``EXTRACT(<part> FROM col)``.
+
+        Args:
+            part: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the integer part.
+        """
+        return f"EXTRACT({self._extract_parts[part]} FROM {col})"
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render ``CAST(col AS DATE)`` (for the ``__date`` lookup).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the date part.
+        """
+        return f"CAST({col} AS DATE)"
+
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render a JSON key path as text: chain ``->`` then ``->>`` for the last.
+
+        The result is text (comparable with a bound string). With no keys the
+        column itself is returned.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            A SQL expression yielding the addressed value as text.
+        """
+        if not keys:
+            return col
+        parts = [col]
+        last = len(keys) - 1
+        for i, key in enumerate(keys):
+            parts.append(f"{'->>' if i == last else '->'} {self._literal(key)}")
+        return " ".join(parts)
+
+    def json_contains_sql(self, col: str, placeholder: str) -> str:
+        """Render a JSON containment test with the ``@>`` operator.
+
+        The bound value is a JSON string cast to ``jsonb``, so an object subset,
+        an array element, or an array-of-objects subset all match.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            placeholder: The bound-parameter placeholder for the JSON value.
+
+        Returns:
+            A boolean SQL expression testing containment.
+        """
+        return f"{col} @> {placeholder}::jsonb"
+
     def search_sql(self, col: str, placeholder: str) -> str:
         """Render a PostgreSQL full-text match using ``to_tsvector``/``plainto_tsquery``.
 
@@ -1264,48 +1348,21 @@ class SqliteDialect(BaseDialect):
             return ""  # declared inline on the column
         return super()._pk_clause(tspec)
 
-    def create_table_sql(self, meta: MetaInfo, safe: bool = True) -> list[str]:
-        """Render statements to create a model's table and its indexes.
+    def _pk_line(self, meta: MetaInfo) -> str | None:
+        """Omit the separate ``PRIMARY KEY`` clause for an inline auto pk.
+
+        SQLite renders an auto-increment primary key inline as ``INTEGER PRIMARY
+        KEY``; any other primary key still needs the table-level clause.
 
         Args:
             meta: The model metadata describing the table.
-            safe: Whether to emit ``IF NOT EXISTS`` guards.
 
         Returns:
-            The list of SQL statements creating the table.
+            The ``PRIMARY KEY (...)`` clause, or None for an inline auto pk.
         """
-        pk = meta.pk_field
-        lines = [self.column_sql(f) for f in meta.fields.values()]
-        if not self._is_auto_pk(pk):
-            lines.append(f"PRIMARY KEY ({self.quote(pk.db_column)})")
-
-        for field in meta.fields.values():
-            if isinstance(field, ForeignKeyField) and field.db_constraint:
-                ref = get_model(field.reference)
-                col = self.quote(field.db_column)
-                ref_tbl = self.quote(ref._meta.table)
-                ref_pk = self.quote(ref._meta.pk_field.db_column)
-                lines.append(
-                    f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) "
-                    f"ON DELETE {field.on_delete}"
-                )
-        lines.extend(self._unique_together_lines(meta))
-        for constraint in meta.constraints:
-            lines.append(self._constraint_clause(constraint.to_spec()))
-
-        ine = "IF NOT EXISTS " if safe else ""
-        body = ",\n  ".join(lines)
-        statements = [f"CREATE TABLE {ine}{self.quote(meta.table)} (\n  {body}\n)"]
-        for field in meta.fields.values():
-            if field.index and not field.unique and not field.pk:
-                idx_name = f"idx_{meta.table}_{field.db_column}"
-                tbl = self.quote(meta.table)
-                statements.append(
-                    f"CREATE INDEX {ine}{self.quote(idx_name)} "
-                    f"ON {tbl} ({self.quote(field.db_column)})"
-                )
-        statements.extend(self._composite_index_statements(meta, ine))
-        return statements
+        if self._is_auto_pk(meta.pk_field):
+            return None
+        return super()._pk_line(meta)
 
 
 _DIALECTS: dict[str, type[BaseDialect]] = {
