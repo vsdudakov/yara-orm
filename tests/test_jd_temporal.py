@@ -267,9 +267,7 @@ async def test_datetime_range_filter(db):
     await JdMoment.create(at=dt.datetime(2020, 6, 1, 0, 0, 0))
     await JdMoment.create(at=dt.datetime(2021, 1, 1, 0, 0, 0))
 
-    rows = await JdMoment.filter(
-        at__range=(dt.datetime(2020, 3, 1), dt.datetime(2020, 12, 31))
-    )
+    rows = await JdMoment.filter(at__range=(dt.datetime(2020, 3, 1), dt.datetime(2020, 12, 31)))
     assert len(rows) == 1
     assert rows[0].at.month == 6
 

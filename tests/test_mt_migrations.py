@@ -353,9 +353,7 @@ async def test_history_and_heads_reflect_multiple_migrations(sqlite_orm, tmp_pat
         (tmp_path / f"000{i}_{name}.py").write_text(
             "from yara_orm import migrations as m\n\n\n"
             "class Migration(m.Migration):\n"
-            f"    dependencies = ['000{i - 1}_"
-            + ("initial" if i == 2 else "two")
-            + "']\n"
+            f"    dependencies = ['000{i - 1}_" + ("initial" if i == 2 else "two") + "']\n"
             "    operations = [m.RunPython(None)]\n"
         )
     assert await mgr.upgrade() == ["0002_two", "0003_three"]

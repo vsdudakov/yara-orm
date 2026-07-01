@@ -36,9 +36,7 @@ async def test_get_or_create_concurrent_all_created_distinct(db):
     WHEN they run together
     THEN each reports created=True and every distinct row lands exactly once
     """
-    results = await asyncio.gather(
-        *(MtCnRow.get_or_create(name=f"new-{i}") for i in range(20))
-    )
+    results = await asyncio.gather(*(MtCnRow.get_or_create(name=f"new-{i}") for i in range(20)))
     assert all(created for _obj, created in results)
     assert await MtCnRow.all().count() == 20
     assert {r.name for r in await MtCnRow.all()} == {f"new-{i}" for i in range(20)}
@@ -69,6 +67,7 @@ async def test_concurrent_bulk_creates(db):
     WHEN they all run together
     THEN every row from every batch is persisted with no loss or duplication
     """
+
     async def batch(prefix: str) -> None:
         await MtCnRow.bulk_create([MtCnRow(name=f"{prefix}-{i}") for i in range(10)])
 

@@ -339,9 +339,9 @@ def run_pony() -> dict:
     try:
         with _Stopwatch() as sw:
             with pony.db_session:
-                pony.select(
-                    (p.cat, pony.count(p), pony.sum(p.value)) for p in BPony
-                ).filter(lambda cat, cnt, total: cnt > TH).order_by(1)[:]
+                pony.select((p.cat, pony.count(p), pony.sum(p.value)) for p in BPony).filter(
+                    lambda cat, cnt, total: cnt > TH
+                ).order_by(1)[:]
         res["group_by"] = sw.elapsed
     except Exception:  # noqa: BLE001 - Pony's group-by/HAVING dialecting is finicky
         pass  # leave group_by unset -> reported as "-" without losing the other ops
