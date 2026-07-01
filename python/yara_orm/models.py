@@ -1713,6 +1713,16 @@ class Model(metaclass=ModelMeta):
         dialect = get_dialect(cls)
         engine = get_executor(cls, write=True)
         meta = cls._meta
+        # ``auto_now`` (updated_at-style) columns bump on every update: set each
+        # object's value to now and include the column in the SET list even when
+        # the caller did not list it. ``auto_now_add`` columns are left alone.
+        auto_now_names = [name for name, f in meta.auto_now_fields if f.auto_now]
+        if auto_now_names:
+            for obj in objects:
+                obj._apply_auto_now()
+            for name in auto_now_names:
+                if name not in field_names:
+                    field_names.append(name)
         pk_field = meta.pk_field
         q = dialect.quote
         table = q(meta.table)

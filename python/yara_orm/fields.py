@@ -208,6 +208,23 @@ class Field:
 # ---------------------------------------------------------------------------
 # Numeric
 # ---------------------------------------------------------------------------
+def _int_to_db(value: Any) -> Any:
+    """Coerce a numeric string to ``int`` before binding.
+
+    So an integer column filtered with string values (``id__in={"1", "2"}``, a
+    ``str(ext_id)`` from an external system) binds as ``int`` rather than text —
+    otherwise PostgreSQL rejects it with 'operator does not exist: integer =
+    text'. Non-string values (incl. ``bool``, ``F``, ``None``) pass through.
+
+    Args:
+        value: The Python value about to be bound.
+
+    Returns:
+        ``int(value)`` for a string, otherwise ``value`` unchanged.
+    """
+    return int(value) if isinstance(value, str) else value
+
+
 class SmallIntField(Field):
     """A small integer column."""
 
@@ -226,6 +243,17 @@ class SmallIntField(Field):
         super().__init__(pk=pk, **kwargs)
         if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
             self.auto_increment = True
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a numeric string to ``int`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``int(value)`` for a string, otherwise ``value`` unchanged.
+        """
+        return _int_to_db(value)
 
 
 class IntField(Field):
@@ -246,6 +274,17 @@ class IntField(Field):
         super().__init__(pk=pk, **kwargs)
         if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
             self.auto_increment = True
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a numeric string to ``int`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``int(value)`` for a string, otherwise ``value`` unchanged.
+        """
+        return _int_to_db(value)
 
     def to_python(self, value: Any) -> Any:
         """Convert a database value into an ``int``.
@@ -277,6 +316,17 @@ class BigIntField(Field):
         super().__init__(pk=pk, **kwargs)
         if self.pk:  # honors the `primary_key=` alias reconciled by the base Field
             self.auto_increment = True
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a numeric string to ``int`` before binding.
+
+        Args:
+            value: The Python value to convert.
+
+        Returns:
+            ``int(value)`` for a string, otherwise ``value`` unchanged.
+        """
+        return _int_to_db(value)
 
     def to_python(self, value: Any) -> Any:
         """Convert a database value into an ``int``.
