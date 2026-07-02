@@ -14,13 +14,64 @@ import uuid as _uuid
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .db_defaults import DatabaseDefault
 from .exceptions import FieldError
 
 if TYPE_CHECKING:
+    from .relations import (
+        ForeignKeyNullableRelation as ForeignKeyNullableRelation,
+    )
+    from .relations import (
+        ForeignKeyRelation as ForeignKeyRelation,
+    )
+    from .relations import (
+        ManyToManyRelation as ManyToManyRelation,
+    )
+    from .relations import (
+        OneToOneNullableRelation as OneToOneNullableRelation,
+    )
+    from .relations import (
+        OneToOneRelation as OneToOneRelation,
+    )
+    from .relations import (
+        ReverseRelation as ReverseRelation,
+    )
     from .validators import Validator
+
+#: Relation typing aliases re-exported from ``relations`` (lazily, via the
+#: module ``__getattr__`` below — ``relations`` imports this module's field
+#: classes, so a top-level import here would be circular).
+_RELATION_TYPE_EXPORTS = frozenset(
+    {
+        "ForeignKeyRelation",
+        "ForeignKeyNullableRelation",
+        "OneToOneRelation",
+        "OneToOneNullableRelation",
+        "ReverseRelation",
+        "ManyToManyRelation",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve the relation typing aliases lazily (PEP 562).
+
+    Args:
+        name: The attribute being looked up on the module.
+
+    Returns:
+        The alias from :mod:`yara_orm.relations`.
+
+    Raises:
+        AttributeError: For any other missing module attribute.
+    """
+    if name in _RELATION_TYPE_EXPORTS:
+        from . import relations
+
+        return getattr(relations, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class Field:
@@ -907,13 +958,15 @@ _ON_DELETE_ACTIONS = frozenset(
 )
 
 
-class ForeignKeyField(Field):
-    """A foreign key to another model.
+class ForeignKeyFieldInstance(Field):
+    """The field object behind a :func:`ForeignKeyField` declaration.
 
     Declared under the relation name (e.g. ``tournament``); the metaclass
     synthesises a concrete ``<name>_id`` column and installs a forward accessor
     (``await obj.tournament``) plus a reverse manager (``related_name``) on the
-    target model.
+    target model. Constructed via the :func:`ForeignKeyField` factory (whose
+    return is typed as the relation, Tortoise-style); use this class for
+    ``isinstance`` checks.
     """
 
     field_kind = "fk"
@@ -1011,7 +1064,7 @@ class ForeignKeyField(Field):
         return self._target_pk_field
 
 
-class OneToOneField(ForeignKeyField):
+class OneToOneFieldInstance(ForeignKeyFieldInstance):
     """A unique foreign key; the reverse accessor yields a single instance."""
 
     is_o2o = True
@@ -1021,7 +1074,8 @@ class OneToOneField(ForeignKeyField):
 
         Args:
             reference: Dotted path or name of the target model (or pass ``to=``).
-            **kwargs: Additional options forwarded to :class:`ForeignKeyField`.
+            **kwargs: Additional options forwarded to
+                :class:`ForeignKeyFieldInstance`.
 
         Returns:
             None
@@ -1030,11 +1084,13 @@ class OneToOneField(ForeignKeyField):
         super().__init__(reference, **kwargs)
 
 
-class ManyToManyField(Field):
-    """A many-to-many relation realised through a join table.
+class ManyToManyFieldInstance(Field):
+    """The field object behind a :func:`ManyToManyField` declaration.
 
     No column is added to the owning table; the metaclass installs a manager
     supporting ``add``/``remove``/``clear`` and querying through the join table.
+    Constructed via the :func:`ManyToManyField` factory; use this class for
+    ``isinstance`` checks.
     """
 
     field_kind = "m2m"
@@ -1084,35 +1140,109 @@ class ManyToManyField(Field):
         self.backward_key = backward_key
 
 
-class _RelationHint:
-    """Subscriptable no-op standing in for relation type hints.
+# ---------------------------------------------------------------------------
+# Relation field factories (Tortoise-style)
+# ---------------------------------------------------------------------------
+# The factories construct the ``*FieldInstance`` objects but are *typed* as
+# returning the relation the attribute resolves to, so a declared annotation
+# is the attribute's static type and an unannotated declaration stays valid:
+#
+#     author: ForeignKeyRelation[Author] = ForeignKeyField("Author")
+#     tags: ManyToManyRelation[Tag] = ManyToManyField("Tag")
 
-    Relation attributes may be annotated as ``ForeignKeyRelation[X]`` /
-    ``ReverseRelation[X]`` etc. (evaluated at class-definition time). yara derives
-    accessors from the FK declaration, so these are annotation-only: subscripting
-    returns ``None`` so the annotation is harmless at runtime.
+
+def ForeignKeyField(
+    reference: str | None = None,
+    related_name: str | None = None,
+    on_delete: str = OnDelete.CASCADE,
+    source_field: str | None = None,
+    db_constraint: bool = True,
+    to: str | None = None,
+    **kwargs: Any,
+) -> ForeignKeyRelation[Any]:
+    """Declare a foreign key to another model.
+
+    Args:
+        reference: Dotted path or name of the target model.
+        related_name: Name of the reverse accessor on the target model.
+        on_delete: Referential action applied on deletion.
+        source_field: Explicit name for this table's FK column; defaults to
+            ``<name>_id``.
+        db_constraint: Whether to emit a database ``FOREIGN KEY`` constraint.
+        to: Modern alias for ``reference``.
+        **kwargs: Additional options forwarded to :class:`Field`.
+
+    Returns:
+        The field object (typed as the relation the attribute resolves to).
     """
+    return cast(
+        "ForeignKeyRelation[Any]",
+        ForeignKeyFieldInstance(
+            reference,
+            related_name=related_name,
+            on_delete=on_delete,
+            source_field=source_field,
+            db_constraint=db_constraint,
+            to=to,
+            **kwargs,
+        ),
+    )
 
-    def __class_getitem__(cls, _item: Any) -> None:
-        """Return ``None`` for any subscription (annotation-only).
 
-        Args:
-            _item: The (ignored) type argument.
+def OneToOneField(
+    reference: str | None = None,
+    **kwargs: Any,
+) -> OneToOneRelation[Any]:
+    """Declare a unique foreign key (one-to-one) to another model.
 
-        Returns:
-            None
-        """
-        return None
+    Args:
+        reference: Dotted path or name of the target model (or pass ``to=``).
+        **kwargs: Additional options forwarded to :func:`ForeignKeyField`.
+
+    Returns:
+        The field object (typed as the relation the attribute resolves to).
+    """
+    return cast("OneToOneRelation[Any]", OneToOneFieldInstance(reference, **kwargs))
 
 
-# Relation typing generics, re-exposed so existing annotations like
-# ``ForeignKeyNullableRelation[BillingPlan]`` keep importing and evaluating.
-ForeignKeyRelation = _RelationHint
-ForeignKeyNullableRelation = _RelationHint
-OneToOneRelation = _RelationHint
-OneToOneNullableRelation = _RelationHint
-ReverseRelation = _RelationHint
-ManyToManyRelation = _RelationHint
+def ManyToManyField(
+    reference: str | None = None,
+    related_name: str | None = None,
+    through: str | None = None,
+    forward_key: str | None = None,
+    backward_key: str | None = None,
+    through_fields: tuple[str, str] | None = None,
+    to: str | None = None,
+    **kwargs: Any,
+) -> ManyToManyRelation[Any]:
+    """Declare a many-to-many relation realised through a join table.
+
+    Args:
+        reference: Dotted path or name of the target model.
+        related_name: Name of the reverse accessor on the target model.
+        through: Name of the join table; synthesised when omitted.
+        forward_key: Join-table column referencing the owning model.
+        backward_key: Join-table column referencing the target model.
+        through_fields: Alternate spelling of ``(forward_key, backward_key)``.
+        to: Modern alias for ``reference``.
+        **kwargs: Additional options forwarded to :class:`Field`.
+
+    Returns:
+        The field object (typed as the relation the attribute resolves to).
+    """
+    return cast(
+        "ManyToManyRelation[Any]",
+        ManyToManyFieldInstance(
+            reference,
+            related_name=related_name,
+            through=through,
+            forward_key=forward_key,
+            backward_key=backward_key,
+            through_fields=through_fields,
+            to=to,
+            **kwargs,
+        ),
+    )
 
 
 # The on-delete actions are also exposed as bare module-level names
@@ -1159,4 +1289,7 @@ __all__ = [
     "ForeignKeyField",
     "OneToOneField",
     "ManyToManyField",
+    "ForeignKeyFieldInstance",
+    "OneToOneFieldInstance",
+    "ManyToManyFieldInstance",
 ]

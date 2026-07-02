@@ -6,6 +6,28 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Typed relations (Tortoise-style).** The relation annotations
+  `ForeignKeyRelation[X]` / `ForeignKeyNullableRelation[X]` /
+  `OneToOneRelation[X]` / `OneToOneNullableRelation[X]` /
+  `ReverseRelation[X]` / `ManyToManyRelation[X]` are now real generics:
+  a checker sees `book.author` as `Author | ForwardRelation[Author]`,
+  `await author.books` as `list[Book]`, and `book.fans` as
+  `M2MManager[Author]` (previously they were subscriptable no-ops). The
+  relation field factories are typed to return the relation, so
+  `author: fields.ForeignKeyRelation[Author] = fields.ForeignKeyField("Author")`
+  type-checks, and unannotated declarations keep working.
+
+### Changed
+
+- `ForeignKeyField` / `OneToOneField` / `ManyToManyField` are now factory
+  *functions* (Tortoise's exact structure); the classes they construct are
+  `ForeignKeyFieldInstance` / `OneToOneFieldInstance` /
+  `ManyToManyFieldInstance`. Declarations are untouched; only
+  `isinstance(f, fields.ForeignKeyField)`-style checks (and subclassing)
+  must switch to the `*Instance` names.
+
 ## [1.10.0] - 2026-07-02
 
 A full-codebase correctness audit (five independent review passes over the query

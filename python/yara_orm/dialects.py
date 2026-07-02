@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .exceptions import ConfigurationError, UnSupportedError
-from .fields import ForeignKeyField
+from .fields import ForeignKeyFieldInstance
 from .registry import get_model
 
 if TYPE_CHECKING:
@@ -298,7 +298,7 @@ class BaseDialect:
             The SQL type string for the field.
         """
         kind = field.field_kind
-        if isinstance(field, ForeignKeyField):
+        if isinstance(field, ForeignKeyFieldInstance):
             ref = get_model(field.reference)
             pk = ref._meta.pk_field
             # Reference the scalar type of the target pk, never its serial form.
@@ -474,7 +474,7 @@ class BaseDialect:
             lines.append(pk_line)
 
         for field in meta.fields.values():
-            if isinstance(field, ForeignKeyField) and field.db_constraint:
+            if isinstance(field, ForeignKeyFieldInstance) and field.db_constraint:
                 ref = get_model(field.reference)
                 col = self.quote(field.db_column)
                 ref_tbl = self.quote(ref._meta.table)
