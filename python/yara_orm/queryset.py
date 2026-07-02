@@ -23,8 +23,27 @@ if TYPE_CHECKING:
     from .fields import Field
     from .models import MetaInfo, Model
 
+
+def _like_escape(value: Any) -> str:
+    r"""Escape LIKE/ILIKE metacharacters in a user-supplied value.
+
+    Pattern lookups (``contains``/``startswith``/``iexact``/...) wrap the raw
+    value in wildcards, so any ``%``/``_`` inside it must match literally —
+    otherwise user input silently acts as a wildcard. Paired with an
+    ``ESCAPE '\\'`` clause on the rendered comparison.
+
+    Args:
+        value: The raw lookup value.
+
+    Returns:
+        The value with ``\\``, ``%`` and ``_`` backslash-escaped.
+    """
+    return str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 # op -> (sql operator, pattern builder or None). A pattern builder turns the
-# value into a LIKE/ILIKE pattern (bound as plain text); None binds via to_db.
+# value into a LIKE/ILIKE pattern (bound as plain text, wildcards escaped);
+# None binds via to_db.
 _OPERATORS = {
     "exact": ("=", None),
     "not": ("!=", None),
@@ -32,14 +51,14 @@ _OPERATORS = {
     "gte": (">=", None),
     "lt": ("<", None),
     "lte": ("<=", None),
-    "contains": ("LIKE", lambda v: f"%{v}%"),
-    "icontains": ("ILIKE", lambda v: f"%{v}%"),
-    "startswith": ("LIKE", lambda v: f"{v}%"),
-    "istartswith": ("ILIKE", lambda v: f"{v}%"),
-    "endswith": ("LIKE", lambda v: f"%{v}"),
-    "iendswith": ("ILIKE", lambda v: f"%{v}"),
+    "contains": ("LIKE", lambda v: f"%{_like_escape(v)}%"),
+    "icontains": ("ILIKE", lambda v: f"%{_like_escape(v)}%"),
+    "startswith": ("LIKE", lambda v: f"{_like_escape(v)}%"),
+    "istartswith": ("ILIKE", lambda v: f"{_like_escape(v)}%"),
+    "endswith": ("LIKE", lambda v: f"%{_like_escape(v)}"),
+    "iendswith": ("ILIKE", lambda v: f"%{_like_escape(v)}"),
     # Case-insensitive exact match: ILIKE with no wildcards in the bound value.
-    "iexact": ("ILIKE", lambda v: f"{v}"),
+    "iexact": ("ILIKE", _like_escape),
 }
 
 # Date/time part lookups, e.g. ``created_at__year=2024`` (rendered per dialect).
@@ -193,7 +212,10 @@ class QuerySet:
         """
         self.model = model
         self._conditions: list[Q] = []  # AND-combined at the top level
-        self._having: list[tuple[str, str, Any]] = []  # (annotation, op, value)
+        # Each entry is one filter()/exclude() call over annotations: a group of
+        # (annotation, op, value) lookups ANDed together, negated as a whole
+        # when it came from exclude() (NOT (a AND b), per De Morgan).
+        self._having: list[tuple[list[tuple[str, str, Any]], bool]] = []
         self._order: list[tuple[str, bool]] = []
         self._limit: int | None = None
         self._offset: int | None = None
@@ -207,6 +229,9 @@ class QuerySet:
         self._for_update_skip_locked: bool = False
         self._for_update_of: tuple[str, ...] = ()
         self._only: tuple[str, ...] | None = None
+        # The columns ``only()`` was explicitly given (without the auto-added
+        # pk), so a Subquery can project exactly what the caller named.
+        self._only_explicit: tuple[str, ...] | None = None
         self._defer: frozenset[str] = frozenset()
         # Per-relation column projections from ``only()``/``defer()`` paths
         # (``contact__properties``): a joined relation loads only/all-but these
@@ -239,6 +264,7 @@ class QuerySet:
         qs._for_update_skip_locked = self._for_update_skip_locked
         qs._for_update_of = self._for_update_of
         qs._only = self._only
+        qs._only_explicit = self._only_explicit
         qs._defer = self._defer
         qs._only_related = dict(self._only_related)
         qs._defer_related = dict(self._defer_related)
@@ -255,14 +281,22 @@ class QuerySet:
 
         Returns:
             A cloned ``QuerySet`` with the added conditions.
+
+        Raises:
+            TypeError: When a positional argument is not a ``Q`` node.
         """
+        for arg in args:
+            if not isinstance(arg, Q):
+                raise TypeError(
+                    f"filter() positional arguments must be Q objects, got {type(arg).__name__}"
+                )
         qs = self._clone()
-        qs._conditions.extend(a for a in args if isinstance(a, Q))
+        qs._conditions.extend(args)
         where_kw = {}
         for key, value in kwargs.items():
             base, op = _split_lookup(key)
             if base in qs._annotations:
-                qs._having.append((base, op, value))
+                qs._having.append(([(base, op, value)], False))
             else:
                 where_kw[key] = value
         if where_kw:
@@ -274,13 +308,43 @@ class QuerySet:
 
         Args:
             *args: ``Q`` nodes whose combined condition is negated.
-            **kwargs: Field lookups whose combined condition is negated.
+            **kwargs: Field lookups whose combined condition is negated;
+                lookups over annotations become negated ``HAVING`` clauses.
 
         Returns:
             A cloned ``QuerySet`` with the negated condition appended.
+
+        Raises:
+            TypeError: When a positional argument is not a ``Q`` node.
+            FieldError: When annotation lookups are mixed with other conditions
+                in the same call (the negation cannot be split soundly).
         """
+        for arg in args:
+            if not isinstance(arg, Q):
+                raise TypeError(
+                    f"exclude() positional arguments must be Q objects, got {type(arg).__name__}"
+                )
         qs = self._clone()
-        qs._conditions.append(~Q(*args, **kwargs))
+        where_kw = {}
+        having = []
+        for key, value in kwargs.items():
+            base, op = _split_lookup(key)
+            if base in qs._annotations:
+                having.append((base, op, value))
+            else:
+                where_kw[key] = value
+        if having and (args or where_kw):
+            # NOT(column AND annotation) cannot be split into a WHERE part and a
+            # HAVING part without changing meaning (De Morgan), so reject it.
+            raise FieldError(
+                "exclude() cannot mix annotation lookups with other conditions in one call"
+            )
+        if having:
+            # One exclude() call negates the conjunction of its lookups:
+            # exclude(a, b) compiles to NOT (a AND b), not NOT a AND NOT b.
+            qs._having.append((having, True))
+        else:
+            qs._conditions.append(~Q(*args, **where_kw))
         return qs
 
     def annotate(self, **annotations: Any) -> QuerySet:
@@ -455,17 +519,18 @@ class QuerySet:
         qs._using = connection_name
         return qs
 
-    def _using_name(self) -> str | None:
-        """Return the connection name used for dialect resolution.
+    def _using_name(self) -> Any:
+        """Return the ``using`` value for dialect resolution.
 
-        A ``using_db`` connection passed as an object has no name to look up, so
-        the dialect falls back to the active transaction or the default
-        connection (the object itself is still used as the executor).
+        Both a connection name and a connection/executor object are meaningful
+        to ``get_dialect``: statements execute on the bound object, so SQL must
+        render for *its* dialect (a transaction wrapper carries the dialect of
+        the connection it is pinned to).
 
         Returns:
-            The connection name string, or None when none/an object is bound.
+            The bound connection name/object, or None when unbound.
         """
-        return self._using if isinstance(self._using, str) else None
+        return self._using
 
     def _resolve_related_field_path(self, path: str) -> tuple[str, str]:
         """Split a ``rel__...__col`` path into its relation path and column.
@@ -529,6 +594,7 @@ class QuerySet:
         names = tuple(dict.fromkeys((pk_name, *base)))  # pk first, de-duplicated
         qs = self._clone()
         qs._only = names
+        qs._only_explicit = tuple(dict.fromkeys(base))
         qs._defer = frozenset()
         qs._only_related = {rp: tuple(dict.fromkeys(cols)) for rp, cols in related.items()}
         qs._defer_related = {}
@@ -565,6 +631,7 @@ class QuerySet:
         qs = self._clone()
         qs._defer = frozenset(f for f in base if f != pk_name)
         qs._only = None
+        qs._only_explicit = None
         qs._defer_related = {rp: frozenset(cols) for rp, cols in related.items()}
         qs._only_related = {}
         return qs
@@ -588,17 +655,25 @@ class QuerySet:
                 raise ValueError("negative indexing is not supported")
             qs = self._clone()
             start = item.start or 0
-            qs._offset = start or None
-            qs._limit = (item.stop - start) if item.stop is not None else None
+            # Compose relative to any window already set, so ``qs[2:5][1:2]``
+            # and ``qs.offset(5)[:3]`` slice the current results rather than
+            # restarting from the table. An empty/inverted window clamps to
+            # ``LIMIT 0`` (never a negative limit).
+            qs._offset = ((self._offset or 0) + start) or None
+            window = None if item.stop is None else max(item.stop - start, 0)
+            if self._limit is not None:
+                remaining = max(self._limit - start, 0)
+                window = remaining if window is None else min(window, remaining)
+            qs._limit = window
             return qs
         if isinstance(item, int):
             if item < 0:
                 raise ValueError("negative indexing is not supported")
 
             async def _get_index() -> Model:
-                qs = self._clone()
-                qs._offset, qs._limit = item, 1
-                rows = await qs._fetch()
+                # Index through the slice path so it composes with an existing
+                # offset/limit (``qs[10:][3]`` fetches absolute row 13).
+                rows = await self[item : item + 1]._fetch()
                 if not rows:
                     raise IndexError("QuerySet index out of range")
                 return rows[0]
@@ -621,7 +696,7 @@ class QuerySet:
 
     @staticmethod
     def _forward_join(
-        cur_table: str, cur_meta: MetaInfo, info: Any, dialect: BaseDialect
+        cur_table: str, cur_meta: MetaInfo, info: Any, dialect: BaseDialect, alias: str
     ) -> tuple[MetaInfo, str]:
         """Build the ``LEFT JOIN`` from ``cur_table`` across a forward relation.
 
@@ -629,19 +704,25 @@ class QuerySet:
         ``_add_relation_join``) so the forward-FK join shape is defined once.
 
         Args:
-            cur_table: The already-quoted table the join starts from.
+            cur_table: The already-quoted table/alias the join starts from.
             cur_meta: The metadata of the model owning ``info``.
             info: The forward ``RelationInfo`` to traverse.
             dialect: The SQL dialect providing identifier quoting.
+            alias: The already-quoted alias for the joined table. Aliasing per
+                relation path keeps two paths to the same table — or a self
+                relation — from colliding as duplicate unaliased joins.
 
         Returns:
-            A ``(target_meta, join_sql)`` tuple.
+            A ``(target_meta, join_sql)`` tuple; the joined table's columns
+            must be referenced through ``alias``.
         """
         q = dialect.quote
         tmeta = info.resolve_target()._meta
         src = q(cur_meta.get_field(info.source_attr).db_column)
-        ttable = q(tmeta.table)
-        join = f" LEFT JOIN {ttable} ON {cur_table}.{src} = {ttable}.{q(tmeta.pk_field.db_column)}"
+        join = (
+            f" LEFT JOIN {q(tmeta.table)} AS {alias} "
+            f"ON {cur_table}.{src} = {alias}.{q(tmeta.pk_field.db_column)}"
+        )
         return tmeta, join
 
     def _compile_lookup(
@@ -824,7 +905,9 @@ class QuerySet:
             # not exist: uuid ~~* text'.
             if field is not None and field.field_kind not in _TEXT_KINDS:
                 col = dialect.cast_text(col)
-            return f"{col} {sql_op} {placeholder}", [pattern(value)], idx
+            # The pattern builder backslash-escapes %/_ in the value; ESCAPE
+            # makes both backends honour that escaping.
+            return f"{col} {sql_op} {placeholder} ESCAPE '\\'", [pattern(value)], idx
         clause = f"{col} {sql_op} {placeholder}"
         if op == "not":
             # ``!=`` drops NULL rows (``NULL != x`` is UNKNOWN); keep them,
@@ -853,11 +936,9 @@ class QuerySet:
         Returns:
             A ``(sql, params, next_index)`` tuple.
         """
-        # Lazily imported (breaks the queryset <-> relations import cycle).
-        model_name = _rel().model_name
-
         descriptor = getattr(self.model, base)
-        source = registry.get_model(model_name(descriptor.source_reference))
+        # References are qualified (module.Name); get_model handles both forms.
+        source = registry.get_model(descriptor.source_reference)
         smeta = source._meta
         q = dialect.quote
         meta = self.model._meta
@@ -962,11 +1043,7 @@ class QuerySet:
         """
         # Lazily imported (breaks the queryset <-> relations import cycle).
         rel = _rel()
-        M2MDescriptor, ReverseFKDescriptor, model_name = (
-            rel.M2MDescriptor,
-            rel.ReverseFKDescriptor,
-            rel.model_name,
-        )
+        M2MDescriptor, ReverseFKDescriptor = rel.M2MDescriptor, rel.ReverseFKDescriptor
 
         seg, _, rest = base.partition("__")
         inner_key = rest if op == "exact" else f"{rest}__{op}"
@@ -991,7 +1068,7 @@ class QuerySet:
         descriptor = getattr(self.model, seg, None)
         if isinstance(descriptor, ReverseFKDescriptor):
             # Reverse FK: base.pk IN (SELECT child.<fk> FROM child WHERE inner)
-            source = registry.get_model(model_name(descriptor.source_reference))
+            source = registry.get_model(descriptor.source_reference)
             smeta = source._meta
             inner, params, idx = QuerySet(source)._compile_lookup(inner_key, value, dialect, idx)
             sub = (
@@ -1061,6 +1138,13 @@ class QuerySet:
         pk = q(meta.pk_field.db_column)
         through = q(info.through)
         far_pk = target_model._meta.pk_field
+        if op in ("isnull", "not_isnull"):
+            # ``tags__isnull=True`` asks "has no linked row": membership in the
+            # through table decides presence; the value picks the polarity.
+            absent = (op == "isnull") == bool(value)
+            membership = "NOT IN" if absent else "IN"
+            inner = f"SELECT {through}.{q(near)} FROM {through}"
+            return f"{table}.{pk} {membership} ({inner})", [], idx
         if op == "in":
             vals = [v.pk if _is_model(v) else v for v in value]
             if not vals:
@@ -1349,34 +1433,32 @@ class QuerySet:
             joins: Mapping of join key to join SQL, mutated in place.
 
         Returns:
-            The ``_meta`` object of the joined target model.
+            A ``(target_meta, alias)`` tuple; ``alias`` is the already-quoted
+            alias the joined table's columns must be referenced through.
         """
         # Lazily imported (breaks the queryset <-> relations import cycle).
         _relmod = _rel()
-        M2MDescriptor, ReverseFKDescriptor, model_name = (
-            _relmod.M2MDescriptor,
-            _relmod.ReverseFKDescriptor,
-            _relmod.model_name,
-        )
+        M2MDescriptor, ReverseFKDescriptor = _relmod.M2MDescriptor, _relmod.ReverseFKDescriptor
 
         q = dialect.quote
         meta = self.model._meta
         table = q(meta.table)
         pk = q(meta.pk_field.db_column)
+        alias = q(rel)
 
         if rel in meta.relations:
-            tmeta, joins[rel] = self._forward_join(table, meta, meta.relations[rel], dialect)
-            return tmeta
+            tmeta, joins[rel] = self._forward_join(table, meta, meta.relations[rel], dialect, alias)
+            return tmeta, alias
 
         descriptor = getattr(self.model, rel, None)
         if isinstance(descriptor, ReverseFKDescriptor):
-            source = registry.get_model(model_name(descriptor.source_reference))
+            source = registry.get_model(descriptor.source_reference)
             smeta = source._meta
             joins[rel] = (
-                f" LEFT JOIN {q(smeta.table)} ON {q(smeta.table)}."
+                f" LEFT JOIN {q(smeta.table)} AS {alias} ON {alias}."
                 f"{q(descriptor.source_attr)} = {table}.{pk}"
             )
-            return smeta
+            return smeta, alias
         if isinstance(descriptor, M2MDescriptor):
             info = descriptor.info
             info.finalize()
@@ -1386,14 +1468,16 @@ class QuerySet:
             else:
                 near, far = info.backward_key, info.forward_key
                 tmeta = info.resolve_target()._meta
+            through_alias = q(rel + "#t")
             joins[rel + "#t"] = (
-                f" LEFT JOIN {q(info.through)} ON {q(info.through)}.{q(near)} = {table}.{pk}"
+                f" LEFT JOIN {q(info.through)} AS {through_alias} "
+                f"ON {through_alias}.{q(near)} = {table}.{pk}"
             )
             joins[rel] = (
-                f" LEFT JOIN {q(tmeta.table)} ON {q(tmeta.table)}."
-                f"{q(tmeta.pk_field.db_column)} = {q(info.through)}.{q(far)}"
+                f" LEFT JOIN {q(tmeta.table)} AS {alias} ON {alias}."
+                f"{q(tmeta.pk_field.db_column)} = {through_alias}.{q(far)}"
             )
-            return tmeta
+            return tmeta, alias
         raise FieldError(f"Cannot aggregate over unknown relation {rel!r}")
 
     def _aggregate_expr(
@@ -1478,8 +1562,8 @@ class QuerySet:
         if "__" not in field:
             if field in meta.fields or field == "pk":
                 return f"{table}.{q(meta.get_field(field).db_column)}"
-            tmeta = self._add_relation_join(field, dialect, joins)
-            return f"{q(tmeta.table)}.{q(tmeta.pk_field.db_column)}"
+            tmeta, alias = self._add_relation_join(field, dialect, joins)
+            return f"{alias}.{q(tmeta.pk_field.db_column)}"
 
         segments = field.split("__")
         cur_meta = meta
@@ -1489,18 +1573,21 @@ class QuerySet:
             last = i == len(segments) - 1
             info = cur_meta.relations.get(seg)
             if info is not None:
-                # Forward relation: chain a LEFT JOIN to its target table.
+                # Forward relation: chain a LEFT JOIN to its target table,
+                # aliased by the relation path so two paths hitting the same
+                # table (or a self relation) stay distinct joins.
                 chain = f"{chain}__{seg}" if chain else seg
-                tmeta, joins[chain] = self._forward_join(cur_table, cur_meta, info, dialect)
-                cur_meta, cur_table = tmeta, q(tmeta.table)
+                alias = q(chain)
+                tmeta, joins[chain] = self._forward_join(cur_table, cur_meta, info, dialect, alias)
+                cur_meta, cur_table = tmeta, alias
                 if last:
                     return f"{cur_table}.{q(cur_meta.pk_field.db_column)}"
             elif last:
                 return f"{cur_table}.{q(cur_meta.get_field(seg).db_column)}"
             elif cur_meta is meta and len(segments) == 2:
                 # A single reverse-FK / M2M hop, e.g. ``tags__name``.
-                tmeta = self._add_relation_join(seg, dialect, joins)
-                return f"{q(tmeta.table)}.{q(tmeta.get_field(segments[1]).db_column)}"
+                tmeta, alias = self._add_relation_join(seg, dialect, joins)
+                return f"{alias}.{q(tmeta.get_field(segments[1]).db_column)}"
             else:
                 raise FieldError(f"Cannot traverse relation path {field!r}")
         raise FieldError(f"Cannot traverse relation path {field!r}")  # pragma: no cover
@@ -1542,15 +1629,26 @@ class QuerySet:
             and the updated index.
         """
         clauses, params = [], []
-        for name, op, value in self._having:
-            # Render the annotation expression, then reuse the same comparison
+        for group, negated in self._having:
+            # Render each annotation expression, then reuse the same comparison
             # compiler as WHERE so every lookup (in/range/isnull/icontains/date
             # parts/...) works against an aggregate, with dialect-correct
             # operators and bound (never spliced) values.
-            expr, idx = self._aggregate_expr(self._annotations[name], dialect, joins, params, idx)
-            clause, p, idx = self._compile_field_op(expr, None, op, value, dialect, idx)
+            parts = []
+            for name, op, value in group:
+                expr, idx = self._aggregate_expr(
+                    self._annotations[name], dialect, joins, params, idx
+                )
+                clause, p, idx = self._compile_field_op(expr, None, op, value, dialect, idx)
+                parts.append(clause)
+                params.extend(p)
+            clause = " AND ".join(parts)
+            if negated:
+                # An ``exclude()`` group: negate the conjunction as a whole.
+                clause = f"NOT ({clause})"
+            elif len(parts) > 1:
+                clause = f"({clause})"
             clauses.append(clause)
-            params.extend(p)
         having = (" HAVING " + " AND ".join(clauses)) if clauses else ""
         return having, params, idx
 
@@ -1643,7 +1741,7 @@ class QuerySet:
         distinct = "DISTINCT " if self._distinct else ""
         sql = (
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{self._lock_sql(dialect)}"
         )
         return sql, params, None
 
@@ -1658,6 +1756,14 @@ class QuerySet:
                 self._only is not None or self._defer or self._only_related or self._defer_related
             ) and self._annotations:
                 raise FieldError("only()/defer() cannot be combined with annotate()")
+            if self._annotations and self._select_related:
+                # The annotated compile groups by pk and hydrates only base
+                # columns; joining/hydrating relations too would need a second
+                # compile shape — reject instead of silently dropping the joins.
+                raise FieldError(
+                    "select_related() cannot be combined with annotate(); "
+                    "use prefetch_related() to load relations alongside annotations"
+                )
             if self._annotations:
                 return await self._fetch_annotated()
             return await self._fetch_select_related()
@@ -1789,9 +1895,14 @@ class QuerySet:
         for rel in (*self._select_related, *self._only_related, *self._defer_related):
             ensure_path(rel)
         where, params, _ = self._compile_conditions(dialect)
+        lock = self._lock_sql(dialect)
+        if lock and joins and not self._for_update_of:
+            # PostgreSQL rejects FOR UPDATE on the nullable side of a LEFT
+            # JOIN, so with joined relations lock only the base table's rows.
+            lock = lock.replace("FOR UPDATE", f"FOR UPDATE OF {table}", 1)
         sql = (
             f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{lock}"
         )
         return sql, params, order, nodes, len(base_fields)
 
@@ -1854,7 +1965,16 @@ class QuerySet:
 
         Returns:
             A ``(sql, params)`` tuple.
+
+        Raises:
+            UnSupportedError: With ``select_for_update()`` set; ``FOR UPDATE``
+                is not allowed with GROUP BY/aggregates.
         """
+        if self._for_update:
+            raise UnSupportedError(
+                "select_for_update() cannot be combined with annotate(): "
+                "FOR UPDATE is not allowed with GROUP BY/aggregates"
+            )
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -1947,9 +2067,14 @@ class QuerySet:
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(meta.table)
         distinct = "DISTINCT " if self._distinct else ""
+        lock = self._lock_sql(dialect)
+        if lock and joins and not self._for_update_of:
+            # PostgreSQL rejects FOR UPDATE on the nullable side of a LEFT
+            # JOIN, so with joined relations lock only the base table's rows.
+            lock = lock.replace("FOR UPDATE", f"FOR UPDATE OF {table}", 1)
         sql = (
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}"
+            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{lock}"
         )
         return await engine.fetch_rows(sql, params)
 
@@ -1969,7 +2094,16 @@ class QuerySet:
         Returns:
             A ``(sql, params, names)`` tuple; ``names`` are the output column
             names in select order.
+
+        Raises:
+            UnSupportedError: With ``select_for_update()`` set; ``FOR UPDATE``
+                is not allowed with GROUP BY/aggregates.
         """
+        if self._for_update:
+            raise UnSupportedError(
+                "select_for_update() cannot be combined with annotate()/group_by(): "
+                "FOR UPDATE is not allowed with GROUP BY/aggregates"
+            )
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -2304,19 +2438,28 @@ class QuerySet:
         return QuerySetSingle(self, _resolve_first)
 
     async def last(self) -> Model | None:
-        """Fetch the last matching object under the current ordering.
+        """Fetch the last matching object under the effective ordering.
 
-        With no explicit ``order_by`` the ordering defaults to descending
-        primary key; otherwise the configured ordering is reversed.
+        The effective ordering — explicit ``order_by``, else the model's
+        ``Meta.ordering``, else ascending primary key — is reversed and the
+        first row taken.
 
         Returns:
             The last matching model instance, or ``None`` when there are none.
+
+        Raises:
+            TypeError: When the query set is already sliced (limit/offset);
+                reversing a slice is ambiguous (matching Django).
         """
+        if self._limit is not None or self._offset is not None:
+            raise TypeError("Cannot reverse a query once a slice has been taken")
         qs = self._clone()
-        if qs._order:
-            qs._order = [(name, not desc) for name, desc in qs._order]
-        else:
-            qs._order = [(self.model._meta.pk_field.model_field_name, True)]
+        order = (
+            qs._order
+            or list(self.model._meta.ordering)
+            or [(self.model._meta.pk_field.model_field_name, False)]
+        )
+        qs._order = [(name, not desc) for name, desc in order]
         rows = await qs.limit(1)._fetch()
         return rows[0] if rows else None
 
@@ -2346,14 +2489,34 @@ class QuerySet:
         flipped = [name[1:] if name.startswith("-") else f"-{name}" for name in order]
         return await self.order_by(*flipped).first()
 
-    async def count(self) -> int:
-        """Count the rows matching the current conditions.
+    def _needs_wrapped_terminal(self) -> bool:
+        """Report whether count()/exists() must wrap the full SELECT.
+
+        A HAVING clause, an explicit grouping or a limit/offset slice all change
+        which result rows exist, so counting the base table's rows would be
+        wrong; the full select is wrapped as a subquery instead.
 
         Returns:
-            The number of matching rows.
+            ``True`` when the wrapped form is required.
+        """
+        return bool(
+            self._having or self._group_by or self._limit is not None or self._offset is not None
+        )
+
+    async def count(self) -> int:
+        """Count the rows (or groups, when grouped) matching this query set.
+
+        Returns:
+            The number of matching rows, honouring annotation filters
+            (``HAVING``), ``group_by`` (groups are counted) and slicing.
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
+        if self._needs_wrapped_terminal():
+            inner, params = self.get_parameterized_sql()
+            sub = dialect.quote("sub")
+            row = await engine.fetch_row(f"SELECT COUNT(*) FROM ({inner}) AS {sub}", params)
+            return int(row[0]) if row else 0
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
         row = await engine.fetch_row(f"SELECT COUNT(*) FROM {table}{where}", params)
@@ -2363,25 +2526,70 @@ class QuerySet:
         """Report whether any row matches the current conditions.
 
         Returns:
-            ``True`` if at least one matching row exists.
+            ``True`` if at least one matching row (or group, when grouped)
+            exists, honouring annotation filters and slicing.
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
+        if self._needs_wrapped_terminal():
+            inner, params = self.get_parameterized_sql()
+            sub = dialect.quote("sub")
+            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) AS {sub} LIMIT 1", params)
+            return bool(rows)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
         rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where} LIMIT 1", params)
         return bool(rows)
+
+    def _pk_having_subselect(self, dialect: BaseDialect, start: int = 1) -> tuple[str, list[Any]]:
+        """Build the ``SELECT pk ... GROUP BY pk HAVING ...`` restriction.
+
+        ``DELETE``/``UPDATE`` statements cannot carry a ``HAVING`` clause, so
+        annotation filters are applied by restricting the statement to the
+        primary keys of the groups that survive them.
+
+        Args:
+            dialect: The SQL dialect providing quoting and placeholders.
+            start: The first bind-parameter index (continues the outer
+                statement's numbering).
+
+        Returns:
+            A ``(sql, params)`` tuple for the subselect.
+        """
+        meta = self.model._meta
+        meta.compile(dialect)
+        q = dialect.quote
+        table = q(meta.table)
+        pk = f"{table}.{q(meta.pk_field.db_column)}"
+        joins: dict[str, str] = {}
+        where, wparams, idx = self._compile_conditions(dialect, start=start)
+        having, hparams, _ = self._compile_having(dialect, idx, joins)
+        sql = f"SELECT {pk} FROM {table}{''.join(joins.values())}{where} GROUP BY {pk}{having}"
+        return sql, wparams + hparams
 
     async def delete(self) -> int:
         """Delete all rows matching the current conditions.
 
         Returns:
             The number of rows deleted.
+
+        Raises:
+            TypeError: When the query set is sliced (limit/offset); a sliced
+                delete is ambiguous (matching Django).
         """
+        if self._limit is not None or self._offset is not None:
+            raise TypeError("Cannot use limit/offset with delete()")
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, write=True, using=self._using)
+        meta = self.model._meta
+        table = dialect.quote(meta.table)
+        if self._having:
+            # Annotation filters compile to HAVING (which DELETE cannot carry);
+            # without this restriction they were dropped — a full-table wipe.
+            sub, params = self._pk_having_subselect(dialect)
+            pk = f"{table}.{dialect.quote(meta.pk_field.db_column)}"
+            return await engine.execute(f"DELETE FROM {table} WHERE {pk} IN ({sub})", params)
         where, params, _ = self._compile_conditions(dialect)
-        table = dialect.quote(self.model._meta.table)
         return await engine.execute(f"DELETE FROM {table}{where}", params)
 
     async def update(self, **kwargs: Any) -> int:
@@ -2393,7 +2601,13 @@ class QuerySet:
 
         Returns:
             The number of rows updated.
+
+        Raises:
+            TypeError: When the query set is sliced (limit/offset); a sliced
+                update is ambiguous (matching Django).
         """
+        if self._limit is not None or self._offset is not None:
+            raise TypeError("Cannot use limit/offset with update()")
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, write=True, using=self._using)
         meta = self.model._meta
@@ -2423,9 +2637,17 @@ class QuerySet:
                 assignments.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
                 params.append(field.to_db(value))
                 idx += 1
-        where, where_params, _ = self._compile_conditions(dialect, start=idx)
-        params.extend(where_params)
         table = dialect.quote(meta.table)
+        if self._having:
+            # Annotation filters compile to HAVING (which UPDATE cannot carry);
+            # restrict to the pks of the groups that survive them instead.
+            sub, sub_params = self._pk_having_subselect(dialect, start=idx)
+            params.extend(sub_params)
+            pk = f"{table}.{dialect.quote(meta.pk_field.db_column)}"
+            where = f" WHERE {pk} IN ({sub})"
+        else:
+            where, where_params, _ = self._compile_conditions(dialect, start=idx)
+            params.extend(where_params)
         sql = f"UPDATE {table} SET {', '.join(assignments)}{where}"
         return await engine.execute(sql, params)
 

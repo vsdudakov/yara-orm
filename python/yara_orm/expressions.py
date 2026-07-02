@@ -117,6 +117,17 @@ class Expression:
         """
         return CombinedExpression(other, "*", self)
 
+    def __rtruediv__(self, other: Any) -> CombinedExpression:
+        """Return ``other / self`` for a literal left operand.
+
+        Args:
+            other: The left-hand literal operand.
+
+        Returns:
+            The combined expression.
+        """
+        return CombinedExpression(other, "/", self)
+
 
 class F(Expression):
     """A reference to a model column by field name."""
@@ -308,7 +319,13 @@ class When:
 
         Returns:
             None
+
+        Raises:
+            ValueError: When no conditions are given (the arm would render as
+                the invalid ``WHEN  THEN ...``).
         """
+        if not conditions:
+            raise ValueError("When() requires at least one condition")
         self.then = then
         self.conditions = conditions
 
@@ -416,7 +433,15 @@ class Subquery:
                 "pass a lazy queryset such as Model.filter(...).only('col') rather "
                 "than an awaited values()/values_list()."
             )
-        sub_sql, sub_params, _ = self.queryset._plain_select_sql(dialect, start=idx)
+        inner = self.queryset
+        explicit = getattr(inner, "_only_explicit", None)
+        if explicit and inner._only != explicit:
+            # ``only()`` force-includes the pk so instances can hydrate, but a
+            # subquery must project exactly the requested column(s) — otherwise
+            # ``Subquery(qs.only("email"))`` renders a two-column SELECT.
+            inner = inner._clone()
+            inner._only = explicit
+        sub_sql, sub_params, _ = inner._plain_select_sql(dialect, start=idx)
         params.extend(sub_params)
         return f"({sub_sql})", idx + len(sub_params)
 
