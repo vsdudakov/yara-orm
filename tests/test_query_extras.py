@@ -247,15 +247,18 @@ async def test_only_unknown_field_raises(db):
 
 
 @pytest.mark.asyncio
-async def test_only_with_annotate_raises(db):
+async def test_only_with_annotate_combines(db):
     """
-    GIVEN a query combining only() and annotate()
+    GIVEN a query combining only() and an aggregate annotate()
     WHEN it is executed
-    THEN a FieldError explains the combination is unsupported
+    THEN the annotation rides along the narrowed projection and the
+         unselected columns stay deferred
     """
     await _seed()
+    authors = await QxAuthor.all().annotate(n=Count("books")).only("name").order_by("name")
+    assert [(a.name, a.n) for a in authors] == [("Ada", 1), ("Bob", 1)]
     with pytest.raises(FieldError):
-        await QxAuthor.all().annotate(n=Count("books")).only("name")
+        _ = authors[0].bio  # deferred: not in only()
 
 
 @pytest.mark.asyncio

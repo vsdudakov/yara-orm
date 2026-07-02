@@ -11,6 +11,7 @@ import json
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from . import registry
+from .aggregations import Aggregate
 from .connection import get_dialect, get_executor
 from .exceptions import FieldError, UnSupportedError
 from .expressions import Expression
@@ -352,6 +353,11 @@ class QuerySet:
 
     def annotate(self, **annotations: Any) -> QuerySet:
         """Return a new query set with extra aggregate annotations.
+
+        Annotations combine with ``select_related()`` (a single joined SELECT)
+        and with ``only()``/``defer()`` (the annotation expressions are appended
+        to the narrowed projection); each annotation value is set as an
+        attribute on the resulting instances.
 
         Args:
             **annotations: Mapping of output name to aggregate expression.
@@ -1656,6 +1662,42 @@ class QuerySet:
         return having, params, idx
 
     # -- execution --------------------------------------------------------
+    def _has_aggregate_annotations(self) -> bool:
+        """Report whether any annotation is an aggregate expression.
+
+        Decides whether an annotated ``select_related`` query needs a
+        ``GROUP BY``. Only real :class:`~yara_orm.aggregations.Aggregate`
+        instances count: a ``RawSQL`` fragment is opaque, so a raw aggregate
+        (as opposed to e.g. a window function) is not detected — use the
+        aggregate classes (``Count``/``Sum``/...) for grouped shapes.
+
+        Returns:
+            ``True`` when at least one annotation is an ``Aggregate``.
+        """
+        return any(isinstance(agg, Aggregate) for agg in self._annotations.values())
+
+    def _check_annotation_collisions(self) -> None:
+        """Reject annotation names shadowing model fields under only()/defer().
+
+        With a narrowed projection, an annotation reusing a column name would
+        either overwrite the loaded value or silently "un-defer" the column
+        with a non-column value, so the combination is ambiguous and raises.
+
+        Raises:
+            FieldError: When ``only()``/``defer()`` is active and an annotation
+                name equals a model field name.
+        """
+        if self._only is None and not self._defer:
+            return
+        meta = self.model._meta
+        for name in self._annotations:
+            if name in meta.fields:
+                raise FieldError(
+                    f"annotate() name {name!r} collides with a field of "
+                    f"{self.model.__name__}; rename the annotation when "
+                    "using only()/defer()"
+                )
+
     def _selected_fields(self) -> list[Field]:
         """Return the fields to SELECT under ``only()`` / ``defer()``.
 
@@ -1754,22 +1796,12 @@ class QuerySet:
         Returns:
             A list of model instances, with any requested relations prefetched.
         """
-        if self._annotations or self._select_related or self._only_related or self._defer_related:
-            if (
-                self._only is not None or self._defer or self._only_related or self._defer_related
-            ) and self._annotations:
-                raise FieldError("only()/defer() cannot be combined with annotate()")
-            if self._annotations and self._select_related:
-                # The annotated compile groups by pk and hydrates only base
-                # columns; joining/hydrating relations too would need a second
-                # compile shape — reject instead of silently dropping the joins.
-                raise FieldError(
-                    "select_related() cannot be combined with annotate(); "
-                    "use prefetch_related() to load relations alongside annotations"
-                )
-            if self._annotations:
-                return await self._fetch_annotated()
+        if self._select_related or self._only_related or self._defer_related:
+            # Handles annotations too: the join plan's columns are followed by
+            # the annotation expressions in one SELECT.
             return await self._fetch_select_related()
+        if self._annotations:
+            return await self._fetch_annotated()
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         sql, params, sel = self._plain_select_sql(dialect)
@@ -1818,6 +1850,11 @@ class QuerySet:
 
         Shared by :meth:`_fetch_select_related` and
         :meth:`get_parameterized_sql` so both render the identical statement.
+        Annotations combine with the join plan: their expressions are appended
+        after the relation columns, and aggregate annotations (or a ``HAVING``
+        filter) add a ``GROUP BY`` over the base pk plus each joined relation's
+        pk; non-aggregate annotations (window functions, ``F`` arithmetic) add
+        no grouping.
 
         Args:
             dialect: The SQL dialect providing quoting and placeholders.
@@ -1825,8 +1862,25 @@ class QuerySet:
         Returns:
             A ``(sql, params, order, nodes, ncols)`` tuple: the SELECT and its
             bound params, the relation paths in join order, the per-relation
-            decode nodes and the base model's column count.
+            decode nodes and the base model's column count (annotation values
+            trail the relation columns).
+
+        Raises:
+            UnSupportedError: With ``select_for_update()`` and ``annotate()``
+                both set. The lock is rejected on *every* annotated shape:
+                grouped/aggregate results cannot be locked, and even the
+                ungrouped shape may carry a window function (e.g. via
+                ``RawSQL``), which PostgreSQL also refuses to lock.
+            FieldError: When an annotation name collides with a model field
+                under an ``only()``/``defer()`` projection.
         """
+        if self._annotations:
+            if self._for_update:
+                raise UnSupportedError(
+                    "select_for_update() cannot be combined with annotate(): "
+                    "FOR UPDATE is not allowed with GROUP BY/aggregates"
+                )
+            self._check_annotation_collisions()
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
@@ -1897,15 +1951,41 @@ class QuerySet:
         # relation referenced by an only()/defer() ``rel__col`` projection.
         for rel in (*self._select_related, *self._only_related, *self._defer_related):
             ensure_path(rel)
-        where, params, _ = self._compile_conditions(dialect)
+        # Annotation expressions follow the relation columns; their joins are
+        # collected separately and de-duplicated against the plan's joins (an
+        # annotation over an already-select_related relation would otherwise
+        # emit the identical LEFT JOIN twice, colliding on the alias).
+        select_params: list[Any] = []
+        ann_joins: dict[str, str] = {}
+        idx = 1
+        for name, agg in self._annotations.items():
+            expr, idx = self._aggregate_expr(agg, dialect, ann_joins, select_params, idx)
+            select.append(f"{expr} AS {q(name)}")
+        where, wparams, idx = self._compile_conditions(dialect, start=idx)
+        having, hparams, _ = self._compile_having(dialect, idx, ann_joins)
+        params = select_params + wparams + hparams
+        extra_joins = "".join(j for key, j in ann_joins.items() if key not in nodes)
+        group = ""
+        if self._annotations and (self._having or self._has_aggregate_annotations()):
+            # Aggregates (or a HAVING filter) need grouping. Group by the base
+            # pk plus each joined relation's pk: the pk of a grouped table makes
+            # its remaining selected columns functionally dependent (PostgreSQL's
+            # rule; SQLite allows bare columns), so the wide join projection
+            # stays selectable while a reverse-relation aggregate still
+            # collapses to one row per base row.
+            group_refs = [f"{table}.{q(meta.pk_field.db_column)}"]
+            group_refs += [
+                f"{q(path)}.{q(nodes[path]['target']._meta.pk_field.db_column)}" for path in order
+            ]
+            group = " GROUP BY " + ", ".join(group_refs)
         lock = self._lock_sql(dialect)
         if lock and joins and not self._for_update_of:
             # PostgreSQL rejects FOR UPDATE on the nullable side of a LEFT
             # JOIN, so with joined relations lock only the base table's rows.
             lock = lock.replace("FOR UPDATE", f"FOR UPDATE OF {table}", 1)
         sql = (
-            f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{where}"
-            f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{lock}"
+            f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{extra_joins}{where}"
+            f"{group}{having}{self._order_sql(dialect)}{self._tail_sql(dialect)}{lock}"
         )
         return sql, params, order, nodes, len(base_fields)
 
@@ -1915,15 +1995,19 @@ class QuerySet:
         Each selected relation is LEFT JOINed (aliased by relation name, so
         self-joins and repeated targets are unambiguous) and its columns are
         decoded into a related instance cached under the instance's prefetch
-        slot — making the relation available synchronously.
+        slot — making the relation available synchronously. Annotation values
+        trail the relation columns and are set as instance attributes.
 
         Returns:
-            The model instances with each selected relation cached.
+            The model instances with each selected relation cached (and any
+            annotation values attached).
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         sql, params, order, nodes, ncols = self._select_related_plan(dialect)
         base_sel = self._selected_fields() if (self._only is not None or self._defer) else None
+        annotation_names = list(self._annotations)
+        ann_base = ncols + sum(nodes[path]["width"] for path in order)
         rows = await engine.fetch_rows(sql, params)
         instances = []
         for row in rows:
@@ -1949,6 +2033,8 @@ class QuerySet:
                     child = node["target"]._from_db_row(chunk)
                 parent_inst.__dict__.setdefault("_prefetch", {})[node["seg"]] = child
                 built[path] = child
+            for offset, name in enumerate(annotation_names):
+                setattr(obj, name, row[ann_base + offset])
             instances.append(obj)
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
@@ -1963,6 +2049,9 @@ class QuerySet:
         Shared by :meth:`_fetch_annotated` and :meth:`get_parameterized_sql` so
         both render the identical statement.
 
+        The base columns honour ``only()``/``defer()`` (the pk is always
+        included, so the ``GROUP BY`` stays valid).
+
         Args:
             dialect: The SQL dialect providing quoting and placeholders.
 
@@ -1972,18 +2061,21 @@ class QuerySet:
         Raises:
             UnSupportedError: With ``select_for_update()`` set; ``FOR UPDATE``
                 is not allowed with GROUP BY/aggregates.
+            FieldError: When an annotation name collides with a model field
+                under an ``only()``/``defer()`` projection.
         """
         if self._for_update:
             raise UnSupportedError(
                 "select_for_update() cannot be combined with annotate(): "
                 "FOR UPDATE is not allowed with GROUP BY/aggregates"
             )
+        self._check_annotation_collisions()
         meta = self.model._meta
         meta.compile(dialect)
         q = dialect.quote
         table = q(meta.table)
         joins: dict[str, str] = {}
-        select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
+        select = [f"{table}.{q(f.db_column)}" for f in self._selected_fields()]
         select_params: list[Any] = []
         idx = 1
         for name in self._annotations:
@@ -2005,20 +2097,27 @@ class QuerySet:
     async def _fetch_annotated(self) -> list[Model]:
         """Execute an annotated query and attach annotations to instances.
 
+        Under ``only()``/``defer()`` the base instance hydrates partially (the
+        unselected columns stay deferred and raise on access).
+
         Returns:
             A list of model instances with each annotation value set as an
             attribute, with any requested relations prefetched.
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
-        meta = self.model._meta
         sql, params = self._annotated_select_sql(dialect)
+        base_sel = self._selected_fields() if (self._only is not None or self._defer) else None
         annotation_names = list(self._annotations.keys())
         rows = await engine.fetch_rows(sql, params)
-        ncols = len(meta.field_list)
+        ncols = len(base_sel) if base_sel is not None else len(self.model._meta.field_list)
         instances = []
         for row in rows:
-            obj = self.model._from_db_row(row[:ncols])
+            obj = (
+                self.model._from_db_row_fields(row[:ncols], base_sel)
+                if base_sel is not None
+                else self.model._from_db_row(row[:ncols])
+            )
             for offset, name in enumerate(annotation_names):
                 setattr(obj, name, row[ncols + offset])
             instances.append(obj)
@@ -2403,11 +2502,12 @@ class QuerySet:
         if self._group_by:
             sql, params, _ = self._grouped_select_sql(dialect)
             return sql, params
-        if self._annotations:
-            return self._annotated_select_sql(dialect)
-        if self._select_related:
+        if self._select_related or self._only_related or self._defer_related:
+            # The join plan also carries any annotations (combined shape).
             sql, params, _, _, _ = self._select_related_plan(dialect)
             return sql, params
+        if self._annotations:
+            return self._annotated_select_sql(dialect)
         sql, params, _ = self._plain_select_sql(dialect)
         return sql, params
 

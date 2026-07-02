@@ -166,10 +166,33 @@ Annotation filters also carry through the write and inspection terminals:
 `delete()` / `update()` restrict through a grouped subquery, and `count()`
 counts the rows that survive the `HAVING` (with `group_by()`, the groups).
 
-!!! note "`select_related()` and `annotate()` don't combine"
-    An annotated query groups by the primary key, which conflicts with hydrating
-    joined relations — combining the two raises `FieldError`. Use
-    [`prefetch_related()`](relations.md) to load relations alongside annotations.
+!!! note "`select_related()` combines with `annotate()`"
+    Annotations ride along a [`select_related()`](relations.md) join plan in a
+    single SELECT — the related instances hydrate as usual and each annotation
+    value is set as an attribute:
+
+    ```python
+    calls = (
+        await Call.filter(org_id=org_id)
+        .select_related("contact", "disposition")
+        .annotate(duration_rank=RawSQL("RANK() OVER (ORDER BY duration DESC)"))
+        .only("id", "to_number", "started")
+    )
+    calls[0].contact.name, calls[0].duration_rank  # both loaded
+    ```
+
+    Non-aggregate annotations (window functions, `F` arithmetic) add no
+    `GROUP BY`. An **aggregate** annotation (or a `HAVING` filter) groups by
+    the base table's primary key plus each joined relation's primary key, so a
+    reverse-relation `Count` collapses back to one row per base row while the
+    joined columns stay selectable (PostgreSQL's functional-dependency rule;
+    SQLite allows bare columns). `select_for_update()` still raises
+    `UnSupportedError` on **every** annotated shape — grouped results cannot be
+    locked, and even ungrouped annotations may carry a window expression (e.g.
+    via `RawSQL`), which PostgreSQL also refuses to lock. Note that a `RawSQL`
+    fragment is opaque: a raw aggregate written as text is *not* detected as an
+    aggregate (no `GROUP BY` is added) — use the aggregate classes
+    (`Count`/`Sum`/...) for grouped shapes.
 
 ## Putting it together
 

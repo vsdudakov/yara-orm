@@ -238,10 +238,14 @@ await Book.all().only("author__country__code")
 ```
 
 Naming **only** related paths (no base column) restricts the base model to its
-primary key, loading the joined relation partially. This is why `only()` /
-`defer()` work with `select_related()`, but they **cannot** be combined with
-`annotate()`. For plain dict/tuple projections that skip model construction
-entirely, prefer [`values()` / `values_list()`](#projections-values-and-values_list).
+primary key, loading the joined relation partially. `only()` / `defer()` also
+combine with `annotate()` (with or without `select_related()`): the annotation
+expressions are appended to the narrowed projection and set as instance
+attributes, while unselected columns stay deferred. An annotation may **not**
+reuse a model field name when `only()`/`defer()` is active — that would
+silently "un-defer" the column — and raises `FieldError`. For plain dict/tuple
+projections that skip model construction entirely, prefer
+[`values()` / `values_list()`](#projections-values-and-values_list).
 
 ## Inspecting a query: `sql()` / `explain()`
 

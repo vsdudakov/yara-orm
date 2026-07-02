@@ -9,7 +9,7 @@ Each test guards one verified finding:
 - select_for_update() is emitted (or rejected) on every select shape.
 - LIKE/ILIKE lookups escape ``%``/``_``/``\\`` in user values.
 - last() uses Meta.ordering and rejects sliced query sets.
-- select_related() + annotate() raises instead of silently dropping joins.
+- select_related() + annotate() compiles to one joined, annotated SELECT.
 - exclude() targets annotations (negated HAVING).
 - filter()/exclude() reject non-Q positional arguments.
 - ``Subquery(qs.only("col"))`` projects exactly the named column.
@@ -398,15 +398,18 @@ async def test_last_rejects_sliced_queryset(db):
 # select_related + annotate
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_select_related_with_annotate_raises(db):
+async def test_select_related_with_annotate_works(db):
     """
-    GIVEN a query combining select_related() with annotate()
+    GIVEN a query combining select_related() with an aggregate annotate()
     WHEN it executes
-    THEN a FieldError is raised instead of silently dropping the joins
+    THEN the joins are kept: each instance carries the hydrated relation and
+         the annotation value (grouped by the base and joined pks)
     """
     await _seed_authors()
-    with pytest.raises(FieldError):
-        await AudqBook.annotate(n=Count("id")).select_related("author")
+    books = await AudqBook.annotate(n=Count("id")).select_related("author").order_by("title")
+    assert [b.title for b in books] == ["A1", "A2", "B1"]
+    assert [b.author.name for b in books] == ["Ada", "Ada", "Bob"]
+    assert [b.n for b in books] == [1, 1, 1]  # grouped per book row, not inflated
 
 
 # ---------------------------------------------------------------------------
