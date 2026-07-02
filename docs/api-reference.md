@@ -56,6 +56,8 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | `update_or_create` | `await Model.update_or_create(defaults=None, **kwargs)` | Update or create → `(instance, created)`. |
 | `bulk_create` | `await Model.bulk_create(objects, batch_size=500)` | Multi-row insert. |
 | `bulk_update` | `await Model.bulk_update(objects, fields, batch_size=500)` | Batched multi-row update. |
+| `bulk_get_or_create` | `await Model.bulk_get_or_create(records, key_fields, defaults=None, batch_size=500)` | Batched fetch-or-create → `[(instance, created)]` in input order. |
+| `bulk_update_or_create` | `await Model.bulk_update_or_create(records, key_fields, update_fields=None, batch_size=500)` | Batched update-or-create → `[(instance, created)]` in input order. |
 | `in_bulk` | `await Model.in_bulk(ids, field_name="pk")` | Fetch many rows as a `{key: instance}` dict. |
 | `get` | `await Model.get(**kwargs)` | Single row; raises `DoesNotExist` / `MultipleObjectsReturned`. |
 | `get_or_none` | `await Model.get_or_none(**kwargs)` | Single row or `None`. |
