@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-02
+
 ### Added
 
 - **Typed relations (Tortoise-style).** The relation annotations
