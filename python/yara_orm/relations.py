@@ -78,7 +78,7 @@ class RelationInfo:
         """
         target = self._target
         if target is None:
-            target = self._target = registry.get_model(model_name(self.reference))
+            target = self._target = registry.get_model(self.reference)
         return target
 
 
@@ -122,7 +122,7 @@ class M2MInfo:
         """
         target = self._target
         if target is None:
-            target = self._target = registry.get_model(model_name(self.reference))
+            target = self._target = registry.get_model(self.reference)
         return target
 
     def finalize(self) -> type[Model]:
@@ -186,7 +186,20 @@ class ForwardRelationDescriptor:
             return self
         cache = instance.__dict__.get("_prefetch")
         if cache and self.info.name in cache:
-            return cache[self.info.name]
+            cached = cache[self.info.name]
+            if cached is None:
+                # A prefetch resolved this relation to None (no row, or its
+                # custom queryset excluded it); serve that result.
+                return None
+            # Serve a cached object only while it matches the current FK value;
+            # a direct write to the ``<name>_id`` attribute (which bypasses
+            # this descriptor) leaves a stale entry — drop it and reload. A
+            # deferred FK column (``only()``/``defer()``) has no local value to
+            # compare, so the cache is trusted as-is.
+            fk = instance.__dict__.get(self.info.source_attr, _MISSING)
+            if fk is _MISSING or cached.pk == fk:
+                return cached
+            del cache[self.info.name]
         return ForwardRelation(instance, self.info)
 
     def __set__(self, instance: Model, value: Model | Any) -> None:
@@ -196,19 +209,33 @@ class ForwardRelationDescriptor:
             instance: The model instance the attribute is set on.
             value: A related model instance, a raw key value, or None.
 
+        Raises:
+            ValueError: When ``value`` is an unsaved model instance (its primary
+                key is ``None``) — storing it would silently persist a NULL
+                foreign key.
+
         Returns:
             None
         """
         # Deferred: breaks the relations <-> models import cycle.
         from .models import Model
 
-        if value is None:
-            instance.__dict__[self.info.source_attr] = None
-        elif isinstance(value, Model):
+        if isinstance(value, Model):
+            if value.pk is None:
+                raise ValueError(
+                    f'Cannot assign "{value!r}" to {type(instance).__name__}.'
+                    f"{self.info.name}: the instance isn't saved in the database "
+                    f"yet; save it first"
+                )
             instance.__dict__[self.info.source_attr] = value.pk
             instance.__dict__.setdefault("_prefetch", {})[self.info.name] = value
         else:
+            # ``None`` or a raw key value: drop any stale cached related object
+            # so the accessor reflects the new key instead of the old instance.
             instance.__dict__[self.info.source_attr] = value
+            cache = instance.__dict__.get("_prefetch")
+            if cache is not None:
+                cache.pop(self.info.name, None)
 
 
 class ForwardRelation:
@@ -249,7 +276,10 @@ class ForwardRelation:
             return None
         target = self.info.resolve_target()
         obj = await target.get_or_none(pk=fk)
-        self.instance.__dict__.setdefault("_prefetch", {})[self.info.name] = obj
+        # A miss (dangling key) is not cached: caching ``None`` would keep
+        # serving it even after the row appears or the key changes.
+        if obj is not None:
+            self.instance.__dict__.setdefault("_prefetch", {})[self.info.name] = obj
         return obj
 
 
@@ -286,9 +316,12 @@ class ReverseFKDescriptor:
         Returns:
             The source model class.
         """
+        # The registry installs reverse descriptors with the qualified
+        # ``module.ClassName`` reference, which resolves exactly (no bare-name
+        # guessing between identically named models in different modules).
         source = self._source
         if source is None:
-            source = self._source = registry.get_model(model_name(self.source_reference))
+            source = self._source = registry.get_model(self.source_reference)
         return source
 
     def __get__(

@@ -6,7 +6,7 @@ from enum import IntEnum
 
 import pytest
 
-from yara_orm import Count, Model, Sum, fields, registry
+from yara_orm import ConfigurationError, Count, Model, Sum, fields, registry
 from yara_orm.dialects import SqliteDialect
 
 
@@ -76,12 +76,16 @@ def test_registry_resolution_and_clear():
 
     saved = dict(registry._MODELS)
     try:
-        # Two models sharing a bare name: the most recently defined wins.
+        # Two models sharing a bare name: ambiguous references raise; the
+        # qualified forms still resolve each model unambiguously.
         first = type("Dupe", (), {})
         second = type("Dupe", (), {})
         registry._MODELS["m1.Dupe"] = first
         registry._MODELS["m2.Dupe"] = second
-        assert registry.get_model("Dupe") is second
+        with pytest.raises(ConfigurationError):
+            registry.get_model("Dupe")
+        assert registry.get_model("m1.Dupe") is first
+        assert registry.get_model("m2.Dupe") is second
 
         registry.clear()
         assert registry.all_models() == []

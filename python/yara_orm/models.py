@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -172,6 +173,12 @@ class MetaInfo:
             if isinstance(f, DatetimeField) and (f.auto_now or f.auto_now_add)
         ]
         self.validated_fields = [f for f in self.field_list if f.validators]
+        # Columns whose value the *database* supplies (``default=Now()`` etc.).
+        # The write paths treat these specially: omitted from an INSERT unless
+        # explicitly set, and never overwritten with a never-fetched ``None``.
+        self.db_default_fields = [
+            f for f in self.field_list if isinstance(f.default, DatabaseDefault)
+        ]
 
     @property
     def db_table(self) -> str:
@@ -265,7 +272,15 @@ class MetaInfo:
             if not (f is self.pk_field and f.auto_increment)
             and not isinstance(f.default, DatabaseDefault)
         ]
-        ret = q(self.pk_field.db_column)
+        # With ``Meta.fetch_db_defaults`` the INSERT also returns the
+        # database-supplied default columns, so the instance reflects the
+        # persisted row (both PostgreSQL and SQLite >= 3.35 support RETURNING).
+        self.insert_returning_fields = [self.pk_field]
+        if self.fetch_db_defaults:
+            self.insert_returning_fields += [
+                f for f in self.db_default_fields if f is not self.pk_field
+            ]
+        ret = ", ".join(q(f.db_column) for f in self.insert_returning_fields)
         if self.insert_fields:
             cols = ", ".join(q(f.db_column) for f in self.insert_fields)
             holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(self.insert_fields)))
@@ -620,8 +635,21 @@ class ModelMeta(type):
             {"__qualname__": f"{name}.MultipleObjectsReturned"},
         )
 
-        # Bind the model's manager (a declared ``Meta.manager`` or the default).
-        manager = getattr(meta_cls, "manager", None) or Manager()
+        # Bind the model's manager (a declared ``Meta.manager``, one inherited
+        # from a base's Meta — so a soft-delete manager on an abstract base
+        # scopes every subclass — or the default). The instance is *copied* per
+        # class: rebinding a manager shared between two models' Meta in place
+        # would silently point the first model's queries at the second.
+        manager = getattr(meta_cls, "manager", None)
+        if manager is None:
+            for parent in parents:
+                parent_meta = getattr(parent, "_meta", None)
+                # A plain ``Manager`` carries no behaviour worth inheriting; only
+                # a custom subclass propagates (mirroring ``extra_kwargs``).
+                if parent_meta is not None and type(parent_meta.manager) is not Manager:
+                    manager = parent_meta.manager
+                    break
+        manager = copy.copy(manager) if manager is not None else Manager()
         manager._model = cls
         cls._meta.manager = manager
 
@@ -690,6 +718,11 @@ class Model(metaclass=ModelMeta):
             if value is None:
                 self.__dict__[info.source_attr] = None
             elif isinstance(value, Model):
+                if value.pk is None:
+                    raise ValueError(
+                        f'Cannot assign "{value!r}" to {type(self).__name__}.{rel_name}: '
+                        f"the instance isn't saved in the database yet; save it first"
+                    )
                 self.__dict__[info.source_attr] = value.pk
                 self.__dict__.setdefault("_prefetch", {})[rel_name] = value
             else:
@@ -791,10 +824,56 @@ class Model(metaclass=ModelMeta):
     def __hash__(self) -> int:
         """Hash by model type and primary key, consistent with :meth:`__eq__`.
 
+        Raises:
+            TypeError: For an unsaved instance (``pk`` is ``None``) — its hash
+                would change once ``save()`` assigns the primary key, making it
+                unfindable in any set/dict it was already placed in.
+
         Returns:
-            A hash over ``(type, pk)``; unsaved instances hash by ``pk=None``.
+            A hash over ``(type, pk)``.
         """
-        return hash((type(self), self.pk))
+        pk = self.pk
+        if pk is None:
+            raise TypeError("Model instances without a primary key are unhashable")
+        return hash((type(self), pk))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Set the attribute, un-marking a pending database-default column.
+
+        An explicit assignment — including ``None`` — makes the in-memory value
+        authoritative again, so the next full ``save()`` writes it instead of
+        skipping the column as never-fetched.
+
+        Args:
+            name: The attribute name being assigned.
+            value: The value to assign.
+
+        Returns:
+            None
+        """
+        unfetched = self.__dict__.get("_unfetched_db_defaults")
+        if unfetched:
+            unfetched.discard(name)
+        super().__setattr__(name, value)
+
+    def _mark_unfetched_db_defaults(self) -> None:
+        """Record which database-default columns hold a never-fetched ``None``.
+
+        Called right after an INSERT: any ``DatabaseDefault`` column that is
+        still ``None`` in memory was filled by the database but not returned
+        (``Meta.fetch_db_defaults`` off), so a later full ``save()`` must not
+        overwrite it. Explicit assignments clear the mark (``__setattr__``).
+
+        Returns:
+            None
+        """
+        unset = {
+            f.model_field_name
+            for f in self._meta.db_default_fields
+            if getattr(self, f.model_field_name, None) is None
+        }
+        if unset:
+            self.__dict__["_unfetched_db_defaults"] = unset
 
     @classmethod
     def _from_db_row(cls, values: list[Any]) -> Model:
@@ -970,7 +1049,7 @@ class Model(metaclass=ModelMeta):
         executor = get_executor(cls, write=True, using=using_db)
         if has_signals:
             await signals.emit_pre_save(cls, self, executor, update_fields)
-        await self._perform_save(executor, update_fields)
+        await self._perform_save(executor, update_fields, using_db)
         if has_signals:
             await signals.emit_post_save(cls, self, created, executor, update_fields)
         return self
@@ -988,13 +1067,17 @@ class Model(metaclass=ModelMeta):
             for validator in field.validators:
                 validator(value)
 
-    async def _perform_save(self, executor: Any, update_fields: list[str] | None = None) -> None:
+    async def _perform_save(
+        self, executor: Any, update_fields: list[str] | None = None, using_db: Any = None
+    ) -> None:
         """Run the INSERT or UPDATE statement that persists this instance.
 
         Args:
             executor: The write-capable database executor to run SQL against.
             update_fields: Optional subset of fields to write on an UPDATE; see
                 :meth:`save`. Ignored for INSERTs.
+            using_db: Optional connection name/object the statement runs on, so
+                the SQL is rendered for that connection's dialect.
 
         Returns:
             None
@@ -1003,7 +1086,7 @@ class Model(metaclass=ModelMeta):
             self._apply_auto_now(only=set(update_fields))
         else:
             self._apply_auto_now()
-        dialect = get_dialect(type(self))
+        dialect = get_dialect(type(self), using=using_db)
         meta = self._meta
         meta.compile(dialect)
         pk_field = meta.pk_field
@@ -1012,14 +1095,21 @@ class Model(metaclass=ModelMeta):
         if not self._in_db:
             pk_attr = pk_field.model_field_name
             pk_unset = pk_field.auto_increment and getattr(self, pk_attr, None) is None
-            if pk_unset:
+            # An explicit value on a database-default column must reach the
+            # INSERT (the cached statement omits those columns), so the fast
+            # path only applies while every such column is unset.
+            if pk_unset and all(
+                getattr(self, f.model_field_name, None) is None for f in meta.db_default_fields
+            ):
                 # Fast path: reuse the cached INSERT statement, bind params only.
                 params = [
                     f.to_db(getattr(self, f.model_field_name, None)) for f in meta.insert_fields
                 ]
                 row = await executor.fetch_row(meta.insert_sql, params)
-                setattr(self, pk_attr, pk_field.to_python(row[0]))
+                for field, value in zip(meta.insert_returning_fields, row):
+                    setattr(self, field.model_field_name, field.to_python(value))
                 self._in_db = True
+                self._mark_unfetched_db_defaults()
                 return
 
             columns = []
@@ -1028,22 +1118,28 @@ class Model(metaclass=ModelMeta):
             idx = 1
             for name, field in meta.fields.items():
                 value = getattr(self, name, None)
-                # Omit an unset database-default column so the DB supplies it.
-                if value is None and isinstance(field.default, DatabaseDefault):
+                # Omit an unset database-default column so the DB supplies it,
+                # and an unset auto-increment pk so the DB assigns it.
+                if value is None and (
+                    isinstance(field.default, DatabaseDefault)
+                    or (field is pk_field and field.auto_increment)
+                ):
                     continue
                 columns.append(dialect.quote(field.db_column))
                 placeholders.append(dialect.placeholder(idx))
                 params.append(field.to_db(value))
                 idx += 1
 
-            returning = dialect.quote(pk_field.db_column)
+            returning = ", ".join(dialect.quote(f.db_column) for f in meta.insert_returning_fields)
             sql = (
                 f"INSERT INTO {table} ({', '.join(columns)}) "
                 f"VALUES ({', '.join(placeholders)}) RETURNING {returning}"
             )
             row = await executor.fetch_row(sql, params)
-            setattr(self, pk_field.model_field_name, pk_field.to_python(row[0]))
+            for field, value in zip(meta.insert_returning_fields, row):
+                setattr(self, field.model_field_name, field.to_python(value))
             self._in_db = True
+            self._mark_unfetched_db_defaults()
         elif update_fields is not None:
             # Partial update: write only the named fields (relation names map to
             # their FK column). The pk is the WHERE key, never an assignment.
@@ -1063,11 +1159,21 @@ class Model(metaclass=ModelMeta):
             await executor.execute(meta.partial_update_sql(dialect, resolved), params)
         elif meta.update_sql is not None:
             # Reuse the cached UPDATE statement; only the bound values change.
-            params = [
-                f.to_db(getattr(self, f.model_field_name, None)) for f in meta.update_field_list
-            ]
+            fields = meta.update_field_list
+            sql = meta.update_sql
+            unfetched = self.__dict__.get("_unfetched_db_defaults")
+            if unfetched:
+                # Never overwrite a database-default column with a ``None`` the
+                # instance holds only because the DB-supplied value was never
+                # fetched (e.g. after ``create()`` without fetch_db_defaults).
+                # An explicitly assigned ``None`` clears the mark and is written.
+                fields = [f for f in fields if f.model_field_name not in unfetched]
+                if not fields:
+                    return
+                sql = meta.partial_update_sql(dialect, fields)
+            params = [f.to_db(getattr(self, f.model_field_name, None)) for f in fields]
             params.append(pk_field.to_db(self.pk))
-            await executor.execute(meta.update_sql, params)
+            await executor.execute(sql, params)
 
     async def delete(self, using_db: Any = None) -> None:
         """Delete this instance's row, emitting pre/post-delete signals.
@@ -1079,7 +1185,7 @@ class Model(metaclass=ModelMeta):
             None
         """
         cls = type(self)
-        dialect = get_dialect(cls)
+        dialect = get_dialect(cls, using=using_db)
         executor = get_executor(cls, write=True, using=using_db)
         meta = self._meta
         has_signals = signals._has_handlers(cls)
@@ -1442,7 +1548,17 @@ class Model(metaclass=ModelMeta):
             clauses.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
             params.append(field.to_db(value))
             idx += 1
-        sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)} LIMIT {limit}"
+        # Honour ``Meta.ordering`` like the QuerySet fallback path does, so a
+        # multi-match lookup (``get_or_none``) picks the same deterministic row
+        # on either path instead of an arbitrary one.
+        order = ""
+        if meta.ordering:
+            parts = [
+                f"{dialect.quote(meta.get_field(name).db_column)} {'DESC' if desc else 'ASC'}"
+                for name, desc in meta.ordering
+            ]
+            order = f" ORDER BY {', '.join(parts)}"
+        sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)}{order} LIMIT {limit}"
         return await engine.fetch_rows(sql, params)
 
     @classmethod
@@ -1559,6 +1675,33 @@ class Model(metaclass=ModelMeta):
         return obj, False
 
     @classmethod
+    def _natural_key(cls, values: dict[str, Any] | Model, key_fields: tuple[str, ...]) -> tuple:
+        """Build a comparable key tuple from a record dict or an instance.
+
+        Both sides are normalised through ``field.to_db`` (the canonical
+        loose-input coercion lever), so a record carrying ``"42"`` or an ISO
+        date string matches the typed attribute of a fetched instance instead
+        of silently missing and duplicating the row.
+
+        Args:
+            values: A record mapping or a model instance.
+            key_fields: The field names forming the natural key.
+
+        Returns:
+            The normalised key tuple.
+        """
+        meta = cls._meta
+        out = []
+        for name in key_fields:
+            if isinstance(values, dict):
+                value = values[name]  # ty: ignore[invalid-argument-type]
+            else:
+                value = getattr(values, name)
+            field = meta.fields.get(name)
+            out.append(field.to_db(value) if field is not None else value)
+        return tuple(out)
+
+    @classmethod
     async def _existing_by_key(
         cls, records: list[dict[str, Any]], key_fields: tuple[str, ...]
     ) -> dict[tuple, Model]:
@@ -1566,21 +1709,21 @@ class Model(metaclass=ModelMeta):
 
         Fetches candidates in a single query (the first key field's ``__in``) and
         matches the full key tuple in memory, so a composite key still costs one
-        round-trip.
+        round-trip. Keys are normalised via :meth:`_natural_key`.
 
         Args:
             records: The records whose keys to look up.
             key_fields: The field names forming the natural key.
 
         Returns:
-            A mapping of key tuple to the existing instance.
+            A mapping of normalised key tuple to the existing instance.
         """
         first = key_fields[0]
         values = list({rec[first] for rec in records})
-        wanted = {tuple(rec[f] for f in key_fields) for rec in records}
+        wanted = {cls._natural_key(rec, key_fields) for rec in records}
         out: dict[tuple, Model] = {}
         for obj in await cls.filter(**{f"{first}__in": values}):
-            key = tuple(getattr(obj, f) for f in key_fields)
+            key = cls._natural_key(obj, key_fields)
             if key in wanted:
                 out[key] = obj
         return out
@@ -1620,7 +1763,7 @@ class Model(metaclass=ModelMeta):
         results: list[tuple[Model, bool]] = []
         to_create: list[Model] = []
         for rec in records:
-            key = tuple(rec[f] for f in keys)
+            key = cls._natural_key(rec, keys)
             found = existing.get(key)
             if found is not None:
                 results.append((found, False))
@@ -1662,18 +1805,24 @@ class Model(metaclass=ModelMeta):
             raise ValueError("bulk_update_or_create requires at least one key field")
         if not records:
             return []
-        updates = (
-            list(update_fields)
-            if update_fields is not None
-            else [f for f in records[0] if f not in keys]
-        )
+        if update_fields is not None:
+            updates = list(update_fields)
+        else:
+            # Every non-key field present in *any* record (per the docstring);
+            # records may be heterogeneous, so the first one is not enough.
+            seen_fields: dict[str, None] = {}
+            for rec in records:
+                for f in rec:
+                    if f not in keys:
+                        seen_fields[f] = None
+            updates = list(seen_fields)
         existing = await cls._existing_by_key(records, keys)
         pending: dict[tuple, Model] = {}  # new keys created in this batch
         results: list[tuple[Model, bool]] = []
         to_create: list[Model] = []
         to_update: dict[int, Model] = {}  # id(obj) -> obj, deduped
         for rec in records:
-            key = tuple(rec[f] for f in keys)
+            key = cls._natural_key(rec, keys)
             found = existing.get(key)
             if found is not None:
                 found.update_from_dict({f: rec[f] for f in updates if f in rec})
@@ -1773,74 +1922,102 @@ class Model(metaclass=ModelMeta):
                 conflict_cols = []
             conflict_sql = dialect.on_conflict_sql(conflict_cols, update_cols)
 
-        insert_fields = [
+        base_fields = [
             f
             for f in meta.fields.values()
             if not (f is pk_field and f.auto_increment)
             and not isinstance(f.default, DatabaseDefault)
         ]
-        ncols = len(insert_fields)
-        if not ncols:
-            # Only an auto-increment pk: DEFAULT VALUES is single-row, so insert
-            # each object on its own (a degenerate but valid case).
+        db_default_fields = [
+            f
+            for f in meta.fields.values()
+            if isinstance(f.default, DatabaseDefault) and not (f is pk_field and f.auto_increment)
+        ]
+
+        # A database-default column is omitted so the DB fills it — but an
+        # object carrying an explicit value must have it inserted, not silently
+        # replaced by the default. Group rows by which of those columns they
+        # set, so each group's INSERT lists exactly the supplied columns.
+        if db_default_fields:
+            groups: dict[tuple[str, ...], list[Model]] = {}
             for obj in objects:
-                await obj.save()
-            return objects
-        # Keep batches under PostgreSQL's 65535 bind-parameter ceiling.
-        batch_size = min(batch_size, max(1, 65535 // ncols))
-        columns = ", ".join(dialect.quote(f.db_column) for f in insert_fields)
+                sig = tuple(
+                    f.model_field_name
+                    for f in db_default_fields
+                    if getattr(obj, f.model_field_name, None) is not None
+                )
+                groups.setdefault(sig, []).append(obj)
+        else:
+            groups = {(): objects}
 
-        def values_clause(nrows: int) -> str:
-            """Build the ``VALUES`` placeholder groups for ``nrows`` rows.
-
-            Args:
-                nrows: Number of rows in the batch.
-
-            Returns:
-                The comma-separated parenthesised placeholder groups.
-            """
-            rows = []
-            idx = 1
-            for _ in range(nrows):
-                holes = ", ".join(dialect.placeholder(idx + j) for j in range(ncols))
-                rows.append(f"({holes})")
-                idx += ncols
-            return ", ".join(rows)
-
-        def build_sql(nrows: int) -> str:
-            """Build the multi-row INSERT statement for ``nrows`` rows.
-
-            Args:
-                nrows: Number of rows the statement should insert.
-
-            Returns:
-                The complete INSERT SQL string (with conflict and/or RETURNING).
-            """
-            # RETURNING is omitted under ON CONFLICT: skipped rows would not be
-            # returned, so the row order could not be matched back to objects.
-            ret = "" if upsert else f" RETURNING {returning}"
-            return (
-                f"INSERT INTO {table} ({columns}) VALUES {values_clause(nrows)}{conflict_sql}{ret}"
-            )
-
-        # Pre-build the statement shared by every full-size batch.
-        full_sql = build_sql(batch_size) if len(objects) >= batch_size else None
-
-        for start in range(0, len(objects), batch_size):
-            batch = objects[start : start + batch_size]
-            sql = full_sql if len(batch) == batch_size else build_sql(len(batch))
-            params: list = []
-            for obj in batch:
-                obj._apply_auto_now()
-                for field in insert_fields:
-                    params.append(field.to_db(getattr(obj, field.model_field_name, None)))
-            if upsert:
-                await engine.execute(sql, params)
+        for sig, group in groups.items():
+            insert_fields = base_fields + [meta.fields[name] for name in sig]
+            ncols = len(insert_fields)
+            if not ncols:
+                # Only an auto-increment pk: DEFAULT VALUES is single-row, so
+                # insert each object on its own (a degenerate but valid case).
+                for obj in group:
+                    await obj.save()
                 continue
-            returned = await engine.fetch_rows(sql, params)
-            for obj, row in zip(batch, returned):
-                setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
-                obj._in_db = True
+            # Keep batches under PostgreSQL's 65535 bind-parameter ceiling.
+            size = min(batch_size, max(1, 65535 // ncols))
+            columns = ", ".join(dialect.quote(f.db_column) for f in insert_fields)
+
+            def values_clause(nrows: int, ncols: int = ncols) -> str:
+                """Build the ``VALUES`` placeholder groups for ``nrows`` rows.
+
+                Args:
+                    nrows: Number of rows in the batch.
+                    ncols: Number of columns per row.
+
+                Returns:
+                    The comma-separated parenthesised placeholder groups.
+                """
+                rows = []
+                idx = 1
+                for _ in range(nrows):
+                    holes = ", ".join(dialect.placeholder(idx + j) for j in range(ncols))
+                    rows.append(f"({holes})")
+                    idx += ncols
+                return ", ".join(rows)
+
+            def build_sql(nrows: int, columns: str = columns) -> str:
+                """Build the multi-row INSERT statement for ``nrows`` rows.
+
+                Args:
+                    nrows: Number of rows the statement should insert.
+                    columns: The rendered column list for this group.
+
+                Returns:
+                    The complete INSERT SQL string (with conflict/RETURNING).
+                """
+                # RETURNING is omitted under ON CONFLICT: skipped rows would not
+                # be returned, so the row order could not be matched to objects.
+                ret = "" if upsert else f" RETURNING {returning}"
+                return (
+                    f"INSERT INTO {table} ({columns}) "
+                    f"VALUES {values_clause(nrows)}{conflict_sql}{ret}"
+                )
+
+            # Pre-build the statement shared by every full-size batch.
+            full_sql = build_sql(size) if len(group) >= size else None
+
+            for start in range(0, len(group), size):
+                batch = group[start : start + size]
+                sql = full_sql if len(batch) == size else build_sql(len(batch))
+                params: list = []
+                for obj in batch:
+                    obj._apply_auto_now()
+                    for field in insert_fields:
+                        params.append(field.to_db(getattr(obj, field.model_field_name, None)))
+                if upsert:
+                    await engine.execute(sql, params)
+                    continue
+                returned = await engine.fetch_rows(sql, params)
+                for obj, row in zip(batch, returned):
+                    setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
+                    obj._in_db = True
+                    obj._mark_unfetched_db_defaults()
         return objects
 
     @classmethod

@@ -8,6 +8,7 @@ decision in the dialect layer.
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid as _uuid
 from datetime import date, datetime, time, timedelta
@@ -156,11 +157,17 @@ class Field:
 
         Returns:
             The default value (invoked if callable), or ``None`` for a
-            database-side default — the database supplies that value.
+            database-side default — the database supplies that value. A mutable
+            default (``dict``/``list``/``set``) is deep-copied so instances
+            never share (and mutate) one object.
         """
         if isinstance(self.default, DatabaseDefault):
             return None
-        return self.default() if callable(self.default) else self.default
+        if callable(self.default):
+            return self.default()
+        if isinstance(self.default, (dict, list, set)):
+            return copy.deepcopy(self.default)
+        return self.default
 
     def to_db(self, value: Any) -> Any:
         """Convert a Python value into something the engine can bind.
@@ -445,20 +452,41 @@ class BooleanField(Field):
 
     field_kind = "bool"
 
+    #: String spellings accepted (case-insensitively) as boolean input.
+    _TRUE_STRINGS = frozenset({"true", "t", "1", "yes", "y", "on"})
+    _FALSE_STRINGS = frozenset({"false", "f", "0", "no", "n", "off"})
+
     def to_db(self, value: Any) -> Any:
         """Coerce the Python value to a ``bool`` before binding.
 
-        Coerces with ``bool(value)`` so truthy non-bool inputs (``1``/``0``, a
-        non-empty string) round-trip instead of reaching the engine as a type
-        the boolean column rejects.
+        Strings are coerced semantically (``"true"``/``"t"``/``"1"`` and
+        ``"false"``/``"f"``/``"0"``, case-insensitive) — ``bool("false")`` would
+        silently bind ``True``. Other values coerce with ``bool(value)`` so
+        ``1``/``0`` round-trip.
 
         Args:
             value: The Python value to convert.
 
+        Raises:
+            ValueError: For a string that spells neither true nor false.
+
         Returns:
-            ``None`` when value is ``None``, otherwise ``bool(value)``.
+            ``None`` when value is ``None``, otherwise the coerced ``bool``.
         """
-        return None if value is None else bool(value)
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in self._TRUE_STRINGS:
+                return True
+            if text in self._FALSE_STRINGS:
+                return False
+            raise ValueError(
+                f"Invalid boolean string {value!r} for field {self.model_field_name!r}; "
+                f"expected a true/false spelling such as 'true'/'false', 't'/'f', "
+                f"'1'/'0', 'yes'/'no' or 'on'/'off'"
+            )
+        return bool(value)
 
     def to_python(self, value: Any) -> Any:
         """Convert a database value into a ``bool``.
@@ -974,10 +1002,9 @@ class ForeignKeyField(Field):
             return self._target_pk_field
         # Lazy import avoids a circular import at module load.
         from . import registry
-        from .relations import model_name
 
         try:
-            target = registry.get_model(model_name(self.reference))
+            target = registry.get_model(self.reference)
         except KeyError:
             return None
         self._target_pk_field = target._meta.pk_field

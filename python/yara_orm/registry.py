@@ -46,12 +46,26 @@ def get_model(name: str) -> type[Model]:
     if cached is not None:
         return cached
     short = name.rsplit(".", 1)[-1]
-    matches = [m for m in _MODELS.values() if m.__name__ == short]
+    matches = [(key, m) for key, m in _MODELS.items() if m.__name__ == short]
+    if len(matches) > 1 and "." in name:
+        # A partially-qualified reference ("app.models.Tag" against the key
+        # "myproj.app.models.Tag") disambiguates same-named models when exactly
+        # one candidate's registration key ends with it.
+        suffixed = [(key, m) for key, m in matches if key.endswith(f".{name}")]
+        if len(suffixed) == 1:
+            matches = suffixed
     if not matches:
         raise KeyError(f"Unknown model referenced: {name!r}")
-    # A single match is exact; an ambiguous bare name resolves to the most
-    # recently defined model across modules.
-    result = matches[0] if len(matches) == 1 else matches[-1]
+    # A single match resolves exactly; an ambiguous bare name is an error —
+    # guessing (e.g. "most recently defined wins") silently wires relations to
+    # the wrong model.
+    if len(matches) > 1:
+        candidates = ", ".join(sorted(key for key, _ in matches))
+        raise ConfigurationError(
+            f"Ambiguous model reference {name!r}: matches {candidates}. "
+            f"Use the qualified 'module.ClassName' form."
+        )
+    result = matches[0][1]
     _RESOLVE_CACHE[name] = result
     return result
 
@@ -104,45 +118,128 @@ def _check_related_name(related_name: str, target: type[Model], source: str) -> 
         )
 
 
+def _substitute_class(related_name: str, model: type[Model]) -> str:
+    """Expand the Django-style ``%(class)s`` placeholder in a ``related_name``.
+
+    Lets an abstract base declare ``related_name="%(class)s_items"`` so each
+    concrete subclass installs a distinct reverse accessor instead of
+    colliding on the inherited name.
+
+    Args:
+        related_name: The declared reverse-accessor name.
+        model: The source model owning the relation.
+
+    Returns:
+        The name with ``%(class)s`` replaced by the lowercased class name.
+    """
+    return related_name.replace("%(class)s", model.__name__.lower())
+
+
+def _duplicate_related_name_error(
+    related_name: str, target: type[Model], source: str, other: str
+) -> ConfigurationError:
+    """Build the error for two relations claiming one reverse name on a target.
+
+    Args:
+        related_name: The colliding reverse-accessor name.
+        target: The model both relations point at.
+        source: The qualified name of the model now claiming the name.
+        other: A description of the attribute already holding the name.
+
+    Returns:
+        The ``ConfigurationError`` to raise.
+    """
+    return ConfigurationError(
+        f"related_name {related_name!r} on {source} is already used by {other} on "
+        f"{target.__name__}; give each relation a distinct related_name (an abstract "
+        f"base can use '%(class)s' — e.g. related_name='%(class)s_set' — so every "
+        f"concrete subclass derives its own)"
+    )
+
+
 def resolve_relations() -> None:
     """Install reverse FK/O2O/M2M accessors on target models.
 
     Idempotent: safe to call repeatedly (on every ``YaraOrm.init`` / schema build).
+    A ``related_name`` already claimed on the target by a *different* relation
+    raises ``ConfigurationError`` instead of silently keeping the first winner.
     """
     # Deferred: breaks the registry <-> relations import cycle.
     from .relations import M2MDescriptor, ReverseFKDescriptor
 
     for model in list(_MODELS.values()):
         meta = model._meta
+        source_ref = f"{model.__module__}.{model.__name__}"
         # Forward FK/O2O: install reverse manager on the target.
         for info in meta.relations.values():
             related_name = info.field.related_name
             if not related_name:
                 continue
+            related_name = _substitute_class(related_name, model)
             target = info.resolve_target()
             _check_related_name(related_name, target, model.__name__)
-            if not hasattr(target, related_name):
-                setattr(
-                    target,
-                    related_name,
-                    ReverseFKDescriptor(
-                        related_name,
-                        model.__name__,
-                        info.source_attr,
-                        info.is_o2o,
-                    ),
+            existing = getattr(target, related_name, None)
+            if isinstance(existing, ReverseFKDescriptor):
+                if (
+                    existing.source_reference == source_ref
+                    and existing.source_attr == info.source_attr
+                ):
+                    continue  # already installed by a previous resolve pass
+                raise _duplicate_related_name_error(
+                    related_name, target, source_ref, existing.source_reference
                 )
+            if existing is not None:
+                raise _duplicate_related_name_error(
+                    related_name, target, source_ref, f"attribute {related_name!r}"
+                )
+            setattr(
+                target,
+                related_name,
+                ReverseFKDescriptor(
+                    related_name,
+                    source_ref,
+                    info.source_attr,
+                    info.is_o2o,
+                ),
+            )
         # M2M: finalise keys and install reverse manager on the target.
         for info in meta.m2m.values():
             target = info.finalize()
             related_name = info.field.related_name
             if not related_name:
                 continue
+            related_name = _substitute_class(related_name, model)
             _check_related_name(related_name, target, model.__name__)
-            if not hasattr(target, related_name):
-                setattr(
-                    target,
-                    related_name,
-                    M2MDescriptor(info, target._meta.pk_field.model_field_name, reverse=True),
+            existing = getattr(target, related_name, None)
+            if isinstance(existing, M2MDescriptor):
+                # Compare by identity of the *relation* (owning model + attr),
+                # not the info object: re-registering a module (reload, test
+                # re-definition) builds a fresh info for the same relation and
+                # must stay idempotent, like the ReverseFK branch above.
+                ex = existing.info
+                ex_owner = f"{ex.owner.__module__}.{ex.owner.__name__}"
+                if existing.reverse and ex_owner == source_ref and ex.name == info.name:
+                    if ex is not info:
+                        # Point the descriptor at the fresh info so it tracks
+                        # the re-registered model class.
+                        setattr(
+                            target,
+                            related_name,
+                            M2MDescriptor(
+                                info, target._meta.pk_field.model_field_name, reverse=True
+                            ),
+                        )
+                    continue  # already installed by a previous resolve pass
+                raise _duplicate_related_name_error(
+                    related_name, target, source_ref, f"m2m relation {existing.info.name!r}"
                 )
+            if existing is not None:
+                raise _duplicate_related_name_error(
+                    related_name, target, source_ref, f"attribute {related_name!r}"
+                )
+            setattr(
+                target,
+                related_name,
+                M2MDescriptor(info, target._meta.pk_field.model_field_name, reverse=True),
+            )
     _RESOLVED["done"] = True

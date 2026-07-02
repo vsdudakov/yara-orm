@@ -7,6 +7,7 @@ and raise :class:`ValidationError` when a value is invalid.
 from __future__ import annotations
 
 import ipaddress
+import math
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -181,9 +182,18 @@ class NumericValidator(Validator):
             raise ValidationError(f"{value!r} is not numeric")
         if isinstance(value, str):
             try:
-                Decimal(value)
+                parsed = Decimal(value)
             except InvalidOperation as exc:
                 raise ValidationError(f"{value!r} is not numeric") from exc
+            # ``Decimal`` parses "nan"/"inf"/"Infinity"; a numeric column can
+            # never hold those, so reject non-finite values here.
+            if not parsed.is_finite():
+                raise ValidationError(f"{value!r} is not a finite number")
+        elif isinstance(value, Decimal):
+            if not value.is_finite():
+                raise ValidationError(f"{value!r} is not a finite number")
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValidationError(f"{value!r} is not a finite number")
 
 
 class CommaSeparatedIntegerListValidator(Validator):
