@@ -29,7 +29,13 @@ from .relations import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from .connection import BaseDBAsyncClient
     from .dialects import BaseDialect
+    from .migrations import Constraint
+    from .prefetch import Prefetch
+    from .queryset import Q
 
 
 class MetaInfo:
@@ -52,7 +58,7 @@ class MetaInfo:
         ordering: list[tuple[str, bool]] | None = None,
         unique_together: list[tuple[str, ...]] | None = None,
         indexes: list[Index] | None = None,
-        constraints: list[Any] | None = None,
+        constraints: list[Constraint] | None = None,
     ) -> None:
         """Store resolved table metadata and precompute the row-decode plan.
 
@@ -574,7 +580,7 @@ class ModelMeta(type):
 
         unique_together = _normalize_field_groups(getattr(meta_cls, "unique_together", None))
         indexes = _normalize_indexes(getattr(meta_cls, "indexes", None))
-        constraints = list(getattr(meta_cls, "constraints", None) or ())
+        constraints: list[Constraint] = list(getattr(meta_cls, "constraints", None) or ())
 
         relations = {}
         for rel_name, fk in fk_decls.items():
@@ -737,7 +743,7 @@ class Model(metaclass=ModelMeta):
             else:
                 raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
 
-    def __await__(self) -> Any:
+    def __await__(self) -> Generator[Any, Any, Model]:
         """Make instances awaitable, yielding ``self``.
 
         Some code (and test factories) does ``await Model.create(...)``
@@ -1027,7 +1033,11 @@ class Model(metaclass=ModelMeta):
                     continue
                 setattr(self, name, now)
 
-    async def save(self, update_fields: list[str] | None = None, using_db: Any = None) -> Model:
+    async def save(
+        self,
+        update_fields: list[str] | None = None,
+        using_db: str | BaseDBAsyncClient | None = None,
+    ) -> Model:
         """Persist this instance, emitting pre/post-save signals if registered.
 
         Args:
@@ -1068,7 +1078,10 @@ class Model(metaclass=ModelMeta):
                 validator(value)
 
     async def _perform_save(
-        self, executor: Any, update_fields: list[str] | None = None, using_db: Any = None
+        self,
+        executor: BaseDBAsyncClient,
+        update_fields: list[str] | None = None,
+        using_db: str | BaseDBAsyncClient | None = None,
     ) -> None:
         """Run the INSERT or UPDATE statement that persists this instance.
 
@@ -1175,7 +1188,7 @@ class Model(metaclass=ModelMeta):
             params.append(pk_field.to_db(self.pk))
             await executor.execute(sql, params)
 
-    async def delete(self, using_db: Any = None) -> None:
+    async def delete(self, using_db: str | BaseDBAsyncClient | None = None) -> None:
         """Delete this instance's row, emitting pre/post-delete signals.
 
         Args:
@@ -1287,7 +1300,9 @@ class Model(metaclass=ModelMeta):
         return obj
 
     @classmethod
-    async def fetch_for_list(cls, instances: list[Model], *relations: Any) -> list[Model]:
+    async def fetch_for_list(
+        cls, instances: list[Model], *relations: str | Prefetch
+    ) -> list[Model]:
         """Prefetch ``relations`` across a list of instances (one query each).
 
         Args:
@@ -1313,7 +1328,9 @@ class Model(metaclass=ModelMeta):
         return cls._meta.manager.get_queryset()
 
     @classmethod
-    def filter(cls, *args: Any, using_db: Any = None, **kwargs: Any) -> QuerySet:
+    def filter(
+        cls, *args: Q, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
+    ) -> QuerySet:
         """Return a query set filtered by the given conditions.
 
         Args:
@@ -1328,7 +1345,9 @@ class Model(metaclass=ModelMeta):
         return qs.using_db(using_db) if using_db is not None else qs
 
     @classmethod
-    def exclude(cls, *args: Any, using_db: Any = None, **kwargs: Any) -> QuerySet:
+    def exclude(
+        cls, *args: Q, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
+    ) -> QuerySet:
         """Return a query set excluding rows matching the given conditions.
 
         Args:
@@ -1355,7 +1374,7 @@ class Model(metaclass=ModelMeta):
         return cls._meta.manager.get_queryset().annotate(**annotations)
 
     @classmethod
-    def prefetch_related(cls, *specs: Any) -> QuerySet:
+    def prefetch_related(cls, *specs: str | Prefetch) -> QuerySet:
         """Return a query set that prefetches the given relations.
 
         Args:
@@ -1562,7 +1581,9 @@ class Model(metaclass=ModelMeta):
         return await engine.fetch_rows(sql, params)
 
     @classmethod
-    def get(cls, *, using_db: Any = None, **kwargs: Any) -> QuerySetSingle[Model]:
+    def get(
+        cls, *, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
+    ) -> QuerySetSingle[Model]:
         """Return a chainable, awaitable single-row result for the lookups.
 
         ``await Model.get(id=x)`` resolves to the instance (via a fast path);
@@ -1615,7 +1636,9 @@ class Model(metaclass=ModelMeta):
         return cls._from_db_row(rows[0]) if rows else None
 
     @classmethod
-    async def create(cls, *, using_db: Any = None, **kwargs: Any) -> Model:
+    async def create(
+        cls, *, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
+    ) -> Model:
         """Construct an instance from the given values and save it.
 
         Args:
@@ -1631,7 +1654,10 @@ class Model(metaclass=ModelMeta):
 
     @classmethod
     async def get_or_create(
-        cls, defaults: dict[str, Any] | None = None, using_db: Any = None, **kwargs: Any
+        cls,
+        defaults: dict[str, Any] | None = None,
+        using_db: str | BaseDBAsyncClient | None = None,
+        **kwargs: Any,
     ) -> tuple[Model, bool]:
         """Fetch the row matching ``kwargs`` or create it.
 
@@ -1651,7 +1677,10 @@ class Model(metaclass=ModelMeta):
 
     @classmethod
     async def update_or_create(
-        cls, defaults: dict[str, Any] | None = None, using_db: Any = None, **kwargs: Any
+        cls,
+        defaults: dict[str, Any] | None = None,
+        using_db: str | BaseDBAsyncClient | None = None,
+        **kwargs: Any,
     ) -> tuple[Model, bool]:
         """Update the row matching ``kwargs`` with ``defaults``, or create it.
 
@@ -1719,7 +1748,9 @@ class Model(metaclass=ModelMeta):
             A mapping of normalised key tuple to the existing instance.
         """
         first = key_fields[0]
-        values = list({rec[first] for rec in records})
+        # ``Any``: the values feed a ``filter(**{...})`` unpacking, whose dict
+        # value type must stay assignable to every keyword parameter.
+        values: Any = list({rec[first] for rec in records})
         wanted = {cls._natural_key(rec, key_fields) for rec in records}
         out: dict[tuple, Model] = {}
         for obj in await cls.filter(**{f"{first}__in": values}):
@@ -1853,7 +1884,9 @@ class Model(metaclass=ModelMeta):
         Returns:
             A dict mapping each present key to its instance.
         """
-        ids = list(id_list)
+        # ``Any``: the ids feed a ``filter(**{...})`` unpacking, whose dict
+        # value type must stay assignable to every keyword parameter.
+        ids: Any = list(id_list)
         if not ids:
             return {}
         objects = await cls.filter(**{f"{field_name}__in": ids})
@@ -2004,7 +2037,9 @@ class Model(metaclass=ModelMeta):
 
             for start in range(0, len(group), size):
                 batch = group[start : start + size]
-                sql = full_sql if len(batch) == size else build_sql(len(batch))
+                # ``full_sql`` is always built when a full-size batch exists
+                # (len(batch) == size implies len(group) >= size).
+                sql = cast("str", full_sql) if len(batch) == size else build_sql(len(batch))
                 params: list = []
                 for obj in batch:
                     obj._apply_auto_now()
@@ -2101,7 +2136,7 @@ class Model(metaclass=ModelMeta):
         return total
 
     async def refresh_from_db(
-        self, fields: Iterable[str] | None = None, using_db: Any = None
+        self, fields: Iterable[str] | None = None, using_db: str | BaseDBAsyncClient | None = None
     ) -> Model:
         """Reload this instance's column values from the database.
 

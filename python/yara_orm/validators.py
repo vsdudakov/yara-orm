@@ -10,9 +10,12 @@ import ipaddress
 import math
 import re
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .exceptions import ValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Sized
 
 
 class Validator:
@@ -98,7 +101,7 @@ class MinLengthValidator(Validator):
         """
         self.min_length = min_length
 
-    def __call__(self, value: Any) -> None:
+    def __call__(self, value: Sized) -> None:
         """Raise if ``len(value)`` is below the minimum.
 
         Args:
@@ -125,7 +128,7 @@ class MaxLengthValidator(Validator):
         """
         self.max_length = max_length
 
-    def __call__(self, value: Any) -> None:
+    def __call__(self, value: Sized) -> None:
         """Raise if ``len(value)`` exceeds the maximum.
 
         Args:
@@ -153,7 +156,7 @@ class RegexValidator(Validator):
         """
         self.regex = re.compile(pattern, flags)
 
-    def __call__(self, value: Any) -> None:
+    def __call__(self, value: str) -> None:
         """Raise if ``value`` does not match the pattern.
 
         Args:

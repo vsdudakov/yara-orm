@@ -20,6 +20,8 @@ from .db_defaults import DatabaseDefault
 from .exceptions import FieldError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .relations import (
         ForeignKeyNullableRelation as ForeignKeyNullableRelation,
     )
@@ -174,9 +176,9 @@ class Field:
         #: Whether the database assigns this column's value (serial pk).
         self.auto_increment = False
         #: Extra parameters consumed by the dialect type templates.
-        self.type_params: dict[str, Any] = {}
+        self.type_params: dict[str, int] = {}
 
-    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+    def __get__(self, instance: object | None, owner: type | None = None) -> Any:
         """Non-data descriptor: guard access to columns not loaded into an instance.
 
         A normally-constructed or fully-fetched instance has every field in its
@@ -335,7 +337,7 @@ class _IntegerField(Field):
         """
         return _int_to_db(value)
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> int | None:
         """Convert a database value into an ``int``.
 
         Args:
@@ -370,7 +372,7 @@ class FloatField(Field):
 
     field_kind = "float"
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> float | None:
         """Convert a database value into a ``float``.
 
         Args:
@@ -406,7 +408,7 @@ class DecimalField(Field):
         super().__init__(**kwargs)
         self.type_params = {"max_digits": max_digits, "decimal_places": decimal_places}
 
-    def to_db(self, value: Any) -> Any:
+    def to_db(self, value: Any) -> Decimal | None:
         """Convert a value into a ``Decimal`` for binding.
 
         The engine binds ``Decimal`` straight to a NUMERIC parameter, so values
@@ -423,7 +425,7 @@ class DecimalField(Field):
             return None
         return value if isinstance(value, Decimal) else Decimal(str(value))
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> Decimal | None:
         """Convert a database value into a ``Decimal``.
 
         A value already decoded as a ``Decimal`` by the engine (PostgreSQL
@@ -507,7 +509,7 @@ class BooleanField(Field):
     _TRUE_STRINGS = frozenset({"true", "t", "1", "yes", "y", "on"})
     _FALSE_STRINGS = frozenset({"false", "f", "0", "no", "n", "off"})
 
-    def to_db(self, value: Any) -> Any:
+    def to_db(self, value: Any) -> bool | None:
         """Coerce the Python value to a ``bool`` before binding.
 
         Strings are coerced semantically (``"true"``/``"t"``/``"1"`` and
@@ -539,7 +541,7 @@ class BooleanField(Field):
             )
         return bool(value)
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> bool | None:
         """Convert a database value into a ``bool``.
 
         Args:
@@ -691,7 +693,7 @@ class TimeDeltaField(Field):
     field_kind = "timedelta"
     read_identity = False
 
-    def to_db(self, value: Any) -> Any:
+    def to_db(self, value: Any) -> int | None:
         """Convert a ``timedelta`` to its total microseconds for binding.
 
         Args:
@@ -706,7 +708,7 @@ class TimeDeltaField(Field):
             return (value.days * 86400 + value.seconds) * 1_000_000 + value.microseconds
         return int(value)
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> timedelta | None:
         """Convert stored microseconds back into a ``timedelta``.
 
         Args:
@@ -746,7 +748,7 @@ class UUIDField(Field):
             kwargs["default"] = _uuid.uuid4
         super().__init__(pk=pk, **kwargs)
 
-    def to_db(self, value: Any) -> Any:
+    def to_db(self, value: Any) -> _uuid.UUID | None:
         """Convert a value into a ``UUID`` for binding.
 
         Args:
@@ -777,8 +779,8 @@ class JSONField(Field):
     def __init__(
         self,
         *,
-        encoder: Any = None,
-        decoder: Any = None,
+        encoder: Callable[[Any], Any] | None = None,
+        decoder: Callable[[Any], Any] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the JSON field with optional value-transform hooks.
@@ -859,7 +861,7 @@ class IntEnumField(Field):
         super().__init__(**kwargs)
         self.enum_type = enum_type
 
-    def to_db(self, value: Any) -> Any:
+    def to_db(self, value: Any) -> int | None:
         """Convert an enum member into its integer value.
 
         Args:
@@ -872,7 +874,7 @@ class IntEnumField(Field):
             return None
         return int(value.value if isinstance(value, self.enum_type) else value)
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> IntEnum | None:
         """Convert a database integer into an enum member.
 
         Args:
@@ -906,7 +908,7 @@ class CharEnumField(Field):
         self.max_length = max_length
         self.type_params = {"max_length": max_length}
 
-    def to_db(self, value: Any) -> Any:
+    def to_db(self, value: Any) -> str | None:
         """Convert an enum member into its string value.
 
         Args:
@@ -919,7 +921,7 @@ class CharEnumField(Field):
             return None
         return str(value.value if isinstance(value, self.enum_type) else value)
 
-    def to_python(self, value: Any) -> Any:
+    def to_python(self, value: Any) -> Enum | None:
         """Convert a database string into an enum member.
 
         Args:

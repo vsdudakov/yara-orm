@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from . import _engine, registry
@@ -23,15 +23,33 @@ from .exceptions import (
 )
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from .models import Model
 
-_ENGINE = None
+    class Router(Protocol):
+        """Structural type for a per-model connection router.
+
+        Any object with ``db_for_read`` / ``db_for_write`` methods returning a
+        connection name (or a falsy value to fall through) qualifies.
+        """
+
+        def db_for_read(self, model: type[Model]) -> str | None:
+            """Return the connection name for reads on ``model``, or None."""
+            ...
+
+        def db_for_write(self, model: type[Model]) -> str | None:
+            """Return the connection name for writes on ``model``, or None."""
+            ...
+
+
+_ENGINE: _engine.Engine | None = None
 _DIALECT: BaseDialect | None = None
 
 #: Named connections: name -> (engine, dialect). "default" is the primary.
-_CONNECTIONS: dict = {}
+_CONNECTIONS: dict[str, tuple[_engine.Engine, BaseDialect]] = {}
 #: Optional router selecting a connection per model (see docs/Router example).
-_ROUTER = None
+_ROUTER: Router | None = None
 
 #: When inside ``in_transaction()``, the active pinned connections keyed by
 #: connection name (``None`` outside any transaction). Query execution routes
@@ -40,7 +58,9 @@ _ROUTER = None
 #: for another database. The dict is treated as immutable: entering a
 #: transaction sets a *copy* with the new entry (contextvars snapshot values,
 #: they do not track mutation).
-_active_tx: contextvars.ContextVar = contextvars.ContextVar("orm_active_tx", default=None)
+_active_tx: contextvars.ContextVar[dict[str, TransactionWrapper] | None] = contextvars.ContextVar(
+    "orm_active_tx", default=None
+)
 
 
 def _active_tx_for(name: str) -> TransactionWrapper | None:
@@ -62,13 +82,13 @@ def _active_tx_for(name: str) -> TransactionWrapper | None:
 #: of the Python query path). Each hook is
 #: called as ``hook(sql, params)`` before a statement runs. Empty by default, so
 #: the hot path pays nothing and ``get_executor`` returns the raw engine.
-_QUERY_HOOKS: list = []
+_QUERY_HOOKS: list[Callable[[str, list[Any] | None], object]] = []
 
 #: URL schemes treated as PostgreSQL (driver aliases normalised to ``postgres``).
 _POSTGRES_URL_SCHEMES = frozenset({"postgres", "postgresql", "psycopg", "psycopg2", "asyncpg"})
 
 
-def register_query_hook(hook: Any) -> None:
+def register_query_hook(hook: Callable[[str, list[Any] | None], object]) -> None:
     """Register a callable invoked as ``hook(sql, params)`` before each query.
 
     Lets you wrap the query path (e.g. SQLCommenter,
@@ -108,7 +128,9 @@ def _run_hooks(sql: str, params: list[Any] | None) -> None:
         hook(sql, params)
 
 
-async def _run_query(method: Any, sql: str, params: list[Any] | None) -> Any:
+async def _run_query(
+    method: Callable[[str, list[Any]], Awaitable[Any]], sql: str, params: list[Any] | None
+) -> Any:
     """Run one engine call: fire hooks, then translate engine errors.
 
     The native engine raises a bare ``RuntimeError`` for SQL failures; these are
@@ -245,7 +267,7 @@ class Record(dict):
     strings, so an integer key is unambiguously positional.
     """
 
-    def __getitem__(self, key: Any) -> Any:
+    def __getitem__(self, key: str | int | slice) -> Any:
         """Return a column by name (str) or by position (int/slice).
 
         Args:
@@ -267,7 +289,7 @@ class Record(dict):
         return super().__getitem__(key)
 
 
-def _as_records(rows: Any) -> Any:
+def _as_records(rows: list[dict[str, Any]]) -> list[Record]:
     """Wrap a list of dict rows as :class:`Record` for positional access.
 
     Args:
@@ -324,7 +346,7 @@ class _ManualSQLCompat:
     ``execute`` / ``fetch_all`` (both already translate engine errors).
     """
 
-    async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def execute(self, sql: str, params: list[Any] | None = None) -> int:
         """Execute a statement (provided by the concrete host).
 
         Args:
@@ -336,7 +358,7 @@ class _ManualSQLCompat:
         """
         raise NotImplementedError  # pragma: no cover - provided by host
 
-    async def fetch_all(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_all(self, sql: str, params: list[Any] | None = None) -> list[Record]:
         """Fetch rows as dicts (provided by the concrete host).
 
         Args:
@@ -350,7 +372,7 @@ class _ManualSQLCompat:
 
     async def execute_query(
         self, sql: str, params: list[Any] | None = None
-    ) -> tuple[int, list[dict[str, Any]]]:
+    ) -> tuple[int, list[Record]]:
         """Run ``sql`` and return ``(rowcount, rows)``.
 
         Rows are dicts, as returned for SELECTs; ``rowcount`` is the
@@ -367,9 +389,7 @@ class _ManualSQLCompat:
         rows = await self.fetch_all(sql, params)
         return len(rows), rows
 
-    async def execute_query_dict(
-        self, sql: str, params: list[Any] | None = None
-    ) -> list[dict[str, Any]]:
+    async def execute_query_dict(self, sql: str, params: list[Any] | None = None) -> list[Record]:
         """Run ``sql`` and return the rows as dicts.
 
         Args:
@@ -402,26 +422,29 @@ class _ManualSQLCompat:
 class BaseDBAsyncClient(Protocol):
     """Structural type for a database executor.
 
-    Both the pooled-connection proxy and the transaction wrapper satisfy it, so
-    annotations like ``using_db: BaseDBAsyncClient | None`` keep
-    their meaning. It is the public type for objects returned by
-    ``connections.get()`` / yielded by ``in_transaction()``.
+    The raw engine, the pooled-connection proxy and the transaction wrapper
+    all satisfy it, so annotations like ``using_db: BaseDBAsyncClient | None``
+    keep their meaning. It is the public type for objects returned by
+    ``get_executor()`` / ``connections.get()`` / yielded by
+    ``in_transaction()``. Members are declared as ``Awaitable``-returning
+    methods (which ``async def`` implementations satisfy) so the native
+    engine's PyO3 methods match too.
     """
 
-    async def execute(self, sql: str, params: list[Any] | None = ...) -> Any:
+    def execute(self, sql: str, params: list[Any] = ...) -> Awaitable[Any]:
         """Execute a statement and return the driver result."""
         ...
 
-    async def fetch_all(self, sql: str, params: list[Any] | None = ...) -> Any:
+    def fetch_all(self, sql: str, params: list[Any] = ...) -> Awaitable[Any]:
         """Fetch rows as dicts."""
         ...
 
-    async def fetch_row(self, sql: str, params: list[Any] | None = ...) -> Any:
-        """Fetch a single positional row, or None."""
+    def fetch_rows(self, sql: str, params: list[Any] = ...) -> Awaitable[Any]:
+        """Fetch rows as positional lists."""
         ...
 
-    async def execute_query(self, sql: str, params: list[Any] | None = ...) -> Any:
-        """Run a statement and return ``(rowcount, rows)``."""
+    def fetch_row(self, sql: str, params: list[Any] = ...) -> Awaitable[Any]:
+        """Fetch a single positional row, or None."""
         ...
 
 
@@ -473,7 +496,7 @@ def _normalize_isolation(isolation: str, dialect_name: str) -> str:
     return level
 
 
-def get_engine() -> Any:
+def get_engine() -> _engine.Engine:
     """Return the default engine, raising if the ORM is not initialised.
 
     Returns:
@@ -509,8 +532,10 @@ def _route(model: type[Model] | None, write: bool) -> str:
 
 
 def get_executor(
-    model: type[Model] | None = None, write: bool = False, using: str | None = None
-) -> Any:
+    model: type[Model] | None = None,
+    write: bool = False,
+    using: str | BaseDBAsyncClient | None = None,
+) -> BaseDBAsyncClient:
     """Return the object statements run on for ``model``.
 
     This is the active transaction, or the connection chosen for ``model`` by
@@ -558,7 +583,9 @@ def get_executor(
     return _EngineProxy(engine) if _QUERY_HOOKS else engine
 
 
-def get_dialect(model: type[Model] | None = None, using: str | Any | None = None) -> BaseDialect:
+def get_dialect(
+    model: type[Model] | None = None, using: str | BaseDBAsyncClient | None = None
+) -> BaseDialect:
     """Return the SQL dialect for ``model``'s connection.
 
     Args:
@@ -608,7 +635,7 @@ def get_dialect(model: type[Model] | None = None, using: str | Any | None = None
     return _named_connection(name)[1]
 
 
-def _named_connection(name: str) -> tuple[Any, BaseDialect]:
+def _named_connection(name: str) -> tuple[_engine.Engine, BaseDialect]:
     """Return the ``(engine, dialect)`` pair registered under ``name``.
 
     Args:
@@ -675,7 +702,7 @@ class YaraOrm:
     async def init(
         cls,
         db_url: str | None = None,
-        router: Any = None,
+        router: Router | None = None,
         use_tz: bool = False,
         timezone: str = "UTC",
         *,
@@ -739,7 +766,7 @@ class YaraOrm:
         return db_url
 
     @staticmethod
-    def _connection_url(spec: Any) -> str:
+    def _connection_url(spec: str | dict[str, Any]) -> str:
         """Resolve a connection spec to a database URL.
 
         Accepts a URL string directly, or a ``{"engine", "credentials": {...}}``
@@ -763,7 +790,7 @@ class YaraOrm:
         return f"postgres://{auth}{host}:{port}/{database}"
 
     @classmethod
-    async def _init_from_config(cls, config: dict[str, Any], router: Any = None) -> None:
+    async def _init_from_config(cls, config: dict[str, Any], router: Router | None = None) -> None:
         """Initialise from a config dict.
 
         Args:
@@ -807,7 +834,7 @@ class YaraOrm:
             await previous[0].close()
 
     @classmethod
-    def set_router(cls, router: Any) -> None:
+    def set_router(cls, router: Router | None) -> None:
         """Set the active per-model connection router.
 
         Args:
@@ -820,7 +847,7 @@ class YaraOrm:
         _ROUTER = router
 
     @classmethod
-    def get_connection(cls, name: str = "default") -> Any:
+    def get_connection(cls, name: str = "default") -> TransactionWrapper | _EngineProxy:
         """Return the manual-SQL executor for ``name``.
 
         Args:
@@ -957,7 +984,7 @@ class TransactionWrapper(_ManualSQLCompat):
 
     def __init__(
         self,
-        tx: Any,
+        tx: _engine.Transaction,
         dialect: BaseDialect | None = None,
         connection_name: str = "default",
     ) -> None:
@@ -988,7 +1015,7 @@ class TransactionWrapper(_ManualSQLCompat):
         #: transaction — which cannot be untangled, so it is surfaced early.
         self._sp_stack: list[str] = []
 
-    async def _control(self, method: Any, *args: Any) -> Any:
+    async def _control(self, method: Callable[..., Awaitable[Any]], *args: Any) -> Any:
         """Run a transaction-control call, translating engine errors.
 
         The native layer raises ``TransactionManagementError`` for use of a
@@ -1091,7 +1118,7 @@ class TransactionWrapper(_ManualSQLCompat):
         await self._control(self._tx.rollback_to, name)
         self._pop_savepoint(name)
 
-    async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def execute(self, sql: str, params: list[Any] | None = None) -> int:
         """Execute a statement on the transaction.
 
         Args:
@@ -1103,7 +1130,7 @@ class TransactionWrapper(_ManualSQLCompat):
         """
         return await _run_query(self._tx.execute, sql, params)
 
-    async def fetch_rows(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_rows(self, sql: str, params: list[Any] | None = None) -> list[list[Any]]:
         """Fetch multiple rows for a query on the transaction.
 
         Args:
@@ -1115,7 +1142,7 @@ class TransactionWrapper(_ManualSQLCompat):
         """
         return await _run_query(self._tx.fetch_rows, sql, params)
 
-    async def fetch_row(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_row(self, sql: str, params: list[Any] | None = None) -> list[Any] | None:
         """Fetch a single row for a query on the transaction.
 
         Args:
@@ -1127,7 +1154,7 @@ class TransactionWrapper(_ManualSQLCompat):
         """
         return await _run_query(self._tx.fetch_row, sql, params)
 
-    async def fetch_all(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_all(self, sql: str, params: list[Any] | None = None) -> list[Record]:
         """Fetch all results for a query on the transaction.
 
         Args:
@@ -1139,7 +1166,7 @@ class TransactionWrapper(_ManualSQLCompat):
         """
         return _as_records(await _run_query(self._tx.fetch_all, sql, _arrayify_params(params)))
 
-    async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Record | None:
         """Fetch a single row as a dict on the transaction.
 
         Args:
@@ -1191,7 +1218,7 @@ class _EngineProxy(_ManualSQLCompat):
     bind an array there.
     """
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: _engine.Engine) -> None:
         """Wrap a native engine.
 
         Args:
@@ -1213,7 +1240,7 @@ class _EngineProxy(_ManualSQLCompat):
         """
         return getattr(self._engine, name)
 
-    async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def execute(self, sql: str, params: list[Any] | None = None) -> int:
         """Execute a statement on the pooled connection.
 
         Args:
@@ -1225,7 +1252,7 @@ class _EngineProxy(_ManualSQLCompat):
         """
         return await _run_query(self._engine.execute, sql, params)
 
-    async def fetch_rows(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_rows(self, sql: str, params: list[Any] | None = None) -> list[list[Any]]:
         """Fetch rows as positional tuples on the pooled connection.
 
         Args:
@@ -1237,7 +1264,7 @@ class _EngineProxy(_ManualSQLCompat):
         """
         return await _run_query(self._engine.fetch_rows, sql, params)
 
-    async def fetch_row(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_row(self, sql: str, params: list[Any] | None = None) -> list[Any] | None:
         """Fetch a single positional row on the pooled connection.
 
         Args:
@@ -1249,7 +1276,7 @@ class _EngineProxy(_ManualSQLCompat):
         """
         return await _run_query(self._engine.fetch_row, sql, params)
 
-    async def fetch_all(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_all(self, sql: str, params: list[Any] | None = None) -> list[Record]:
         """Fetch all rows as dicts on the pooled connection.
 
         Args:
@@ -1261,7 +1288,7 @@ class _EngineProxy(_ManualSQLCompat):
         """
         return _as_records(await _run_query(self._engine.fetch_all, sql, _arrayify_params(params)))
 
-    async def fetch_one(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def fetch_one(self, sql: str, params: list[Any] | None = None) -> dict[str, Any] | None:
         """Fetch a single row as a dict on the pooled connection.
 
         Args:
@@ -1311,7 +1338,7 @@ class _Connections:
     ``execute_query`` / ``execute_query_dict`` / ``execute_script``.
     """
 
-    def get(self, name: str = "default") -> Any:
+    def get(self, name: str = "default") -> TransactionWrapper | _EngineProxy:
         """Return the active executor for ``name``.
 
         Args:
@@ -1385,10 +1412,10 @@ class in_transaction:
         self.connection_name = connection_name
         self.isolation = isolation
         self._conn: TransactionWrapper | None = None
-        self._token: contextvars.Token | None = None
+        self._token: contextvars.Token[dict[str, TransactionWrapper] | None] | None = None
         self._savepoint: str | None = None
 
-    async def __aenter__(self) -> Any:
+    async def __aenter__(self) -> TransactionWrapper:
         """Begin a transaction (or savepoint) and pin it as the active executor.
 
         Raises:
@@ -1432,7 +1459,7 @@ class in_transaction:
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        tb: Any,
+        tb: TracebackType | None,
     ) -> bool:
         """Commit/release on clean exit, roll back on error, and unpin.
 

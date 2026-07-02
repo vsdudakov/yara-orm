@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .connection import BaseDBAsyncClient
     from .models import Model
 
 
@@ -27,7 +28,7 @@ class Signals(Enum):
     post_delete = "post_delete"
 
 
-_HANDLERS: dict[str, dict[type, list]] = {
+_HANDLERS: dict[str, dict[type[Model], list[Callable[..., Awaitable[None]]]]] = {
     "pre_save": {},
     "post_save": {},
     "pre_delete": {},
@@ -37,7 +38,7 @@ _HANDLERS: dict[str, dict[type, list]] = {
 #: Models that have at least one handler on any signal. Lets the (very hot)
 #: save/delete path skip the four-dict scan in :func:`_has_handlers` with a
 #: single set membership test.
-_MODELS_WITH_HANDLERS: set[type] = set()
+_MODELS_WITH_HANDLERS: set[type[Model]] = set()
 
 
 def _decorator(
@@ -127,7 +128,10 @@ def post_delete(
 
 
 async def emit_pre_save(
-    model: type[Model], instance: Model, using_db: Any, update_fields: list[str] | None
+    model: type[Model],
+    instance: Model,
+    using_db: BaseDBAsyncClient,
+    update_fields: list[str] | None,
 ) -> None:
     """Invoke all pre-save handlers registered for ``model``.
 
@@ -148,7 +152,7 @@ async def emit_post_save(
     model: type[Model],
     instance: Model,
     created: bool,
-    using_db: Any,
+    using_db: BaseDBAsyncClient,
     update_fields: list[str] | None,
 ) -> None:
     """Invoke all post-save handlers registered for ``model``.
@@ -167,7 +171,7 @@ async def emit_post_save(
         await func(model, instance, created, using_db, update_fields)
 
 
-async def emit_pre_delete(model: type[Model], instance: Model, using_db: Any) -> None:
+async def emit_pre_delete(model: type[Model], instance: Model, using_db: BaseDBAsyncClient) -> None:
     """Invoke all pre-delete handlers registered for ``model``.
 
     Args:
@@ -182,7 +186,9 @@ async def emit_pre_delete(model: type[Model], instance: Model, using_db: Any) ->
         await func(model, instance, using_db)
 
 
-async def emit_post_delete(model: type[Model], instance: Model, using_db: Any) -> None:
+async def emit_post_delete(
+    model: type[Model], instance: Model, using_db: BaseDBAsyncClient
+) -> None:
     """Invoke all post-delete handlers registered for ``model``.
 
     Args:

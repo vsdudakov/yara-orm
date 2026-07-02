@@ -9,18 +9,21 @@ it) rather than a ``CONCAT`` call.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .expressions import Expression
+
+if TYPE_CHECKING:
+    from .dialects import BaseDialect
 
 # Maps a field name to its qualified SQL column reference.
 ColumnResolver = Callable[[str], str]
 
 
 def _render_operand(
-    operand: Any,
+    operand: str | Expression | Function | Any,
     resolve: ColumnResolver,
-    dialect: Any,
+    dialect: BaseDialect,
     params: list[Any],
     idx: int,
     *,
@@ -70,7 +73,7 @@ class Function:
         raise NotImplementedError
 
     def render_params(
-        self, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+        self, resolve: ColumnResolver, dialect: BaseDialect, params: list[Any], idx: int
     ) -> tuple[str, int]:
         """Render to SQL, binding any embedded literals as parameters.
 
@@ -118,7 +121,7 @@ class _Unary(Function):
         return f"{self.function}({resolve(self.field)})"
 
     def render_params(
-        self, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+        self, resolve: ColumnResolver, dialect: BaseDialect, params: list[Any], idx: int
     ) -> tuple[str, int]:
         """Render ``NAME(operand)``, accepting an ``F``/expression operand.
 
@@ -189,7 +192,7 @@ class Concat(Function):
         return "(" + " || ".join(resolve(f) for f in self.fields) + ")"
 
     def render_params(
-        self, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+        self, resolve: ColumnResolver, dialect: BaseDialect, params: list[Any], idx: int
     ) -> tuple[str, int]:
         """Render ``(a || b || ...)``, accepting ``F``/expression operands.
 
@@ -214,7 +217,7 @@ class Concat(Function):
 class Coalesce(Function):
     """Return the first non-NULL of a column and a fallback value."""
 
-    def __init__(self, field: Any, default: Any) -> None:
+    def __init__(self, field: str | Expression | Function, default: Any) -> None:
         """Store the column and its fallback value.
 
         Args:
@@ -230,7 +233,7 @@ class Coalesce(Function):
         self.default = default
 
     def render_params(
-        self, resolve: ColumnResolver, dialect: Any, params: list[Any], idx: int
+        self, resolve: ColumnResolver, dialect: BaseDialect, params: list[Any], idx: int
     ) -> tuple[str, int]:
         """Render ``COALESCE(column, ?)``, binding the fallback as a parameter.
 

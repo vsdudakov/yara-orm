@@ -107,7 +107,9 @@ async def _prefetch_path(
         await _prefetch_path(children, rest, custom_qs, to_attr)
 
 
-def _assign(instances: list[Model], name: str, to_attr: str | None, values: dict) -> None:
+def _assign(
+    instances: list[Model], name: str, to_attr: str | None, values: dict[Model, object]
+) -> None:
     """Store each instance's prefetched result, by relation name or ``to_attr``.
 
     Args:
