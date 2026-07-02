@@ -419,6 +419,8 @@ created = await Book.bulk_create(books, batch_size=500)
 | `await Model.update_or_create(defaults=None, **kwargs)` | `(instance, created)` | Update the match with `defaults`, or create it. |
 | `await Model.in_bulk(ids, field_name="pk")` | `dict[key, Model]` | Fetch many rows, keyed by `field_name`. |
 | `await Model.bulk_update(objects, fields, batch_size=500)` | `int` | Write the named `fields` of many instances in batched statements. |
+| `await Model.bulk_get_or_create(records, key_fields, defaults=None, batch_size=500)` | `list[(instance, created)]` | The batched `get_or_create`: one fetch + one insert for the whole batch. |
+| `await Model.bulk_update_or_create(records, key_fields, update_fields=None, batch_size=500)` | `list[(instance, created)]` | The batched `update_or_create`: one fetch + one update + one insert. |
 
 ```python
 author, created = await Author.get_or_create(name="Ada", defaults={"rating": 5})
@@ -430,6 +432,55 @@ for book in books:
     book.rating = 5
 await Book.bulk_update(books, ["rating"])         # one UPDATE per batch
 ```
+
+### Batched get-or-create / update-or-create
+
+The per-row loop of `get_or_create` / `update_or_create` costs one round trip
+per record. The bulk variants take **plain dicts** and resolve the whole batch
+in a fixed number of queries — one `SELECT` matching existing rows by
+`key_fields`, then one `bulk_create` for the misses (and, for
+`bulk_update_or_create`, one `bulk_update` for the hits):
+
+```python
+results = await Author.bulk_get_or_create(
+    [
+        {"name": "Ada", "rating": 5},
+        {"name": "Grace", "rating": 4},
+        {"name": "Ada"},               # repeated key: same instance, created once
+    ],
+    key_fields=["name"],
+    defaults={"active": True},          # applied only to newly created rows
+)
+for author, created in results:         # one (instance, created) per input record,
+    ...                                 # in input order
+
+results = await Stat.bulk_update_or_create(
+    [{"key": "a", "hits": 10}, {"key": "b", "hits": 3}],
+    key_fields=["key"],
+    update_fields=["hits"],             # default: every non-key field present
+)                                       # in any record
+```
+
+Semantics worth knowing:
+
+- **`key_fields` is the natural key** (one or more columns) used to match
+  existing rows; it must be non-empty. Both sides of the match are normalised
+  through `to_db`, so loosely typed key values (`"42"` for an int column, a
+  UUID string, an ISO date string) match the stored row instead of silently
+  inserting a duplicate.
+- **Duplicate keys within one batch collapse**: repeats of an existing key get
+  the same fetched instance; repeats of a new key get the single instance
+  created for it (later records of a duplicate key report `created=False` in
+  `bulk_update_or_create`).
+- `bulk_get_or_create` **never modifies existing rows** — `defaults` apply
+  only to the rows it creates. Use `bulk_update_or_create` to overwrite
+  `update_fields` on the matched rows.
+- These ride on `bulk_create`/`bulk_update`, so the same caveats apply:
+  **signals and field validators are bypassed**, and matching + insert are
+  separate statements (not `ON CONFLICT`) — a row inserted concurrently
+  between them can still raise `IntegrityError` under a unique constraint.
+  For a single-statement upsert, use
+  [`bulk_create(..., on_conflict=...)`](#upserts-with-bulk_create).
 
 Instance helpers for in-place edits:
 

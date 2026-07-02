@@ -93,7 +93,9 @@ Signals fire for **instance-level** operations:
 
     - `Model.filter(...).update(...)`
     - `Model.filter(...).delete()`
-    - `Model.bulk_create(...)`
+    - `Model.bulk_create(...)` / `Model.bulk_update(...)`
+    - `Model.bulk_get_or_create(...)` / `Model.bulk_update_or_create(...)`
+      (they delegate to the two above)
 
     If you need per-row hooks to run, iterate and call `instance.save()` / `instance.delete()` on each object instead of using the bulk path.
 
