@@ -276,3 +276,117 @@ def test_ambiguous_bare_model_reference_raises():
         for model in (m1, m2):
             registry._MODELS.pop(f"{model.__module__}.{model.__name__}", None)
         registry._RESOLVE_CACHE.clear()
+
+
+def test_fk_related_name_colliding_with_plain_attribute_raises():
+    """
+    GIVEN a FK whose related_name matches a plain attribute on the target
+    WHEN reverse relations are resolved
+    THEN a ConfigurationError names the occupied attribute
+    """
+
+    class ArAttrTarget(Model):
+        id = fields.IntField(pk=True)
+        ar_taken = "occupied"
+
+        class Meta:
+            table = "ar_attr_target"
+
+    class ArAttrSrc(Model):
+        id = fields.IntField(pk=True)
+        target = fields.ForeignKeyField("ArAttrTarget", related_name="ar_taken")
+
+        class Meta:
+            table = "ar_attr_src"
+
+    try:
+        with pytest.raises(ConfigurationError, match="already used by attribute 'ar_taken'"):
+            registry.resolve_relations()
+    finally:
+        for model in (ArAttrTarget, ArAttrSrc):
+            registry._MODELS.pop(f"{model.__module__}.{model.__name__}", None)
+        registry._RESOLVE_CACHE.clear()
+
+
+def test_duplicate_m2m_related_name_on_one_target_raises():
+    """
+    GIVEN two M2M relations claiming the same related_name on one target
+    WHEN reverse relations are resolved
+    THEN a ConfigurationError names the m2m relation already holding it
+    """
+
+    class ArM2mTarget(Model):
+        id = fields.IntField(pk=True)
+
+        class Meta:
+            table = "ar_m2m_target"
+
+    class ArM2mSrcA(Model):
+        id = fields.IntField(pk=True)
+        links = fields.ManyToManyField(
+            "ArM2mTarget", related_name="ar_m2m_dup", through="ar_m2m_a_t"
+        )
+
+        class Meta:
+            table = "ar_m2m_a"
+
+    class ArM2mSrcB(Model):
+        id = fields.IntField(pk=True)
+        links = fields.ManyToManyField(
+            "ArM2mTarget", related_name="ar_m2m_dup", through="ar_m2m_b_t"
+        )
+
+        class Meta:
+            table = "ar_m2m_b"
+
+    try:
+        with pytest.raises(ConfigurationError, match="already used by m2m relation 'links'"):
+            registry.resolve_relations()
+    finally:
+        for model in (ArM2mTarget, ArM2mSrcA, ArM2mSrcB):
+            registry._MODELS.pop(f"{model.__module__}.{model.__name__}", None)
+        registry._RESOLVE_CACHE.clear()
+
+
+def test_m2m_related_name_colliding_with_plain_attribute_raises():
+    """
+    GIVEN an M2M whose related_name matches a plain attribute on the target
+    WHEN reverse relations are resolved
+    THEN a ConfigurationError names the occupied attribute
+    """
+
+    class ArM2mAttrTarget(Model):
+        id = fields.IntField(pk=True)
+        ar_m2m_taken = "occupied"
+
+        class Meta:
+            table = "ar_m2m_attr_target"
+
+    class ArM2mAttrSrc(Model):
+        id = fields.IntField(pk=True)
+        links = fields.ManyToManyField(
+            "ArM2mAttrTarget", related_name="ar_m2m_taken", through="ar_m2m_attr_t"
+        )
+
+        class Meta:
+            table = "ar_m2m_attr_src"
+
+    try:
+        with pytest.raises(ConfigurationError, match="already used by attribute 'ar_m2m_taken'"):
+            registry.resolve_relations()
+    finally:
+        for model in (ArM2mAttrTarget, ArM2mAttrSrc):
+            registry._MODELS.pop(f"{model.__module__}.{model.__name__}", None)
+        registry._RESOLVE_CACHE.clear()
+
+
+def test_assigning_raw_key_without_prefetch_cache_sets_source_column():
+    """
+    GIVEN an unsaved instance that never had related objects cached
+    WHEN a raw key value is assigned to its forward FK attribute
+    THEN the key column is set directly (no prefetch cache to invalidate)
+    """
+    book = ArBook(title="raw-key")
+    book.author = 7
+    assert "_prefetch" not in book.__dict__
+    assert book.__dict__["author_id"] == 7

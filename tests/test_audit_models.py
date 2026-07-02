@@ -122,7 +122,26 @@ class AmSoftNote(AmSoftBase):
         table = "am_soft_note"
 
 
-MODELS = [AmDoc, AmDocFetch, AmScored, AmKeyed, AmPair, AmFlagged, AmSharedA, AmSharedB, AmSoftNote]
+class AmOnlyDefault(Model):
+    id = fields.IntField(pk=True)
+    flag = fields.IntField(default=SqlDefault("7"))
+
+    class Meta:
+        table = "am_only_default"
+
+
+MODELS = [
+    AmDoc,
+    AmDocFetch,
+    AmScored,
+    AmKeyed,
+    AmPair,
+    AmFlagged,
+    AmSharedA,
+    AmSharedB,
+    AmSoftNote,
+    AmOnlyDefault,
+]
 
 
 # -- database-default columns (findings 1 & 2) --------------------------------
@@ -143,6 +162,22 @@ async def test_full_save_preserves_db_default_columns(sqlite_db):
 
     fresh = await AmDoc.get(id=doc.id)
     assert fresh.title == "hello"
+    assert fresh.flag == 7
+
+
+@pytest.mark.asyncio
+async def test_full_save_with_every_column_unfetched_is_skipped(sqlite_db):
+    """
+    GIVEN a model whose only non-pk column is a never-fetched database default
+    WHEN a full save() runs right after create()
+    THEN the UPDATE is skipped entirely and the DB-computed value survives
+    """
+    doc = await AmOnlyDefault.create()
+    assert doc.flag is None  # never fetched; fetch_db_defaults is off
+
+    await doc.save()
+
+    fresh = await AmOnlyDefault.get(id=doc.id)
     assert fresh.flag == 7
 
 

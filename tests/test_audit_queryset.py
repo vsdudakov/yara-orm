@@ -24,9 +24,11 @@ from yara_orm import (
     FieldError,
     Model,
     Subquery,
+    Sum,
     UnSupportedError,
     When,
     fields,
+    in_transaction,
 )
 from yara_orm.dialects import PostgresDialect
 from yara_orm.expressions import CombinedExpression
@@ -490,3 +492,50 @@ async def test_expression_rtruediv(db):
     book = await AudqBook.create(title="T", price=20, author=ada)
     await AudqBook.filter(id=book.id).update(price=100 / F("price"))
     assert (await AudqBook.get(id=book.id)).price == 5
+
+
+# ---------------------------------------------------------------------------
+# select_for_update() on the values() shape with a joined relation path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_select_for_update_values_with_joined_path_locks_base_table(db):
+    """
+    GIVEN a select_for_update() values() query traversing a relation
+    WHEN it executes inside a transaction
+    THEN the lock narrows to FOR UPDATE OF the base table (PostgreSQL rejects
+         locking the nullable side of the LEFT JOIN) and rows still return
+    """
+    user = await AudqUser.create(name="owner")
+    await AudqTicket.create(title="locked", created_by=user)
+    async with in_transaction():
+        rows = (
+            await AudqTicket.filter(title="locked")
+            .select_for_update()
+            .values("title", "created_by__name")
+        )
+    assert len(rows) == 1
+    assert rows[0]["title"] == "locked"
+    assert "owner" in rows[0].values()
+
+
+# ---------------------------------------------------------------------------
+# HAVING: a multi-lookup conjunction group is parenthesised
+# ---------------------------------------------------------------------------
+
+
+def test_having_multi_lookup_group_renders_parenthesised():
+    """
+    GIVEN a HAVING group holding several lookups without negation
+    WHEN the HAVING clause compiles
+    THEN the conjunction is wrapped in parentheses so it composes soundly
+         with any further HAVING groups ANDed after it
+    """
+    qs = AudqBook.annotate(n=Count("id"), s=Sum("price")).group_by("genre")
+    qs._having = [([("n", "gt", 1), ("s", "lt", 100)], False)]
+    having, params, _ = qs._compile_having(PostgresDialect(), 1, {})
+    assert having.startswith(" HAVING (")
+    assert having.endswith(")")
+    assert " AND " in having
+    assert params == [1, 100]

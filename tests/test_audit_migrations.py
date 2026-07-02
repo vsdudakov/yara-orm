@@ -12,11 +12,11 @@ warning.
 
 import pytest
 
-from yara_orm import Index, IntegrityError, MigrationManager, Model, fields
+from yara_orm import Index, IntegrityError, MigrationManager, Model, connections, fields
 from yara_orm import migrations as m
 from yara_orm.connection import get_engine
-from yara_orm.db_defaults import Now, RandomHex, SqlDefault
-from yara_orm.dialects import PostgresDialect, SqliteDialect
+from yara_orm.db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
+from yara_orm.dialects import PRAGMA_FK_OFF, PRAGMA_FK_ON, PostgresDialect, SqliteDialect
 from yara_orm.exceptions import ConfigurationError
 from yara_orm.migrations import diff_states, model_state
 
@@ -755,3 +755,193 @@ def test_table_recreate_pair_writes_prominent_warning(tmp_path, capsys):
     assert "# WARNING:" in source
     assert "m.RenameModel('au_rename_old', 'au_rename_new')" in source
     assert "DESTROYS" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Coverage: unserialisable custom DatabaseDefault subclasses are rejected
+# ---------------------------------------------------------------------------
+
+
+def test_custom_database_default_subclass_is_rejected():
+    """
+    GIVEN a custom DatabaseDefault subclass migrations cannot serialise
+    WHEN its migration source and spec are rendered
+    THEN both helpers raise ConfigurationError pointing at SqlDefault
+    """
+
+    class _WeirdDefault(DatabaseDefault):
+        pass
+
+    with pytest.raises(ConfigurationError, match="SqlDefault"):
+        m._default_source(_WeirdDefault())
+    with pytest.raises(ConfigurationError, match="SqlDefault"):
+        m._default_spec(_WeirdDefault())
+
+
+# ---------------------------------------------------------------------------
+# Coverage: FK to a varchar pk records the target's type_params
+# ---------------------------------------------------------------------------
+
+
+class AuCharPk(Model):
+    code = fields.CharField(pk=True, max_length=24)
+
+    class Meta:
+        table = "au_char_pk"
+
+
+class AuCharChild(Model):
+    id = fields.IntField(pk=True)
+    parent = fields.ForeignKeyField("AuCharPk")
+
+    class Meta:
+        table = "au_char_child"
+
+
+def test_fk_to_varchar_pk_records_type_params_in_source():
+    """
+    GIVEN a foreign key whose target pk is a varchar with a max_length
+    WHEN the field renders as migration source
+    THEN resolved_fk records the target's type_params alongside table/pk/kind
+    """
+    fk = next(f for f in AuCharChild._meta.field_list if getattr(f, "reference", None))
+    src = m._field_source(fk)
+    assert "m.resolved_fk(" in src
+    assert "kind='varchar'" in src
+    assert "type_params={'max_length': 24}" in src
+
+
+# ---------------------------------------------------------------------------
+# Coverage: column renames follow INCLUDE lists and skip check constraints
+# ---------------------------------------------------------------------------
+
+
+def test_rename_in_table_follows_include_and_skips_check_constraints():
+    """
+    GIVEN a table state with a covering composite index and mixed constraints
+    WHEN a column referenced by both is renamed
+    THEN the index columns and INCLUDE list plus unique-constraint fields
+         follow the rename while raw-SQL check constraints stay untouched
+    """
+    tstate = {
+        "fields": {"a": fields.IntField(), "c": fields.IntField()},
+        "indexes": [],
+        "composite_indexes": {"ix": {"columns": ["a"], "include": ["a", "c"]}},
+        "constraints": [
+            {"kind": "check", "name": "ck", "check": "a > 0"},
+            {"kind": "unique", "name": "uq", "fields": ["a"]},
+        ],
+    }
+    m._rename_in_table(tstate, "a", "b")
+    assert list(tstate["fields"]) == ["b", "c"]
+    assert tstate["composite_indexes"]["ix"]["columns"] == ["b"]
+    assert tstate["composite_indexes"]["ix"]["include"] == ["b", "c"]
+    assert tstate["constraints"][0]["check"] == "a > 0"  # raw SQL untouched
+    assert tstate["constraints"][1]["fields"] == ["b"]
+
+
+# ---------------------------------------------------------------------------
+# Coverage: recreate warning only fires for identically-shaped tables
+# ---------------------------------------------------------------------------
+
+
+class AuRenamedWider(Model):
+    id = fields.IntField(pk=True)
+    payload = fields.CharField(max_length=10)
+    extra = fields.IntField(default=0)
+
+    class Meta:
+        table = "au_rename_wider"
+
+
+def test_table_recreate_warning_skips_differently_shaped_tables():
+    """
+    GIVEN a diff dropping one table while creating a differently-shaped one
+    WHEN the recreate warnings are computed
+    THEN no warning is emitted (this is not the shape of a Meta.table rename)
+    """
+    old = model_state([AuRenameMe])
+    new = model_state([AuRenamedWider])
+    assert m._table_recreate_warnings(old, new) == []
+
+
+# ---------------------------------------------------------------------------
+# Coverage: pragma-bracketed ops outside an atomic migration self-wrap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_non_atomic_pragma_op_wraps_itself_in_a_transaction(sqlite_empty):
+    """
+    GIVEN a non-atomic migration operation bracketed with FK pragmas
+    WHEN it is applied outside any transaction
+    THEN it wraps itself in its own pinned transaction and completes
+    """
+    await m._apply_op_sql(
+        get_engine(),
+        [
+            PRAGMA_FK_OFF,
+            "CREATE TABLE au_pragma_scratch (id INTEGER PRIMARY KEY)",
+            PRAGMA_FK_ON,
+        ],
+        atomic=False,
+    )
+    rows = await connections.get("default").fetch_rows("SELECT COUNT(*) FROM au_pragma_scratch")
+    assert rows[0][0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage: a failed rebuild restores foreign-key enforcement
+# ---------------------------------------------------------------------------
+
+
+class _FkRecorder:
+    """Records executed SQL; raises on the marker statement."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def execute(self, sql, params=None):
+        self.calls.append(sql)
+        if sql == "BOOM":
+            raise RuntimeError("boom")
+
+
+@pytest.mark.asyncio
+async def test_failed_rebuild_restores_fk_enforcement_inside_transaction():
+    """
+    GIVEN a rebuild that fails after FK enforcement was switched off
+    WHEN the statements ran on a pinned transaction
+    THEN the transaction rolls back, enforcement is restored and a fresh
+         BEGIN reopens the transaction before the error propagates
+    """
+    eng = _FkRecorder()
+    with pytest.raises(RuntimeError, match="boom"):
+        await m._run_op_sql(eng, [PRAGMA_FK_OFF, "BOOM"], in_txn=True)
+    assert eng.calls[-3:] == ["ROLLBACK", PRAGMA_FK_ON, "BEGIN"]
+
+
+@pytest.mark.asyncio
+async def test_failed_rebuild_restores_fk_enforcement_in_autocommit():
+    """
+    GIVEN a rebuild that fails after FK enforcement was switched off
+    WHEN the statements ran in autocommit (no pinned transaction)
+    THEN enforcement is restored before the error propagates
+    """
+    eng = _FkRecorder()
+    with pytest.raises(RuntimeError, match="boom"):
+        await m._run_op_sql(eng, [PRAGMA_FK_OFF, "BOOM"], in_txn=False)
+    assert eng.calls[-1] == PRAGMA_FK_ON
+
+
+@pytest.mark.asyncio
+async def test_failed_op_without_fk_toggle_reraises_without_restore():
+    """
+    GIVEN an operation that fails before any FK pragma was executed
+    WHEN the statements run
+    THEN the error propagates as-is with no enforcement-restore statements
+    """
+    eng = _FkRecorder()
+    with pytest.raises(RuntimeError, match="boom"):
+        await m._run_op_sql(eng, ["BOOM"], in_txn=False)
+    assert eng.calls == ["BOOM"]
