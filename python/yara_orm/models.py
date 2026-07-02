@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
 
 from . import registry, signals
 from . import timezone as _tz
@@ -29,13 +29,19 @@ from .relations import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Sequence
+
+    from typing_extensions import Self
 
     from .connection import BaseDBAsyncClient
     from .dialects import BaseDialect
     from .migrations import Constraint
     from .prefetch import Prefetch
     from .queryset import Q
+
+#: A concrete model type flowing through helpers that take instances (e.g.
+#: ``fetch_for_list``), so the caller's model type is preserved.
+_ModelT = TypeVar("_ModelT", bound="Model")
 
 
 class MetaInfo:
@@ -101,8 +107,10 @@ class MetaInfo:
         #: ``None`` (the default) yara stays strict and rejects them.
         self.extra_kwargs: str | None = None
         #: The model's manager; rebound to the declared/default one by the
-        #: metaclass once the class object exists.
-        self.manager: Manager = Manager()
+        #: metaclass once the class object exists. ``Any``-parameterised: the
+        #: bound model is only known per concrete class (``Model.filter``
+        #: re-types the result as ``QuerySet[Self]``).
+        self.manager: Manager[Any] = Manager()
         self.table = table
         self.fields = fields
         self.pk_field = pk_field
@@ -743,7 +751,7 @@ class Model(metaclass=ModelMeta):
             else:
                 raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
 
-    def __await__(self) -> Generator[Any, Any, Model]:
+    def __await__(self) -> Generator[Any, Any, Self]:
         """Make instances awaitable, yielding ``self``.
 
         Some code (and test factories) does ``await Model.create(...)``
@@ -784,7 +792,7 @@ class Model(metaclass=ModelMeta):
         """
         self._in_db = value
 
-    async def fetch_related(self, *names: str) -> Model:
+    async def fetch_related(self, *names: str) -> Self:
         """Populate the named relations on this instance (one query each).
 
         Args:
@@ -882,7 +890,7 @@ class Model(metaclass=ModelMeta):
             self.__dict__["_unfetched_db_defaults"] = unset
 
     @classmethod
-    def _from_db_row(cls, values: list[Any]) -> Model:
+    def _from_db_row(cls, values: list[Any]) -> Self:
         """Build an instance from positional column values (fast read path).
 
         Column order matches ``_meta.field_list`` because the SELECT is compiled
@@ -910,7 +918,7 @@ class Model(metaclass=ModelMeta):
         return obj
 
     @classmethod
-    def _from_db_rows(cls, rows: list[list[Any]]) -> list[Model]:
+    def _from_db_rows(cls, rows: list[list[Any]]) -> list[Self]:
         """Build instances for many rows, hoisting the per-row invariants once.
 
         The batch counterpart of :meth:`_from_db_row` for the common
@@ -927,7 +935,7 @@ class Model(metaclass=ModelMeta):
         names = meta.decoder_names
         active = meta.active_decoders
         new = cls.__new__
-        out: list[Model] = []
+        out: list[Self] = []
         for values in rows:
             obj = new(cls)
             d = obj.__dict__
@@ -941,7 +949,7 @@ class Model(metaclass=ModelMeta):
         return out
 
     @classmethod
-    def _from_db_row_fields(cls, values: list[Any], fields: list[Field]) -> Model:
+    def _from_db_row_fields(cls, values: list[Any], fields: list[Field]) -> Self:
         """Build a partially-populated instance from a subset of columns.
 
         Powers ``only()`` / ``defer()``: only ``fields`` are set, so reading any
@@ -969,7 +977,7 @@ class Model(metaclass=ModelMeta):
         return obj
 
     @classmethod
-    def _from_db_rows_fields(cls, rows: list[list[Any]], fields: list[Field]) -> list[Model]:
+    def _from_db_rows_fields(cls, rows: list[list[Any]], fields: list[Field]) -> list[Self]:
         """Build partially-populated instances for many rows (batch fast path).
 
         The ``only()``/``defer()`` counterpart of :meth:`_from_db_rows`: the
@@ -984,7 +992,7 @@ class Model(metaclass=ModelMeta):
         """
         names, active = cls._meta.partial_decode_plan(fields)
         new = cls.__new__
-        out: list[Model] = []
+        out: list[Self] = []
         for values in rows:
             obj = new(cls)
             d = obj.__dict__
@@ -1037,7 +1045,7 @@ class Model(metaclass=ModelMeta):
         self,
         update_fields: list[str] | None = None,
         using_db: str | BaseDBAsyncClient | None = None,
-    ) -> Model:
+    ) -> Self:
         """Persist this instance, emitting pre/post-save signals if registered.
 
         Args:
@@ -1210,7 +1218,7 @@ class Model(metaclass=ModelMeta):
         if has_signals:
             await signals.emit_post_delete(cls, self, executor)
 
-    def clone(self, pk: Any = None) -> Model:
+    def clone(self, pk: Any = None) -> Self:
         """Return an unsaved copy of this instance, ready to insert as a new row.
 
         Copies every loaded field except the primary key, so the next ``save()``
@@ -1279,7 +1287,7 @@ class Model(metaclass=ModelMeta):
         }
 
     @classmethod
-    def construct(cls, _from_db: bool = False, **kwargs: Any) -> Model:
+    def construct(cls, _from_db: bool = False, **kwargs: Any) -> Self:
         """Build a detached instance directly, skipping validation and defaults.
 
         A fast, low-ceremony constructor: the given values are written straight
@@ -1301,8 +1309,8 @@ class Model(metaclass=ModelMeta):
 
     @classmethod
     async def fetch_for_list(
-        cls, instances: list[Model], *relations: str | Prefetch
-    ) -> list[Model]:
+        cls, instances: Sequence[_ModelT], *relations: str | Prefetch
+    ) -> list[_ModelT]:
         """Prefetch ``relations`` across a list of instances (one query each).
 
         Args:
@@ -1319,7 +1327,7 @@ class Model(metaclass=ModelMeta):
 
     # -- query entry points ----------------------------------------------
     @classmethod
-    def all(cls) -> QuerySet:
+    def all(cls) -> QuerySet[Self]:
         """Return a query set over all rows of this model.
 
         Returns:
@@ -1330,7 +1338,7 @@ class Model(metaclass=ModelMeta):
     @classmethod
     def filter(
         cls, *args: Q, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
-    ) -> QuerySet:
+    ) -> QuerySet[Self]:
         """Return a query set filtered by the given conditions.
 
         Args:
@@ -1347,7 +1355,7 @@ class Model(metaclass=ModelMeta):
     @classmethod
     def exclude(
         cls, *args: Q, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
-    ) -> QuerySet:
+    ) -> QuerySet[Self]:
         """Return a query set excluding rows matching the given conditions.
 
         Args:
@@ -1362,7 +1370,7 @@ class Model(metaclass=ModelMeta):
         return qs.using_db(using_db) if using_db is not None else qs
 
     @classmethod
-    def annotate(cls, **annotations: Any) -> QuerySet:
+    def annotate(cls, **annotations: Any) -> QuerySet[Self]:
         """Return a query set with the given computed annotations.
 
         Args:
@@ -1374,7 +1382,7 @@ class Model(metaclass=ModelMeta):
         return cls._meta.manager.get_queryset().annotate(**annotations)
 
     @classmethod
-    def prefetch_related(cls, *specs: str | Prefetch) -> QuerySet:
+    def prefetch_related(cls, *specs: str | Prefetch) -> QuerySet[Self]:
         """Return a query set that prefetches the given relations.
 
         Args:
@@ -1386,7 +1394,7 @@ class Model(metaclass=ModelMeta):
         return cls._meta.manager.get_queryset().prefetch_related(*specs)
 
     @classmethod
-    def select_related(cls, *relations: str) -> QuerySet:
+    def select_related(cls, *relations: str) -> QuerySet[Self]:
         """Return a query set that eager-loads forward FK/O2O relations by join.
 
         Args:
@@ -1398,7 +1406,7 @@ class Model(metaclass=ModelMeta):
         return cls._meta.manager.get_queryset().select_related(*relations)
 
     @classmethod
-    async def first(cls) -> Model | None:
+    async def first(cls) -> Self | None:
         """Return the first row (by default ordering), or ``None``.
 
         Returns:
@@ -1407,7 +1415,7 @@ class Model(metaclass=ModelMeta):
         return await cls._meta.manager.get_queryset().first()
 
     @classmethod
-    async def last(cls) -> Model | None:
+    async def last(cls) -> Self | None:
         """Return the last row (by default ordering), or ``None``.
 
         Returns:
@@ -1416,7 +1424,7 @@ class Model(metaclass=ModelMeta):
         return await cls._meta.manager.get_queryset().last()
 
     @classmethod
-    async def earliest(cls, *fields: str) -> Model | None:
+    async def earliest(cls, *fields: str) -> Self | None:
         """Return the earliest row ordered ascending by ``fields``.
 
         Args:
@@ -1428,7 +1436,7 @@ class Model(metaclass=ModelMeta):
         return await cls._meta.manager.get_queryset().earliest(*fields)
 
     @classmethod
-    async def latest(cls, *fields: str) -> Model | None:
+    async def latest(cls, *fields: str) -> Self | None:
         """Return the latest row ordered descending by ``fields``.
 
         Args:
@@ -1453,7 +1461,7 @@ class Model(metaclass=ModelMeta):
         return await (qs.filter(**kwargs) if kwargs else qs).exists()
 
     @classmethod
-    def distinct(cls) -> QuerySet:
+    def distinct(cls) -> QuerySet[Self]:
         """Return a query set selecting only distinct rows.
 
         Returns:
@@ -1467,7 +1475,7 @@ class Model(metaclass=ModelMeta):
         nowait: bool = False,
         skip_locked: bool = False,
         of: tuple[str, ...] = (),
-    ) -> QuerySet:
+    ) -> QuerySet[Self]:
         """Return a query set that locks matched rows (``FOR UPDATE``).
 
         Args:
@@ -1509,7 +1517,7 @@ class Model(metaclass=ModelMeta):
         return await cls._meta.manager.get_queryset().values_list(*fields, flat=flat)
 
     @classmethod
-    async def raw(cls, sql: str, params: list[Any] | None = None) -> list[Model]:
+    async def raw(cls, sql: str, params: list[Any] | None = None) -> list[Self]:
         """Run raw SQL returning this model's instances (positional columns).
 
         Args:
@@ -1583,7 +1591,7 @@ class Model(metaclass=ModelMeta):
     @classmethod
     def get(
         cls, *, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
-    ) -> QuerySetSingle[Model]:
+    ) -> QuerySetSingle[Self]:
         """Return a chainable, awaitable single-row result for the lookups.
 
         ``await Model.get(id=x)`` resolves to the instance (via a fast path);
@@ -1602,7 +1610,7 @@ class Model(metaclass=ModelMeta):
         return QuerySetSingle(cls.filter(**kwargs), _resolve_get, fast=lambda: cls._get_one(kwargs))
 
     @classmethod
-    async def _get_one(cls, kwargs: dict[str, Any]) -> Model:
+    async def _get_one(cls, kwargs: dict[str, Any]) -> Self:
         """Fast single-row fetch used when no prefetch/select is chained.
 
         Args:
@@ -1621,7 +1629,7 @@ class Model(metaclass=ModelMeta):
         return cls._from_db_row(rows[0])
 
     @classmethod
-    async def get_or_none(cls, **kwargs: Any) -> Model | None:
+    async def get_or_none(cls, **kwargs: Any) -> Self | None:
         """Fetch the instance matching the lookups, or ``None`` if absent.
 
         Args:
@@ -1638,7 +1646,7 @@ class Model(metaclass=ModelMeta):
     @classmethod
     async def create(
         cls, *, using_db: str | BaseDBAsyncClient | None = None, **kwargs: Any
-    ) -> Model:
+    ) -> Self:
         """Construct an instance from the given values and save it.
 
         Args:
@@ -1658,7 +1666,7 @@ class Model(metaclass=ModelMeta):
         defaults: dict[str, Any] | None = None,
         using_db: str | BaseDBAsyncClient | None = None,
         **kwargs: Any,
-    ) -> tuple[Model, bool]:
+    ) -> tuple[Self, bool]:
         """Fetch the row matching ``kwargs`` or create it.
 
         Args:
@@ -1681,7 +1689,7 @@ class Model(metaclass=ModelMeta):
         defaults: dict[str, Any] | None = None,
         using_db: str | BaseDBAsyncClient | None = None,
         **kwargs: Any,
-    ) -> tuple[Model, bool]:
+    ) -> tuple[Self, bool]:
         """Update the row matching ``kwargs`` with ``defaults``, or create it.
 
         Args:
@@ -1733,7 +1741,7 @@ class Model(metaclass=ModelMeta):
     @classmethod
     async def _existing_by_key(
         cls, records: list[dict[str, Any]], key_fields: tuple[str, ...]
-    ) -> dict[tuple, Model]:
+    ) -> dict[tuple, Self]:
         """Return ``{key_tuple: instance}`` for records that already exist.
 
         Fetches candidates in a single query (the first key field's ``__in``) and
@@ -1752,7 +1760,7 @@ class Model(metaclass=ModelMeta):
         # value type must stay assignable to every keyword parameter.
         values: Any = list({rec[first] for rec in records})
         wanted = {cls._natural_key(rec, key_fields) for rec in records}
-        out: dict[tuple, Model] = {}
+        out: dict[tuple, Self] = {}
         for obj in await cls.filter(**{f"{first}__in": values}):
             key = cls._natural_key(obj, key_fields)
             if key in wanted:
@@ -1766,7 +1774,7 @@ class Model(metaclass=ModelMeta):
         key_fields: Iterable[str],
         defaults: dict[str, Any] | None = None,
         batch_size: int = 500,
-    ) -> list[tuple[Model, bool]]:
+    ) -> list[tuple[Self, bool]]:
         """Fetch or create many rows in as few queries as possible.
 
         Existing rows are matched by ``key_fields`` in one query; the missing ones
@@ -1791,8 +1799,8 @@ class Model(metaclass=ModelMeta):
             return []
         defaults = defaults or {}
         existing = await cls._existing_by_key(records, keys)
-        results: list[tuple[Model, bool]] = []
-        to_create: list[Model] = []
+        results: list[tuple[Self, bool]] = []
+        to_create: list[Self] = []
         for rec in records:
             key = cls._natural_key(rec, keys)
             found = existing.get(key)
@@ -1814,7 +1822,7 @@ class Model(metaclass=ModelMeta):
         key_fields: Iterable[str],
         update_fields: Iterable[str] | None = None,
         batch_size: int = 500,
-    ) -> list[tuple[Model, bool]]:
+    ) -> list[tuple[Self, bool]]:
         """Update existing rows (matched by ``key_fields``) or create missing ones.
 
         Existing rows are fetched in one query and updated with a single
@@ -1848,10 +1856,10 @@ class Model(metaclass=ModelMeta):
                         seen_fields[f] = None
             updates = list(seen_fields)
         existing = await cls._existing_by_key(records, keys)
-        pending: dict[tuple, Model] = {}  # new keys created in this batch
-        results: list[tuple[Model, bool]] = []
-        to_create: list[Model] = []
-        to_update: dict[int, Model] = {}  # id(obj) -> obj, deduped
+        pending: dict[tuple, Self] = {}  # new keys created in this batch
+        results: list[tuple[Self, bool]] = []
+        to_create: list[Self] = []
+        to_update: dict[int, Self] = {}  # id(obj) -> obj, deduped
         for rec in records:
             key = cls._natural_key(rec, keys)
             found = existing.get(key)
@@ -1874,7 +1882,7 @@ class Model(metaclass=ModelMeta):
         return results
 
     @classmethod
-    async def in_bulk(cls, id_list: Iterable[Any], field_name: str = "pk") -> dict[Any, Model]:
+    async def in_bulk(cls, id_list: Iterable[Any], field_name: str = "pk") -> dict[Any, Self]:
         """Fetch instances keyed by ``field_name`` for the given values.
 
         Args:
@@ -1896,12 +1904,12 @@ class Model(metaclass=ModelMeta):
     @classmethod
     async def bulk_create(
         cls,
-        objects: Iterable[Model],
+        objects: Iterable[Self],
         batch_size: int = 500,
         ignore_conflicts: bool = False,
         update_fields: Iterable[str] | None = None,
         on_conflict: Iterable[str] | None = None,
-    ) -> list[Model]:
+    ) -> list[Self]:
         """Insert many instances using one multi-row INSERT per batch.
 
         Each batch is a single prepared statement (parsed once, cached on the
@@ -1972,7 +1980,7 @@ class Model(metaclass=ModelMeta):
         # replaced by the default. Group rows by which of those columns they
         # set, so each group's INSERT lists exactly the supplied columns.
         if db_default_fields:
-            groups: dict[tuple[str, ...], list[Model]] = {}
+            groups: dict[tuple[str, ...], list[Self]] = {}
             for obj in objects:
                 sig = tuple(
                     f.model_field_name
@@ -2057,7 +2065,7 @@ class Model(metaclass=ModelMeta):
 
     @classmethod
     async def bulk_update(
-        cls, objects: Iterable[Model], fields: Iterable[str], batch_size: int = 500
+        cls, objects: Iterable[Self], fields: Iterable[str], batch_size: int = 500
     ) -> int:
         """Update the given ``fields`` of many instances in batched statements.
 
@@ -2137,7 +2145,7 @@ class Model(metaclass=ModelMeta):
 
     async def refresh_from_db(
         self, fields: Iterable[str] | None = None, using_db: str | BaseDBAsyncClient | None = None
-    ) -> Model:
+    ) -> Self:
         """Reload this instance's column values from the database.
 
         Args:
@@ -2157,7 +2165,7 @@ class Model(metaclass=ModelMeta):
             setattr(self, field.model_field_name, getattr(fresh, field.model_field_name))
         return self
 
-    def update_from_dict(self, data: dict[str, Any]) -> Model:
+    def update_from_dict(self, data: dict[str, Any]) -> Self:
         """Set attributes from ``data`` in place (without saving).
 
         Unknown keys raise unless ``Meta.extra_kwargs == "store"``, in which case

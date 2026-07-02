@@ -446,6 +446,14 @@ type as `Any`. For `isinstance` checks against the field objects themselves,
 use the `ForeignKeyFieldInstance` / `OneToOneFieldInstance` /
 `ManyToManyFieldInstance` classes (the factories return instances of these).
 
+Scalar fields need no annotations at all: field declarations are generic over
+their value type (`to_number = fields.CharField(...)` types `call.to_number`
+as `str`, `duration = fields.IntField(null=True)` as `int | None`), and
+querysets are generic over the model, so `await author.books` is
+`list[Book]`, `author.books.filter(...)` is a `QuerySet[Book]` and
+`await Book.filter(...).first()` is `Book | None`. See
+[Typed fields and querysets](models-and-fields.md#typed-fields-and-querysets).
+
 ## See also
 
 - [Querying](querying.md)

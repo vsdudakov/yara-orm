@@ -449,6 +449,43 @@ and instead manages a join table. Their full behaviour — accessors, `related_n
     For `await book.author`, reverse managers and `await book.tags.add(...)`, see
     [Relations](relations.md).
 
+## Typed fields and querysets
+
+Field declarations are fully typed — no annotations needed. Every scalar field
+is generic over its Python value type, and `null=True` folds `None` in, so a
+type checker (ty, pyright, mypy) sees exactly what an attribute holds:
+
+```python
+class Call(Model):
+    to_number = fields.CharField(max_length=32)
+    duration = fields.IntField(null=True)
+    status = fields.CharEnumField(CallStatus, max_length=16)
+
+call = await Call.get(id=1)      # Call
+call.to_number                   # str
+call.duration                    # int | None
+call.status                      # CallStatus
+call.to_number = 5               # type error: int is not str
+Call.to_number                   # CharField[str] (class-level access)
+```
+
+Query entry points and querysets carry the model type through every chain:
+`Call.filter(...)` is a `QuerySet[Call]`, `await Call.filter(...)` is
+`list[Call]`, `await Call.filter(...).first()` is `Call | None`, and
+`Call.get(...)` / `Call.create(...)` resolve to `Call`. `values()` /
+`values_list()` keep their plain row types.
+
+The mapping is: `SmallIntField`/`IntField`/`BigIntField` → `int`,
+`FloatField` → `float`, `DecimalField` → `Decimal`, `BooleanField` → `bool`,
+`CharField`/`TextField` → `str`, `BinaryField` → `bytes`, `DateField` →
+`date`, `DatetimeField` → `datetime`, `TimeField` → `time`, `TimeDeltaField`
+→ `timedelta`, `UUIDField` → `UUID`, `IntEnumField(E)`/`CharEnumField(E)` →
+`E`, and `JSONField` → `Any` (annotate it, e.g.
+`data: fields.JSONField[list[dict] | None] = fields.JSONField(null=True)`, to
+narrow JSON values). All of this is type-checking only: at runtime a field
+stays a non-data descriptor and attribute access is plain instance-`__dict__`
+lookup, so nothing gets slower.
+
 ## See also
 
 - [Custom fields](custom-fields.md)

@@ -400,7 +400,7 @@ class _ChainableManager(Generic[MODEL]):
     queryset without re-declaring each method.
     """
 
-    def _qs(self) -> QuerySet:  # pragma: no cover - abstract
+    def _qs(self) -> QuerySet[MODEL]:  # pragma: no cover - abstract
         """Return the base queryset over the related rows."""
         raise NotImplementedError
 
@@ -424,7 +424,7 @@ class _ChainableManager(Generic[MODEL]):
         """
         return _AsyncList(self._as_list())
 
-    def all(self) -> QuerySet:
+    def all(self) -> QuerySet[MODEL]:
         """Return a chainable queryset for all related rows.
 
         Returns:
@@ -432,7 +432,7 @@ class _ChainableManager(Generic[MODEL]):
         """
         return self._qs()
 
-    def filter(self, *args: Q, **kwargs: Any) -> QuerySet:
+    def filter(self, *args: Q, **kwargs: Any) -> QuerySet[MODEL]:
         """Return the related queryset further filtered by the given criteria.
 
         Args:
@@ -444,7 +444,7 @@ class _ChainableManager(Generic[MODEL]):
         """
         return self._qs().filter(*args, **kwargs)
 
-    def order_by(self, *fields: str) -> QuerySet:
+    def order_by(self, *fields: str) -> QuerySet[MODEL]:
         """Return the related queryset ordered by the given fields.
 
         Args:
@@ -481,7 +481,7 @@ class RelatedManager(_ChainableManager[MODEL]):
 
     def __init__(
         self,
-        model: type[Model],
+        model: type[MODEL],
         filters: dict[str, Any],
         cached: Any = _MISSING,
     ) -> None:
@@ -499,7 +499,7 @@ class RelatedManager(_ChainableManager[MODEL]):
         self._filters = filters
         self._cached = cached
 
-    def _qs(self) -> QuerySet:
+    def _qs(self) -> QuerySet[MODEL]:
         """Build a filtered queryset for the related rows.
 
         Returns:
@@ -515,11 +515,9 @@ class RelatedManager(_ChainableManager[MODEL]):
         """
         if self._cached is not _MISSING:
             return self._cached
-        # The rows come from a dynamically routed queryset; the annotation on
-        # the declaring model (ReverseRelation[X]) is the static source of truth.
-        return cast("list[MODEL]", await self._qs()._fetch())
+        return await self._qs()._fetch()
 
-    async def create(self, **kwargs: Any) -> Model:
+    async def create(self, **kwargs: Any) -> MODEL:
         """Create a related instance bound to the manager's criteria.
 
         Args:
@@ -702,11 +700,14 @@ class M2MManager(_ChainableManager[MODEL]):
         if reverse:
             self.near_key = info.forward_key
             self.far_key = info.backward_key
-            self.target = info.owner
+            target = info.owner
         else:
             self.near_key = info.backward_key
             self.far_key = info.forward_key
-            self.target = info.resolve_target()
+            target = info.resolve_target()
+        # The target class is registry-resolved; ``ManyToManyRelation[X]`` on
+        # the declaring model is the static source of truth for ``MODEL``.
+        self.target = cast("type[MODEL]", target)
         self.name = info.name
 
     def _sql(self, dialect: BaseDialect) -> dict[str, str]:
@@ -762,11 +763,9 @@ class M2MManager(_ChainableManager[MODEL]):
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=False)
         rows = await engine.fetch_rows(self._sql(dialect)["fetch"], [self.instance.pk])
-        # The target class is registry-resolved; ManyToManyRelation[X] on the
-        # declaring model is the static source of truth.
-        return cast("list[MODEL]", self.target._from_db_rows(rows))
+        return self.target._from_db_rows(rows)
 
-    def _qs(self) -> QuerySet:
+    def _qs(self) -> QuerySet[MODEL]:
         """Build a queryset over the target rows linked to this instance.
 
         Returns:

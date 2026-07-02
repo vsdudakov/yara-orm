@@ -241,10 +241,12 @@ def test_field_classes_are_subscriptable_for_annotations():
     """
     GIVEN a field class used in a generic type annotation
     WHEN it is subscripted (e.g. ``JSONField[dict]``)
-    THEN it returns the class itself rather than raising
+    THEN it evaluates to a generic alias of the class rather than raising
     """
-    assert fields.JSONField[dict | None] is fields.JSONField
-    assert fields.CharField[str] is fields.CharField
+    import typing
+
+    assert typing.get_origin(fields.JSONField[dict | None]) is fields.JSONField
+    assert typing.get_origin(fields.CharField[str]) is fields.CharField
 
 
 def test_bare_on_delete_constants_alias_ondelete_members():
