@@ -14,12 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .exceptions import ConfigurationError, UnSupportedError
-from .fields import ForeignKeyFieldInstance
+from .fields import ForeignKeyFieldInstance, registered_field_kind
 from .registry import get_model
 
 if TYPE_CHECKING:
     from .fields import Field
-    from .models import Index, MetaInfo
+    from .models import Index, MetaInfo, Model
     from .relations import M2MInfo
 
 
@@ -130,6 +130,8 @@ class BaseDialect:
     #: Whether ``CREATE INDEX`` accepts a per-column operator class
     #: (``col gin_trgm_ops``); PostgreSQL does, SQLite has no such syntax.
     index_opclass = True
+    #: Whether the backend supports ``CREATE EXTENSION`` (PostgreSQL only).
+    supports_extensions = False
 
     # -- identifiers & placeholders --------------------------------------
     def quote(self, identifier: str) -> str:
@@ -288,6 +290,56 @@ class BaseDialect:
         raise UnSupportedError(f"{self.name} does not support the __search lookup")
 
     # -- type rendering ---------------------------------------------------
+    def _kind_template(self, kind: str) -> str:
+        """Resolve the SQL type template for a kind, consulting the registry.
+
+        Built-in kinds come from :attr:`type_map`; anything else falls back to
+        the :func:`~yara_orm.fields.register_field_kind` registry.
+
+        Args:
+            kind: The abstract field kind.
+
+        Raises:
+            ConfigurationError: When the kind is neither built in nor
+                registered (or is registered without SQL for this dialect).
+
+        Returns:
+            The ``str.format`` template for the kind's SQL type.
+        """
+        template = self.type_map.get(kind)
+        if template is not None:
+            return template
+        registration = registered_field_kind(kind)
+        if registration is None:
+            raise ConfigurationError(
+                f"Dialect {self.name!r} has no type mapping for kind {kind!r}; "
+                "register custom kinds with yara_orm.register_field_kind(...)"
+            )
+        return registration.sql_template(self.name)
+
+    def _render_type(self, kind: str, type_params: dict[str, Any]) -> str:
+        """Render the concrete SQL type for a kind from its type parameters.
+
+        Args:
+            kind: The abstract field kind.
+            type_params: The field's type parameters filled into the template.
+
+        Raises:
+            ConfigurationError: When the template's placeholders do not match
+                the type parameters.
+
+        Returns:
+            The SQL type string.
+        """
+        template = self._kind_template(kind)
+        try:
+            return template.format(**type_params)
+        except (KeyError, IndexError) as exc:
+            raise ConfigurationError(
+                f"cannot render the SQL type for kind {kind!r}: template {template!r} "
+                f"does not match type_params {type_params!r} ({exc!r})"
+            ) from exc
+
     def column_type(self, field: Field) -> str:
         """Resolve the concrete SQL column type for a field.
 
@@ -302,18 +354,36 @@ class BaseDialect:
             ref = get_model(field.reference)
             pk = ref._meta.pk_field
             # Reference the scalar type of the target pk, never its serial form.
-            return self.type_map[pk.field_kind].format(**pk.type_params)
+            return self._render_type(pk.field_kind, pk.type_params)
 
         if field.auto_increment and kind in self.serial_map:
             return self.serial_map[kind]
 
-        try:
-            template = self.type_map[kind]
-        except KeyError as exc:
-            raise ConfigurationError(
-                f"Dialect {self.name!r} has no type mapping for kind {kind!r}"
-            ) from exc
-        return template.format(**field.type_params)
+        return self._render_type(kind, field.type_params)
+
+    # -- required extensions ----------------------------------------------
+    def extensions_sql(self, models: list[type[Model]]) -> list[str]:
+        """Render ``CREATE EXTENSION`` statements the models' fields require.
+
+        Collects the ``requires_extension`` declarations of every registered
+        field kind used by the models (deduplicated, sorted). Empty on dialects
+        without extension support (SQLite).
+
+        Args:
+            models: The models whose fields are scanned.
+
+        Returns:
+            The ``CREATE EXTENSION IF NOT EXISTS`` statements (possibly empty).
+        """
+        if not self.supports_extensions:
+            return []
+        extensions: set[str] = set()
+        for model in models:
+            for field in model._meta.fields.values():
+                registration = registered_field_kind(field.field_kind)
+                if registration is not None and registration.requires_extension:
+                    extensions.add(registration.requires_extension)
+        return [f"CREATE EXTENSION IF NOT EXISTS {self.quote(ext)}" for ext in sorted(extensions)]
 
     # -- DDL --------------------------------------------------------------
     def column_sql(self, field: Field) -> str:
@@ -591,7 +661,7 @@ class BaseDialect:
         Returns:
             The scalar SQL type matching the primary key.
         """
-        return self.type_map[pk_field.field_kind].format(**pk_field.type_params)
+        return self._render_type(pk_field.field_kind, pk_field.type_params)
 
     # -- migration rendering (spec-based, model-independent) -------------
     # Migrations carry self-contained column/table specs (plain dicts) so the
@@ -608,7 +678,7 @@ class BaseDialect:
         kind = spec["kind"]
         if spec.get("auto_increment") and kind in self.serial_map:
             return self.serial_map[kind]
-        return self.type_map[kind].format(**spec.get("type_params", {}))
+        return self._render_type(kind, spec.get("type_params", {}))
 
     def _render_default(self, default: dict[str, Any]) -> str:
         """Render the SQL expression for a migration default spec.
@@ -1136,6 +1206,7 @@ class PostgresDialect(BaseDialect):
     # and case-insensitive); `__search` uses full-text via to_tsvector/tsquery.
     regex_ops = {"regex": "~", "iregex": "~*", "posix_regex": "~", "iposix_regex": "~*"}
     supports_search = True
+    supports_extensions = True
 
     def date_part_sql(self, part: str, col: str) -> str:
         """Render ``EXTRACT(<part> FROM col)``.

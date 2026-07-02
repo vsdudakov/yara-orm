@@ -19,9 +19,11 @@ from .connection import (
     BaseDBAsyncClient,
     IsolationLevel,
     YaraOrm,
+    clear_query_annotators,
     clear_query_hooks,
     connections,
     in_transaction,
+    register_query_annotator,
     register_query_hook,
     run_async,
 )
@@ -47,6 +49,7 @@ from .exceptions import (
     ValidationError,
 )
 from .expressions import Array, Case, F, RawSQL, Subquery, Value, When
+from .fields import register_field_kind, unregister_field_kind
 from .functions import Coalesce, Concat, Length, Lower, Random, Trim, Upper
 from .manager import Manager
 from .migrations import CheckConstraint, MigrationManager, UniqueConstraint
@@ -81,6 +84,8 @@ __all__ = [
     "SqlDefault",
     "DatabaseDefault",
     "fields",
+    "register_field_kind",
+    "unregister_field_kind",
     "migrations",
     "MigrationManager",
     "Manager",
@@ -106,6 +111,8 @@ __all__ = [
     "in_transaction",
     "register_query_hook",
     "clear_query_hooks",
+    "register_query_annotator",
+    "clear_query_annotators",
     "BaseDBAsyncClient",
     "atomic",
     "run_async",

@@ -241,6 +241,44 @@ While at least one hook is registered, both model and manual statements route th
 a proxy that invokes the hooks; with none registered there is **no overhead** — the
 hot path uses the raw engine.
 
+## Attributing queries with annotators
+
+Hooks only *observe* SQL. To attach per-request attribution that reaches the
+database — so `pg_stat_statements`, Datadog or slow-query logs can tell you *which
+endpoint* issued a statement — register a **query annotator**. Each annotator is a
+zero-argument callable (typically reading your app's contextvars) returning a short
+string, or `None`/`""` to skip; the non-empty results of all annotators are joined
+with `,` in registration order into a single comment prepended to every statement:
+
+```python
+import yara_orm
+
+@yara_orm.register_query_annotator
+def annotator() -> str | None:
+    return f"http_path={path.get()},caller={caller.get()}"
+
+await Thing.all()
+# executes as: /* http_path=/api/calls,caller=list_calls */ SELECT ...
+
+yara_orm.clear_query_annotators()   # back to zero overhead
+```
+
+The comment is applied on every Python query path — model queries, manual SQL via
+`connections.get()`, statements inside `in_transaction()` and `execute_script`
+(each script statement gets the comment). Like hooks, annotators cost nothing while
+none are registered, and **hooks see the final SQL including the comment**.
+Returned values are sanitised before embedding: control characters and the comment
+delimiters `*/` / `/*` are stripped, so a value can never terminate the comment and
+inject SQL. Exceptions raised by an annotator propagate to the query caller, the
+same as hook exceptions.
+
+!!! warning "Statement-cache cardinality"
+    The PostgreSQL statement cache is keyed on the SQL text, so high-cardinality
+    comment values (request ids, timestamps, user ids) make every statement unique
+    and defeat prepared-statement reuse. Prefer low-cardinality attribution values
+    such as the route template and caller name, or disable the cache with
+    `statement_cache_size=0` in the connection URL.
+
 ## See also
 
 - [Querying](querying.md)

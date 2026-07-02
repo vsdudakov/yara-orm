@@ -275,6 +275,7 @@ A migration file is plain Python: a `class Migration(m.Migration)` with an
 | `RemoveCompositeIndex(table, name, columns, condition=None)` | Drop a multi-column index. |
 | `RunSQL(sql, reverse_sql=None)` | Run literal SQL forward and, optionally, its reverse. |
 | `RunPython(forward, backward=None)` | Run async Python callables (hand-written migrations only). |
+| `CreateExtension(name)` | `CREATE EXTENSION IF NOT EXISTS <name>` on PostgreSQL; a no-op on SQLite (unlike `RunSQL`, it renders per dialect). Reverse is empty — the extension is never dropped. |
 
 `makemigrations` generates the **idempotent** analogs of the schema operations —
 `CreateModelIfNotExists`, `DeleteModelIfExists`, `AddFieldIfNotExists`,
@@ -284,6 +285,14 @@ A migration file is plain Python: a `class Migration(m.Migration)` with an
 use `AddIndexConcurrently`, `AddUniqueIndexConcurrently` or
 `RemoveIndexConcurrently` with `atomic = False` (those builds cannot run inside a
 transaction). `RunSQL` and `RunPython` are for hand-written `--empty` migrations.
+
+Custom field kinds registered with
+[`register_field_kind()`](custom-fields.md) participate like built-ins: the
+field is serialised as `fields.<ClassName>(...)` (or the registration's custom
+`source`), a `type_params` change diffs to `AlterField`, and when the kind
+declares `requires_extension`, `makemigrations` prepends the matching
+`m.CreateExtension(...)` operations to any migration that creates or retypes
+such a column (idempotent — a re-run with no column changes emits nothing).
 
 A generated initial migration for a `User` and a related `Post` looks like:
 

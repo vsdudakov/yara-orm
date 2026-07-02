@@ -100,12 +100,14 @@ nav:
       - Quick start: getting-started/quickstart.md
   - Guides:
       - Models & fields: guides/models-and-fields.md
+      - Custom fields: guides/custom-fields.md
       - Querying: guides/querying.md
       - Working with JSON: guides/json-fields.md
       - Relations: guides/relations.md
       - Aggregation & grouping: guides/aggregation.md
       - Transactions: guides/transactions.md
       - Signals: guides/signals.md
+      - Testing with factories: guides/testing-factories.md
       - Manual SQL: guides/manual-sql.md
       - Multiple databases: guides/multiple-databases.md
       - Migrations: guides/migrations.md
