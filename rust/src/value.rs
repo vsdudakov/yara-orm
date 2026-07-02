@@ -26,8 +26,15 @@ fn oob(v: i64, sql_type: &str) -> Box<dyn Error + Sync + Send> {
 
 // Text wire formats shared by every encoder (pg-text, JSON, SQLite), so the
 // timestamp/date/time representation cannot drift between the paths. `TimestampTz`
-// uses RFC 3339 directly (`to_rfc3339`), so it needs no format string here.
+// uses RFC 3339 directly (`to_rfc3339`) on the PostgreSQL text path.
 const FMT_TIMESTAMP: &str = "%Y-%m-%d %H:%M:%S%.6f";
+// SQLite stores datetimes as TEXT compared *lexicographically*, so aware
+// values must share the naive layout (same fixed-width space-separated prefix;
+// RFC 3339's 'T' would sort every aware value after every naive one on the
+// same day). The value is already UTC; the explicit "+00:00" suffix keeps
+// awareness distinguishable on read while ordering stays correct — any two
+// distinct instants differ within the fixed-width prefix.
+const FMT_TIMESTAMPTZ_SQLITE: &str = "%Y-%m-%d %H:%M:%S%.6f+00:00";
 const FMT_DATE: &str = "%Y-%m-%d";
 const FMT_TIME: &str = "%H:%M:%S%.6f";
 
@@ -499,7 +506,10 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
 fn value_to_json(v: Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
-        Value::Null | Value::Bytes(_) => J::Null,
+        Value::Null => J::Null,
+        // JSON has no byte type; base64 keeps bytes reversible and matches the
+        // `py_to_json` encoding for bytes inside JSON parameters.
+        Value::Bytes(b) => J::String(base64_encode(&b)),
         Value::Bool(b) => J::Bool(b),
         Value::Int(i) => J::from(i),
         Value::Float(f) => J::from(f),
@@ -509,7 +519,7 @@ fn value_to_json(v: Value) -> serde_json::Value {
         Value::Uuid(u) => J::String(u.to_string()),
         Value::Decimal(d) => J::String(d.to_string()),
         Value::Timestamp(t) => J::String(t.format(FMT_TIMESTAMP).to_string()),
-        Value::TimestampTz(t) => J::String(t.to_rfc3339()),
+        Value::TimestampTz(t) => J::String(t.format(FMT_TIMESTAMPTZ_SQLITE).to_string()),
         Value::Date(d) => J::String(d.format(FMT_DATE).to_string()),
         Value::Time(t) => J::String(t.format(FMT_TIME).to_string()),
     }
@@ -536,7 +546,12 @@ pub fn value_into_sqlite(v: Value) -> rusqlite::types::Value {
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Decimal(d) => S::Text(d.to_string()),
         Value::Timestamp(dt) => S::Text(dt.format(FMT_TIMESTAMP).to_string()),
-        Value::TimestampTz(dt) => S::Text(dt.to_rfc3339()),
+        // Aware datetimes are UTC here; render them with the same fixed-width
+        // space-separated layout as naive values (plus the "+00:00" marker) so
+        // SQLite's lexicographic TEXT comparisons order naive and aware values
+        // consistently. (`to_rfc3339`'s 'T' separator would break that; the
+        // decoder still accepts the old RFC 3339 rows for existing databases.)
+        Value::TimestampTz(dt) => S::Text(dt.format(FMT_TIMESTAMPTZ_SQLITE).to_string()),
         Value::Date(d) => S::Text(d.format(FMT_DATE).to_string()),
         Value::Time(t) => S::Text(t.format(FMT_TIME).to_string()),
     }
@@ -581,6 +596,12 @@ pub fn decode_sqlite(decl: &str, vr: rusqlite::types::ValueRef) -> Value {
     }
     if decl.contains("TIMESTAMP") || decl.contains("DATETIME") {
         if let Some(s) = text(vr) {
+            // Canonical aware layout (space-separated, explicit offset) first;
+            // RFC 3339 ('T' separator) next, accepting rows written by older
+            // releases so existing databases keep decoding as aware values.
+            if let Ok(dt) = chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%:z") {
+                return Value::TimestampTz(dt.with_timezone(&chrono::Utc));
+            }
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
                 return Value::TimestampTz(dt.with_timezone(&chrono::Utc));
             }
@@ -718,14 +739,43 @@ fn decode_pg_cell(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Result<Va
         1182 => get_arr!(NaiveDate, Value::Date),        // _date
         1183 => get_arr!(NaiveTime, Value::Time),        // _time
         _ => {
-            // Genuinely unknown type: try its text representation, and if even
-            // that fails we don't understand the type at all, so degrade to NULL
-            // rather than failing the whole query. (Known types above still
-            // error on a decode failure, since there it would mean data loss.)
+            // Genuinely unknown type: try its text representation (this covers
+            // text-family types the jump table doesn't list). If that fails,
+            // a genuine SQL NULL still decodes as None, but a non-NULL value we
+            // cannot decode is an *error* — silently returning NULL would drop
+            // data (the old behaviour).
             match row.try_get::<_, Option<String>>(idx) {
                 Ok(Some(v)) => Ok(Value::Text(v)),
-                _ => Ok(Value::Null),
+                Ok(None) => Ok(Value::Null),
+                Err(_) => match row.try_get::<_, Option<NullProbe>>(idx) {
+                    Ok(None) => Ok(Value::Null),
+                    _ => Err(EngineError::Conversion(format!(
+                        "unsupported PostgreSQL type OID {} for column {:?}; \
+                         cast the column to text in SQL to read it",
+                        ty.oid(),
+                        row.columns()[idx].name(),
+                    ))),
+                },
             }
         }
+    }
+}
+
+/// Accepts any PostgreSQL type without decoding it — used solely to tell a
+/// genuine SQL NULL apart from an undecodable non-NULL value in a column of an
+/// unsupported type (`String`'s `FromSql` rejects such columns before it can
+/// see that the cell is NULL).
+struct NullProbe;
+
+impl<'a> tokio_postgres::types::FromSql<'a> for NullProbe {
+    fn from_sql(
+        _ty: &Type,
+        _raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(NullProbe)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
     }
 }

@@ -8,6 +8,7 @@ import pytest
 from test_extra import CvEAuthor, CvEBook, CvENoRel, CvETag
 
 from yara_orm import (
+    ConfigurationError,
     Count,
     DoesNotExist,
     FieldError,
@@ -170,8 +171,9 @@ async def test_connections_get_default_and_unknown(db):
     """
     await CvEAuthor.create(name="a")
     assert (await connections.get("default").fetch_rows("SELECT 1"))[0][0] == 1
-    # Unknown name falls back to the default executor.
-    assert (await connections.get("ghost").fetch_rows("SELECT 1"))[0][0] == 1
+    # Unknown names raise instead of silently falling back to the default.
+    with pytest.raises(ConfigurationError):
+        connections.get("ghost")
 
 
 def test_char_enum_conversions():

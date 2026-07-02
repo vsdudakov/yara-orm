@@ -33,10 +33,30 @@ _CONNECTIONS: dict = {}
 #: Optional router selecting a connection per model (see docs/Router example).
 _ROUTER = None
 
-#: When inside ``in_transaction()``, the active pinned connection. Query
-#: execution routes through this instead of the pool so all statements share
-#: one transaction.
+#: When inside ``in_transaction()``, the active pinned connections keyed by
+#: connection name (``None`` outside any transaction). Query execution routes
+#: through the wrapper registered for the statement's *resolved* connection
+#: name, so a transaction on one connection never absorbs statements destined
+#: for another database. The dict is treated as immutable: entering a
+#: transaction sets a *copy* with the new entry (contextvars snapshot values,
+#: they do not track mutation).
 _active_tx: contextvars.ContextVar = contextvars.ContextVar("orm_active_tx", default=None)
+
+
+def _active_tx_for(name: str) -> TransactionWrapper | None:
+    """Return the active transaction pinned to connection ``name``, if any.
+
+    Args:
+        name: The resolved connection name.
+
+    Returns:
+        The pinned :class:`TransactionWrapper`, or None.
+    """
+    txs = _active_tx.get()
+    if txs is None:
+        return None
+    return txs.get(name)
+
 
 #: Optional pre-execute query hooks (register a hook to observe/annotate the SQL
 #: of the Python query path). Each hook is
@@ -115,9 +135,10 @@ def _split_sql_statements(script: str) -> list[str]:
 
     The native engine runs one command per call (prepared statement), so scripts
     must be split. The split respects dollar-quoted bodies (``$$ ... $$`` /
-    ``$tag$ ... $tag$``), single-quoted strings (incl. ``''`` escapes) and
-    ``--`` / ``/* */`` comments, so semicolons inside them do not terminate a
-    statement (e.g. a ``DO $$ ... $$;`` PL/pgSQL block stays intact).
+    ``$tag$ ... $tag$``), single-quoted strings (incl. ``''`` escapes),
+    double-quoted identifiers (incl. ``""`` escapes) and ``--`` / ``/* */``
+    comments, so semicolons inside them do not terminate a statement (e.g. a
+    ``DO $$ ... $$;`` PL/pgSQL block stays intact).
 
     Args:
         script: The SQL script possibly containing several statements.
@@ -129,7 +150,7 @@ def _split_sql_statements(script: str) -> list[str]:
     buf: list[str] = []
     i, n = 0, len(script)
     dollar_tag: str | None = None
-    in_squote = in_line_comment = in_block_comment = False
+    in_squote = in_dquote = in_line_comment = in_block_comment = False
     while i < n:
         ch = script[i]
         two = script[i : i + 2]
@@ -163,6 +184,16 @@ def _split_sql_statements(script: str) -> list[str]:
                     continue
                 in_squote = False
             i += 1
+        elif in_dquote:
+            buf.append(ch)
+            if ch == '"':
+                # A doubled quote inside a quoted identifier is an escape.
+                if i + 1 < n and script[i + 1] == '"':
+                    buf.append('"')
+                    i += 2
+                    continue
+                in_dquote = False
+            i += 1
         elif two == "--":
             in_line_comment = True
             buf.append(two)
@@ -173,6 +204,10 @@ def _split_sql_statements(script: str) -> list[str]:
             i += 2
         elif ch == "'":
             in_squote = True
+            buf.append(ch)
+            i += 1
+        elif ch == '"':
+            in_dquote = True
             buf.append(ch)
             i += 1
         elif ch == "$":
@@ -487,48 +522,83 @@ def get_executor(
         write: Whether the executor is for a write operation.
         using: Explicit connection (from ``QuerySet.using_db``) overriding the
             router: a registered connection name, or a connection/executor
-            object used directly. An active transaction still takes precedence.
+            object used directly. An active transaction on the *resolved*
+            connection name takes precedence over its pool; a transaction on a
+            different connection does not capture the statement.
 
     Returns:
-        The active transaction or the routed connection object.
+        The active transaction for the resolved connection, or the routed
+        connection object.
     """
-    tx = _active_tx.get()
+    if using is not None and not isinstance(using, str):
+        # ``using_db`` was given a connection/executor object; use it directly
+        # (it may itself be a transaction wrapper).
+        return using
+    name = using if using is not None else _route(model, write)
+    # A transaction pins only statements resolved to *its* connection name, so
+    # a model routed to connection B is never absorbed by an open transaction
+    # on connection A (which would silently write to the wrong database).
+    tx = _active_tx_for(name)
     if tx is not None:
         return tx
-    if using is not None and not isinstance(using, str):
-        # ``using_db`` was given a connection/executor object; use it directly.
-        return using
-    if using is not None:
-        engine = _named_connection(using)[0]
-    else:
-        name = _route(model, write)
-        # "default" goes through get_engine() so an uninitialised ORM errors clearly.
-        engine = get_engine() if name == "default" else _named_connection(name)[0]
+    if not write and using is None:
+        # Read-your-own-writes under a read/write-splitting router: a read the
+        # router sends to a replica must still see rows the open transaction
+        # wrote on the model's write connection, so that transaction captures
+        # the read instead of the replica pool.
+        write_name = _route(model, True)
+        if write_name != name:
+            tx = _active_tx_for(write_name)
+            if tx is not None:
+                return tx
+    # "default" goes through get_engine() so an uninitialised ORM errors clearly.
+    engine = get_engine() if name == "default" else _named_connection(name)[0]
     # While query hooks are registered, route the hot path through the proxy so
     # model statements fire them too; otherwise return the raw engine (no cost).
     return _EngineProxy(engine) if _QUERY_HOOKS else engine
 
 
-def get_dialect(model: type[Model] | None = None, using: str | None = None) -> BaseDialect:
+def get_dialect(model: type[Model] | None = None, using: str | Any | None = None) -> BaseDialect:
     """Return the SQL dialect for ``model``'s connection.
 
     Args:
         model: Model class used to route to a connection, or None.
-        using: Explicit connection name (from ``QuerySet.using_db``) that
-            overrides the router.
+        using: Explicit connection (from ``QuerySet.using_db``) that overrides
+            the router: a registered connection name, or a connection/executor
+            object — statements execute on that object, so SQL must render for
+            *its* dialect, not the model-routed one.
 
     Returns:
         The dialect for the resolved connection.
     """
-    # An active transaction pins the connection, so SQL must be rendered for
-    # that connection's dialect — mirroring get_executor, which gives the
-    # transaction precedence over the router and any ``using`` override.
-    tx = _active_tx.get()
+    # Resolution mirrors get_executor: the connection *name* decides. An active
+    # transaction on that name was opened on the same connection, so its
+    # dialect and the named connection's dialect are the same object; a
+    # transaction on a different connection must not skew rendering.
+    if using is not None:
+        if isinstance(using, str):
+            return _named_connection(using)[1]
+        dialect = getattr(using, "dialect", None)
+        if isinstance(dialect, BaseDialect):
+            # A TransactionWrapper (or wrapper-like executor) carries the
+            # dialect of the connection it is pinned to.
+            return dialect
+        if isinstance(dialect, str):
+            # A raw engine / engine proxy exposes its dialect by name.
+            return resolve_dialect(dialect)
+        # Unknown executor object: fall back to model routing below.
+    name = _route(model, False)
+    tx = _active_tx_for(name)
     if tx is not None and tx.dialect is not None:
         return tx.dialect
-    if using is not None:
-        return _named_connection(using)[1]
-    name = _route(model, False)
+    # Mirror get_executor's read-your-own-writes fallback: a read the router
+    # sends elsewhere executes on the open write-connection transaction, so it
+    # must render for that transaction's dialect too.
+    write_name = _route(model, True)
+    if write_name != name:
+        tx = _active_tx_for(write_name)
+        if tx is not None and tx.dialect is not None:
+            return tx.dialect
     if name == "default":
         if _DIALECT is None:
             raise ConfigurationError(
@@ -570,15 +640,13 @@ def _topo_sort_models(models: list[type[Model]]) -> list[type[Model]]:
     Returns:
         The models in foreign-key dependency order.
     """
-    from .relations import model_name
-
     included = {m.__name__: m for m in models}
     deps: dict[str, set[str]] = {}
     for model in models:
         targets: set[str] = set()
         for info in model._meta.relations.values():
             try:
-                target = registry.get_model(model_name(info.reference))
+                target = registry.get_model(info.reference)
             except KeyError:  # pragma: no cover - unresolved cross-set reference
                 continue
             if target is model or target.__name__ not in included:
@@ -638,10 +706,16 @@ class YaraOrm:
             raise ConfigurationError("YaraOrm.init requires either db_url or config=")
         global _ENGINE, _DIALECT, _ROUTER
         _tz._set_config(timezone=timezone, use_tz=use_tz)
+        # Re-initialising without close() would leak the previous engine's
+        # pool; close it once the replacement connected (so a failed connect
+        # leaves the old connection usable).
+        previous = _CONNECTIONS.get("default")
         _ENGINE = await _engine.connect(cls._normalize_url(db_url))
         _DIALECT = resolve_dialect(_ENGINE.dialect)
         _CONNECTIONS["default"] = (_ENGINE, _DIALECT)
         _ROUTER = router
+        if previous is not None:
+            await previous[0].close()
         registry.resolve_relations()
 
     @staticmethod
@@ -723,8 +797,14 @@ class YaraOrm:
         Returns:
             None
         """
+        # Re-registering a name must not leak the old engine's pool: connect
+        # the replacement first (a failed connect keeps the old one usable),
+        # then close the engine being replaced.
+        previous = _CONNECTIONS.get(name)
         engine = await _engine.connect(cls._normalize_url(db_url))
         _CONNECTIONS[name] = (engine, resolve_dialect(engine.dialect))
+        if previous is not None:
+            await previous[0].close()
 
     @classmethod
     def set_router(cls, router: Any) -> None:
@@ -875,13 +955,20 @@ def run_async(coro: Coroutine[Any, Any, Any]) -> None:
 class TransactionWrapper(_ManualSQLCompat):
     """Adapts a native transaction handle to the executor interface."""
 
-    def __init__(self, tx: Any, dialect: BaseDialect | None = None) -> None:
+    def __init__(
+        self,
+        tx: Any,
+        dialect: BaseDialect | None = None,
+        connection_name: str = "default",
+    ) -> None:
         """Wrap a native transaction handle.
 
         Args:
             tx: The native transaction object to adapt.
             dialect: The dialect of the connection the transaction runs on, so
                 statements routed to the transaction render for the right SQL.
+            connection_name: Name of the connection the transaction is pinned
+                to (used for routing and error messages).
 
         Returns:
             None
@@ -889,8 +976,37 @@ class TransactionWrapper(_ManualSQLCompat):
         self._tx = tx
         #: Dialect of the pinned connection (read by ``get_dialect``).
         self.dialect = dialect
+        #: Name of the connection this transaction runs on.
+        self.connection_name = connection_name
         #: Monotonic counter producing unique savepoint names for nested blocks.
         self._savepoint_seq = 0
+        #: Names handed out by :meth:`new_savepoint` (ORM-managed savepoints).
+        self._own_savepoints: set[str] = set()
+        #: ORM-managed savepoints currently open, in creation order. Nested
+        #: ``in_transaction`` blocks release strictly LIFO, so an out-of-order
+        #: release means concurrent tasks are interleaving savepoints in one
+        #: transaction — which cannot be untangled, so it is surfaced early.
+        self._sp_stack: list[str] = []
+
+    async def _control(self, method: Any, *args: Any) -> Any:
+        """Run a transaction-control call, translating engine errors.
+
+        The native layer raises ``TransactionManagementError`` for use of a
+        finished transaction; any other native failure (a bare ``RuntimeError``
+        from the driver) is surfaced as :class:`OperationalError`, matching the
+        statement path (:func:`_run_query`).
+
+        Args:
+            method: The bound native coroutine method (commit/rollback/...).
+            *args: Arguments forwarded to the method.
+
+        Returns:
+            The method's result.
+        """
+        try:
+            return await method(*args)
+        except RuntimeError as exc:
+            raise OperationalError(str(exc)) from exc
 
     def new_savepoint(self) -> str:
         """Return a fresh, unique savepoint name for this transaction.
@@ -899,7 +1015,42 @@ class TransactionWrapper(_ManualSQLCompat):
             A savepoint identifier unique within the transaction.
         """
         self._savepoint_seq += 1
-        return f"yara_sp_{self._savepoint_seq}"
+        name = f"yara_sp_{self._savepoint_seq}"
+        self._own_savepoints.add(name)
+        return name
+
+    def _check_savepoint_order(self, name: str) -> None:
+        """Raise if an ORM-managed savepoint is resolved out of LIFO order.
+
+        Args:
+            name: The savepoint about to be released / rolled back to.
+
+        Raises:
+            TransactionManagementError: If ``name`` is ORM-managed but not the
+                innermost open savepoint — the signature of concurrent tasks
+                sharing one transaction, which is unsupported.
+
+        Returns:
+            None
+        """
+        if name in self._own_savepoints and self._sp_stack and self._sp_stack[-1] != name:
+            raise TransactionManagementError(
+                f"savepoint {name!r} resolved out of order (innermost is "
+                f"{self._sp_stack[-1]!r}): concurrent tasks must not share one "
+                "in_transaction() block — run each task in its own transaction"
+            )
+
+    def _pop_savepoint(self, name: str) -> None:
+        """Drop ``name`` (and anything stacked on it) from the open-savepoint stack.
+
+        Args:
+            name: The savepoint that was released or rolled back to.
+
+        Returns:
+            None
+        """
+        if name in self._sp_stack:
+            del self._sp_stack[self._sp_stack.index(name) :]
 
     async def savepoint(self, name: str) -> None:
         """Establish a savepoint on the transaction.
@@ -910,7 +1061,9 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             None
         """
-        await self._tx.savepoint(name)
+        await self._control(self._tx.savepoint, name)
+        if name in self._own_savepoints:
+            self._sp_stack.append(name)
 
     async def release(self, name: str) -> None:
         """Release (merge) a savepoint, keeping its work.
@@ -921,7 +1074,9 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             None
         """
-        await self._tx.release(name)
+        self._check_savepoint_order(name)
+        await self._control(self._tx.release, name)
+        self._pop_savepoint(name)
 
     async def rollback_to(self, name: str) -> None:
         """Roll back to a savepoint, discarding work since it was set.
@@ -932,7 +1087,9 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             None
         """
-        await self._tx.rollback_to(name)
+        self._check_savepoint_order(name)
+        await self._control(self._tx.rollback_to, name)
+        self._pop_savepoint(name)
 
     async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
         """Execute a statement on the transaction.
@@ -993,7 +1150,8 @@ class TransactionWrapper(_ManualSQLCompat):
             The fetched row as a dict, or None.
         """
         # The native transaction has no ``fetch_one``; derive it from the dict
-        # rows so the manual-SQL surface matches the pooled connection's.
+        # rows so the manual-SQL surface matches the pooled connection's
+        # (fetch_all also applies the raw-SQL list->array binding).
         rows = await self.fetch_all(sql, params)
         return rows[0] if rows else None
 
@@ -1003,7 +1161,7 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             None
         """
-        await self._tx.commit()
+        await self._control(self._tx.commit)
 
     async def rollback(self) -> None:
         """Roll back the underlying transaction.
@@ -1011,7 +1169,7 @@ class TransactionWrapper(_ManualSQLCompat):
         Returns:
             None
         """
-        await self._tx.rollback()
+        await self._control(self._tx.rollback)
 
 
 class _EngineProxy(_ManualSQLCompat):
@@ -1023,6 +1181,14 @@ class _EngineProxy(_ManualSQLCompat):
     fires the query hooks, and engine ``RuntimeError``s surface as
     ``OperationalError``. Unknown attributes (``begin``, ``close``,
     ``execute_many``, ``dialect``) pass through to the wrapped engine.
+
+    Array binding: the dict-returning raw methods (``fetch_all`` /
+    ``fetch_one`` / ``execute_query`` / ``execute_query_dict``) bind a bare
+    ``list`` parameter as a PostgreSQL array (asyncpg-compatible). The
+    positional methods (``execute`` / ``fetch_rows`` / ``fetch_row``) are
+    shared with the model layer — where a bare list means a JSON value — so
+    they bind lists as JSON; wrap the parameter in :class:`yara_orm.Array` to
+    bind an array there.
     """
 
     def __init__(self, engine: Any) -> None:
@@ -1105,7 +1271,36 @@ class _EngineProxy(_ManualSQLCompat):
         Returns:
             The fetched row as a dict, or None.
         """
-        return await _run_query(self._engine.fetch_one, sql, params)
+        # Like fetch_all, this is a raw-SQL-only method, so a bare list binds
+        # as a PostgreSQL array (asyncpg-compatible) rather than JSON.
+        return await _run_query(self._engine.fetch_one, sql, _arrayify_params(params))
+
+    async def execute_script(self, script: str) -> None:
+        """Run a multi-statement SQL script on one pinned pooled connection.
+
+        The pooled path would otherwise run each statement on whichever
+        connection the pool hands out, so session state (PRAGMA, SET, temp
+        tables) and any explicit BEGIN/COMMIT would be split across
+        connections. Every statement runs sequentially on a single connection
+        in autocommit — no wrapping transaction — so non-transactional
+        statements (``VACUUM``, ``CREATE INDEX CONCURRENTLY``) work and
+        PRAGMAs take effect. A transaction the script leaves open is rolled
+        back before the connection returns to the pool.
+
+        Args:
+            script: The SQL script to run.
+
+        Returns:
+            None
+        """
+        statements = _split_sql_statements(script)
+        if not statements:
+            return
+        _run_hooks(script, None)
+        try:
+            await self._engine.execute_script(statements)
+        except RuntimeError as exc:
+            raise OperationalError(str(exc)) from exc
 
 
 class _Connections:
@@ -1122,19 +1317,27 @@ class _Connections:
         Args:
             name: Connection name to look up.
 
+        Raises:
+            ConfigurationError: If no connection is registered under ``name``
+                (a typo must not silently run statements on the default
+                database).
+
         Returns:
-            The active transaction, or a proxy over the named/default
-            connection that adds the compatibility raw-SQL methods.
+            The active transaction pinned to ``name``, or a proxy over the
+            named connection that adds the compatibility raw-SQL methods.
         """
-        tx = _active_tx.get()
+        # Only a transaction opened on *this* connection name is returned; a
+        # transaction on another connection must not capture the statements.
+        tx = _active_tx_for(name)
         if tx is not None:
             return tx
-        if name in _CONNECTIONS:
-            return _EngineProxy(_CONNECTIONS[name][0])
-        # Wrap the raw default engine, not get_executor(): the latter already
-        # returns an _EngineProxy while query hooks are registered, which would
-        # double-wrap and fire the hooks twice for raw SQL on this path.
-        return _EngineProxy(get_engine())
+        if name == "default":
+            # Wrap the raw default engine, not get_executor(): the latter
+            # already returns an _EngineProxy while query hooks are registered,
+            # which would double-wrap and fire the hooks twice for raw SQL on
+            # this path. get_engine() errors clearly when uninitialised.
+            return _EngineProxy(get_engine())
+        return _EngineProxy(_named_connection(name)[0])
 
 
 connections = _Connections()
@@ -1144,13 +1347,28 @@ class in_transaction:
     """Async context manager running its body in a single DB transaction.
 
     Commits on clean exit, rolls back if the block raises. While active, all
-    model/queryset statements route through the pinned connection.
+    model/queryset statements *resolved to the same connection name* route
+    through the pinned connection; statements routed to other connections run
+    on their own pools (or their own transactions).
 
-    Nesting is supported: a block entered while another transaction is active
-    opens a **savepoint** instead of a new transaction, so the inner block can
-    roll back (on error) without aborting the outer one, and its work is merged
-    into the outer transaction on success. An ``isolation`` level may be set on
-    the outermost block only.
+    Nesting is supported: a block entered while a transaction is active **on
+    the same connection name** opens a **savepoint** instead of a new
+    transaction, so the inner block can roll back (on error) without aborting
+    the outer one, and its work is merged into the outer transaction on
+    success. A nested block naming a *different* connection opens an
+    independent sibling transaction on that connection (committed/rolled back
+    on its own). An ``isolation`` level may be set where a transaction begins
+    (the outermost block per connection name).
+
+    .. warning::
+        Spawning concurrent tasks (``asyncio.gather`` / ``create_task``) that
+        share one open transaction is **unsupported**: sibling tasks would
+        interleave statements and savepoints on the single pinned connection,
+        destructively releasing each other's savepoints. Detected out-of-order
+        savepoint handling raises :class:`TransactionManagementError`. (Tasks
+        created inside the block inherit the transaction pin via their copied
+        context.) Run each concurrent task in its own ``in_transaction()``
+        block instead.
     """
 
     def __init__(self, connection_name: str = "default", isolation: str | None = None) -> None:
@@ -1180,8 +1398,9 @@ class in_transaction:
         Returns:
             The active transaction wrapper.
         """
-        existing = _active_tx.get()
+        existing = _active_tx_for(self.connection_name)
         if existing is not None:
+            # Same connection name: nest as a savepoint inside that transaction.
             if self.isolation is not None:
                 raise TransactionManagementError(
                     "isolation level cannot be set on a nested transaction"
@@ -1190,12 +1409,23 @@ class in_transaction:
             self._savepoint = existing.new_savepoint()
             await existing.savepoint(self._savepoint)
             return existing
+        # No transaction on *this* connection: begin one. A transaction open on
+        # a different connection name stays active alongside (a sibling, not a
+        # savepoint) — its statements and this block's must not share a
+        # connection, or writes would land in the wrong database.
         engine, dialect = _named_connection(self.connection_name)
         isolation = None
         if self.isolation is not None:
             isolation = _normalize_isolation(self.isolation, dialect.name)
-        self._conn = TransactionWrapper(await engine.begin(isolation), dialect)
-        self._token = _active_tx.set(self._conn)
+        self._conn = TransactionWrapper(
+            await engine.begin(isolation), dialect, self.connection_name
+        )
+        current = _active_tx.get()
+        # Copy-on-set: contextvars snapshot the value, so the mapping itself is
+        # never mutated in place (sibling tasks keep their own view).
+        updated = dict(current) if current else {}
+        updated[self.connection_name] = self._conn
+        self._token = _active_tx.set(updated)
         return self._conn
 
     async def __aexit__(

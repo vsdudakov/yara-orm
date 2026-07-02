@@ -35,6 +35,14 @@ pub trait Backend: Send + Sync {
     /// path for bulk inserts with `RETURNING`.
     async fn execute_many(&self, sql: &str, rows: &[Vec<Value>]) -> Result<Vec<Row>, EngineError>;
 
+    /// Run pre-split script statements sequentially on ONE pooled connection,
+    /// each in autocommit (no wrapping transaction), so session state (PRAGMA,
+    /// SET, temp tables) and explicit BEGIN/COMMIT inside the script hold
+    /// together, and non-transactional statements (VACUUM, CREATE INDEX
+    /// CONCURRENTLY) still work. If the script leaves a transaction open, it is
+    /// rolled back before the connection returns to the pool.
+    async fn execute_script(&self, statements: &[String]) -> Result<(), EngineError>;
+
     /// Short dialect identifier (e.g. `"postgres"`); the Python layer uses this
     /// to pick a SQL dialect for query generation.
     fn dialect(&self) -> &'static str;
