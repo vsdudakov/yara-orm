@@ -106,8 +106,10 @@ Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `descrip
 
 Database-side column defaults (pass as a field `default`): `Now()`,
 `RandomHex(size)`, `SqlDefault(sql)` (base `DatabaseDefault`). The database fills
-the value on insert. `Manager` is the base queryset provider; subclass it and set
-`Meta.manager` to scope every query. See [Models & fields](guides/models-and-fields.md).
+the value on insert; set `Meta.fetch_db_defaults = True` to read it back onto the
+instance via `INSERT … RETURNING`. `Manager` is the base queryset provider;
+subclass it and set `Meta.manager` to scope every query (inherited from abstract
+bases). See [Models & fields](guides/models-and-fields.md).
 
 ## QuerySet & Q
 
@@ -159,9 +161,10 @@ Handlers are async. The `Signals` enum names the four lifecycle signals. See
 ## Transactions
 
 `in_transaction(connection_name="default", isolation=None)` (async context manager) and
-`atomic(connection_name="default", isolation=None)` (decorator). Nested blocks open
-savepoints automatically; `isolation` takes an `IsolationLevel` constant (PostgreSQL honours
-all four, SQLite is serializable-only). See [Transactions](guides/transactions.md).
+`atomic(connection_name="default", isolation=None)` (decorator). Nested blocks on the same
+connection name open savepoints automatically; a different name opens an independent
+transaction on that connection. `isolation` takes an `IsolationLevel` constant (PostgreSQL
+honours all four, SQLite is serializable-only). See [Transactions](guides/transactions.md).
 
 ## Migrations
 
@@ -174,8 +177,8 @@ operation classes `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`, `Alte
 `UniqueConstraint` / `CheckConstraint`). Generated migrations use the idempotent analogs
 (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,
 `AddUniqueIndexConcurrently` and `RemoveIndexConcurrently` are for hand-written non-atomic
-migrations. Constraint operations are PostgreSQL-only (SQLite raises `UnSupportedError`).
-CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
+migrations. Constraint operations alter in place on PostgreSQL and rebuild the table on
+SQLite. CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
 
 ## Dialects
 

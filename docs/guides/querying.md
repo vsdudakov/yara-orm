@@ -118,6 +118,14 @@ await Book.filter(title__icontains="ocean")
 !!! note "Case-insensitive lookups across dialects"
     The `i*` lookups (`icontains`, `istartswith`, `iendswith`) use `ILIKE` on PostgreSQL. On SQLite they fall back to `LIKE`, which is already case-insensitive for ASCII — so the behaviour is consistent: a case-insensitive match on either backend.
 
+!!! note "Pattern lookups treat the value literally"
+    The value you pass to `contains` / `startswith` / `endswith` (and their `i*`
+    variants) is matched **literally**: `%`, `_` and `\` in the value are escaped
+    before the `LIKE` pattern is built, so `title__contains="100%"` matches the
+    three characters `100%`, not "100 followed by anything". `iexact` is likewise
+    a true case-insensitive *equality* — wildcards in the value do not act as
+    wildcards.
+
 !!! note "`__contains` on a JSON column is containment"
     For a text column `__contains` is a `LIKE '%v%'` substring match (the table
     above). For a [`JSONField`](json-fields.md) it is structural containment
@@ -147,8 +155,9 @@ await Tag.filter(books__title="Dune")
 
 Each relation hop compiles to a membership subquery, so spanning works at any depth (and across self-relations) without duplicating rows.
 
-An `isnull` lookup on a **reverse relation** filters on the *existence* of related
-rows rather than a column value — it compiles to `EXISTS` / `NOT EXISTS`:
+An `isnull` lookup on a **reverse relation or many-to-many** filters on the
+*existence* of related rows rather than a column value — it compiles to a
+membership test on the relation:
 
 ```python
 # Authors with NO related books at all -> NOT EXISTS (...)
@@ -156,6 +165,9 @@ await Author.filter(books__isnull=True)
 
 # Authors that have at least one related book -> EXISTS (...)
 await Author.filter(books__isnull=False)
+
+# Books with no tags at all (M2M)
+await Book.filter(tags__isnull=True)
 ```
 
 This complements the reverse field traversal above: `Author.filter(books__rating__gte=5)`
@@ -187,6 +199,10 @@ await Book.exclude(
 # A scalar subquery compared for equality
 await Book.filter(author_id=Subquery(Author.filter(name="Ada").values_list("id", flat=True)))
 ```
+
+A single-column `only()` projection works too — `Subquery(qs.only("email"))`
+projects exactly the named column (the usual implicit primary key is not
+added inside a subquery).
 
 !!! note "`exclude(col__in=Subquery(...))` is NULL-safe"
     A single-column `values_list` subquery drops `NULL`s, so `exclude(col__in=Subquery(...))`
@@ -245,7 +261,9 @@ from yara_orm import Q
 await Book.filter((Q(rating=1) | Q(rating=3)) & ~Q(title="Gamma")).order_by("title")
 ```
 
-Positional `Q` args and keyword lookups can be mixed — they are ANDed together:
+Positional `Q` args and keyword lookups can be mixed — they are ANDed together.
+A positional argument that is not a `Q` object raises `TypeError` (it would
+otherwise be silently ignored):
 
 ```python
 # (rating >= 1) AND title IN (...)
@@ -291,6 +309,11 @@ page = await Book.all().order_by("id")[40:60]   # offset 40, limit 20 -> queryse
 third = await Book.all().order_by("id")[2]       # a single Book (IndexError if missing)
 ```
 
+Slices and indexes **compose relative to the current window**: slicing an
+already-sliced queryset narrows it further, exactly like slicing a list.
+`qs[10:][3]` is absolute row 13, `qs[2:5][1:2]` is absolute row 3, and an
+empty or inverted window (`qs[5:3]`) matches no rows.
+
 Use `.distinct()` to drop duplicate rows from the result:
 
 ```python
@@ -306,15 +329,24 @@ These run the query. All are coroutines (`await` them), except awaiting the quer
 | `await qs` | `list[Model]` | Awaiting the queryset fetches all matching rows. |
 | `await qs.get(**kwargs)` | `Model` | Exactly one row. Raises `DoesNotExist` if none, `MultipleObjectsReturned` if more than one. |
 | `await qs.first()` | `Model \| None` | First row, or `None` when empty. |
-| `await qs.last()` | `Model \| None` | Last row (ordering reversed; defaults to descending pk). |
+| `await qs.last()` | `Model \| None` | Last row: the effective ordering (explicit `order_by()`, else `Meta.ordering`, else pk) reversed. Raises `TypeError` on a sliced queryset. |
 | `await qs.earliest(*fields)` | `Model \| None` | First row ordered ascending by `fields` (pk by default). |
 | `await qs.latest(*fields)` | `Model \| None` | First row ordered descending by `fields` (pk by default). |
-| `await qs.count()` | `int` | Number of matching rows (`SELECT COUNT(*)`). |
-| `await qs.exists()` | `bool` | `True` if at least one row matches. |
-| `await qs.delete()` | `int` | Deletes matching rows, returns the count. |
-| `await qs.update(**kwargs)` | `int` | Updates matching rows, returns the count. |
+| `await qs.count()` | `int` | Number of matching rows (`SELECT COUNT(*)`). Honours `group_by()` (counts groups), annotation filters and slices. |
+| `await qs.exists()` | `bool` | `True` if at least one row matches (within the slice, if any). |
+| `await qs.delete()` | `int` | Deletes matching rows, returns the count. Raises `TypeError` on a sliced queryset. |
+| `await qs.update(**kwargs)` | `int` | Updates matching rows, returns the count. Raises `TypeError` on a sliced queryset. |
 
-`.select_for_update()` adds `FOR UPDATE` to lock the selected rows for the duration of the surrounding transaction on PostgreSQL; it is a no-op on SQLite.
+`delete()` and `update()` honour **annotation filters** — a condition on an
+`annotate()` alias restricts the statement through a grouped subquery on the
+primary key:
+
+```python
+# Delete only authors with more than five books
+await Author.annotate(n=Count("books")).filter(n__gt=5).delete()
+```
+
+`.select_for_update()` adds `FOR UPDATE` to lock the selected rows for the duration of the surrounding transaction on PostgreSQL; it is a no-op on SQLite. It applies to plain fetches, `select_related()` joins and `values()` / `values_list()` projections alike; combining it with `annotate()` or `group_by()` raises `UnSupportedError` (PostgreSQL forbids locking an aggregated result).
 
 ```python
 async with in_transaction():

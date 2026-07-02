@@ -65,6 +65,8 @@ class Author(Model):
 | `unique_together`   | Composite `UNIQUE` constraint(s) over groups of field names.         |
 | `indexes`           | Composite index(es) over groups of field names.                     |
 | `constraints`       | Declarative `UniqueConstraint` / `CheckConstraint` objects; see below. |
+| `manager`           | A custom `Manager` scoping every query; see [Custom managers](#custom-managers). |
+| `fetch_db_defaults` | Read database-computed defaults back onto the instance on insert; see [Database-side defaults](#database-side-defaults). |
 
 ```python
 class Booking(Model):
@@ -143,6 +145,9 @@ class Account(Model):
 - `Model.describe()` returns a structured dict of the model's schema (table, primary key, fields, relations, `Meta` options) — handy for tooling.
 - `instance.clone()` returns an unsaved copy with no primary key, ready to `save()` as a new row (pass `clone(pk=...)` to set one).
 - All query-set terminals are also model classmethods: `await Book.first()`, `await Book.exists(...)`, `await Book.values_list("title", flat=True)`, etc.
+- Instances hash by primary key, so an **unsaved** instance (pk still `None`)
+  is unhashable — putting one in a `set`/`dict` raises `TypeError` rather than
+  silently going stale when `save()` assigns the pk.
 
 ### Default ordering
 
@@ -264,7 +269,14 @@ class Session(Model):
 !!! note "Callable defaults"
     A `default` that is callable is invoked per row at insert time, so
     `default=uuid.uuid4` produces a fresh value for each instance rather than one
-    shared value.
+    shared value. A **mutable literal** default (`default={}` or `default=[]` on a
+    `JSONField`, say) is copied per instance, so mutating one instance's value
+    never leaks into another.
+
+!!! note "`BooleanField` string input is semantic"
+    Strings are coerced by meaning, not truthiness: `"true"/"t"/"1"/"yes"/"y"/"on"`
+    → `True`, `"false"/"f"/"0"/"no"/"n"/"off"` → `False` (case-insensitive), and
+    an unrecognised string raises `ValueError` instead of silently binding `True`.
 
 ## Validators
 
@@ -306,9 +318,30 @@ class Session(Model):
 ```
 
 `Now()` and `SqlDefault(...)` are portable; `RandomHex` renders per backend
-(SQLite honours the byte count, PostgreSQL uses a 32-char `md5`). The value is
-filled on insert — call `refresh_from_db()` if you need it on the in-memory
-instance immediately.
+(SQLite honours the byte count, PostgreSQL uses a 32-char `md5`). By default the
+value is filled on insert and left off the in-memory instance — set
+`Meta.fetch_db_defaults = True` to have `create()` / `save()` read the computed
+values back onto the instance via `INSERT ... RETURNING` (both backends):
+
+```python
+class Session(Model):
+    created = fields.DatetimeField(default=Now())
+
+    class Meta:
+        fetch_db_defaults = True
+
+s = await Session.create()
+s.created                    # the database-computed timestamp, no reload needed
+```
+
+Passing an **explicit value** for a db-default column stores that value instead
+of the default. And a full `save()` never writes `NULL` over a db-default column
+whose value was simply never fetched — the column is skipped unless you fetched
+it, set it, or name it in `update_fields`.
+
+Database-side defaults round-trip through [migrations](migrations.md): the
+`DEFAULT` clause is emitted in migration DDL and default changes are
+autodetected.
 
 ## Custom managers
 
@@ -330,6 +363,10 @@ class Article(Model):
     class Meta:
         manager = ActiveManager()
 ```
+
+A custom manager declared on an [abstract base](#abstract-base-models) is
+inherited by its concrete subclasses (each class gets its own bound copy), so a
+soft-delete scope written once applies to every subclass.
 
 ## Enum fields
 

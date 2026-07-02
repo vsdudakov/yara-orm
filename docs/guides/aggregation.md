@@ -157,6 +157,20 @@ Author.annotate(books=Count("books")).filter(books__gte=1)
 
 Because `books` is an annotation, the `books__gte=1` lookup compiles to `HAVING`. If you had filtered on a column such as `name__startswith="A"`, that would compile to `WHERE` instead. The two can be mixed freely in a single `.filter(...)` call.
 
+`exclude()` accepts annotation lookups too, compiling to a negated `HAVING`
+(`exclude(books__gte=1)` keeps authors with **no** books). One `exclude(...)`
+call cannot mix annotation and column lookups — negating across the WHERE/HAVING
+boundary is ambiguous, so that raises `FieldError`; use two calls instead.
+
+Annotation filters also carry through the write and inspection terminals:
+`delete()` / `update()` restrict through a grouped subquery, and `count()`
+counts the rows that survive the `HAVING` (with `group_by()`, the groups).
+
+!!! note "`select_related()` and `annotate()` don't combine"
+    An annotated query groups by the primary key, which conflicts with hydrating
+    joined relations — combining the two raises `FieldError`. Use
+    [`prefetch_related()`](relations.md) to load relations alongside annotations.
+
 ## Putting it together
 
 A realistic report: group authors, count their books, average the ratings, keep only authors with at least one book, and order by the busiest author first.

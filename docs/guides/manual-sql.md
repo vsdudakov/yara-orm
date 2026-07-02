@@ -68,9 +68,16 @@ For projects migrating from Tortoise ORM, the executor also accepts Tortoise's
 spellings: `await conn.execute_query(sql, params)` returns a `(rowcount, rows)`
 tuple (rows as dicts), `await conn.execute_query_dict(sql, params)` returns the rows
 as dicts, and `await conn.execute_script(script)` runs a **multi-statement** script
-(it splits on `;`, leaving dollar-quoted `DO $$ … $$` blocks, string literals and
-comments intact). A database error surfaces as `OperationalError` from these methods,
-so existing `except OperationalError` handlers keep working.
+(it splits on `;`, leaving dollar-quoted `DO $$ … $$` blocks, quoted identifiers,
+string literals and comments intact). The whole script runs **on a single
+pinned connection**, each statement in autocommit — so session state (`SET`,
+`PRAGMA`, temp tables) and an explicit `BEGIN` / `COMMIT` inside the script
+hold together, and non-transactional statements (`VACUUM`,
+`CREATE INDEX CONCURRENTLY`) work. A transaction the script leaves open is
+rolled back before the connection returns to the pool; for all-or-nothing
+semantics, wrap the script in its own `BEGIN;` … `COMMIT;`. A database error
+surfaces as `OperationalError` from these methods, so existing
+`except OperationalError` handlers keep working.
 
 ```python
 conn = connections.get("default")
@@ -120,9 +127,12 @@ uses `?1, ?2, ...`. Use the form that matches the backend you connected to.
 
 ## Binding lists as PostgreSQL arrays
 
-A bare Python `list` (or `tuple`) passed as a raw-SQL param binds as a PostgreSQL
-**array** (asyncpg-style), coercing element types as needed (`UUID`, `Decimal`,
-`date`, …). Reference it with `ANY($n)` or `unnest($n::type[])`:
+A bare Python `list` (or `tuple`) passed to the dict-returning raw methods —
+`fetch_all`, `fetch_one`, `execute_query`, `execute_query_dict` — binds as a
+PostgreSQL **array** (asyncpg-style), coercing element types as needed (`UUID`,
+`Decimal`, `date`, …). Reference it with `ANY($n)` or `unnest($n::type[])`.
+(For `execute` / `fetch_rows` / `fetch_row`, which the model layer shares, a
+bare list is a JSON value — wrap it in `Array` there to bind an array.)
 
 ```python
 conn = connections.get("default")
