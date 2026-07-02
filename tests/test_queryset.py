@@ -863,12 +863,16 @@ async def test_defer_drops_base_columns_with_select_related(db):
 
 
 @pytest.mark.asyncio
-async def test_only_defer_still_rejected_with_annotate(db):
+async def test_only_combines_with_annotate(db):
     """
-    GIVEN only()/defer() combined with annotate()
+    GIVEN only() combined with an aggregate annotate()
     WHEN the query runs
-    THEN it still raises (only the select_related combination is supported)
+    THEN the narrowed base projection loads, the annotation is attached and
+         the unselected columns stay deferred
     """
     await _seed_mc()
+    [book] = await McBook.filter(title="B1").annotate(c=Count("id")).only("id", "title")
+    assert book.title == "B1"
+    assert book.c == 1
     with pytest.raises(FieldError):
-        await McBook.all().annotate(c=Count("id")).group_by("author_id").only("id")
+        _ = book.rating  # deferred: not in only()
