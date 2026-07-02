@@ -6,6 +6,158 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-07-02
+
+A full-codebase correctness audit (five independent review passes over the query
+compiler, migrations, model layer, connection/transaction machinery and the Rust
+engine) followed by a fix of every confirmed finding. 147 new regression tests.
+
+### Fixed — data loss
+
+- **Annotation-filtered `delete()` / `update()` no longer wipe the table.**
+  `annotate(n=Count(...)).filter(n__gt=5).delete()` compiled its HAVING
+  condition to nothing and emitted `DELETE FROM t` with **no WHERE clause**.
+  Both terminals now restrict through `pk IN (SELECT pk ... GROUP BY pk
+  HAVING ...)`; sliced `delete()`/`update()` raise `TypeError` (Django parity).
+- **Migrations preserve database-side defaults.** `makemigrations` dropped
+  `default=Now()`-style DB defaults from column DDL entirely — a migrated table
+  failed its first insert with a NOT NULL violation and the drift was invisible
+  to a follow-up diff. Defaults are now recorded in migration files
+  (`default=db_defaults.Now()`), rendered as `DEFAULT` clauses, and default
+  changes autodetect to `AlterField`.
+- **SQLite `AlterField` rebuilds no longer cascade-delete child rows.** The
+  table rebuild dropped the old table with `foreign_keys=ON`, firing
+  `ON DELETE CASCADE` into every child table. The rebuild is now bracketed by
+  the FK-pragma sandwich from SQLite's documented recipe; child rows survive
+  and FK enforcement resumes afterwards. Rebuilds also keep composite indexes,
+  named constraints and `unique_together`, and recreate single-column indexes
+  under their final names (a second alter on the same table previously failed
+  on a leftover `idx__new_*` index).
+- **A full `save()` after `create()` no longer NULLs DB-default columns.**
+  Unfetched `DatabaseDefault` columns are excluded from a full-row UPDATE, and
+  `Meta.fetch_db_defaults = True` is now implemented: `create()`/`save()`
+  refresh DB-generated values onto the instance via `INSERT ... RETURNING`
+  (both backends). Explicitly supplied values for DB-default columns are also
+  actually inserted (they were silently dropped in favour of the default).
+- **Writes inside a transaction land on the right database.** A nested
+  `in_transaction("other")` and any model routed to another connection were
+  silently absorbed by the open transaction's connection. Transactions are now
+  tracked per connection name: same-name nesting still uses savepoints, a
+  different name opens an independent transaction, and the router/`using`
+  resolution is honoured inside transactions.
+- **Cancelling a transaction mid-`commit`/`rollback`/`begin` (e.g.
+  `asyncio.wait_for` timeouts) can no longer return a connection to the pool
+  with an open transaction**, where the next request would silently join and
+  lose its writes. Connections re-enter the pool only after a clean
+  COMMIT/ROLLBACK; on any cancellation window the connection is rolled back in
+  the background or destroyed.
+- **Naive and aware datetimes compare correctly on SQLite.** Aware values were
+  stored as RFC 3339 (`T` separator) next to naive space-separated text, so
+  range filters and ordering across the two forms were lexicographically wrong.
+  Aware datetimes now store as `YYYY-MM-DD HH:MM:SS.ffffff+00:00` UTC text;
+  existing RFC 3339 rows still decode. **Upgrade note:** a SQLite database
+  holding aware datetimes written by ≤ 1.9 should rewrite them once so old and
+  new rows compare correctly —
+  `UPDATE t SET col = replace(col, 'T', ' ') WHERE col LIKE '%T%'`
+  per affected column (naive-only columns, the default, need nothing).
+
+### Fixed — wrong results
+
+- **`count()` / `exists()` honour `group_by`, annotation filters and slices**
+  (previously they counted the unfiltered, unsliced table).
+- **Slices compose relative to the existing window** — `qs.offset(5)[:3]`
+  returns rows 5–7 (was 0–2), `qs[10:][3]` row 13, and an inverted slice is
+  empty (was: unbounded on SQLite via `LIMIT -2`).
+- **Two FKs to the same table (or a self-FK) in `values()` / `group_by()` /
+  aggregates** now join under per-path aliases instead of erroring (42712) or
+  silently reading the wrong side.
+- **M2M `__isnull`** compiles to a real membership test (it previously bound
+  `True` as a target pk — "objects tagged with tag 1" on SQLite).
+- **`select_for_update()` is no longer silently dropped** on
+  `select_related()` / `values()` shapes, and raises on `annotate`/`group_by`
+  shapes PostgreSQL cannot lock.
+- **`iexact`/`contains`/`startswith`/`endswith` escape `%`, `_` and `\`** in
+  the user value (with an `ESCAPE` clause), so user input can no longer smuggle
+  LIKE wildcards — `filter(email__iexact="a_min@x.com")` is exact again.
+- **`last()` follows `Meta.ordering`** (it reversed pk order regardless);
+  `first()`/`last()` now return opposite ends of the same ordering.
+- **A stale FK cache no longer serves the old object** after `book.author =
+  None` / `book.author = other_pk` / a direct `author_id` write; a cached miss
+  is also not pinned forever.
+- **`Prefetch(relation, queryset=...)` constrains forward FK/O2O prefetches**
+  (the custom queryset was ignored on the forward branch).
+- **`get_or_none()` with multiple matches is deterministic** — the fast path
+  applies `Meta.ordering` like the queryset path.
+- **`bulk_get_or_create` / `bulk_update_or_create` match keys typed loosely**
+  (`"42"` vs `42`, UUID strings) instead of silently inserting duplicates, and
+  the default `update_fields` is the union across all records, not the first.
+- **Unknown PostgreSQL column types raise a clear error** naming the OID and
+  column (previously every such cell silently decoded to `None`); `bytes`
+  inside a bound array on SQLite base64-encode instead of becoming JSON `null`.
+
+### Fixed — silent misconfiguration now raises
+
+- `connections.get("typo")` raises `ConfigurationError` instead of silently
+  using the default connection.
+- A duplicate `related_name` on one target raises at startup (the second
+  model's reverse accessor was silently never installed); `related_name`
+  supports Django-style `%(class)s` for abstract bases.
+- An ambiguous bare model name (two `Order` classes in different modules)
+  raises listing the candidates instead of picking the most recently defined.
+- Assigning an unsaved instance to a FK raises `ValueError` (it silently
+  stored NULL).
+- `filter()`/`exclude()` reject non-`Q` positional arguments (they were
+  silently discarded — `filter(expr)` was a no-op returning all rows).
+- `makemigrations` refuses to write a migration that would drop **every**
+  table (the empty-`--models` footgun); `--allow-destructive` overrides.
+- `upgrade`/`downgrade` validate the target migration before applying anything
+  (an unknown target used to apply *all* remaining migrations) and both accept
+  numeric prefixes; duplicate migration numbers and unsatisfiable declared
+  dependencies warn at load time (ties in numeric order now break
+  deterministically by file name).
+- Unsaved model instances are unhashable (Django parity — a saved pk changed
+  the hash and corrupted sets/dicts); `BooleanField` coerces `"false"`/`"0"`
+  to `False` and rejects unrecognised strings (any non-empty string bound as
+  `True`); `NumericValidator` rejects `nan`/`inf`.
+
+### Added
+
+- `exclude()` can target annotations (negated HAVING), symmetric with
+  `filter()`.
+- Migrations: FK targets are stamped into generated files (`m.resolved_fk`),
+  so replaying/diffing no longer needs the referenced model importable, and
+  target-pk-type changes propagate to referencing columns; single-column
+  `unique` toggles and `on_delete` changes are autodetected;
+  `AddConstraint`/`RemoveConstraint` apply on SQLite via a table rebuild.
+- SQLite transactions use `BEGIN IMMEDIATE` (+ a 5 s busy timeout), so
+  concurrent read-then-write transactions queue instead of failing instantly
+  with `database is locked`; `sqlite://` URLs accept `?mode=memory` and reject
+  unknown parameters instead of treating them as part of the filename.
+- `execute_script()` runs the whole script on a single pinned connection
+  (statements were previously spread across pooled connections, splitting
+  session state and explicit BEGIN/COMMIT); each statement still runs in
+  autocommit, so `VACUUM`/`PRAGMA`-style statements keep working, and a
+  transaction the script leaves open is rolled back before the connection
+  returns to the pool. `execute_many()` is transactional (all-or-nothing).
+- Transaction-control failures raise `OperationalError` /
+  `TransactionManagementError` (not bare `RuntimeError`), connect failures
+  raise `DBConnectionError`, and out-of-order savepoint release from
+  concurrent tasks sharing one transaction is detected with a clear error.
+
+### Changed
+
+- `select_related()` combined with `annotate()` raises `FieldError` (the
+  eager joins were silently dropped; use `prefetch_related()`).
+- An `exclude()` mixing annotation and column lookups in one call raises
+  `FieldError` (a sound De Morgan split isn't possible).
+- Rename autodetection is conservative: only an unambiguous single drop+add
+  pair of identical spec becomes `RenameField`; ambiguous sets emit drop+add
+  plus a hint. A same-shape drop+create table pair gets a prominent warning
+  suggesting `RenameModel` instead of silently destroying data.
+- `Subquery(qs.only("col"))` projects exactly the named column (the auto-pk
+  no longer widens the subquery); `When(...)` with no condition raises;
+  `100 / F("x")` works (`__rtruediv__`).
+
 ## [1.9.0] - 2026-07-01
 
 ### Security
