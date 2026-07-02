@@ -12,7 +12,7 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from .db_defaults import DatabaseDefault
+from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .exceptions import ConfigurationError, UnSupportedError
 from .fields import ForeignKeyField
 from .registry import get_model
@@ -33,6 +33,13 @@ _QUOTE_CACHE: dict[str, str] = {}
 #: arbitrary SQL out of ``CREATE INDEX``.
 _INDEX_METHODS = frozenset({"btree", "hash", "gist", "gin", "spgist", "brin"})
 _OPCLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+#: Statements bracketing SQLite's table rebuild. ``PRAGMA foreign_keys`` is a
+#: silent no-op inside a transaction, so the migration runner recognises these
+#: exact strings and executes them *outside* the migration transaction (the
+#: standard SQLite rebuild recipe: enforcement off, rebuild, enforcement on).
+PRAGMA_FK_OFF = "PRAGMA foreign_keys=OFF"
+PRAGMA_FK_ON = "PRAGMA foreign_keys=ON"
 
 
 def _validate_index_using(using: str | None) -> None:
@@ -603,6 +610,26 @@ class BaseDialect:
             return self.serial_map[kind]
         return self.type_map[kind].format(**spec.get("type_params", {}))
 
+    def _render_default(self, default: dict[str, Any]) -> str:
+        """Render the SQL expression for a migration default spec.
+
+        The spec is the serialised form of a ``db_defaults`` object (built by
+        the migration spec-builder), reconstructed here so the expression
+        renders for the active dialect.
+
+        Args:
+            default: The default spec (``kind`` plus its parameters).
+
+        Returns:
+            The SQL default expression.
+        """
+        kind = default["kind"]
+        if kind == "now":
+            return Now().to_sql(self)
+        if kind == "random_hex":
+            return RandomHex(default["size"]).to_sql(self)
+        return SqlDefault(default["sql"]).to_sql(self)
+
     def render_column_def(self, name: str, spec: dict[str, Any]) -> str:
         """Render a column definition from a migration column spec.
 
@@ -622,6 +649,10 @@ class BaseDialect:
             parts.append("NOT NULL")
         if spec.get("unique") and not spec.get("pk"):
             parts.append("UNIQUE")
+        if spec.get("default"):
+            # Parenthesised for the same reason as ``column_sql``: SQLite needs
+            # expression defaults in parens, and PostgreSQL accepts them.
+            parts.append(f"DEFAULT ({self._render_default(spec['default'])})")
         return " ".join(parts)
 
     def _pk_clause(self, tspec: dict[str, Any]) -> str:
@@ -758,7 +789,7 @@ class BaseDialect:
             The list of SQL statements applying the column change.
         """
         if not self.alter_column_in_place:
-            return self._rebuild_table(table, table_spec, old, new, name)
+            return self.render_rebuild_table(table, table_spec)
         t = self.quote(table)
         col = self.quote(name)
         out: list[str] = []
@@ -770,37 +801,78 @@ class BaseDialect:
         if bool(old.get("null")) != bool(new.get("null")):
             action = "DROP NOT NULL" if new.get("null") else "SET NOT NULL"
             out.append(f"ALTER TABLE {t} ALTER COLUMN {col} {action}")
+        if old.get("default") != new.get("default"):
+            if new.get("default"):
+                expr = self._render_default(new["default"])
+                out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
+            else:
+                out.append(f"ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT")
+        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
+            # The inline column UNIQUE renders as PostgreSQL's default-named
+            # constraint (<table>_<column>_key), so toggle that constraint.
+            uq = self.quote(f"{table}_{name}_key")
+            if new.get("unique"):
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
+            else:
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT IF EXISTS {uq}")
+        if old.get("fk") != new.get("fk"):
+            # Same story for the FOREIGN KEY constraint (<table>_<column>_fkey):
+            # drop and re-add it to change the target or ON DELETE action.
+            fk = self.quote(f"{table}_{name}_fkey")
+            out.append(f"ALTER TABLE {t} DROP CONSTRAINT IF EXISTS {fk}")
+            ref = new.get("fk")
+            if ref:
+                out.append(
+                    f"ALTER TABLE {t} ADD CONSTRAINT {fk} FOREIGN KEY ({col}) "
+                    f"REFERENCES {self.quote(ref['table'])} ({self.quote(ref['pk'])}) "
+                    f"ON DELETE {ref.get('on_delete', 'CASCADE')}"
+                )
         return out
 
-    def _rebuild_table(
-        self,
-        table: str,
-        table_spec: dict[str, Any],
-        old: dict[str, Any],
-        new: dict[str, Any],
-        name: str,
-    ) -> list[str]:
+    def render_rebuild_table(self, table: str, table_spec: dict[str, Any]) -> list[str]:
         """Rebuild a table to apply a change a dialect cannot do in place.
 
         Copies the rows into a freshly created table (carrying ``table_spec``)
-        and swaps it in, the standard SQLite approach to altering a column.
+        and swaps it in, the standard SQLite approach to altering a column or
+        changing a constraint. Secondary indexes are created **after** the
+        swap, under the final table name: ``RENAME TO`` does not rename
+        indexes, so creating them on the temp table would leave them named
+        ``idx__new_<table>_...`` (breaking later index drops and colliding on
+        the next rebuild).
 
         Args:
             table: The table name.
             table_spec: The full table spec the rebuilt table should match.
-            old: The column spec before the change (unused; kept for symmetry).
-            new: The column spec after the change (unused; kept for symmetry).
-            name: The column being altered (carried over in the copy).
 
         Returns:
             The list of SQL statements rebuilding the table.
         """
         tmp = f"_new_{table}"
+        bare = dict(table_spec)
+        indexes = bare.pop("indexes", None) or []
+        composite = bare.pop("composite_indexes", None) or {}
+        bare["indexes"] = []
         cols = ", ".join(self.quote(c) for c in table_spec["columns"])
-        out = self.render_create_table(tmp, table_spec, safe=False)
+        out = self.render_create_table(tmp, bare, safe=False)
         out.append(f"INSERT INTO {self.quote(tmp)} ({cols}) SELECT {cols} FROM {self.quote(table)}")
         out.append(f"DROP TABLE {self.quote(table)}")
         out.append(f"ALTER TABLE {self.quote(tmp)} RENAME TO {self.quote(table)}")
+        for col in indexes:
+            out.extend(self.render_create_index(table, col, safe=False))
+        for idx_name, spec in composite.items():
+            out.extend(
+                self.render_create_composite_index(
+                    table,
+                    idx_name,
+                    spec["columns"],
+                    safe=False,
+                    condition=spec.get("condition"),
+                    unique=spec.get("unique", False),
+                    using=spec.get("using"),
+                    include=spec.get("include"),
+                    opclass=spec.get("opclass"),
+                )
+            )
         return out
 
     def render_create_index(
@@ -1337,6 +1409,25 @@ class SqliteDialect(BaseDialect):
         return []
 
     # -- migration rendering overrides ----------------------------------
+    def render_rebuild_table(self, table: str, table_spec: dict[str, Any]) -> list[str]:
+        """Rebuild a table with foreign-key enforcement toggled off around it.
+
+        The rebuild drops the original table, and with ``PRAGMA foreign_keys``
+        on (set per connection by the backend) that drop performs an implicit
+        ``DELETE`` which fires ``ON DELETE CASCADE`` on referencing tables —
+        silently wiping child rows. The pragma statements bracket the rebuild;
+        they are no-ops inside a transaction, so the migration runner executes
+        them outside it (see the ``PRAGMA_FK_OFF``/``PRAGMA_FK_ON`` contract).
+
+        Args:
+            table: The table name.
+            table_spec: The full table spec the rebuilt table should match.
+
+        Returns:
+            The list of SQL statements rebuilding the table.
+        """
+        return [PRAGMA_FK_OFF, *super().render_rebuild_table(table, table_spec), PRAGMA_FK_ON]
+
     def render_drop_table(self, table: str) -> list[str]:
         """Render a statement to drop a table without ``CASCADE``.
 

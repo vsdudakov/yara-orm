@@ -316,10 +316,46 @@ async def test_runsql_list_forward_and_reverse_execute(sqlite_orm, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_add_constraint_migration_rejected_on_sqlite(sqlite_orm, tmp_path):
+async def test_add_constraint_migration_rebuilds_on_sqlite(sqlite_orm, tmp_path):
     """
-    GIVEN a migration adding a table-level constraint via ALTER TABLE
-    WHEN it is applied on SQLite (which cannot ALTER ... ADD CONSTRAINT)
+    GIVEN a migration adding a table-level constraint
+    WHEN it is applied on SQLite (no ALTER ... ADD CONSTRAINT; the operation
+         routes through the table rebuild instead)
+    THEN the constraint is enforced, existing rows survive, and downgrade
+         removes it again
+    """
+    from yara_orm import IntegrityError
+
+    mgr = _mgr(tmp_path)
+    mgr.make_migrations(name="initial")
+    await mgr.upgrade()
+    await MtCovA.create(name="kept")
+
+    (tmp_path / "0002_con.py").write_text(
+        "from yara_orm import migrations as m\n\n\n"
+        "class Migration(m.Migration):\n"
+        "    dependencies = ['0001_initial']\n"
+        "    operations = [\n"
+        "        m.AddConstraint('mt_cov_a', m.UniqueConstraint("
+        "fields=['name'], name='uq_mt_cov_a_name')),\n"
+        "    ]\n"
+    )
+    await mgr.upgrade()
+    assert await MtCovA.filter(name="kept").exists() is True  # rows survive
+    with pytest.raises(IntegrityError):
+        await MtCovA.create(name="kept")  # the unique constraint is enforced
+
+    await mgr.downgrade(steps=1)
+    await MtCovA.create(name="kept")  # duplicate allowed again
+    assert await MtCovA.filter(name="kept").count() == 2
+
+
+@pytest.mark.asyncio
+async def test_add_constraint_on_untracked_table_rejected_on_sqlite(sqlite_orm, tmp_path):
+    """
+    GIVEN a migration adding a constraint to a table the migration state does
+          not track (created via RunSQL, so no rebuild spec exists)
+    WHEN it is applied on SQLite
     THEN the upgrade raises UnSupportedError
     """
     mgr = _mgr(tmp_path)
@@ -331,8 +367,10 @@ async def test_add_constraint_migration_rejected_on_sqlite(sqlite_orm, tmp_path)
         "class Migration(m.Migration):\n"
         "    dependencies = ['0001_initial']\n"
         "    operations = [\n"
-        "        m.AddConstraint('mt_cov_a', m.UniqueConstraint("
-        "fields=['name'], name='uq_mt_cov_a_name')),\n"
+        "        m.RunSQL('CREATE TABLE raw_t (a INTEGER)', "
+        "reverse_sql='DROP TABLE raw_t'),\n"
+        "        m.AddConstraint('raw_t', m.UniqueConstraint("
+        "fields=['a'], name='uq_raw_t_a')),\n"
         "    ]\n"
     )
     with pytest.raises(UnSupportedError):

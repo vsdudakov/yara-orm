@@ -52,7 +52,9 @@ async def _run(args: argparse.Namespace) -> None:
             manager.init()
             print(f"created migrations directory: {manager.directory}")
         elif args.command == "makemigrations":
-            name = manager.make_migrations(name=args.name, empty=args.empty)
+            name = manager.make_migrations(
+                name=args.name, empty=args.empty, allow_destructive=args.allow_destructive
+            )
             print(f"created {name}" if name else "no changes detected")
         elif args.command == "upgrade":
             done = await manager.upgrade(target=args.version)
@@ -92,6 +94,11 @@ def main() -> None:
     mk = sub.add_parser("makemigrations")
     mk.add_argument("--name", default=None)
     mk.add_argument("--empty", action="store_true")
+    mk.add_argument(
+        "--allow-destructive",
+        action="store_true",
+        help="permit a diff that drops every recorded table (default: abort)",
+    )
     up = sub.add_parser("upgrade")
     up.add_argument("version", nargs="?", default=None)
     dn = sub.add_parser("downgrade")
