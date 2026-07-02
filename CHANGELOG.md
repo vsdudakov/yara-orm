@@ -27,6 +27,15 @@ All notable changes to **yara-orm** are documented here. The format is based on
   `ManyToManyFieldInstance`. Declarations are untouched; only
   `isinstance(f, fields.ForeignKeyField)`-style checks (and subclassing)
   must switch to the `*Instance` names.
+- **Precise annotations across the public API.** ``Any`` was replaced with
+  the real type wherever one exists: ``using_db`` params are
+  ``str | BaseDBAsyncClient | None``, executors are the ``BaseDBAsyncClient``
+  protocol (now satisfied statically by the engine, transaction wrapper and
+  proxy alike), a ``Router`` protocol types ``init(router=)``/``set_router``,
+  ``transactions.atomic`` is fully ``ParamSpec``-typed, signal registries,
+  query hooks, dialects and relation/join internals carry concrete types, and
+  concrete fields' ``to_db``/``to_python`` declare their real returns.
+  Annotation-only — no runtime behaviour change.
 
 ## [1.10.0] - 2026-07-02
 

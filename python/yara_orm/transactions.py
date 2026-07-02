@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING
 
 from .connection import in_transaction
+
+if TYPE_CHECKING:
+    from typing import ParamSpec, TypeVar
+
+    P = ParamSpec("P")
+    T = TypeVar("T")
 
 
 def atomic(
     connection_name: str = "default",
     isolation: str | None = None,
-) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
+) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]:
     """Wrap a coroutine so it runs inside a transaction (mirrors ``@atomic()``).
 
     Args:
@@ -25,7 +31,7 @@ def atomic(
         A decorator wrapping a coroutine to run inside a transaction.
     """
 
-    def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    def decorator(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
         """Wrap ``func`` so each call runs inside a transaction.
 
         Args:
@@ -36,7 +42,7 @@ def atomic(
         """
 
         @functools.wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             """Run the wrapped coroutine within a transaction.
 
             Args:

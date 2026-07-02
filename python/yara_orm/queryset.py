@@ -19,9 +19,12 @@ from .functions import Function
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 
+    from .connection import BaseDBAsyncClient
     from .dialects import BaseDialect
     from .fields import Field
     from .models import MetaInfo, Model
+    from .prefetch import Prefetch
+    from .relations import RelationInfo
 
 
 def _like_escape(value: Any) -> str:
@@ -219,9 +222,9 @@ class QuerySet:
         self._order: list[tuple[str, bool]] = []
         self._limit: int | None = None
         self._offset: int | None = None
-        self._annotations: dict = {}
+        self._annotations: dict[str, Any] = {}
         self._group_by: list[str] = []
-        self._prefetch: list = []
+        self._prefetch: list[str | Prefetch] = []
         self._select_related: list[str] = []
         self._distinct: bool = False
         self._for_update: bool = False
@@ -238,7 +241,7 @@ class QuerySet:
         # columns and hydrates a partial related instance. Keyed by relation path.
         self._only_related: dict[str, tuple[str, ...]] = {}
         self._defer_related: dict[str, frozenset[str]] = {}
-        self._using: str | Any | None = None
+        self._using: str | BaseDBAsyncClient | None = None
 
     # -- cloning / chaining ----------------------------------------------
     def _clone(self) -> QuerySet:
@@ -385,7 +388,7 @@ class QuerySet:
         """
         return self._clone()
 
-    def prefetch_related(self, *specs: Any) -> QuerySet:
+    def prefetch_related(self, *specs: str | Prefetch) -> QuerySet:
         """Return a new query set that prefetches the given relations.
 
         Args:
@@ -503,7 +506,7 @@ class QuerySet:
         qs._for_update_of = tuple(of)
         return qs
 
-    def using_db(self, connection_name: str | Any) -> QuerySet:
+    def using_db(self, connection_name: str | BaseDBAsyncClient) -> QuerySet:
         """Return a new query set that executes on a given connection.
 
         Args:
@@ -519,7 +522,7 @@ class QuerySet:
         qs._using = connection_name
         return qs
 
-    def _using_name(self) -> Any:
+    def _using_name(self) -> str | BaseDBAsyncClient | None:
         """Return the ``using`` value for dialect resolution.
 
         Both a connection name and a connection/executor object are meaningful
@@ -696,7 +699,7 @@ class QuerySet:
 
     @staticmethod
     def _forward_join(
-        cur_table: str, cur_meta: MetaInfo, info: Any, dialect: BaseDialect, alias: str
+        cur_table: str, cur_meta: MetaInfo, info: RelationInfo, dialect: BaseDialect, alias: str
     ) -> tuple[MetaInfo, str]:
         """Build the ``LEFT JOIN`` from ``cur_table`` across a forward relation.
 
@@ -1424,7 +1427,7 @@ class QuerySet:
         rel: str,
         dialect: BaseDialect,
         joins: dict[str, str],
-    ) -> Any:
+    ) -> tuple[MetaInfo, str]:
         """Register the join(s) needed to aggregate across a relation.
 
         Args:
@@ -1929,7 +1932,7 @@ class QuerySet:
                 if base_sel is not None
                 else self.model._from_db_row(row[:ncols])
             )
-            built: dict[str | None, Any] = {None: obj}
+            built: dict[str | None, Model | None] = {None: obj}
             obj.__dict__.setdefault("_prefetch", {})
             for path in order:
                 node = nodes[path]
@@ -1979,7 +1982,7 @@ class QuerySet:
         meta.compile(dialect)
         q = dialect.quote
         table = q(meta.table)
-        joins: dict = {}
+        joins: dict[str, str] = {}
         select = [f"{table}.{q(f.db_column)}" for f in meta.field_list]
         select_params: list[Any] = []
         idx = 1
@@ -2108,7 +2111,7 @@ class QuerySet:
         meta.compile(dialect)
         q = dialect.quote
         table = q(meta.table)
-        joins: dict = {}
+        joins: dict[str, str] = {}
         select, names, group_cols = [], [], []
         requested = list(fields) if fields else None
 
@@ -2612,7 +2615,7 @@ class QuerySet:
         engine = get_executor(self.model, write=True, using=self._using)
         meta = self.model._meta
         assignments: list[str] = []
-        params: list = []
+        params: list[Any] = []
         idx = 1
         for name, value in kwargs.items():
             if name in meta.relations:
@@ -2809,7 +2812,7 @@ class QuerySetSingle(Generic[_SingleT]):
         """
         return QuerySetSingle(queryset, resolver=self._resolver)
 
-    def prefetch_related(self, *specs: Any) -> QuerySetSingle[_SingleT]:
+    def prefetch_related(self, *specs: str | Prefetch) -> QuerySetSingle[_SingleT]:
         """Return a single-row result that also prefetches the given relations.
 
         Args:
@@ -2831,7 +2834,7 @@ class QuerySetSingle(Generic[_SingleT]):
         """
         return self._chain(self._queryset.select_related(*relations))
 
-    def using_db(self, connection: Any) -> QuerySetSingle[_SingleT]:
+    def using_db(self, connection: str | BaseDBAsyncClient) -> QuerySetSingle[_SingleT]:
         """Return a single-row result bound to the given connection.
 
         Args:

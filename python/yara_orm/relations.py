@@ -17,8 +17,10 @@ from .queryset import QuerySet
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Generator
 
+    from .dialects import BaseDialect
     from .fields import ForeignKeyFieldInstance, ManyToManyFieldInstance
     from .models import Model
+    from .queryset import Q
 
 #: The related model a relation annotation is parameterised over, e.g.
 #: ``books: ReverseRelation["Book"]``.
@@ -430,7 +432,7 @@ class _ChainableManager(Generic[MODEL]):
         """
         return self._qs()
 
-    def filter(self, *args: Any, **kwargs: Any) -> QuerySet:
+    def filter(self, *args: Q, **kwargs: Any) -> QuerySet:
         """Return the related queryset further filtered by the given criteria.
 
         Args:
@@ -572,7 +574,7 @@ class _AsyncList(Generic[MODEL]):
         return item
 
 
-async def _ensure(awaitable: Awaitable[list[Any]]) -> list[Any]:
+async def _ensure(awaitable: Awaitable[list[MODEL]]) -> list[MODEL]:
     """Await and return the resolved list.
 
     Args:
@@ -651,8 +653,8 @@ class _M2MMembershipSubquery:
 
     def as_sql(
         self,
-        queryset: Any,
-        dialect: Any,
+        queryset: QuerySet,
+        dialect: BaseDialect,
         joins: dict[str, str],
         params: list[Any],
         idx: int,
@@ -707,7 +709,7 @@ class M2MManager(_ChainableManager[MODEL]):
             self.target = info.resolve_target()
         self.name = info.name
 
-    def _sql(self, dialect: Any) -> dict[str, str]:
+    def _sql(self, dialect: BaseDialect) -> dict[str, str]:
         """Return cached static SQL pieces for this side of the relation.
 
         The join-table SELECT/DELETE and the quoted join-table identifiers are

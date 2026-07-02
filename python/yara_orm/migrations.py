@@ -56,9 +56,10 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from types import ModuleType
 
+    from .connection import BaseDBAsyncClient
     from .dialects import BaseDialect
     from .fields import Field
-    from .models import Model
+    from .models import MetaInfo, Model
 
 MIGRATION_TABLE = "orm_migrations"
 _FILENAME_RE = re.compile(r"^(\d+)_.*\.py$")
@@ -479,7 +480,7 @@ def _index_option_source(
     return args
 
 
-def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
+def _meta_index_specs(meta: MetaInfo) -> dict[str, dict[str, Any]]:
     """Return the composite indexes a model declares via ``Meta.indexes``.
 
     Args:
@@ -516,7 +517,7 @@ def _meta_index_specs(meta: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _meta_named_constraint_specs(meta: Any) -> list[dict[str, Any]]:
+def _meta_named_constraint_specs(meta: MetaInfo) -> list[dict[str, Any]]:
     """Return the **named** declarative constraints from ``Meta.constraints``.
 
     Only named constraints are tracked for diffing: ALTER TABLE drops a
@@ -537,7 +538,7 @@ def _meta_named_constraint_specs(meta: Any) -> list[dict[str, Any]]:
     return specs
 
 
-def _meta_unique_together_specs(meta: Any) -> list[dict[str, Any]]:
+def _meta_unique_together_specs(meta: MetaInfo) -> list[dict[str, Any]]:
     """Return ``UNIQUE`` constraint specs for a model's ``Meta.unique_together``.
 
     ``generate_schemas`` renders each group as an inline ``UNIQUE (...)`` clause,
@@ -3056,7 +3057,7 @@ class MigrationManager:
         return out
 
 
-async def _apply_op_sql(engine: Any, sqls: list[str], atomic: bool) -> None:
+async def _apply_op_sql(engine: BaseDBAsyncClient, sqls: list[str], atomic: bool) -> None:
     """Execute one operation's statements, honouring out-of-transaction pragmas.
 
     SQLite's table rebuild brackets its statements with ``PRAGMA foreign_keys``
@@ -3082,7 +3083,7 @@ async def _apply_op_sql(engine: Any, sqls: list[str], atomic: bool) -> None:
         await _run_op_sql(get_executor(), sqls, in_txn=True)
 
 
-async def _run_op_sql(engine: Any, sqls: list[str], in_txn: bool) -> None:
+async def _run_op_sql(engine: BaseDBAsyncClient, sqls: list[str], in_txn: bool) -> None:
     """Run statements, hoisting ``PRAGMA foreign_keys`` out of the transaction.
 
     Inside a pinned transaction the pragma is executed between a ``COMMIT`` and

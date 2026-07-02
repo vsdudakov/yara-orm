@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .dialects import BaseDialect
+    from .queryset import QuerySet
 
 # A column renderer turns a field name into its SQL column reference.
 ColumnRenderer = Callable[[str], str]
@@ -219,7 +220,7 @@ class Value(Expression):
 class CombinedExpression(Expression):
     """An arithmetic combination of two operands (expressions or literals)."""
 
-    def __init__(self, left: Any, op: str, right: Any) -> None:
+    def __init__(self, left: Expression | Any, op: str, right: Expression | Any) -> None:
         """Store the two operands and the operator joining them.
 
         Args:
@@ -258,7 +259,7 @@ class CombinedExpression(Expression):
 
 
 def _resolve_operand(
-    operand: Any,
+    operand: Expression | Any,
     render_column: ColumnRenderer,
     dialect: BaseDialect,
     params: list[Any],
@@ -283,8 +284,8 @@ def _resolve_operand(
 
 
 def _render_value(
-    value: Any,
-    queryset: Any,
+    value: Expression | Any,
+    queryset: QuerySet,
     dialect: BaseDialect,
     joins: dict[str, str],
     params: list[Any],
@@ -310,7 +311,7 @@ def _render_value(
 class When:
     """One ``WHEN <conditions> THEN <value>`` arm of a :class:`Case`."""
 
-    def __init__(self, then: Any, **conditions: Any) -> None:
+    def __init__(self, then: Expression | Any, **conditions: Any) -> None:
         """Store the arm's filter conditions and result value.
 
         Args:
@@ -333,7 +334,7 @@ class When:
 class Case:
     """A SQL ``CASE`` expression built from :class:`When` arms and a default."""
 
-    def __init__(self, *whens: When, default: Any = None) -> None:
+    def __init__(self, *whens: When, default: Expression | Any = None) -> None:
         """Store the ``WHEN`` arms and the optional ``ELSE`` default.
 
         Args:
@@ -348,7 +349,7 @@ class Case:
 
     def as_sql(
         self,
-        queryset: Any,
+        queryset: QuerySet,
         dialect: BaseDialect,
         joins: dict[str, str],
         params: list[Any],
@@ -402,7 +403,7 @@ class Subquery:
 
     def as_sql(
         self,
-        queryset: Any,
+        queryset: QuerySet,
         dialect: BaseDialect,
         joins: dict[str, str],
         params: list[Any],
@@ -471,7 +472,7 @@ class RawSQL:
 
     def as_sql(
         self,
-        queryset: Any,
+        queryset: QuerySet,
         dialect: BaseDialect,
         joins: dict[str, str],
         params: list[Any],
