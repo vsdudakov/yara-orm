@@ -237,7 +237,12 @@ fewer edits:
   on-delete constants exist alongside `fields.OnDelete.*`; **`blank=` / `max_length=`**
   on length-less fields are accepted and ignored.
 - **Relation type hints** (`ForeignKeyRelation`, `ReverseRelation`,
-  `ManyToManyRelation`, …) are importable from `yara_orm.fields` for annotations.
+  `ManyToManyRelation`, …) are importable from `yara_orm.fields` and are real
+  generics — `books: fields.ReverseRelation["Book"]` types exactly as in
+  Tortoise (see [Typing your relations](relations.md#typing-your-relations)).
+  As in Tortoise, the field factories return relation-typed values and the
+  underlying classes are `ForeignKeyFieldInstance` / `OneToOneFieldInstance` /
+  `ManyToManyFieldInstance` for `isinstance` checks.
 - A foreign key declared on an **`abstract = True` base** is inherited by concrete
   subclasses (relation accessor included).
 - `_meta` exposes the Tortoise aliases **`db_table`**, **`fields_map`**,

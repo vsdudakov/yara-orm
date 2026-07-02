@@ -272,15 +272,15 @@ def test_q_connector_constants():
     assert (Q(a=1) & Q(b=2)).connector == Q.AND
 
 
-def test_relation_hint_placeholders_are_subscriptable():
+def test_relation_typing_aliases_are_subscriptable():
     """
-    GIVEN relation typing generics re-exposed on ``fields``
+    GIVEN the relation typing aliases re-exposed on ``fields``
     WHEN they are subscripted in an annotation position
-    THEN subscripting succeeds (annotation-only, returns None)
+    THEN each yields a real generic alias parameterised by the model
     """
-    assert fields.ForeignKeyNullableRelation[ExParent] is None
-    assert fields.ReverseRelation["ExChild"] is None
-    assert fields.ManyToManyRelation[ExParent] is None
+    assert fields.ForeignKeyNullableRelation[ExParent] is not None
+    assert fields.ReverseRelation["ExChild"] is not None
+    assert fields.ManyToManyRelation[ExParent] is not None
 
 
 @pytest.mark.asyncio

@@ -50,7 +50,7 @@ from .connection import get_dialect, get_executor, in_transaction
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .dialects import PRAGMA_FK_OFF, PRAGMA_FK_ON
 from .exceptions import ConfigurationError, UnSupportedError
-from .fields import ForeignKeyField, OnDelete
+from .fields import ForeignKeyFieldInstance, OnDelete
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -283,7 +283,7 @@ def _field_source(field: Field) -> str:
     Returns:
         The constructor-call source reconstructing an equivalent field.
     """
-    if isinstance(field, ForeignKeyField):
+    if isinstance(field, ForeignKeyFieldInstance):
         cls = "OneToOneField" if field.is_o2o else "ForeignKeyField"
         args = [repr(field.reference)]
         if field.on_delete != OnDelete.CASCADE:
@@ -353,7 +353,7 @@ def _column_spec(field: Field) -> dict[str, Any]:
     Returns:
         The column specification mapping.
     """
-    if isinstance(field, ForeignKeyField):
+    if isinstance(field, ForeignKeyFieldInstance):
         target = cast(dict[str, Any], _fk_target(field))
         return {
             "kind": target["kind"],
@@ -389,7 +389,7 @@ def _fk_spec(field: Field) -> dict[str, Any] | None:
     Returns:
         The foreign-key spec, or ``None`` when the field is not a foreign key.
     """
-    if not isinstance(field, ForeignKeyField):
+    if not isinstance(field, ForeignKeyFieldInstance):
         return None
     target = cast(dict[str, Any], _fk_target(field))
     return {
@@ -2241,8 +2241,12 @@ def model_state(models: list[type[Model]] | None = None) -> dict[str, Any]:
             if info.through in tables:  # pragma: no cover - defensive de-dup
                 continue
             join_fields: dict[str, Field] = {
-                info.backward_key: ForeignKeyField(model.__name__, on_delete=OnDelete.CASCADE),
-                info.forward_key: ForeignKeyField(target.__name__, on_delete=OnDelete.CASCADE),
+                info.backward_key: ForeignKeyFieldInstance(
+                    model.__name__, on_delete=OnDelete.CASCADE
+                ),
+                info.forward_key: ForeignKeyFieldInstance(
+                    target.__name__, on_delete=OnDelete.CASCADE
+                ),
             }
             tables[info.through] = _new_tstate(join_fields, [info.backward_key, info.forward_key])
     return {"tables": tables}

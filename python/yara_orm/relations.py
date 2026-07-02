@@ -8,7 +8,7 @@ are cached on the instance under ``_prefetch`` and served without a query.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast
 
 from . import registry
 from .connection import get_dialect, get_executor
@@ -17,8 +17,12 @@ from .queryset import QuerySet
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Generator
 
-    from .fields import ForeignKeyField, ManyToManyField
+    from .fields import ForeignKeyFieldInstance, ManyToManyFieldInstance
     from .models import Model
+
+#: The related model a relation annotation is parameterised over, e.g.
+#: ``books: ReverseRelation["Book"]``.
+MODEL = TypeVar("MODEL", bound="Model")
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +34,7 @@ class RelationInfo:
     def __init__(
         self,
         name: str,
-        field: ForeignKeyField,
+        field: ForeignKeyFieldInstance,
         source_attr: str,
         reference: str,
         is_o2o: bool,
@@ -76,7 +80,7 @@ class M2MInfo:
     def __init__(
         self,
         name: str,
-        field: ManyToManyField,
+        field: ManyToManyFieldInstance,
         owner: type[Model],
         reference: str,
     ) -> None:
@@ -226,7 +230,7 @@ class ForwardRelationDescriptor:
                 cache.pop(self.info.name, None)
 
 
-class ForwardRelation:
+class ForwardRelation(Generic[MODEL]):
     """Awaitable resolving to the related instance (cached if prefetched)."""
 
     def __init__(self, instance: Model, info: RelationInfo) -> None:
@@ -242,7 +246,7 @@ class ForwardRelation:
         self.instance = instance
         self.info = info
 
-    def __await__(self) -> Generator[Any, None, Model | None]:
+    def __await__(self) -> Generator[Any, None, MODEL | None]:
         """Await resolution of the related instance.
 
         Returns:
@@ -250,7 +254,7 @@ class ForwardRelation:
         """
         return self._resolve().__await__()
 
-    async def _resolve(self) -> Model | None:
+    async def _resolve(self) -> MODEL | None:
         """Load the related instance from the database and cache it.
 
         Only reached for an un-cached relation — the descriptor serves a
@@ -268,7 +272,9 @@ class ForwardRelation:
         # serving it even after the row appears or the key changes.
         if obj is not None:
             self.instance.__dict__.setdefault("_prefetch", {})[self.info.name] = obj
-        return obj
+        # The registry resolves the target dynamically; the annotation on the
+        # declaring model (ForeignKeyRelation[X]) is the static source of truth.
+        return cast("MODEL | None", obj)
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +388,7 @@ class ReverseOneToOne:
         return await self.model.get_or_none(**{self.source_attr: self.pk})
 
 
-class _ChainableManager:
+class _ChainableManager(Generic[MODEL]):
     """Shared awaitable/chainable surface for the relation managers.
 
     Subclasses provide ``_qs()`` (the base queryset over the related rows) and
@@ -396,11 +402,11 @@ class _ChainableManager:
         """Return the base queryset over the related rows."""
         raise NotImplementedError
 
-    async def _as_list(self) -> list[Model]:  # pragma: no cover - abstract
+    async def _as_list(self) -> list[MODEL]:  # pragma: no cover - abstract
         """Resolve the related rows to a list, serving the prefetch cache."""
         raise NotImplementedError
 
-    def __await__(self) -> Generator[Any, None, list[Model]]:
+    def __await__(self) -> Generator[Any, None, list[MODEL]]:
         """Await the related rows, serving the cache when prefetched.
 
         Returns:
@@ -408,7 +414,7 @@ class _ChainableManager:
         """
         return self._as_list().__await__()
 
-    def __aiter__(self) -> _AsyncList:
+    def __aiter__(self) -> _AsyncList[MODEL]:
         """Iterate asynchronously over the related rows.
 
         Returns:
@@ -468,7 +474,7 @@ class _ChainableManager:
         return getattr(self._qs(), name)
 
 
-class RelatedManager(_ChainableManager):
+class RelatedManager(_ChainableManager[MODEL]):
     """Reverse-FK manager: awaitable to a list, chainable, async-iterable."""
 
     def __init__(
@@ -499,7 +505,7 @@ class RelatedManager(_ChainableManager):
         """
         return QuerySet(self.model).filter(**self._filters)
 
-    async def _as_list(self) -> list[Model]:
+    async def _as_list(self) -> list[MODEL]:
         """Resolve the related rows, serving the prefetch cache when present.
 
         Returns:
@@ -507,7 +513,9 @@ class RelatedManager(_ChainableManager):
         """
         if self._cached is not _MISSING:
             return self._cached
-        return await self._qs()._fetch()
+        # The rows come from a dynamically routed queryset; the annotation on
+        # the declaring model (ReverseRelation[X]) is the static source of truth.
+        return cast("list[MODEL]", await self._qs()._fetch())
 
     async def create(self, **kwargs: Any) -> Model:
         """Create a related instance bound to the manager's criteria.
@@ -522,10 +530,10 @@ class RelatedManager(_ChainableManager):
         return await self.model.create(**kwargs)
 
 
-class _AsyncList:
+class _AsyncList(Generic[MODEL]):
     """Turn an awaitable-to-list into an async iterator."""
 
-    def __init__(self, awaitable: Awaitable[list[Any]]) -> None:
+    def __init__(self, awaitable: Awaitable[list[MODEL]]) -> None:
         """Store the awaitable that resolves to the list of items.
 
         Args:
@@ -538,7 +546,7 @@ class _AsyncList:
         self._items = None
         self._i = 0
 
-    def __aiter__(self) -> _AsyncList:
+    def __aiter__(self) -> _AsyncList[MODEL]:
         """Return the async iterator itself.
 
         Returns:
@@ -546,7 +554,7 @@ class _AsyncList:
         """
         return self
 
-    async def __anext__(self) -> Any:
+    async def __anext__(self) -> MODEL:
         """Return the next item, awaiting the list on first access.
 
         Returns:
@@ -671,7 +679,7 @@ class _M2MMembershipSubquery:
         return sql, idx + 1
 
 
-class M2MManager(_ChainableManager):
+class M2MManager(_ChainableManager[MODEL]):
     """Many-to-many manager: awaitable to a list, async-iterable, mutable."""
 
     def __init__(self, info: M2MInfo, instance: Model, reverse: bool) -> None:
@@ -739,7 +747,7 @@ class M2MManager(_ChainableManager):
             cache[key] = entry
         return entry
 
-    async def _as_list(self) -> list[Model]:
+    async def _as_list(self) -> list[MODEL]:
         """Fetch related rows through the join table, using the cache if set.
 
         Returns:
@@ -752,7 +760,9 @@ class M2MManager(_ChainableManager):
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=False)
         rows = await engine.fetch_rows(self._sql(dialect)["fetch"], [self.instance.pk])
-        return self.target._from_db_rows(rows)
+        # The target class is registry-resolved; ManyToManyRelation[X] on the
+        # declaring model is the static source of truth.
+        return cast("list[MODEL]", self.target._from_db_rows(rows))
 
     def _qs(self) -> QuerySet:
         """Build a queryset over the target rows linked to this instance.
@@ -829,3 +839,39 @@ class M2MManager(_ChainableManager):
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=True)
         await engine.execute(self._sql(dialect)["clear"], [self.instance.pk])
+
+
+# ---------------------------------------------------------------------------
+# Typing aliases (Tortoise-compatible spellings)
+# ---------------------------------------------------------------------------
+# Annotate relation attributes with the related model so IDEs and type
+# checkers know what an access resolves to. The field *constructors* return
+# ``Any`` to the type checker, so the annotation is the source of truth:
+#
+#     class Book(Model):
+#         author: fields.ForeignKeyRelation[Author] = fields.ForeignKeyField(
+#             "Author", related_name="books"
+#         )
+#         editor: fields.ForeignKeyNullableRelation[Author] = fields.ForeignKeyField(
+#             "Author", null=True, related_name="edited_books"
+#         )
+#         tags: fields.ManyToManyRelation[Tag] = fields.ManyToManyField("Tag")
+#
+#     class Author(Model):
+#         books: fields.ReverseRelation["Book"]  # annotation only; installed
+#                                                # by the FK's related_name
+#
+#: A forward FK/O2O access: the related instance when prefetched/assigned,
+#: otherwise an awaitable resolving to it.
+ForeignKeyRelation = Union[MODEL, ForwardRelation[MODEL]]
+#: Like :data:`ForeignKeyRelation` for a nullable FK — the access (and the
+#: awaited result) may also be ``None``.
+ForeignKeyNullableRelation = Union[MODEL, ForwardRelation[MODEL], None]
+#: One-to-one relations share the forward-FK access shape.
+OneToOneRelation = ForeignKeyRelation
+OneToOneNullableRelation = ForeignKeyNullableRelation
+#: The reverse-FK accessor a ``related_name`` installs on the target model:
+#: awaitable to a list, chainable, async-iterable.
+ReverseRelation = RelatedManager
+#: The many-to-many accessor: like a reverse relation, plus add/remove/clear.
+ManyToManyRelation = M2MManager

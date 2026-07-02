@@ -394,6 +394,58 @@ for author in authors:
     print(author.top_books)             # a plain list on the instance
 ```
 
+## Typing your relations
+
+Relation attributes can carry Tortoise-style typing annotations so IDEs and
+type checkers know exactly what an access resolves to. The field factories
+(`ForeignKeyField` / `OneToOneField` / `ManyToManyField`) are typed to return
+the relation, so the declared annotation is the attribute's static type:
+
+```python
+from yara_orm import Model, fields
+
+
+class Author(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50)
+
+    # Annotation-only: the accessors are installed by the other side's
+    # related_name. Use a string forward reference for not-yet-defined models.
+    books: fields.ReverseRelation["Book"]
+    liked_books: fields.ManyToManyRelation["Book"]
+
+
+class Book(Model):
+    id = fields.IntField(pk=True)
+    author: fields.ForeignKeyRelation[Author] = fields.ForeignKeyField(
+        "Author", related_name="books"
+    )
+    editor: fields.ForeignKeyNullableRelation[Author] = fields.ForeignKeyField(
+        "Author", null=True, related_name="edited_books"
+    )
+    fans: fields.ManyToManyRelation[Author] = fields.ManyToManyField(
+        "Author", related_name="liked_books"
+    )
+```
+
+With these in place a checker sees `book.author` as
+`Author | ForwardRelation[Author]`, `await author.books` as `list[Book]`, and
+`book.fans` as an `M2MManager[Author]`. The full alias family — importable
+from `yara_orm.fields` or `yara_orm.relations`:
+
+| Alias | Annotates | Access resolves to |
+| --- | --- | --- |
+| `ForeignKeyRelation[X]` | forward FK | `X` (prefetched) or awaitable of `X` |
+| `ForeignKeyNullableRelation[X]` | nullable forward FK | as above, or `None` |
+| `OneToOneRelation[X]` / `OneToOneNullableRelation[X]` | one-to-one | as the FK forms |
+| `ReverseRelation[X]` | reverse FK accessor | manager awaitable to `list[X]` |
+| `ManyToManyRelation[X]` | M2M accessor | manager awaitable to `list[X]`, plus `add`/`remove`/`clear` |
+
+Annotations are optional — undeclared relations behave identically and simply
+type as `Any`. For `isinstance` checks against the field objects themselves,
+use the `ForeignKeyFieldInstance` / `OneToOneFieldInstance` /
+`ManyToManyFieldInstance` classes (the factories return instances of these).
+
 ## See also
 
 - [Querying](querying.md)

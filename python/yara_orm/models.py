@@ -14,9 +14,9 @@ from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
 from .fields import (
     DatetimeField,
     Field,
-    ForeignKeyField,
+    ForeignKeyFieldInstance,
     IntField,
-    ManyToManyField,
+    ManyToManyFieldInstance,
 )
 from .manager import Manager
 from .prefetch import prefetch_instances
@@ -507,15 +507,15 @@ class ModelMeta(type):
             return super().__new__(mcls, name, bases, namespace)
 
         fields: dict[str, Field] = {}
-        fk_decls: dict[str, ForeignKeyField] = {}
-        m2m_decls: dict[str, ManyToManyField] = {}
+        fk_decls: dict[str, ForeignKeyFieldInstance] = {}
+        m2m_decls: dict[str, ManyToManyFieldInstance] = {}
         # Relation/m2m declarations inherited from abstract bases. The base's
         # fields (incl. each FK's ``<name>_id`` column) are merged below, but its
         # FK/M2M *relations* must be re-collected here: without this a concrete
         # subclass of an abstract base keeps the column yet loses the relation
         # accessor, so ``create(rel=...)`` and ``await obj.rel`` break.
-        inherited_fk: dict[str, ForeignKeyField] = {}
-        inherited_m2m: dict[str, ManyToManyField] = {}
+        inherited_fk: dict[str, ForeignKeyFieldInstance] = {}
+        inherited_m2m: dict[str, ManyToManyFieldInstance] = {}
         for parent in parents:
             parent_meta: MetaInfo | None = getattr(parent, "_meta", None)
             if parent_meta is not None:
@@ -525,9 +525,9 @@ class ModelMeta(type):
                 for rel_name, m2m_info in parent_meta.m2m.items():
                     inherited_m2m[rel_name] = m2m_info.field
         for key, value in namespace.items():
-            if isinstance(value, ManyToManyField):
+            if isinstance(value, ManyToManyFieldInstance):
                 m2m_decls[key] = value
-            elif isinstance(value, ForeignKeyField):
+            elif isinstance(value, ForeignKeyFieldInstance):
                 fk_decls[key] = value
             elif isinstance(value, Field):
                 fields[key] = value
