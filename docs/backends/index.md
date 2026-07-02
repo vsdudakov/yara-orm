@@ -27,6 +27,9 @@ await YaraOrm.init("postgres://user:password@host:5432/dbname")
 - Prepared-statement caching (`prepare_cached`) per pooled connection — on by default, disable with `statement_cache_size=0` (see below).
 - Case-insensitive lookups (`icontains`, `istartswith`, …) use SQL `ILIKE`.
 - Column and table `description=` values become SQL `COMMENT`s.
+- A column of a type the engine cannot decode (e.g. `interval`, `money` in raw
+  SQL) raises a clear `OperationalError` naming the column — cast it to text in
+  the query — instead of silently reading back as `None`.
 
 !!! tip "URL schemes"
     Both `postgres://` and `postgresql://` style URLs are accepted, including
@@ -89,11 +92,36 @@ await YaraOrm.init("sqlite:///app.db")     # file-backed
 
 - Rich types (UUID, JSON, datetime, decimal) are mapped onto SQLite's storage classes and
   reconstructed on read from the declared column type — so your models behave identically.
+- Datetimes are stored as text in one canonical layout: naive values as
+  `YYYY-MM-DD HH:MM:SS.ffffff`, timezone-aware values normalised to UTC as
+  `YYYY-MM-DD HH:MM:SS.ffffff+00:00` — so naive and aware rows in one column
+  compare and sort chronologically. Rows written by older versions (RFC 3339
+  `T`-separated text) still decode.
+
+    !!! warning "Upgrading a SQLite database with aware datetimes written by ≤ 1.9"
+        Old aware rows use a `T` separator, so they no longer *compare*
+        correctly against newly written rows or bound query parameters (SQLite
+        compares datetime text lexicographically). Rewrite each affected
+        column once after upgrading — this preserves the stored precision:
+
+        ```sql
+        UPDATE my_table SET created_at = replace(created_at, 'T', ' ')
+        WHERE created_at LIKE '%T%';
+        ```
+
+        Naive-only columns (the default) need no rewrite.
 - Case-insensitive lookups use `LIKE` (SQLite's `LIKE` is already case-insensitive for
   ASCII), since `ILIKE` is PostgreSQL-only. This is handled for you by the dialect.
 - **Foreign keys are enforced.** `PRAGMA foreign_keys=ON` is applied to every pooled
   connection, so `on_delete` actions (CASCADE / SET NULL / RESTRICT) and referential
-  integrity behave the same as on PostgreSQL. File databases also run in WAL mode.
+  integrity behave the same as on PostgreSQL. File databases also run in WAL mode
+  with a 5-second busy timeout.
+- **Transactions begin with `BEGIN IMMEDIATE`**, taking the write lock up front so
+  concurrent read-then-write transactions queue on the busy timeout instead of
+  failing instantly with `database is locked`.
+- URL query parameters are validated: `sqlite://app.db?mode=memory` is supported,
+  and an unrecognised parameter raises `ValueError` instead of being read as part
+  of the file name.
 
 !!! note "When to choose which"
     SQLite is ideal for tests, local development, embedded apps and small services;

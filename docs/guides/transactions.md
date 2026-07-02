@@ -78,9 +78,21 @@ async with in_transaction():
 
 This pinning is why nested or deeply-called code "just works": any model or queryset call made while the block is open — directly or in a helper function it calls — runs on the active transaction without extra wiring.
 
+Pinning is **per connection name**: only statements that resolve to the
+transaction's own connection (via routing or `using_db`) are pinned to it. A
+model routed to a different named connection keeps using its own pool even
+while another connection's transaction is open.
+
+!!! warning "One transaction, one task"
+    A transaction is not a concurrency scope. Spawning concurrent tasks (e.g.
+    `asyncio.gather`) that each open nested blocks on the **same** transaction
+    interleaves savepoints destructively; the ORM detects out-of-order
+    savepoint use and raises `TransactionManagementError`. Run sub-steps
+    sequentially inside a transaction, or give each task its own transaction.
+
 ## Nested transactions (savepoints)
 
-`in_transaction` and `@atomic` **nest**. A block entered while another transaction is already active does not open a second transaction — it establishes a **savepoint** on the same connection. The inner block can roll back independently (when it raises) without aborting the outer transaction, and on a clean exit its work is **released** (merged) into the outer one.
+`in_transaction` and `@atomic` **nest**. A block entered while a transaction is already active **on the same connection name** does not open a second transaction — it establishes a **savepoint** on the same connection. The inner block can roll back independently (when it raises) without aborting the outer transaction, and on a clean exit its work is **released** (merged) into the outer one. (A nested block naming a **different** connection opens an independent transaction on that connection instead — see [Choosing a connection](#choosing-a-connection).)
 
 ```python
 async with in_transaction():
@@ -144,9 +156,33 @@ async def sync() -> None:
 
 The named connection must already be registered. See [Multiple databases](multiple-databases.md) for setting up additional connections and routing.
 
+Transactions on **different** connection names are independent — nesting
+`in_transaction("second")` inside `in_transaction("default")` opens a real
+transaction on `second` (a sibling, not a savepoint), and each commits or
+rolls back on its own. Statements inside the blocks route to whichever pinned
+transaction matches their model's connection.
+
+```python
+async with in_transaction():             # transaction on "default"
+    async with in_transaction("second"):  # independent transaction on "second"
+        await Log.create(...)             # routed to "second" -> its transaction
+        await Account.create(...)         # routed to "default" -> the outer one
+```
+
 ## Backend support
 
 Transactions are backed by the database's native transaction support and behave the same whether the ORM is initialised against **PostgreSQL** or **SQLite** — the same `in_transaction` and `@atomic` code runs unchanged across both.
+
+On SQLite, transactions begin with `BEGIN IMMEDIATE`, so concurrent
+read-then-write transactions queue on the write lock (honouring the busy
+timeout) instead of failing instantly with `database is locked`.
+
+Failures in transaction control itself surface through the ORM's exception
+hierarchy: a failed commit/rollback/savepoint raises `OperationalError`, using
+a finished transaction raises `TransactionManagementError`, and a connection
+that cannot be established raises `DBConnectionError`. A transaction
+interrupted by task cancellation (e.g. a timeout around `commit`) is rolled
+back and its connection is never returned to the pool in a dirty state.
 
 ## See also
 

@@ -109,24 +109,33 @@ default connection.
 
 ## Routing and transactions
 
-Inside `in_transaction()` the active transaction is **pinned**: every statement in
-the block runs on that one connection so they share a single unit of work. While a
-transaction is active the router is bypassed.
+Inside `in_transaction()` the active transaction is **pinned per connection
+name**: every statement that resolves (via the router or `using_db`) to the
+transaction's connection runs on it, sharing a single unit of work. Statements
+whose model routes to a **different** named connection are *not* absorbed —
+they keep using their own connection's pool (or its own transaction, if you
+opened one).
 
 ```python
 from yara_orm import in_transaction
 
 async with in_transaction():
-    # Both statements run on the transaction's connection,
-    # regardless of what the router would otherwise choose.
+    # Both models route to "default", so both statements share the transaction.
     await User.create(name="Ada")
     await Account.create(owner="Ada")
+
+async with in_transaction():                # on "default"
+    await User.create(name="Ada")           # joins the transaction
+    await Event.create(kind="signup")       # routed to "analytics": runs on its
+                                            # own connection, outside this transaction
 ```
 
 !!! warning "Cross-database transactions"
     A transaction spans a single connection. Models that the router places on a
-    different database are not part of that connection's transaction, so plan
-    write boundaries around which database each model lives in. See
+    different database are not part of that connection's transaction — wrap them
+    in their own `in_transaction("name")` block (nested blocks on different
+    names are independent sibling transactions), and plan write boundaries
+    around which database each model lives in. See
     [Transactions](transactions.md) for the full lifecycle.
 
 ## Mixed backends
@@ -173,9 +182,13 @@ print(rows[0][0])
 await connections.get().execute("VACUUM ANALYZE")
 ```
 
+An unregistered (or misspelled) name raises `ConfigurationError` rather than
+silently falling back to the default connection.
+
 !!! note
-    Inside a transaction, `connections.get(...)` returns the active transaction so
-    your manual SQL joins the same unit of work.
+    Inside a transaction, `connections.get(name)` for the transaction's own
+    connection name returns the active transaction, so your manual SQL joins the
+    same unit of work; other names return their own independent connections.
 
 ## See also
 

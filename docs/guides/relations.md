@@ -53,9 +53,14 @@ fields.ForeignKeyField(
 ```
 
 - `reference` — the target model, given as a name (`"Author"`) or a dotted path
-  (`"app.Author"`).
+  (`"app.Author"`). A bare name must be unambiguous — if two registered models
+  share it, resolution raises `ConfigurationError` and you must use the
+  module-qualified form.
 - `related_name` — the name of the reverse accessor installed on the target
-  model (here, `Author.books`).
+  model (here, `Author.books`). Two relations claiming the same name on one
+  target raise `ConfigurationError`. On an abstract base, use the `%(class)s`
+  placeholder so each concrete subclass gets its own reverse name
+  (`related_name="%(class)s_items"`).
 - `on_delete` — the referential action applied when the referenced row is
   deleted (see [`OnDelete`](#on-delete-actions)).
 - `source_field` — the target field that is referenced; defaults to the target's
@@ -101,6 +106,12 @@ Assigning an instance sets the `author_id` backing column to the instance's
 primary key and caches the instance, so `book.author` returns it without a
 query. Use `await book.author` only when the relation has not been cached
 (e.g. on a freshly fetched row).
+
+The cache always tracks the foreign key: assigning `None`, a raw primary key,
+or writing `book.author_id` directly invalidates any previously cached
+instance, so `book.author` never serves a stale object. Assigning an
+**unsaved** instance (its pk is still `None`) raises `ValueError` — save the
+related row first.
 
 ### Reverse manager
 
@@ -367,7 +378,9 @@ for author in authors:
 ```
 
 The supplied queryset constrains the lookup, while the batching guarantee still
-holds: one query loads the filtered related rows for the whole batch.
+holds: one query loads the filtered related rows for the whole batch. This works
+for every relation kind — forward FK / one-to-one included, where a related row
+excluded by the queryset simply leaves the cached attribute as `None`.
 
 Pass `to_attr` to store the result on a custom attribute instead of the relation
 accessor — useful for loading the *same* relation more than once with different

@@ -26,20 +26,45 @@ carry a single `Field` — so a migration reads like your models.
     (Django-style) — each file's `Migration.operations` are applied in order to
     rebuild the recorded schema state, which is then diffed against your current
     models. Applied migrations are recorded per app in an `orm_migrations` table,
-    which is created automatically on first use.
+    which is created automatically on first use. Files are sanity-checked at
+    load time: duplicate numeric prefixes and `dependencies` that would run
+    after their dependant print a warning (existing directories keep loading —
+    number ties run in deterministic file-name order).
+
+!!! warning "SQLite table rebuilds and atomicity"
+    On SQLite, an `AlterField` (or a constraint change) rebuilds the table using
+    SQLite's official recipe, which must toggle `PRAGMA foreign_keys` outside a
+    transaction. An atomic migration containing a rebuild therefore **commits
+    the operations preceding the rebuild** before running it — keep schema
+    rebuilds in their own migration file when you need strict all-or-nothing
+    behaviour around other operations.
 
 !!! tip "Idempotent by default"
     `makemigrations` emits the **idempotent** analog of each operation
     (`CreateModelIfNotExists`, `AddFieldIfNotExists`, `RemoveFieldIfExists`,
-    `AddIndexIfNotExists`, …), so re-running a half-applied migration is safe. A
-    column whose type or nullability changed is emitted as `AlterField`
-    automatically (PostgreSQL alters in place; SQLite rebuilds the table).
+    `AddIndexIfNotExists`, …). A column whose definition changed is emitted as
+    `AlterField` automatically (PostgreSQL alters in place; SQLite rebuilds the
+    table, preserving rows, referencing rows, indexes and constraints).
+
+    Atomic migrations (the default) are all-or-nothing: a failure rolls the
+    whole file back, so re-running is always safe. For `atomic = False`
+    migrations, re-running a half-applied file is safe only for the guarded
+    `*IfExists` / `*IfNotExists` operations — `RenameField`, constraint changes
+    and concurrent index builds are not guarded (and SQLite cannot guard
+    add/drop column at all).
 
 !!! tip "What `makemigrations` auto-detects"
     Beyond create/drop table and add/drop/alter column, the diff also detects:
 
     - **Renames** — a field renamed with an unchanged type becomes a single
       `RenameField` (preserving the data) instead of a destructive drop + add.
+      Detection is deliberately conservative: only an **unambiguous** pairing
+      (one removed and one added column of identical definition) is treated as
+      a rename; ambiguous sets fall back to drop + add with a printed hint to
+      hand-write `RenameField` if a rename was intended.
+    - **Column definition changes** — type, nullability, single-column
+      `unique`, a database-side `default`, a foreign key's `on_delete`, and a
+      referenced primary key's type change all emit `AlterField`.
     - **Composite indexes** — adding/removing a `Meta.indexes` entry (including
       partial `Index(..., condition=...)` indexes) emits
       `AddCompositeIndex` / `RemoveCompositeIndex`.
@@ -48,6 +73,11 @@ carry a single `Field` — so a migration reads like your models.
       `RemoveConstraint`.
     - **Many-to-many fields** — adding/removing an M2M field creates/drops its
       join table.
+
+    Generated foreign keys are stamped with their resolved target
+    (`m.resolved_fk(...)` records the target table, primary-key column and
+    type), so an old migration replays correctly even after the target model
+    is deleted or its primary key changes.
 
 ## The CLI
 
@@ -68,6 +98,7 @@ subcommand:
 | `--app` | `models` | App/label recorded against migrations in `orm_migrations`. |
 | `--db` | _(none)_ | Database URL; opens a connection for commands that touch the DB. |
 | `--models` | _(empty)_ | Comma-separated model modules to import (and resolve relations) before running. |
+| `--allow-destructive` | off | Let `makemigrations` write a diff that would drop **every** recorded table (normally refused as a sign `--models` was forgotten). |
 
 !!! warning "Order matters"
     `--dir`, `--app`, `--db`, and `--models` must appear **before** the
@@ -101,6 +132,9 @@ python -m yara_orm --models myapp.models makemigrations --empty --name backfill
 
 Apply pending migrations, recording each in `orm_migrations`. An optional
 positional `version` stops after that migration; omit it to apply everything.
+The target may be the full name (`0002_add_age`) or just the numeric prefix
+(`0002`); an unknown target errors before anything is applied, listing the
+available migrations.
 
 ```bash
 python -m yara_orm --db postgres://localhost/app --models myapp.models upgrade
@@ -111,7 +145,8 @@ python -m yara_orm --db postgres://localhost/app --models myapp.models upgrade 0
 
 Revert applied migrations. By default reverts `--steps 1` (the most recent
 migration). An optional positional `version` reverts everything **after** that
-migration and takes precedence over `--steps`.
+migration and takes precedence over `--steps`. Like `upgrade`, the target may be
+a full name or a numeric prefix, and an unknown target errors up front.
 
 ```bash
 python -m yara_orm --db postgres://localhost/app --models myapp.models downgrade --steps 2
@@ -233,7 +268,7 @@ A migration file is plain Python: a `class Migration(m.Migration)` with an
 | `DeleteModel(table, fields, composite_pk=None)` | Drop a table (keeps its fields so it can be reversed). |
 | `AddField(table, name, field)` | Add a column from a field object. |
 | `RemoveField(table, name, field)` | Drop a column (keeps the field so it can be reversed). |
-| `AlterField(table, name, field, old)` | Change a column's type/nullability (PostgreSQL in place; SQLite rebuild). |
+| `AlterField(table, name, field, old)` | Change a column's definition (PostgreSQL in place; SQLite rebuilds the table, keeping rows, FK-referencing rows, indexes and constraints). |
 | `AddIndex(table, column)` | Create an index on a single column. |
 | `RemoveIndex(table, column)` | Drop a single-column index. |
 | `AddCompositeIndex(table, name, columns, condition=None)` | Create a multi-column (optionally partial) index. |
@@ -283,8 +318,13 @@ class Migration(m.Migration):
 
 `makemigrations` **auto-detects a column rename** (a removed column and an added
 one with an identical definition) and emits a single `RenameField`, preserving
-the data. A rename whose type *also* changed is not detected as a rename and
-falls back to drop + add. Table and index renames are still hand-written:
+the data. Detection requires the pairing to be unambiguous — with several
+same-definition candidates, or when the type *also* changed, it falls back to
+drop + add (with a hint printed when a hand-written `RenameField` may be what
+you want). Renaming `Meta.table` is likewise not auto-detected: the diff would
+be a destructive drop + create pair, so the generated file carries a prominent
+`# WARNING:` comment suggesting `RenameModel(old, new)` instead. Table and
+index renames are hand-written:
 
 | Operation | Purpose |
 | --- | --- |
@@ -313,12 +353,14 @@ class Migration(m.Migration):
     ]
 ```
 
-!!! warning "Constraints need a name on SQLite-incompatible backends"
+!!! note "Constraint changes across backends"
     `AddConstraint` / `RemoveConstraint` / `RenameConstraint` use
-    `ALTER TABLE … CONSTRAINT`, which **PostgreSQL** supports in place. **SQLite**
-    has no such syntax, so these raise a clear `UnSupportedError` — rebuild the
-    table with `RunSQL` instead. Give every constraint a `name` so the operation
-    can be reversed on `downgrade`.
+    `ALTER TABLE … CONSTRAINT` on **PostgreSQL** (in place). **SQLite** has no
+    such syntax, so on SQLite these rebuild the table with the new constraint
+    set — data, indexes and other constraints preserved. (A table the migration
+    system has no recorded state for — e.g. one created via `RunSQL` — still
+    raises `UnSupportedError` on SQLite.) Give every constraint a `name` so the
+    operation can be reversed on `downgrade`.
 
 ### Data migration with `--empty`
 
