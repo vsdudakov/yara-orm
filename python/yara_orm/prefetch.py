@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from . import registry
 from .connection import get_dialect, get_executor
-from .relations import M2MDescriptor, ReverseFKDescriptor, model_name
+from .relations import M2MDescriptor, ReverseFKDescriptor
 
 if TYPE_CHECKING:
     from .models import Model
@@ -154,7 +154,10 @@ async def _prefetch_one(
             for i in instances
             if getattr(i, info.source_attr) is not None
         }
-        objs = await target.filter(pk__in=list(ids)) if ids else []
+        # Honour a custom ``Prefetch(..., queryset=...)`` exactly like the
+        # reverse/M2M branches: its filters/ordering constrain the lookup.
+        base = custom_qs if custom_qs is not None else target.all()
+        objs = await base.filter(pk__in=list(ids)) if ids else []
         by_id = {o.pk: o for o in objs}
         _assign(
             instances,
@@ -166,9 +169,10 @@ async def _prefetch_one(
 
     descriptor = getattr(model, name, None)
 
-    # Reverse FK / O2O.
+    # Reverse FK / O2O. The descriptor carries the qualified ``module.Name``
+    # reference, so the lookup is exact (no bare-name guessing).
     if isinstance(descriptor, ReverseFKDescriptor):
-        source = registry.get_model(model_name(descriptor.source_reference))
+        source = registry.get_model(descriptor.source_reference)
         pks = [i.pk for i in instances]
         qs = custom_qs if custom_qs is not None else source.all()
         children = await qs.filter(**{f"{descriptor.source_attr}__in": pks})
