@@ -2,13 +2,12 @@
 
 use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use tokio::sync::Mutex;
 
 use crate::backend::{self, Backend, TxConn};
-use crate::error::to_pyerr;
+use crate::error::{to_pyerr, typed_pyerr};
 use crate::value::{PyRow, Value};
 
 #[pyclass]
@@ -120,6 +119,28 @@ impl Engine {
         })
     }
 
+    /// Run pre-split script statements sequentially on one pooled connection,
+    /// each in autocommit. Spawned as a detached task so cancelling the Python
+    /// awaitable cannot abandon the connection mid-script: the script (and its
+    /// trailing open-transaction rollback) always runs to completion.
+    fn execute_script<'p>(
+        &self,
+        py: Python<'p>,
+        statements: Vec<String>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let backend = self.backend.clone();
+        let handle = pyo3_async_runtimes::tokio::get_runtime()
+            .spawn(async move { backend.execute_script(&statements).await });
+        future_into_py(py, async move {
+            match handle.await {
+                Ok(result) => result.map_err(to_pyerr),
+                Err(join_err) => Err(to_pyerr(crate::error::EngineError::Connection(
+                    join_err.to_string(),
+                ))),
+            }
+        })
+    }
+
     /// Close the underlying connection pool.
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
@@ -160,18 +181,26 @@ impl Drop for Transaction {
         // back on the background runtime. Otherwise the pinned connection would
         // be recycled into the pool with `BEGIN` still open (deadpool's Fast
         // recycling performs no reset), corrupting the next consumer's session.
-        if let Ok(mut guard) = self.inner.try_lock() {
-            if let Some(tx) = guard.take() {
-                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-                    let _ = tx.rollback().await;
-                });
+        //
+        // The spawned task *awaits* the lock (never skips under contention): a
+        // holder is an in-flight statement future, and once it resolves/drops
+        // the guard the rollback proceeds. If even the rollback goes wrong, the
+        // backend transaction's own drop guard refuses to recycle the
+        // connection (it is detached from the pool and closed instead).
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            if let Some(tx) = inner.lock().await.take() {
+                let _ = tx.rollback().await;
             }
-        }
+        });
     }
 }
 
 fn tx_finished() -> PyErr {
-    PyRuntimeError::new_err("transaction already committed or rolled back")
+    typed_pyerr(
+        "TransactionManagementError",
+        "transaction already committed or rolled back".to_string(),
+    )
 }
 
 #[pymethods]

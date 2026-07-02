@@ -1,6 +1,6 @@
 //! Engine-level error type shared across backends.
 
-use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::PyErr;
 use thiserror::Error;
@@ -25,9 +25,9 @@ pub enum EngineError {
     #[error("{0}")]
     Integrity(String),
 
-    /// Reserved for backends that decode values in Rust (kept for parity across
-    /// future backends; the Postgres path surfaces these as `Query`).
-    #[allow(dead_code)]
+    /// A result value could not be decoded into a Python-visible type (e.g. an
+    /// unsupported PostgreSQL type OID). Surfaced to Python as
+    /// `yara_orm.exceptions.OperationalError` so it lands in the ORM hierarchy.
     #[error("type conversion error: {0}")]
     Conversion(String),
 }
@@ -51,7 +51,7 @@ impl From<tokio_postgres::Error> for EngineError {
 
 /// Build a Python exception of the given `yara_orm.exceptions` class, falling
 /// back to `PyRuntimeError` if the class cannot be resolved.
-fn typed_pyerr(class: &str, msg: String) -> PyErr {
+pub fn typed_pyerr(class: &str, msg: String) -> PyErr {
     Python::attach(|py| {
         match py
             .import("yara_orm.exceptions")
@@ -67,10 +67,14 @@ fn typed_pyerr(class: &str, msg: String) -> PyErr {
 /// Convert an engine error into the most appropriate Python exception.
 pub fn to_pyerr(e: EngineError) -> PyErr {
     match &e {
-        EngineError::UnsupportedUrl(_) | EngineError::Config(_) | EngineError::Conversion(_) => {
+        EngineError::UnsupportedUrl(_) | EngineError::Config(_) => {
             PyValueError::new_err(e.to_string())
         }
-        EngineError::Connection(_) => PyConnectionError::new_err(e.to_string()),
+        // Connect/pool-acquire failures land in the ORM hierarchy
+        // (`DBConnectionError` subclasses `OperationalError`), so callers can
+        // distinguish "database unreachable" from "bad SQL".
+        EngineError::Connection(_) => typed_pyerr("DBConnectionError", e.to_string()),
+        EngineError::Conversion(_) => typed_pyerr("OperationalError", e.to_string()),
         EngineError::Integrity(msg) => typed_pyerr("IntegrityError", msg.clone()),
         EngineError::Query(_) => PyRuntimeError::new_err(e.to_string()),
     }

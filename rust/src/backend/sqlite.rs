@@ -48,15 +48,41 @@ fn with_stmt<T>(
     }
 }
 
-fn sqlite_path(url: &str) -> String {
-    let path = url
+/// Resolve the database path from a sqlite URL, honouring its query string.
+///
+/// The pool parameters (`max_size`/...) were already stripped by
+/// `extract_pool_params`; whatever query string remains is parsed here rather
+/// than being treated as part of the file name (`sqlite://data.db?cache=shared`
+/// must not open a literal file named `data.db?cache=shared`). `mode=memory`
+/// selects an in-memory database; any other parameter is rejected so a typo
+/// cannot silently corrupt the path.
+fn sqlite_path(url: &str) -> Result<String, EngineError> {
+    let raw = url
         .strip_prefix("sqlite://")
         .or_else(|| url.strip_prefix("sqlite:"))
         .unwrap_or(url);
-    if path.is_empty() {
-        ":memory:".to_string()
+    let (path, query) = match raw.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (raw, None),
+    };
+    let mut memory = false;
+    if let Some(q) = query {
+        for pair in q.split('&').filter(|p| !p.is_empty()) {
+            let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
+            if key == "mode" && val == "memory" {
+                memory = true;
+            } else {
+                return Err(EngineError::Config(format!(
+                    "unsupported sqlite URL parameter {pair:?} (supported: mode=memory, \
+                     max_size, min_size, statement_cache_size)"
+                )));
+            }
+        }
+    }
+    if memory || path.is_empty() {
+        Ok(":memory:".to_string())
     } else {
-        path.to_string()
+        Ok(path.to_string())
     }
 }
 
@@ -118,7 +144,29 @@ fn sql_fetch_rows(
     })
 }
 
+/// Run the whole batch inside one transaction so a mid-batch failure applies
+/// nothing. The transaction begins/ends within this synchronous closure (one
+/// `interact` call), so a cancelled Python future cannot leave it half-open.
 fn sql_execute_many(
+    conn: &Connection,
+    sql: &str,
+    rows: Vec<Vec<Value>>,
+    cache: bool,
+) -> Result<Vec<Row>, EngineError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(map_sqlite)?;
+    match sql_execute_many_inner(conn, sql, rows, cache) {
+        Ok(out) => {
+            conn.execute_batch("COMMIT").map_err(map_sqlite)?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn sql_execute_many_inner(
     conn: &Connection,
     sql: &str,
     rows: Vec<Vec<Value>>,
@@ -172,7 +220,7 @@ pub struct SqliteBackend {
 impl SqliteBackend {
     pub async fn connect(url: &str) -> Result<Self, EngineError> {
         let (clean_url, params) = extract_pool_params(url)?;
-        let path = sqlite_path(&clean_url);
+        let path = sqlite_path(&clean_url)?;
         let in_memory = path == ":memory:";
         let cfg = Config::new(path);
         // In-memory databases are per-connection, so they must pin a single one;
@@ -190,10 +238,15 @@ impl SqliteBackend {
         // lazily — so it is applied from a post_create hook. File databases also
         // get WAL + relaxed sync for throughput; :memory: supports neither WAL
         // nor multiple connections, so it only gets foreign_keys.
+        // `busy_timeout` makes a connection wait (instead of failing instantly
+        // with SQLITE_BUSY) when another connection holds a conflicting lock —
+        // required for concurrent writers on a file database, and what makes
+        // BEGIN IMMEDIATE block rather than error under write contention.
         let pragma = if in_memory {
             "PRAGMA foreign_keys=ON;"
         } else {
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;"
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; \
+             PRAGMA busy_timeout=5000;"
         };
         let pool = cfg
             .builder(Runtime::Tokio1)
@@ -281,6 +334,31 @@ impl Backend for SqliteBackend {
             .map_err(map_interact)?
     }
 
+    async fn execute_script(&self, statements: &[String]) -> Result<(), EngineError> {
+        let obj = self.obj().await?;
+        let statements = statements.to_vec();
+        obj.interact(move |conn| {
+            let mut result = Ok(());
+            for statement in &statements {
+                // Each statement runs in autocommit (no wrapping transaction),
+                // so PRAGMAs take effect and explicit BEGIN/COMMIT inside the
+                // script hold together on this one connection.
+                if let Err(e) = conn.execute_batch(statement) {
+                    result = Err(map_sqlite(e));
+                    break;
+                }
+            }
+            // Safety net: never hand a mid-transaction connection back to the
+            // pool when the script failed (or forgot COMMIT).
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            result
+        })
+        .await
+        .map_err(map_interact)?
+    }
+
     fn dialect(&self) -> &'static str {
         "sqlite"
     }
@@ -293,29 +371,114 @@ impl Backend for SqliteBackend {
         // SQLite transactions are serializable; the Python layer rejects any
         // other requested level, so the isolation hint is ignored here.
         let obj = self.obj().await?;
-        obj.interact(|conn| conn.execute_batch("BEGIN"))
+        // Arm the drop guard *before* BEGIN so a cancellation mid-BEGIN cannot
+        // recycle a possibly-in-transaction connection.
+        let tx = SqliteTx {
+            obj: Some(obj),
+            cache_statements: self.cache_statements,
+            state: TxState::Active,
+        };
+        // BEGIN IMMEDIATE takes the write (RESERVED) lock up front, so
+        // concurrent read-then-write transactions queue on `busy_timeout`
+        // instead of failing instantly with an unretryable
+        // SQLITE_BUSY_SNAPSHOT at their first write. The trade-off — writers
+        // serialize from BEGIN rather than from their first write — is the
+        // right one for an ORM's in_transaction(), which usually writes.
+        tx.obj()
+            .interact(|conn| conn.execute_batch("BEGIN IMMEDIATE"))
             .await
             .map_err(map_interact)?
-            .map_err(map_interact)?;
-        Ok(Box::new(SqliteTx {
-            obj,
-            cache_statements: self.cache_statements,
-        }))
+            .map_err(map_sqlite)?;
+        Ok(Box::new(tx))
     }
 }
 
 // --- transaction -----------------------------------------------------------
 
+/// Lifecycle of a pinned-connection transaction, driving the drop guard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxState {
+    /// A transaction is (or may be) open on the connection.
+    Active,
+    /// COMMIT/ROLLBACK completed cleanly; the connection is safe to recycle.
+    Finished,
+    /// A control statement failed; the connection state is unknown.
+    Broken,
+}
+
+/// A pinned-connection SQLite transaction.
+///
+/// Like the PostgreSQL twin, the connection only returns to the pool after a
+/// clean COMMIT/ROLLBACK; dropped in any other state (cancelled task, abandoned
+/// transaction) the guard rolls the transaction back on the background runtime
+/// and detaches + closes the connection if even that fails, so a
+/// mid-transaction connection is never recycled.
 struct SqliteTx {
-    obj: Object,
+    obj: Option<Object>,
     cache_statements: bool,
+    state: TxState,
+}
+
+impl SqliteTx {
+    fn obj(&self) -> &Object {
+        self.obj
+            .as_ref()
+            .expect("SqliteTx connection is present until drop")
+    }
+
+    async fn control(mut self: Box<Self>, sql: &'static str) -> Result<(), EngineError> {
+        let result = self
+            .obj()
+            .interact(move |conn| conn.execute_batch(sql))
+            .await
+            .map_err(map_interact)
+            .and_then(|r| r.map_err(map_sqlite));
+        self.state = if result.is_ok() {
+            TxState::Finished
+        } else {
+            TxState::Broken
+        };
+        result
+    }
+}
+
+impl Drop for SqliteTx {
+    fn drop(&mut self) {
+        let Some(obj) = self.obj.take() else {
+            return;
+        };
+        match self.state {
+            // Clean end: dropping the Object recycles the connection normally.
+            TxState::Finished => drop(obj),
+            // A COMMIT/ROLLBACK failed outright: state unknown, so take the
+            // connection out of the pool and close it.
+            TxState::Broken => drop(Object::take(obj)),
+            // Dropped mid-transaction: roll back on the background runtime.
+            // "no transaction is active" means a cancelled COMMIT actually
+            // completed — the connection is clean and may recycle. Any other
+            // failure closes the connection instead of recycling it dirty.
+            TxState::Active => {
+                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+                    let rolled_back = obj.interact(|conn| conn.execute_batch("ROLLBACK")).await;
+                    let clean = match &rolled_back {
+                        Ok(Ok(())) => true,
+                        Ok(Err(e)) => e.to_string().contains("no transaction is active"),
+                        Err(_) => false,
+                    };
+                    if !clean {
+                        drop(Object::take(obj));
+                    }
+                });
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl TxConn for SqliteTx {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        self.obj
+        self.obj()
             .interact(move |conn| sql_execute(conn, &sql, params, cache))
             .await
             .map_err(map_interact)?
@@ -324,7 +487,7 @@ impl TxConn for SqliteTx {
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         let (meta, rows) = self
-            .obj
+            .obj()
             .interact(move |conn| sql_fetch_rows(conn, &sql, params, true, cache))
             .await
             .map_err(map_interact)??;
@@ -338,7 +501,7 @@ impl TxConn for SqliteTx {
     ) -> Result<Vec<Vec<Value>>, EngineError> {
         let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
         let (_, rows) = self
-            .obj
+            .obj()
             .interact(move |conn| sql_fetch_rows(conn, &sql, params, false, cache))
             .await
             .map_err(map_interact)??;
@@ -346,45 +509,66 @@ impl TxConn for SqliteTx {
     }
 
     async fn commit(self: Box<Self>) -> Result<(), EngineError> {
-        self.obj
-            .interact(|conn| conn.execute_batch("COMMIT"))
-            .await
-            .map_err(map_interact)?
-            .map_err(map_interact)
+        self.control("COMMIT").await
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), EngineError> {
-        self.obj
-            .interact(|conn| conn.execute_batch("ROLLBACK"))
-            .await
-            .map_err(map_interact)?
-            .map_err(map_interact)
+        self.control("ROLLBACK").await
     }
 
     async fn savepoint(&self, name: &str) -> Result<(), EngineError> {
         let sql = format!("SAVEPOINT {name}");
-        self.obj
+        self.obj()
             .interact(move |conn| conn.execute_batch(&sql))
             .await
             .map_err(map_interact)?
-            .map_err(map_interact)
+            .map_err(map_sqlite)
     }
 
     async fn release(&self, name: &str) -> Result<(), EngineError> {
         let sql = format!("RELEASE SAVEPOINT {name}");
-        self.obj
+        self.obj()
             .interact(move |conn| conn.execute_batch(&sql))
             .await
             .map_err(map_interact)?
-            .map_err(map_interact)
+            .map_err(map_sqlite)
     }
 
     async fn rollback_to(&self, name: &str) -> Result<(), EngineError> {
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
-        self.obj
+        self.obj()
             .interact(move |conn| conn.execute_batch(&sql))
             .await
             .map_err(map_interact)?
-            .map_err(map_interact)
+            .map_err(map_sqlite)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlite_path;
+    use crate::error::EngineError;
+
+    #[test]
+    fn plain_paths_and_memory_defaults() {
+        assert_eq!(sqlite_path("sqlite://./data.db").unwrap(), "./data.db");
+        assert_eq!(sqlite_path("sqlite:/tmp/x.db").unwrap(), "/tmp/x.db");
+        assert_eq!(sqlite_path("sqlite://").unwrap(), ":memory:");
+        assert_eq!(sqlite_path("sqlite://:memory:").unwrap(), ":memory:");
+    }
+
+    #[test]
+    fn mode_memory_is_honoured() {
+        assert_eq!(
+            sqlite_path("sqlite://x.db?mode=memory").unwrap(),
+            ":memory:"
+        );
+    }
+
+    #[test]
+    fn unknown_query_params_error_instead_of_corrupting_the_path() {
+        let err = sqlite_path("sqlite://data.db?cache=shared").unwrap_err();
+        assert!(matches!(err, EngineError::Config(_)));
+        assert!(err.to_string().contains("cache=shared"));
     }
 }
