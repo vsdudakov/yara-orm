@@ -21,18 +21,6 @@ if TYPE_CHECKING:
     from .models import Model
 
 
-def model_name(reference: str) -> str:
-    """Normalise a model reference, accepting ``"app.Model"`` or ``"Model"``.
-
-    Args:
-        reference: A model reference such as ``"app.Model"`` or ``"Model"``.
-
-    Returns:
-        The bare model name without any leading app label.
-    """
-    return reference.rsplit(".", 1)[-1]
-
-
 # ---------------------------------------------------------------------------
 # Relation descriptors (metadata)
 # ---------------------------------------------------------------------------

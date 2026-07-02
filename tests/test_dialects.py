@@ -190,3 +190,34 @@ def test_alter_column_nullability_only():
     tspec = {"columns": {"n": new}, "pk": None, "fks": {}, "indexes": []}
     out = PG.render_alter_column("t", "n", old, new, tspec)
     assert out == ['ALTER TABLE "t" ALTER COLUMN "n" DROP NOT NULL']
+
+
+def test_alter_column_default_set_and_drop():
+    """
+    GIVEN a column change that only adds or removes a database default
+    WHEN rendered on PostgreSQL
+    THEN a SET DEFAULT / DROP DEFAULT statement is produced
+    """
+    plain = dict(INT)
+    defaulted = {**INT, "default": {"kind": "sql", "sql": "7"}}
+    tspec = {"columns": {"n": defaulted}, "pk": None, "fks": {}, "indexes": []}
+    assert PG.render_alter_column("t", "n", plain, defaulted, tspec) == [
+        'ALTER TABLE "t" ALTER COLUMN "n" SET DEFAULT (7)'
+    ]
+    tspec = {"columns": {"n": plain}, "pk": None, "fks": {}, "indexes": []}
+    assert PG.render_alter_column("t", "n", defaulted, plain, tspec) == [
+        'ALTER TABLE "t" ALTER COLUMN "n" DROP DEFAULT'
+    ]
+
+
+def test_alter_column_fk_drop_without_readd():
+    """
+    GIVEN a column change that removes its foreign-key reference
+    WHEN rendered on PostgreSQL
+    THEN only the DROP CONSTRAINT is emitted (no re-added FOREIGN KEY)
+    """
+    with_fk = {**INT, "fk": {"table": "u", "pk": "id", "on_delete": "CASCADE"}}
+    without_fk = dict(INT)
+    tspec = {"columns": {"n": without_fk}, "pk": None, "fks": {}, "indexes": []}
+    out = PG.render_alter_column("t", "n", with_fk, without_fk, tspec)
+    assert out == ['ALTER TABLE "t" DROP CONSTRAINT IF EXISTS "t_n_fkey"']

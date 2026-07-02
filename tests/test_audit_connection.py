@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +25,11 @@ from yara_orm.connection import (
     _engine,
     _named_connection,
     _split_sql_statements,
+    clear_query_hooks,
+    get_dialect,
     get_engine,
+    get_executor,
+    register_query_hook,
 )
 from yara_orm.exceptions import (
     ConfigurationError,
@@ -541,3 +546,112 @@ async def test_execute_many_applies_nothing_on_failure(db):
             [[1, "a"], [1, "b"]],
         )
     assert await AcItem.all().count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage: transaction-wrapper execute_script splits and runs each statement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transaction_execute_script_runs_each_statement(db):
+    """
+    GIVEN a multi-statement script
+    WHEN it runs via execute_script on an open transaction wrapper
+    THEN each statement executes on the transaction and shares its atomicity
+    """
+    with pytest.raises(OperationalError):
+        async with in_transaction() as tx:
+            await tx.execute_script(
+                "INSERT INTO ac_item (name) VALUES ('scr-1');"
+                "INSERT INTO ac_item (name) VALUES ('scr-2')"
+            )
+            assert await AcItem.filter(name__startswith="scr-").count() == 2
+            raise OperationalError("unwind")
+    assert await AcItem.filter(name__startswith="scr-").count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage: user-named savepoints bypass the ORM's LIFO savepoint stack
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_user_named_savepoint_establish_and_release(db):
+    """
+    GIVEN a manually named savepoint (not handed out by new_savepoint)
+    WHEN it is established and then released on the transaction wrapper
+    THEN both calls succeed and the ORM's own-savepoint stack stays empty
+    """
+    async with in_transaction() as tx:
+        await tx.savepoint("ac_user_sp")
+        await AcItem.create(name="sp-row")
+        await tx.release("ac_user_sp")
+        assert tx._sp_stack == []
+    assert await AcItem.filter(name="sp-row").count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Coverage: routed reads use the replica pool when no transaction is open
+# ---------------------------------------------------------------------------
+
+
+class _ReplicaRouter:
+    """Routes every read to the 'second' connection, writes to default."""
+
+    def db_for_read(self, model):
+        return "second"
+
+    def db_for_write(self, model):
+        return "default"
+
+
+@pytest.mark.asyncio
+async def test_routed_read_uses_replica_pool_without_open_transaction():
+    """
+    GIVEN a read/write-splitting router with no transaction open anywhere
+    WHEN the executor and dialect resolve for a read
+    THEN both resolve to the replica connection (nothing to capture on the
+         write connection, so no read-your-own-writes redirect)
+    """
+    async with _two_sqlite_connections(router=_ReplicaRouter()):
+        engine, dialect = _named_connection("second")
+        assert get_executor(AcItem, write=False) is engine
+        assert get_dialect(AcItem) is dialect
+
+
+# ---------------------------------------------------------------------------
+# Coverage: get_dialect falls back to routing for opaque executor objects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_dialect_with_opaque_executor_falls_back_to_routing(db):
+    """
+    GIVEN a using_db-style executor object exposing no usable dialect
+    WHEN the dialect is resolved
+    THEN resolution falls back to the model-routed connection's dialect
+    """
+    default_dialect = get_dialect(AcItem)
+    assert get_dialect(AcItem, using=SimpleNamespace(dialect=None)) is default_dialect
+
+
+# ---------------------------------------------------------------------------
+# Coverage: an empty script through the hook proxy is a no-op
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_engine_proxy_empty_script_is_a_noop(db):
+    """
+    GIVEN a registered query hook (statements route through the engine proxy)
+    WHEN an empty script is executed
+    THEN nothing runs and no hook fires
+    """
+    seen = []
+    register_query_hook(lambda sql, params: seen.append(sql))
+    try:
+        await get_executor().execute_script("")
+        assert seen == []
+    finally:
+        clear_query_hooks()
