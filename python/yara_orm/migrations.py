@@ -50,7 +50,7 @@ from .connection import get_dialect, get_executor, in_transaction
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
 from .dialects import PRAGMA_FK_OFF, PRAGMA_FK_ON
 from .exceptions import ConfigurationError, UnSupportedError
-from .fields import ForeignKeyFieldInstance, OnDelete
+from .fields import ForeignKeyFieldInstance, OnDelete, registered_field_kind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -269,6 +269,30 @@ def _fk_target(field: Field, strict: bool = True) -> dict[str, Any] | None:
     }
 
 
+def _field_flag_args(field: Field) -> list[str]:
+    """Render the schema-relevant flag arguments shared by every field kind.
+
+    Args:
+        field: The field whose flags to render.
+
+    Returns:
+        The ``pk``/``null``/``unique``/``index``/``default`` keyword-argument
+        source fragments that differ from their defaults (possibly empty).
+    """
+    args: list[str] = []
+    if field.pk:
+        args.append("pk=True")
+    if field.null:
+        args.append("null=True")
+    if field.unique:
+        args.append("unique=True")
+    if field.index:
+        args.append("index=True")
+    if isinstance(field.default, DatabaseDefault):
+        args.append(f"default={_default_source(field.default)}")
+    return args
+
+
 def _field_source(field: Field) -> str:
     """Render a field as a ``fields.XxxField(...)`` constructor call.
 
@@ -277,9 +301,15 @@ def _field_source(field: Field) -> str:
     irrelevant to DDL and intentionally dropped; **database-side** defaults are
     part of the DDL and are emitted). Foreign keys whose target is resolvable are
     wrapped in :func:`resolved_fk` so the migration file is registry-independent.
+    A registered custom kind renders via its ``source`` callable, or as
+    ``fields.<ClassName>(<type_params as kwargs>, ...)`` by default.
 
     Args:
         field: The field to render as source.
+
+    Raises:
+        ConfigurationError: For a field kind that is neither built in nor
+            registered via :func:`~yara_orm.fields.register_field_kind`.
 
     Returns:
         The constructor-call source reconstructing an equivalent field.
@@ -304,23 +334,29 @@ def _field_source(field: Field) -> str:
             extra.append(f"type_params={target['type_params']!r}")
         return f"m.resolved_fk({source}, {', '.join(extra)})"
 
+    registration = registered_field_kind(field.field_kind)
+    if registration is not None:
+        if registration.source is not None:
+            return registration.source(field)
+        args = [f"{name}={value!r}" for name, value in field.type_params.items()]
+        args.extend(_field_flag_args(field))
+        return f"fields.{registration.field_cls.__name__}({', '.join(args)})"
+
+    try:
+        cls_name = _KIND_FIELD[field.field_kind]
+    except KeyError:
+        raise ConfigurationError(
+            f"cannot render field kind {field.field_kind!r} into a migration; "
+            "register custom kinds with yara_orm.register_field_kind(...)"
+        ) from None
     args = []
     if field.field_kind == "varchar":
         args.append(f"max_length={field.type_params['max_length']}")
     elif field.field_kind == "decimal":
         args.append(f"max_digits={field.type_params['max_digits']}")
         args.append(f"decimal_places={field.type_params['decimal_places']}")
-    if field.pk:
-        args.append("pk=True")
-    if field.null:
-        args.append("null=True")
-    if field.unique:
-        args.append("unique=True")
-    if field.index:
-        args.append("index=True")
-    if isinstance(field.default, DatabaseDefault):
-        args.append(f"default={_default_source(field.default)}")
-    return f"fields.{_KIND_FIELD[field.field_kind]}({', '.join(args)})"
+    args.extend(_field_flag_args(field))
+    return f"fields.{cls_name}({', '.join(args)})"
 
 
 def _fields_source(fields: dict[str, Field], indent: int) -> str:
@@ -2150,6 +2186,64 @@ class RunSQL(Operation):
         return _call("m.RunSQL", [_fmt(self.sql, 8), f"reverse_sql={_fmt(self.reverse_sql, 8)}"])
 
 
+class CreateExtension(Operation):
+    """Create a PostgreSQL extension; a no-op on dialects without extensions.
+
+    Emitted first in a generated migration whenever a diffed column's
+    registered field kind declares ``requires_extension`` (see
+    :func:`~yara_orm.fields.register_field_kind`). Unlike :class:`RunSQL` the
+    statement renders per dialect, so the same migration applies cleanly on
+    SQLite (where it emits nothing). The reverse is deliberately empty: other
+    tables may rely on the extension, so it is never dropped automatically.
+    """
+
+    def __init__(self, name: str) -> None:
+        """Store the extension name.
+
+        Args:
+            name: The extension to create (e.g. ``"vector"``/``"pg_trgm"``).
+
+        Returns:
+            None
+        """
+        self.name = name
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render ``CREATE EXTENSION IF NOT EXISTS`` on supporting dialects.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (unused).
+
+        Returns:
+            The create-extension statement, or nothing on dialects without
+            extension support (SQLite).
+        """
+        if not dialect.supports_extensions:
+            return []
+        return [f"CREATE EXTENSION IF NOT EXISTS {dialect.quote(self.name)}"]
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Return no SQL: the extension is kept (other tables may use it).
+
+        Args:
+            dialect: Active dialect (unused).
+            state: Current schema state (unused).
+
+        Returns:
+            An empty list.
+        """
+        return []
+
+    def to_source(self) -> str:
+        """Render this operation as Python source for a migration file.
+
+        Returns:
+            The source code constructing this operation.
+        """
+        return f"m.CreateExtension({self.name!r})"
+
+
 class RunPython(Operation):
     """Run async Python callables (hand-written migrations only)."""
 
@@ -2395,7 +2489,51 @@ def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[Operation]:
             )
         )
 
+    extensions = _required_extensions(ops)
+    if extensions:
+        return [cast(Operation, CreateExtension(n)) for n in sorted(extensions)] + ops
     return ops
+
+
+def _required_extensions(ops: list[Operation]) -> set[str]:
+    """Collect the extensions the diffed columns' registered kinds require.
+
+    Only the operations that introduce or retype a column are inspected
+    (``CreateModel``/``AddField``/``AlterField``): an extension is needed
+    exactly when such an operation is present, which also keeps re-runs
+    idempotent — no column change, no ``CreateExtension``.
+
+    Args:
+        ops: The diffed operations.
+
+    Returns:
+        The required extension names (possibly empty).
+    """
+
+    def required(field: Field) -> str | None:
+        """Return the extension a field's registered kind requires, if any.
+
+        Args:
+            field: The field to inspect.
+
+        Returns:
+            The extension name, or ``None``.
+        """
+        registration = registered_field_kind(field.field_kind)
+        return registration.requires_extension if registration else None
+
+    extensions: set[str] = set()
+    for op in ops:
+        candidates: list[Field] = []
+        if isinstance(op, CreateModel):
+            candidates = list(op.fields.values())
+        elif isinstance(op, (AddField, AlterField)):
+            candidates = [op.field]
+        for field in candidates:
+            extension = required(field)
+            if extension:
+                extensions.add(extension)
+    return extensions
 
 
 def _detect_renames(

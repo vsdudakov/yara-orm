@@ -84,6 +84,14 @@ def _active_tx_for(name: str) -> TransactionWrapper | None:
 #: the hot path pays nothing and ``get_executor`` returns the raw engine.
 _QUERY_HOOKS: list[Callable[[str, list[Any] | None], object]] = []
 
+#: Optional query annotators (see :func:`register_query_annotator`): zero-arg
+#: callables returning an attribution string (or None/"" to skip). While any is
+#: registered, every statement on the Python query path executes with one
+#: leading ``/* ... */`` comment composed from the non-empty results. Empty by
+#: default, so the hot path pays nothing (``get_executor`` returns the raw
+#: engine).
+_QUERY_ANNOTATORS: list[Callable[[], str | None]] = []
+
 #: URL schemes treated as PostgreSQL (driver aliases normalised to ``postgres``).
 _POSTGRES_URL_SCHEMES = frozenset({"postgres", "postgresql", "psycopg", "psycopg2", "asyncpg"})
 
@@ -114,6 +122,114 @@ def clear_query_hooks() -> None:
     _QUERY_HOOKS.clear()
 
 
+def register_query_annotator(annotator: Callable[[], str | None]) -> Callable[[], str | None]:
+    """Register a callable whose return value is embedded in a SQL comment.
+
+    Enables per-request query attribution (pg_stat_statements, Datadog, ...):
+    each annotator is called before every statement on the Python query path
+    and typically pulls values from the application's own contextvars. The
+    non-empty results of all annotators are joined with ``,`` in registration
+    order into one leading comment, so a statement executes as::
+
+        /* http_path=/api/calls,caller=list_calls */ SELECT ...
+
+    Usable as a decorator (returns ``annotator`` unchanged)::
+
+        @yara_orm.register_query_annotator
+        def annotator() -> str | None:
+            return f"http_path={path.get()}"
+
+    Returning None (or an empty string) skips that annotator for the
+    statement. Exceptions raised by an annotator propagate to the query
+    caller, matching query-hook behaviour. Returned values are sanitised
+    (comment delimiters and control characters are stripped) so a value can
+    never terminate the comment early. Query hooks observe the final SQL,
+    including the comment. Like hooks, annotators add zero overhead while none
+    are registered.
+
+    Note:
+        The PostgreSQL statement cache is keyed on the SQL text, so
+        high-cardinality values (request ids, timestamps) defeat
+        prepared-statement reuse. Prefer low-cardinality attribution values
+        (route, caller), or disable the cache with ``statement_cache_size=0``
+        in the connection URL.
+
+    Args:
+        annotator: A zero-arg callable returning the attribution string, or
+            None/"" to contribute nothing for this statement.
+
+    Returns:
+        The annotator, unchanged (decorator-friendly).
+    """
+    _QUERY_ANNOTATORS.append(annotator)
+    return annotator
+
+
+def clear_query_annotators() -> None:
+    """Remove all registered query annotators.
+
+    Returns:
+        None
+    """
+    _QUERY_ANNOTATORS.clear()
+
+
+def _sanitize_comment_value(value: str) -> str:
+    """Make an annotator's value safe to embed inside a ``/* ... */`` comment.
+
+    Strips control characters/newlines, then removes every ``*/`` (which would
+    terminate the comment and let the remainder execute as SQL) and ``/*``
+    (PostgreSQL nests block comments, so an unbalanced opener would swallow
+    the statement). The removal loops because deleting one delimiter can
+    splice a new one together (e.g. ``*␀/`` or ``*/*/``).
+
+    Args:
+        value: The raw string an annotator returned.
+
+    Returns:
+        The sanitised value (possibly empty).
+    """
+    value = "".join(ch for ch in value if ch.isprintable())
+    while "*/" in value or "/*" in value:
+        value = value.replace("*/", "").replace("/*", "")
+    return value.strip()
+
+
+def _compose_annotation() -> str:
+    """Build the leading SQL comment from the registered annotators.
+
+    Returns:
+        ``"/* joined,values */ "`` (trailing space included), or ``""`` when
+        every annotator returned nothing.
+    """
+    parts: list[str] = []
+    for annotator in _QUERY_ANNOTATORS:
+        raw = annotator()
+        if not raw:
+            continue
+        value = _sanitize_comment_value(raw)
+        if value:
+            parts.append(value)
+    if not parts:
+        return ""
+    return f"/* {','.join(parts)} */ "
+
+
+def _annotate_sql(sql: str) -> str:
+    """Prepend the composed annotation comment to ``sql``, if any.
+
+    Args:
+        sql: The SQL statement about to run.
+
+    Returns:
+        The statement, prefixed with the annotation comment when annotators
+        are registered and produced a value.
+    """
+    if not _QUERY_ANNOTATORS:
+        return sql
+    return _compose_annotation() + sql
+
+
 def _run_hooks(sql: str, params: list[Any] | None) -> None:
     """Invoke every registered query hook with the statement about to run.
 
@@ -131,11 +247,15 @@ def _run_hooks(sql: str, params: list[Any] | None) -> None:
 async def _run_query(
     method: Callable[[str, list[Any]], Awaitable[Any]], sql: str, params: list[Any] | None
 ) -> Any:
-    """Run one engine call: fire hooks, then translate engine errors.
+    """Run one engine call: annotate, fire hooks, then translate engine errors.
 
-    The native engine raises a bare ``RuntimeError`` for SQL failures; these are
-    surfaced as ``OperationalError``, so callers' ``except OperationalError``
-    handlers (retry/translation) keep working when re-raised as one here.
+    The single choke point of the Python query path: the annotation comment is
+    prepended here, so every statement that reaches the engine through the
+    transaction wrapper or the engine proxy carries it, and hooks observe the
+    final SQL (comment included). The native engine raises a bare
+    ``RuntimeError`` for SQL failures; these are surfaced as
+    ``OperationalError``, so callers' ``except OperationalError`` handlers
+    (retry/translation) keep working when re-raised as one here.
 
     Args:
         method: The bound engine/transaction coroutine method to call.
@@ -145,6 +265,7 @@ async def _run_query(
     Returns:
         The method's result.
     """
+    sql = _annotate_sql(sql)
     _run_hooks(sql, params)
     try:
         return await method(sql, params or [])
@@ -578,9 +699,10 @@ def get_executor(
                 return tx
     # "default" goes through get_engine() so an uninitialised ORM errors clearly.
     engine = get_engine() if name == "default" else _named_connection(name)[0]
-    # While query hooks are registered, route the hot path through the proxy so
-    # model statements fire them too; otherwise return the raw engine (no cost).
-    return _EngineProxy(engine) if _QUERY_HOOKS else engine
+    # While query hooks or annotators are registered, route the hot path
+    # through the proxy so model statements fire/carry them too; otherwise
+    # return the raw engine (no cost).
+    return _EngineProxy(engine) if _QUERY_HOOKS or _QUERY_ANNOTATORS else engine
 
 
 def get_dialect(
@@ -873,6 +995,13 @@ class YaraOrm:
     ) -> None:
         """Create model tables (on each write connection) and their join tables.
 
+        Dialects that declare backend extensions for the models (PostgreSQL
+        ``CREATE EXTENSION IF NOT EXISTS ...`` via ``extensions_sql``) have
+        those statements executed first, on each model's write connection, so
+        extension-provided column types exist before the tables that use them.
+        The statements are ``IF NOT EXISTS``-idempotent, so they are safe to
+        run regardless of ``safe``.
+
         Args:
             safe: Whether to use ``IF NOT EXISTS``-style safe creation.
             models: Models to create, in dependency order; defaults to every
@@ -885,6 +1014,20 @@ class YaraOrm:
         """
         registry.resolve_relations()
         targets = _topo_sort_models(list(models) if models is not None else registry.all_models())
+        # Backend extensions first, grouped per write connection so each
+        # database receives exactly the extensions its own models need.
+        # ``getattr`` guard: extensions_sql is an optional dialect capability.
+        groups: dict[str, list[type[Model]]] = {}
+        for model in targets:
+            groups.setdefault(_route(model, True), []).append(model)
+        for group in groups.values():
+            dialect = get_dialect(group[0])
+            extensions_sql = getattr(dialect, "extensions_sql", None)
+            if extensions_sql is None:
+                continue
+            engine = get_executor(group[0], write=True)
+            for statement in extensions_sql(group):
+                await engine.execute(statement)
         for model in targets:
             engine = get_executor(model, write=True)
             dialect = get_dialect(model)
@@ -1203,10 +1346,10 @@ class _EngineProxy(_ManualSQLCompat):
     """Wraps the native engine to add compatibility manual-SQL methods.
 
     Returned by ``connections.get()`` (and by ``get_executor`` while query hooks
-    are registered) so raw-SQL call sites get ``execute_query`` /
+    or annotators are registered) so raw-SQL call sites get ``execute_query`` /
     ``execute_query_dict`` / ``execute_script`` / ``fetch_one``, every statement
-    fires the query hooks, and engine ``RuntimeError``s surface as
-    ``OperationalError``. Unknown attributes (``begin``, ``close``,
+    fires the query hooks and carries the annotation comment, and engine
+    ``RuntimeError``s surface as ``OperationalError``. Unknown attributes (``begin``, ``close``,
     ``execute_many``, ``dialect``) pass through to the wrapped engine.
 
     Array binding: the dict-returning raw methods (``fetch_all`` /
@@ -1323,6 +1466,13 @@ class _EngineProxy(_ManualSQLCompat):
         statements = _split_sql_statements(script)
         if not statements:
             return
+        # This path hands the split statements straight to the engine (no
+        # _run_query), so annotate here: each statement gets the comment (per-
+        # statement attribution) and hooks observe the annotated script.
+        comment = _compose_annotation() if _QUERY_ANNOTATORS else ""
+        if comment:
+            statements = [comment + statement for statement in statements]
+            script = comment + script
         _run_hooks(script, None)
         try:
             await self._engine.execute_script(statements)
@@ -1360,9 +1510,10 @@ class _Connections:
             return tx
         if name == "default":
             # Wrap the raw default engine, not get_executor(): the latter
-            # already returns an _EngineProxy while query hooks are registered,
-            # which would double-wrap and fire the hooks twice for raw SQL on
-            # this path. get_engine() errors clearly when uninitialised.
+            # already returns an _EngineProxy while query hooks/annotators are
+            # registered, which would double-wrap and fire the hooks twice for
+            # raw SQL on this path. get_engine() errors clearly when
+            # uninitialised.
             return _EngineProxy(get_engine())
         return _EngineProxy(_named_connection(name)[0])
 

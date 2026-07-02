@@ -91,6 +91,17 @@ See the full table in [Models & fields](guides/models-and-fields.md). Field clas
 Common kwargs: `pk`, `null`, `default`, `unique`, `index`, `db_column`, `description`,
 `validators`.
 
+Custom column types register through
+`register_field_kind(kind, *, field_cls, sql, source=None, requires_extension=None)`
+(also exported at top level): `field_cls` is a `Field` subclass declaring the
+matching `field_kind`, `sql` is a type template (`"vector({dim})"`, filled from
+`type_params`) or a per-dialect mapping, `source` optionally renders the
+field's migration source, and `requires_extension` names a PostgreSQL
+extension emitted as `CREATE EXTENSION IF NOT EXISTS`. Registered classes
+resolve as `fields.<ClassName>` so generated migrations import cleanly;
+`unregister_field_kind(kind)` removes a registration (for tests). See
+[Custom fields](guides/custom-fields.md).
+
 ## validators
 
 `yara_orm.validators` — attach via `validators=[...]`; runs on `save()`, raising
@@ -160,6 +171,16 @@ Decorators `pre_save`, `post_save`, `pre_delete`, `post_delete` — each takes t
 Handlers are async. The `Signals` enum names the four lifecycle signals. See
 [Signals](guides/signals.md) for exact signatures.
 
+## contrib.factory
+
+`yara_orm.contrib.factory.YaraModelFactory` — async-aware `factory.Factory` base for the
+optional [factory_boy](https://factoryboy.readthedocs.io/) integration
+(`pip install "yara-orm[factory]"`). `await MyFactory.create(**overrides)` /
+`await MyFactory.create_batch(n)` persist instances (sub-factories awaited depth-first,
+batches inserted sequentially, post-generation hooks run after persistence and may return
+awaitables); `MyFactory.build()` / `build_batch(n)` return unsaved instances synchronously.
+See [Testing with factories](guides/testing-factories.md).
+
 ## Transactions
 
 `in_transaction(connection_name="default", isolation=None)` (async context manager) and
@@ -168,6 +189,19 @@ connection name open savepoints automatically; a different name opens an indepen
 transaction on that connection. `isolation` takes an `IsolationLevel` constant (PostgreSQL
 honours all four, SQLite is serializable-only). See [Transactions](guides/transactions.md).
 
+## Query hooks & annotators
+
+| Member | Signature | Purpose |
+|--------|-----------|---------|
+| `register_query_hook` | `register_query_hook(hook)` | Call `hook(sql, params)` before each statement (observe-only; sees the final SQL, annotation comment included). |
+| `clear_query_hooks` | `clear_query_hooks()` | Remove all hooks (restores the zero-overhead hot path). |
+| `register_query_annotator` | `register_query_annotator(fn)` | Register a zero-arg callable returning an attribution string (or `None`/`""` to skip); usable as a decorator (returns `fn`). Non-empty results of all annotators join with `,` in registration order into one `/* ... */` comment prepended to every statement. Values are sanitised (control characters and `*/` / `/*` stripped) so they cannot break out of the comment; annotator exceptions propagate to the query caller. |
+| `clear_query_annotators` | `clear_query_annotators()` | Remove all annotators (restores the zero-overhead hot path). |
+
+The PostgreSQL statement cache is keyed on SQL text, so prefer low-cardinality
+annotation values (route, caller) or set `statement_cache_size=0`; see
+[Manual SQL](guides/manual-sql.md) for details and examples.
+
 ## Migrations
 
 `migrations.MigrationManager(directory="migrations", app="models", models=None)` plus the
@@ -175,7 +209,9 @@ honours all four, SQLite is serializable-only). See [Transactions](guides/transa
 operation classes `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`, `AlterField`,
 `AddIndex`, `RemoveIndex`, `AddCompositeIndex`, `RemoveCompositeIndex`, `RenameModel`,
 `RenameField`, `RenameIndex`, `AddConstraint`,
-`RemoveConstraint`, `RenameConstraint`, `RunSQL`, `RunPython` (constraints built with
+`RemoveConstraint`, `RenameConstraint`, `RunSQL`, `RunPython`, `CreateExtension`
+(the last renders `CREATE EXTENSION IF NOT EXISTS` on PostgreSQL and nothing on
+SQLite; constraints built with
 `UniqueConstraint` / `CheckConstraint`). Generated migrations use the idempotent analogs
 (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,
 `AddUniqueIndexConcurrently` and `RemoveIndexConcurrently` are for hand-written non-atomic
@@ -185,7 +221,11 @@ SQLite. CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
 ## Dialects
 
 `BaseDialect`, `PostgresDialect`, `SqliteDialect`, and `register_dialect(name, cls)` for
-adding a backend. See [Backends](backends/index.md) and [Architecture](architecture.md).
+adding a backend. `dialect.extensions_sql(models)` returns the
+`CREATE EXTENSION IF NOT EXISTS` statements required by the models' registered
+field kinds (deduped, sorted; empty on SQLite) — `generate_schemas` runs them
+before creating tables. See [Backends](backends/index.md) and
+[Architecture](architecture.md).
 
 ## Exceptions
 

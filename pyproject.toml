@@ -48,7 +48,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+test = ["pytest>=8.0", "pytest-asyncio>=0.23", "factory-boy>=3.3"]
+factory = ["factory-boy>=3.3"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

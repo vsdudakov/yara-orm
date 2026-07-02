@@ -6,6 +6,73 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`yara_orm.contrib.factory` — official factory_boy integration.**
+  `YaraModelFactory` keeps factory_boy's full declaration surface and makes
+  persistence async: `await MyFactory.create(**overrides)` and
+  `await MyFactory.create_batch(n)` return persisted instances (`SubFactory`
+  chains of other `YaraModelFactory` classes are awaited depth-first; batch
+  creations run sequentially), `build()` stays synchronous for unsaved
+  instances, and `@factory.post_generation` hooks run after the row is
+  persisted — a hook returning an awaitable (e.g. `obj.tags.add(*extracted)`)
+  is awaited for you. factory-boy is an optional dependency: install with
+  `pip install "yara-orm[factory]"`. See the new
+  [Testing with factories](https://vsdudakov.github.io/yara-orm/guides/testing-factories/)
+  guide.
+
+- **`select_related()`, `only()`/`defer()` and `annotate()` now combine on one
+  queryset** (previously the combination raised `FieldError`, forcing a
+  fallback to `prefetch_related` and full-row projections). A single SELECT
+  carries the join plan's columns, the narrowed base projection and the
+  annotation expressions: non-aggregate annotations (window `RawSQL`,
+  `F` arithmetic) add no `GROUP BY`, while aggregate annotations (or a
+  `HAVING` filter) group by the base pk plus each joined relation's pk, so
+  reverse-relation aggregates don't inflate row counts. Related instances
+  hydrate as before, annotation values are set as attributes, and unselected
+  columns stay deferred. Annotation names may not shadow a model field when
+  `only()`/`defer()` is active (`FieldError`), and `select_for_update()`
+  still raises `UnSupportedError` on every annotated shape.
+- **Public custom-field-kind registry.** `register_field_kind(kind, *,
+  field_cls, sql, source=None, requires_extension=None)` (and
+  `unregister_field_kind(kind)`) replaces the three private monkey-patches
+  downstream apps needed to teach yara-orm a custom column type (e.g. a
+  pgvector `VectorField`). One call wires the kind into the dialects (`sql`
+  type template, single or per-dialect, filled from the field's
+  `type_params`), the migration writer (fields serialise as
+  `fields.<ClassName>(...)` or via a custom `source` callable, and
+  `fields.<ClassName>` resolves so generated files import cleanly) and the
+  autodetector (a `type_params` change diffs to `AlterField`). Registration
+  is validated (no shadowing built-in kinds, `field_cls` must be a `Field`
+  subclass with the matching `field_kind`, template placeholders must match
+  `type_params` at render time) and idempotent (re-registering the same
+  class is a no-op). See the new [Custom fields](docs/guides/custom-fields.md)
+  guide.
+- **Declarative required PostgreSQL extensions.** A kind registered with
+  `requires_extension="vector"` makes the extension part of the schema:
+  `BaseDialect.extensions_sql(models)` returns the deduped, sorted
+  `CREATE EXTENSION IF NOT EXISTS` statements (empty on SQLite) for
+  `generate_schemas`, and `makemigrations` prepends the new
+  `m.CreateExtension(name)` operation — rendered per dialect, so it applies
+  the guarded `CREATE EXTENSION` on PostgreSQL and is a clean no-op on
+  SQLite — first in any migration that creates or retypes such a column.
+  Its reverse is empty (extensions are never dropped automatically).
+- **Query annotators for SQL attribution.** `register_query_annotator(fn)`
+  (decorator-friendly) and `clear_query_annotators()`: each annotator is a
+  zero-arg callable returning a short string (or `None`/`""` to skip); the
+  non-empty results join with `,` in registration order into a single
+  `/* ... */` comment prepended to every statement on the Python query path
+  (model queries, manual SQL, transactions, `execute_script`), so
+  `pg_stat_statements` / APM tools can attribute queries per request. Values
+  are sanitised (control characters and comment delimiters stripped) so they
+  cannot break out of the comment; query hooks observe the final SQL,
+  comment included; zero overhead while no annotator is registered. Note:
+  the PostgreSQL statement cache is keyed on SQL text — prefer
+  low-cardinality values or `statement_cache_size=0`.
+- `YaraOrm.generate_schemas` now executes a dialect's
+  `extensions_sql(models)` statements (e.g. `CREATE EXTENSION IF NOT
+  EXISTS`) first, per write connection, before creating tables.
+
 ## [1.11.0] - 2026-07-02
 
 ### Added

@@ -17,7 +17,7 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, cast
 
 from .db_defaults import DatabaseDefault
-from .exceptions import FieldError
+from .exceptions import ConfigurationError, FieldError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,13 +58,17 @@ _RELATION_TYPE_EXPORTS = frozenset(
 
 
 def __getattr__(name: str) -> Any:
-    """Resolve the relation typing aliases lazily (PEP 562).
+    """Resolve relation typing aliases and registered field classes lazily (PEP 562).
+
+    Registered custom field classes (see :func:`register_field_kind`) resolve
+    here so generated migration files can round-trip a custom field as
+    ``fields.<ClassName>(...)``.
 
     Args:
         name: The attribute being looked up on the module.
 
     Returns:
-        The alias from :mod:`yara_orm.relations`.
+        The alias from :mod:`yara_orm.relations`, or a registered field class.
 
     Raises:
         AttributeError: For any other missing module attribute.
@@ -73,6 +77,9 @@ def __getattr__(name: str) -> Any:
         from . import relations
 
         return getattr(relations, name)
+    registered = _REGISTERED_FIELD_CLASSES.get(name)
+    if registered is not None:
+        return registered
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -263,6 +270,201 @@ class Field:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         """Return a debugging representation of the field."""
         return f"<{type(self).__name__} {self.model_field_name!r}>"
+
+
+# ---------------------------------------------------------------------------
+# Custom field kinds
+# ---------------------------------------------------------------------------
+#: The abstract kinds built into the dialects (plus the relation pseudo-kinds).
+#: A custom registration may not shadow any of these.
+_BUILTIN_KINDS = frozenset(
+    {
+        "smallint",
+        "int",
+        "bigint",
+        "float",
+        "decimal",
+        "varchar",
+        "text",
+        "bytes",
+        "bool",
+        "datetime",
+        "date",
+        "time",
+        "timedelta",
+        "uuid",
+        "json",
+        "fk",
+        "m2m",
+    }
+)
+
+
+class FieldKindRegistration:
+    """One :func:`register_field_kind` entry: a kind's class, SQL and options."""
+
+    __slots__ = ("kind", "field_cls", "sql", "source", "requires_extension")
+
+    def __init__(
+        self,
+        kind: str,
+        field_cls: type[Field],
+        sql: str | dict[str, str],
+        source: Callable[[Field], str] | None,
+        requires_extension: str | None,
+    ) -> None:
+        """Store the registration data.
+
+        Args:
+            kind: The abstract field kind (matches ``field_cls.field_kind``).
+            field_cls: The :class:`Field` subclass implementing the kind.
+            sql: SQL type template, or a per-dialect mapping of templates.
+            source: Optional callable rendering a field's migration source.
+            requires_extension: Optional PostgreSQL extension the kind needs.
+
+        Returns:
+            None
+        """
+        self.kind = kind
+        self.field_cls = field_cls
+        self.sql = sql
+        self.source = source
+        self.requires_extension = requires_extension
+
+    def sql_template(self, dialect_name: str) -> str:
+        """Resolve the SQL type template for one dialect.
+
+        Args:
+            dialect_name: The active dialect's name (e.g. ``"postgres"``).
+
+        Raises:
+            ConfigurationError: When the per-dialect mapping has no entry for
+                the dialect.
+
+        Returns:
+            The ``str.format`` template filled from a field's ``type_params``.
+        """
+        if isinstance(self.sql, str):
+            return self.sql
+        try:
+            return self.sql[dialect_name]
+        except KeyError:
+            raise ConfigurationError(
+                f"field kind {self.kind!r} has no SQL type template for dialect "
+                f"{dialect_name!r} (registered dialects: {sorted(self.sql)})"
+            ) from None
+
+
+#: kind -> its registration (consulted by the dialects and the migration writer).
+_FIELD_KIND_REGISTRY: dict[str, FieldKindRegistration] = {}
+#: class name -> registered class, resolved by the module ``__getattr__`` so
+#: generated migrations' ``fields.<ClassName>(...)`` calls import cleanly.
+_REGISTERED_FIELD_CLASSES: dict[str, type[Field]] = {}
+
+
+def register_field_kind(
+    kind: str,
+    *,
+    field_cls: type[Field],
+    sql: str | dict[str, str],
+    source: Callable[[Field], str] | None = None,
+    requires_extension: str | None = None,
+) -> None:
+    """Register a custom field kind: its class, SQL type and migration source.
+
+    Teaches every layer about a downstream field type in one call: the dialects
+    render its column type from ``sql``, the migration writer emits
+    ``fields.<ClassName>(...)`` (or the custom ``source``) for it, and
+    ``fields.<ClassName>`` resolves so generated migration files import
+    cleanly. Call it at import time of the module defining the field class, so
+    any process that loads the models (including migration replay) sees the
+    registration.
+
+    Args:
+        kind: The abstract field kind; must equal ``field_cls.field_kind`` and
+            not shadow a built-in kind.
+        field_cls: The :class:`Field` subclass implementing the kind. The
+            default migration source renders its ``type_params`` as keyword
+            arguments, so the constructor must accept them as such.
+        sql: SQL type template (``str.format`` filled from a field's
+            ``type_params``, e.g. ``"vector({dim})"``), or a per-dialect
+            mapping such as ``{"postgres": "vector({dim})", "sqlite": "TEXT"}``.
+        source: Optional callable rendering a field as constructor source for
+            generated migration files; defaults to
+            ``fields.<ClassName>(<type_params as kwargs>, null=..., ...)``.
+        requires_extension: Optional PostgreSQL extension the kind needs (e.g.
+            ``"vector"``); ``generate_schemas`` and generated migrations emit
+            ``CREATE EXTENSION IF NOT EXISTS`` for it on PostgreSQL.
+
+    Raises:
+        ConfigurationError: When the kind shadows a built-in, ``field_cls`` is
+            not a :class:`Field` subclass, its ``field_kind`` does not match,
+            ``sql`` is empty, or the kind/class name is already registered
+            differently.
+
+    Returns:
+        None
+    """
+    if kind in _BUILTIN_KINDS:
+        raise ConfigurationError(f"field kind {kind!r} is built in and cannot be re-registered")
+    if not (isinstance(field_cls, type) and issubclass(field_cls, Field)):
+        raise ConfigurationError(f"field_cls must be a Field subclass, got {field_cls!r}")
+    if field_cls.field_kind != kind:
+        raise ConfigurationError(
+            f"field_cls {field_cls.__name__!r} declares field_kind "
+            f"{field_cls.field_kind!r}, which does not match the registered kind {kind!r}"
+        )
+    if not sql:
+        raise ConfigurationError(
+            f"field kind {kind!r} needs a non-empty SQL type template "
+            "(a string or a per-dialect mapping)"
+        )
+    existing = _FIELD_KIND_REGISTRY.get(kind)
+    if existing is not None:
+        if existing.field_cls is field_cls:
+            return  # idempotent re-registration
+        raise ConfigurationError(
+            f"field kind {kind!r} is already registered with "
+            f"{existing.field_cls.__name__!r}; unregister_field_kind({kind!r}) first"
+        )
+    homonym = _REGISTERED_FIELD_CLASSES.get(field_cls.__name__)
+    if homonym is not None and homonym is not field_cls:
+        raise ConfigurationError(
+            f"a different field class named {field_cls.__name__!r} is already registered; "
+            "migration files resolve classes by name, so names must be unique"
+        )
+    _FIELD_KIND_REGISTRY[kind] = FieldKindRegistration(
+        kind, field_cls, sql, source, requires_extension
+    )
+    _REGISTERED_FIELD_CLASSES[field_cls.__name__] = field_cls
+
+
+def unregister_field_kind(kind: str) -> None:
+    """Remove a custom field kind registration (a no-op when absent).
+
+    Intended for tests that register throwaway kinds.
+
+    Args:
+        kind: The kind to unregister.
+
+    Returns:
+        None
+    """
+    registration = _FIELD_KIND_REGISTRY.pop(kind, None)
+    if registration is not None:
+        _REGISTERED_FIELD_CLASSES.pop(registration.field_cls.__name__, None)
+
+
+def registered_field_kind(kind: str) -> FieldKindRegistration | None:
+    """Look up a custom kind's registration (``None`` for unregistered kinds).
+
+    Args:
+        kind: The abstract field kind to look up.
+
+    Returns:
+        The registration, or ``None`` when the kind is not registered.
+    """
+    return _FIELD_KIND_REGISTRY.get(kind)
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1472,10 @@ __all__ = [
     "ReverseRelation",
     "ManyToManyRelation",
     "Field",
+    "FieldKindRegistration",
+    "register_field_kind",
+    "unregister_field_kind",
+    "registered_field_kind",
     "SmallIntField",
     "IntField",
     "BigIntField",

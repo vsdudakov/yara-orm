@@ -222,6 +222,12 @@ default automatically; see [Primary keys](#primary-keys) below.
 | `OneToOneField`      | `reference` (unique FK)                                 | one-to-one foreign key          |
 | `ManyToManyField`    | `reference`, `related_name`, `through`                  | join-table relation (no column) |
 
+!!! tip "Need a column type yara-orm doesn't ship?"
+    Register your own `Field` subclass (a pgvector `VectorField`, a PostGIS
+    geometry, ...) with `register_field_kind()` — DDL, migrations and required
+    PostgreSQL extensions all follow from that one call. See
+    [Custom fields](custom-fields.md).
+
 !!! tip "Auto timestamps"
     Set `auto_now_add=True` to stamp the row once at creation, or `auto_now=True`
     to refresh the value on every `save()`. In the canonical `Author` model,
@@ -445,6 +451,7 @@ and instead manages a join table. Their full behaviour — accessors, `related_n
 
 ## See also
 
+- [Custom fields](custom-fields.md)
 - [Querying](querying.md)
 - [Relations](relations.md)
 - [Migrations](migrations.md)
