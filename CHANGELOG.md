@@ -8,6 +8,28 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Added
 
+- **Fully-typed model attributes and generic querysets.** Scalar fields are
+  now generic over their Python value type with `null=True` folding `None`
+  in, so `call.to_number` reveals `str`, `call.duration` (from
+  `IntField(null=True)`) reveals `int | None`, enum fields reveal their enum
+  class, class-level access reveals the field object (`Call.to_number` →
+  `CharField[str]`), and assigning a wrongly-typed value is a type error. No
+  annotations needed — the declaration is the source of truth
+  (`JSONField` stays `Any`; annotate `data: fields.JSONField[...] = ...` to
+  narrow it). `QuerySet` is generic over its model and `Model` query entry
+  points return `Self`-parameterised types, so `Call.filter(...)` is a
+  `QuerySet[Call]`, `await Call.filter(...)` is `list[Call]`,
+  `await Call.filter(...).first()` is `Call | None`, and
+  `get`/`create`/`get_or_create`/`bulk_*` resolve to the concrete model.
+  Relation managers' `all()`/`filter()`/`order_by()` now return
+  `QuerySet[Target]`. All of this is type-checking only: fields remain
+  runtime non-data descriptors (typed `__set__` and `__get__` overloads live
+  under `if TYPE_CHECKING:`), so attribute access and row hydration are
+  byte-for-byte the runtime paths they were. One observable change:
+  subscripting a field class (`JSONField[dict]`) now returns a
+  `types.GenericAlias` (real `Generic` machinery) instead of the class
+  itself; annotations keep evaluating fine.
+
 - **`yara_orm.contrib.factory` — official factory_boy integration.**
   `YaraModelFactory` keeps factory_boy's full declaration surface and makes
   persistence async: `await MyFactory.create(**overrides)` and

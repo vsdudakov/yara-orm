@@ -108,6 +108,7 @@ show_missing = true
 fail_under = 100
 exclude_also = [
     "if TYPE_CHECKING:",
+    "@overload",
     "raise NotImplementedError",
     "@abstractmethod",
     "if __name__ == .__main__.:",

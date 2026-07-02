@@ -7,7 +7,7 @@ returns without a query, using a single query per relation (no N+1).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import registry
 from .connection import get_dialect, get_executor
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class Prefetch:
     """Customise a prefetch with a constrained queryset."""
 
-    def __init__(self, relation: str, queryset: QuerySet, to_attr: str | None = None) -> None:
+    def __init__(self, relation: str, queryset: QuerySet[Any], to_attr: str | None = None) -> None:
         """Bind a relation name to the queryset used to load it.
 
         Args:
@@ -38,7 +38,7 @@ class Prefetch:
         self.to_attr = to_attr
 
 
-async def prefetch_instances(instances: list[Model], specs: Sequence[str | Prefetch]) -> None:
+async def prefetch_instances(instances: Sequence[Model], specs: Sequence[str | Prefetch]) -> None:
     """Populate the ``_prefetch`` cache of each instance for every spec.
 
     Args:
@@ -57,7 +57,7 @@ async def prefetch_instances(instances: list[Model], specs: Sequence[str | Prefe
             await _prefetch_path(instances, spec, None, None)
 
 
-def _gather_related(instances: list[Model], name: str) -> list[Model]:
+def _gather_related(instances: Sequence[Model], name: str) -> list[Model]:
     """Collect the loaded related instances cached under ``name`` across a batch.
 
     Args:
@@ -81,7 +81,7 @@ def _gather_related(instances: list[Model], name: str) -> list[Model]:
 
 
 async def _prefetch_path(
-    instances: list[Model], path: str, custom_qs: QuerySet | None, to_attr: str | None
+    instances: Sequence[Model], path: str, custom_qs: QuerySet[Any] | None, to_attr: str | None
 ) -> None:
     """Prefetch a possibly multi-hop relation path (``"author__publisher"``).
 
@@ -108,7 +108,7 @@ async def _prefetch_path(
 
 
 def _assign(
-    instances: list[Model], name: str, to_attr: str | None, values: dict[Model, object]
+    instances: Sequence[Model], name: str, to_attr: str | None, values: dict[Model, object]
 ) -> None:
     """Store each instance's prefetched result, by relation name or ``to_attr``.
 
@@ -130,7 +130,10 @@ def _assign(
 
 
 async def _prefetch_one(
-    instances: list[Model], name: str, custom_qs: QuerySet | None, to_attr: str | None = None
+    instances: Sequence[Model],
+    name: str,
+    custom_qs: QuerySet[Any] | None,
+    to_attr: str | None = None,
 ) -> None:
     """Prefetch a single forward FK/O2O, reverse FK/O2O, or M2M relation.
 
@@ -198,7 +201,7 @@ async def _prefetch_one(
 
 
 async def _prefetch_m2m(
-    instances: list[Model], name: str, descriptor: M2MDescriptor, to_attr: str | None = None
+    instances: Sequence[Model], name: str, descriptor: M2MDescriptor, to_attr: str | None = None
 ) -> None:
     """Prefetch a many-to-many relation with a single join query.
 

@@ -50,7 +50,7 @@ factory-boy`` or ``pip install "yara-orm[factory]"``.
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 try:
     import factory as factory_boy
@@ -292,9 +292,8 @@ class YaraModelFactory(factory_boy.Factory[TModel]):
             The persisted model instance.
         """
         resolved = {key: await _resolve_value(value) for key, value in kwargs.items()}
-        # ``Model.create`` is annotated as returning ``Model``; narrow it back
-        # to the concrete class the factory was declared for.
-        return cast("TModel", await model_class.create(*args, **resolved))
+        # ``Model.create`` returns ``Self``, so the concrete class flows through.
+        return await model_class.create(*args, **resolved)
 
     @classmethod
     def _build(cls, model_class: type[TModel], *args: Any, **kwargs: Any) -> TModel:

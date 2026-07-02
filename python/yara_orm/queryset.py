@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from .prefetch import Prefetch
     from .relations import RelationInfo
 
+#: The model class a queryset yields; every chain method preserves it, so
+#: ``await Call.filter(...)`` reveals ``list[Call]`` (not a bare ``Model``).
+ModelT = TypeVar("ModelT", bound="Model")
+
 
 def _like_escape(value: Any) -> str:
     r"""Escape LIKE/ILIKE metacharacters in a user-supplied value.
@@ -202,10 +206,15 @@ def _is_model(value: Any) -> bool:
     return hasattr(value, "_meta") and hasattr(value, "pk")
 
 
-class QuerySet:
-    """Lazy, chainable builder that compiles and executes SQL queries."""
+class QuerySet(Generic[ModelT]):
+    """Lazy, chainable builder that compiles and executes SQL queries.
 
-    def __init__(self, model: type[Model]) -> None:
+    Generic over the model it yields: chain methods return
+    ``QuerySet[ModelT]`` and terminals resolve to ``ModelT`` /
+    ``list[ModelT]``, so results are typed as the concrete model.
+    """
+
+    def __init__(self, model: type[ModelT]) -> None:
         """Initialize an empty query set bound to a model.
 
         Args:
@@ -245,7 +254,7 @@ class QuerySet:
         self._using: str | BaseDBAsyncClient | None = None
 
     # -- cloning / chaining ----------------------------------------------
-    def _clone(self) -> QuerySet:
+    def _clone(self) -> QuerySet[ModelT]:
         """Create a shallow copy of this query set's mutable state.
 
         Returns:
@@ -275,7 +284,7 @@ class QuerySet:
         qs._using = self._using
         return qs
 
-    def filter(self, *args: Q, **kwargs: Any) -> QuerySet:
+    def filter(self, *args: Q, **kwargs: Any) -> QuerySet[ModelT]:
         """Return a new query set narrowed by the given conditions.
 
         Args:
@@ -307,7 +316,7 @@ class QuerySet:
             qs._conditions.append(Q(**where_kw))
         return qs
 
-    def exclude(self, *args: Q, **kwargs: Any) -> QuerySet:
+    def exclude(self, *args: Q, **kwargs: Any) -> QuerySet[ModelT]:
         """Return a new query set excluding rows matching the conditions.
 
         Args:
@@ -351,7 +360,7 @@ class QuerySet:
             qs._conditions.append(~Q(*args, **where_kw))
         return qs
 
-    def annotate(self, **annotations: Any) -> QuerySet:
+    def annotate(self, **annotations: Any) -> QuerySet[ModelT]:
         """Return a new query set with extra aggregate annotations.
 
         Annotations combine with ``select_related()`` (a single joined SELECT)
@@ -369,7 +378,7 @@ class QuerySet:
         qs._annotations.update(annotations)
         return qs
 
-    def group_by(self, *fields: str) -> QuerySet:
+    def group_by(self, *fields: str) -> QuerySet[ModelT]:
         """Return a new query set grouped by the given fields.
 
         Args:
@@ -382,7 +391,7 @@ class QuerySet:
         qs._group_by.extend(fields)
         return qs
 
-    def all(self) -> QuerySet:
+    def all(self) -> QuerySet[ModelT]:
         """Return a clone of this query set (a no-op chain terminator).
 
         Code often ends a chain with ``.all()`` (e.g.
@@ -394,7 +403,7 @@ class QuerySet:
         """
         return self._clone()
 
-    def prefetch_related(self, *specs: str | Prefetch) -> QuerySet:
+    def prefetch_related(self, *specs: str | Prefetch) -> QuerySet[ModelT]:
         """Return a new query set that prefetches the given relations.
 
         Args:
@@ -407,7 +416,7 @@ class QuerySet:
         qs._prefetch.extend(specs)
         return qs
 
-    def select_related(self, *relations: str) -> QuerySet:
+    def select_related(self, *relations: str) -> QuerySet[ModelT]:
         """Return a new query set that eager-loads forward FK/O2O relations.
 
         Each named relation is joined and hydrated in the same query, so the
@@ -425,7 +434,7 @@ class QuerySet:
         qs._select_related.extend(relations)
         return qs
 
-    def order_by(self, *fields: str) -> QuerySet:
+    def order_by(self, *fields: str) -> QuerySet[ModelT]:
         """Return a new query set ordered by the given fields.
 
         Args:
@@ -449,7 +458,7 @@ class QuerySet:
             qs._order.append((name, descending))
         return qs
 
-    def limit(self, value: int) -> QuerySet:
+    def limit(self, value: int) -> QuerySet[ModelT]:
         """Return a new query set with a row limit applied.
 
         Args:
@@ -462,7 +471,7 @@ class QuerySet:
         qs._limit = int(value)
         return qs
 
-    def offset(self, value: int) -> QuerySet:
+    def offset(self, value: int) -> QuerySet[ModelT]:
         """Return a new query set with a row offset applied.
 
         Args:
@@ -475,7 +484,7 @@ class QuerySet:
         qs._offset = int(value)
         return qs
 
-    def distinct(self) -> QuerySet:
+    def distinct(self) -> QuerySet[ModelT]:
         """Return a new query set that selects only distinct rows.
 
         Returns:
@@ -490,7 +499,7 @@ class QuerySet:
         nowait: bool = False,
         skip_locked: bool = False,
         of: tuple[str, ...] = (),
-    ) -> QuerySet:
+    ) -> QuerySet[ModelT]:
         """Return a new query set that locks matched rows (``FOR UPDATE``).
 
         The lock is emitted on backends that support it (PostgreSQL) and is a
@@ -512,7 +521,7 @@ class QuerySet:
         qs._for_update_of = tuple(of)
         return qs
 
-    def using_db(self, connection_name: str | BaseDBAsyncClient) -> QuerySet:
+    def using_db(self, connection_name: str | BaseDBAsyncClient) -> QuerySet[ModelT]:
         """Return a new query set that executes on a given connection.
 
         Args:
@@ -570,7 +579,7 @@ class QuerySet:
         meta.get_field(col)  # validates the final column exists on the target
         return "__".join(rel_segs), col
 
-    def only(self, *fields: str) -> QuerySet:
+    def only(self, *fields: str) -> QuerySet[ModelT]:
         """Return a new query set selecting only the named columns.
 
         Instances come back partially populated; the primary key is always
@@ -609,7 +618,7 @@ class QuerySet:
         qs._defer_related = {}
         return qs
 
-    def defer(self, *fields: str) -> QuerySet:
+    def defer(self, *fields: str) -> QuerySet[ModelT]:
         """Return a new query set that omits the named columns.
 
         Instances come back without the deferred fields loaded; the primary key
@@ -645,7 +654,7 @@ class QuerySet:
         qs._only_related = {}
         return qs
 
-    def __getitem__(self, item: slice | int) -> QuerySet | Any:
+    def __getitem__(self, item: slice | int) -> QuerySet[ModelT] | Any:
         """Apply offset/limit via ``qs[start:stop]`` or fetch ``qs[i]``.
 
         Args:
@@ -679,7 +688,7 @@ class QuerySet:
             if item < 0:
                 raise ValueError("negative indexing is not supported")
 
-            async def _get_index() -> Model:
+            async def _get_index() -> ModelT:
                 # Index through the slice path so it composes with an existing
                 # offset/limit (``qs[10:][3]`` fetches absolute row 13).
                 rows = await self[item : item + 1]._fetch()
@@ -1790,7 +1799,7 @@ class QuerySet:
         )
         return sql, params, None
 
-    async def _fetch(self) -> list[Model]:
+    async def _fetch(self) -> list[ModelT]:
         """Execute the query and build model instances from the rows.
 
         Returns:
@@ -1989,7 +1998,7 @@ class QuerySet:
         )
         return sql, params, order, nodes, len(base_fields)
 
-    async def _fetch_select_related(self) -> list[Model]:
+    async def _fetch_select_related(self) -> list[ModelT]:
         """Execute a query that joins and hydrates forward FK/O2O relations.
 
         Each selected relation is LEFT JOINed (aliased by relation name, so
@@ -2094,7 +2103,7 @@ class QuerySet:
         )
         return sql, params
 
-    async def _fetch_annotated(self) -> list[Model]:
+    async def _fetch_annotated(self) -> list[ModelT]:
         """Execute an annotated query and attach annotations to instances.
 
         Under ``only()``/``defer()`` the base instance hydrates partially (the
@@ -2128,7 +2137,7 @@ class QuerySet:
             await prefetch_instances(instances, self._prefetch)
         return instances
 
-    def __await__(self) -> Generator[Any, None, list[Model]]:
+    def __await__(self) -> Generator[Any, None, list[ModelT]]:
         """Make the query set awaitable, executing it on ``await``.
 
         Returns:
@@ -2136,7 +2145,7 @@ class QuerySet:
         """
         return self._fetch().__await__()
 
-    async def __aiter__(self) -> AsyncGenerator[Model, None]:
+    async def __aiter__(self) -> AsyncGenerator[ModelT, None]:
         """Iterate the matching instances with ``async for``.
 
         Executes the query once and yields each instance, so
@@ -2395,7 +2404,7 @@ class QuerySet:
         rows = await self._fetch_columns(paths)
         return [dict(zip(names, r)) for r in rows]
 
-    async def get(self, **kwargs: Any) -> Model:
+    async def get(self, **kwargs: Any) -> ModelT:
         """Fetch the single object matching the given lookups.
 
         Args:
@@ -2414,7 +2423,7 @@ class QuerySet:
             )
         return rows[0]
 
-    async def get_or_none(self, **kwargs: Any) -> Model | None:
+    async def get_or_none(self, **kwargs: Any) -> ModelT | None:
         """Fetch the single object matching the lookups, or ``None``.
 
         Args:
@@ -2433,7 +2442,7 @@ class QuerySet:
 
     async def get_or_create(
         self, defaults: dict[str, Any] | None = None, **kwargs: Any
-    ) -> tuple[Model, bool]:
+    ) -> tuple[ModelT, bool]:
         """Fetch the row matching this query plus ``kwargs``, or create it.
 
         Args:
@@ -2450,7 +2459,7 @@ class QuerySet:
 
     async def update_or_create(
         self, defaults: dict[str, Any] | None = None, **kwargs: Any
-    ) -> tuple[Model, bool]:
+    ) -> tuple[ModelT, bool]:
         """Update the row matching this query plus ``kwargs``, or create it.
 
         Args:
@@ -2528,7 +2537,7 @@ class QuerySet:
         rows = await engine.fetch_rows(f"{dialect.explain_prefix}{sql}", params)
         return "\n".join(" ".join(str(c) for c in row) for row in rows)
 
-    def first(self) -> QuerySetSingle[Model | None]:
+    def first(self) -> QuerySetSingle[ModelT | None]:
         """Return a chainable single-row result for the first matching object.
 
         Awaiting it resolves to the first instance or ``None``; chaining
@@ -2540,7 +2549,7 @@ class QuerySet:
         """
         return QuerySetSingle(self, _resolve_first)
 
-    async def last(self) -> Model | None:
+    async def last(self) -> ModelT | None:
         """Fetch the last matching object under the effective ordering.
 
         The effective ordering — explicit ``order_by``, else the model's
@@ -2566,7 +2575,7 @@ class QuerySet:
         rows = await qs.limit(1)._fetch()
         return rows[0] if rows else None
 
-    async def earliest(self, *fields: str) -> Model | None:
+    async def earliest(self, *fields: str) -> ModelT | None:
         """Fetch the first object ordered ascending by ``fields``.
 
         Args:
@@ -2578,7 +2587,7 @@ class QuerySet:
         order = fields or (self.model._meta.pk_field.model_field_name,)
         return await self.order_by(*order).first()
 
-    async def latest(self, *fields: str) -> Model | None:
+    async def latest(self, *fields: str) -> ModelT | None:
         """Fetch the first object ordered descending by ``fields``.
 
         Args:
@@ -2755,7 +2764,7 @@ class QuerySet:
         return await engine.execute(sql, params)
 
 
-async def _resolve_first(queryset: QuerySet) -> Model | None:
+async def _resolve_first(queryset: QuerySet[ModelT]) -> ModelT | None:
     """Fetch the first row of ``queryset`` (the awaited form of ``first()``).
 
     Args:
@@ -2768,7 +2777,7 @@ async def _resolve_first(queryset: QuerySet) -> Model | None:
     return rows[0] if rows else None
 
 
-async def _resolve_get(queryset: QuerySet) -> Model:
+async def _resolve_get(queryset: QuerySet[ModelT]) -> ModelT:
     """Fetch the single row of ``queryset`` (the awaited form of ``get()``).
 
     Args:
@@ -2798,7 +2807,7 @@ class _ValuesQuery:
     def __init__(
         self,
         run: Callable[[], Awaitable[list[Any]]],
-        queryset: QuerySet | None = None,
+        queryset: QuerySet[Any] | None = None,
         paths: tuple[str, ...] | None = None,
     ) -> None:
         """Wrap the zero-arg coroutine factory that runs the projection.
@@ -2878,8 +2887,8 @@ class QuerySetSingle(Generic[_SingleT]):
 
     def __init__(
         self,
-        queryset: QuerySet,
-        resolver: Callable[[QuerySet], Awaitable[_SingleT]],
+        queryset: QuerySet[Any],
+        resolver: Callable[[QuerySet[Any]], Awaitable[_SingleT]],
         fast: Callable[[], Awaitable[_SingleT]] | None = None,
     ) -> None:
         """Wrap the query set whose single row will be awaited.
@@ -2901,7 +2910,7 @@ class QuerySetSingle(Generic[_SingleT]):
         self._fast = fast
         self._resolver = resolver
 
-    def _chain(self, queryset: QuerySet) -> QuerySetSingle[_SingleT]:
+    def _chain(self, queryset: QuerySet[Any]) -> QuerySetSingle[_SingleT]:
         """Wrap ``queryset`` keeping this result's resolver (drops the fast path).
 
         Args:

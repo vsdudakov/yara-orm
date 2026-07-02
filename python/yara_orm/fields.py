@@ -14,13 +14,25 @@ import uuid as _uuid
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from .db_defaults import DatabaseDefault
 from .exceptions import ConfigurationError, FieldError
 
+#: The Python value type a field's instance access resolves to (e.g. ``int``
+#: for an ``IntField``, ``int | None`` for a nullable one).
+VT = TypeVar("VT")
+
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Literal, overload
+
+    from typing_extensions import Self
+
+    #: The enum class an enum field stores (type-checking only; the ``__new__``
+    #: overloads referencing these never execute at runtime).
+    _EnumT = TypeVar("_EnumT", bound=Enum)
+    _IntEnumT = TypeVar("_IntEnumT", bound=IntEnum)
 
     from .relations import (
         ForeignKeyNullableRelation as ForeignKeyNullableRelation,
@@ -83,11 +95,19 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-class Field:
+class Field(Generic[VT]):
     """Describe a single database column.
 
     A field carries an abstract :attr:`field_kind` rather than a concrete SQL
     type, leaving the active dialect to map it onto database-specific DDL.
+
+    Generic over ``VT``, the Python value type instance access resolves to
+    (``Field[VT]`` being a real ``Generic`` also keeps annotations like
+    ``JSONField[list[dict] | None]`` valid). To the type checker the field is
+    a typed data descriptor (see the ``TYPE_CHECKING`` block below); at
+    runtime it stays a *non-data* descriptor — only ``__get__``, the
+    deferred-column guard — so instance ``__dict__`` keeps winning attribute
+    lookup and the hydration/read hot path pays nothing.
     """
 
     #: Abstract type token resolved to concrete SQL by the dialect; every
@@ -99,21 +119,6 @@ class Field:
     #: Compatibility flag: every concrete yara field backs a real column, so
     #: code that branches on ``field.has_db_field`` keeps working.
     has_db_field: bool = True
-
-    def __class_getitem__(cls, _item: Any) -> type:
-        """Make field classes subscriptable for type annotations (no-op).
-
-        Annotations like ``JSONField[list[dict] | None]`` are evaluated at
-        class-definition time; returning the class keeps those annotations
-        valid without affecting runtime behaviour.
-
-        Args:
-            _item: The (ignored) type argument.
-
-        Returns:
-            The field class itself.
-        """
-        return cls
 
     def __init__(
         self,
@@ -185,31 +190,51 @@ class Field:
         #: Extra parameters consumed by the dialect type templates.
         self.type_params: dict[str, int] = {}
 
-    def __get__(self, instance: object | None, owner: type | None = None) -> Any:
-        """Non-data descriptor: guard access to columns not loaded into an instance.
+    if TYPE_CHECKING:
+        # Typed descriptor protocol, visible to the type checker only: class
+        # access reveals the field object itself, instance access reveals the
+        # field's value type, and assignment is checked against it. The typed
+        # ``__set__`` must NOT exist at runtime — a data descriptor would beat
+        # instance ``__dict__`` and break value storage and the read fast path.
+        @overload
+        def __get__(self, instance: None, owner: type | None = None) -> Self: ...
+        @overload
+        def __get__(self, instance: object, owner: type | None = None) -> VT: ...
+        def __get__(self, instance: object | None, owner: type | None = None) -> Self | VT:
+            """Reveal the field for class access, its value type for instances."""
+            ...
 
-        A normally-constructed or fully-fetched instance has every field in its
-        ``__dict__``, so this descriptor is never consulted (``__dict__`` wins)
-        and the hot path pays nothing. It fires only for an instance that omits
-        the column — i.e. one produced by ``only()`` / ``defer()`` — turning a
-        silent wrong value into a clear error.
+        def __set__(self, instance: object, value: VT) -> None:
+            """Check assigned values against the field's value type."""
+            ...
+    else:
 
-        Args:
-            instance: The instance being accessed, or None for class access.
-            owner: The owning class.
+        def __get__(self, instance, owner=None):
+            """Non-data descriptor: guard access to columns not loaded into an instance.
 
-        Raises:
-            FieldError: When accessed on an instance that did not load this field.
+            A normally-constructed or fully-fetched instance has every field in
+            its ``__dict__``, so this descriptor is never consulted (``__dict__``
+            wins) and the hot path pays nothing. It fires only for an instance
+            that omits the column — i.e. one produced by ``only()`` / ``defer()``
+            — turning a silent wrong value into a clear error.
 
-        Returns:
-            The field itself for class-level access.
-        """
-        if instance is None:
-            return self
-        raise FieldError(
-            f"Field {self.model_field_name!r} was not loaded on this instance "
-            f"(deferred via only()/defer()); re-fetch without deferring it to read it"
-        )
+            Args:
+                instance: The instance being accessed, or None for class access.
+                owner: The owning class.
+
+            Raises:
+                FieldError: When accessed on an instance that did not load this
+                    field.
+
+            Returns:
+                The field itself for class-level access.
+            """
+            if instance is None:
+                return self
+            raise FieldError(
+                f"Field {self.model_field_name!r} was not loaded on this instance "
+                f"(deferred via only()/defer()); re-fetch without deferring it to read it"
+            )
 
     # -- value conversion -------------------------------------------------
     def get_default(self) -> Any:
@@ -506,7 +531,7 @@ def _str_to_db(value: Any) -> Any:
     return str(value) if isinstance(value, int) and not isinstance(value, bool) else value
 
 
-class _IntegerField(Field):
+class _IntegerField(Field[VT]):
     """Shared base for the integer column types.
 
     Centralises the primary-key auto-increment wiring and the ``int`` coercion
@@ -551,28 +576,80 @@ class _IntegerField(Field):
         return None if value is None else int(value)
 
 
-class SmallIntField(_IntegerField):
+class SmallIntField(_IntegerField[VT]):
     """A small integer column."""
 
     field_kind = "smallint"
 
+    if TYPE_CHECKING:
 
-class IntField(_IntegerField):
+        @overload
+        def __new__(
+            cls, *, null: Literal[True], pk: bool = ..., **kwargs: Any
+        ) -> SmallIntField[int | None]: ...
+        @overload
+        def __new__(
+            cls, *, null: Literal[False] = ..., pk: bool = ..., **kwargs: Any
+        ) -> SmallIntField[int]: ...
+        def __new__(cls, *, null: bool = ..., pk: bool = ..., **kwargs: Any) -> SmallIntField[Any]:
+            """Resolve the value type (``int`` or ``int | None``) from ``null``."""
+            ...
+
+
+class IntField(_IntegerField[VT]):
     """A standard integer column."""
 
     field_kind = "int"
 
+    if TYPE_CHECKING:
 
-class BigIntField(_IntegerField):
+        @overload
+        def __new__(
+            cls, *, null: Literal[True], pk: bool = ..., **kwargs: Any
+        ) -> IntField[int | None]: ...
+        @overload
+        def __new__(
+            cls, *, null: Literal[False] = ..., pk: bool = ..., **kwargs: Any
+        ) -> IntField[int]: ...
+        def __new__(cls, *, null: bool = ..., pk: bool = ..., **kwargs: Any) -> IntField[Any]:
+            """Resolve the value type (``int`` or ``int | None``) from ``null``."""
+            ...
+
+
+class BigIntField(_IntegerField[VT]):
     """A 64-bit integer column."""
 
     field_kind = "bigint"
 
+    if TYPE_CHECKING:
 
-class FloatField(Field):
+        @overload
+        def __new__(
+            cls, *, null: Literal[True], pk: bool = ..., **kwargs: Any
+        ) -> BigIntField[int | None]: ...
+        @overload
+        def __new__(
+            cls, *, null: Literal[False] = ..., pk: bool = ..., **kwargs: Any
+        ) -> BigIntField[int]: ...
+        def __new__(cls, *, null: bool = ..., pk: bool = ..., **kwargs: Any) -> BigIntField[Any]:
+            """Resolve the value type (``int`` or ``int | None``) from ``null``."""
+            ...
+
+
+class FloatField(Field[VT]):
     """A floating-point column."""
 
     field_kind = "float"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(cls, *, null: Literal[True], **kwargs: Any) -> FloatField[float | None]: ...
+        @overload
+        def __new__(cls, *, null: Literal[False] = ..., **kwargs: Any) -> FloatField[float]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> FloatField[Any]:
+            """Resolve the value type (``float`` or ``float | None``) from ``null``."""
+            ...
 
     def to_python(self, value: Any) -> float | None:
         """Convert a database value into a ``float``.
@@ -586,8 +663,39 @@ class FloatField(Field):
         return None if value is None else float(value)
 
 
-class DecimalField(Field):
+class DecimalField(Field[VT]):
     """A fixed-precision decimal column."""
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls,
+            max_digits: int = ...,
+            decimal_places: int = ...,
+            *,
+            null: Literal[True],
+            **kwargs: Any,
+        ) -> DecimalField[Decimal | None]: ...
+        @overload
+        def __new__(
+            cls,
+            max_digits: int = ...,
+            decimal_places: int = ...,
+            *,
+            null: Literal[False] = ...,
+            **kwargs: Any,
+        ) -> DecimalField[Decimal]: ...
+        def __new__(
+            cls,
+            max_digits: int = ...,
+            decimal_places: int = ...,
+            *,
+            null: bool = ...,
+            **kwargs: Any,
+        ) -> DecimalField[Any]:
+            """Resolve the value type (``Decimal`` or ``Decimal | None``) from ``null``."""
+            ...
 
     field_kind = "decimal"
     # PostgreSQL returns a native ``Decimal`` (NUMERIC), so the read-path
@@ -648,10 +756,26 @@ class DecimalField(Field):
 # ---------------------------------------------------------------------------
 # Text / binary
 # ---------------------------------------------------------------------------
-class CharField(Field):
+class CharField(Field[VT]):
     """A variable-length string column."""
 
     field_kind = "varchar"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls, max_length: int = ..., *, null: Literal[True], **kwargs: Any
+        ) -> CharField[str | None]: ...
+        @overload
+        def __new__(
+            cls, max_length: int = ..., *, null: Literal[False] = ..., **kwargs: Any
+        ) -> CharField[str]: ...
+        def __new__(
+            cls, max_length: int = ..., *, null: bool = ..., **kwargs: Any
+        ) -> CharField[Any]:
+            """Resolve the value type (``str`` or ``str | None``) from ``null``."""
+            ...
 
     def __init__(self, max_length: int = 255, **kwargs: Any) -> None:
         """Initialize the field with its maximum length.
@@ -679,10 +803,20 @@ class CharField(Field):
         return _str_to_db(value)
 
 
-class TextField(Field):
+class TextField(Field[VT]):
     """An unbounded text column."""
 
     field_kind = "text"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(cls, *, null: Literal[True], **kwargs: Any) -> TextField[str | None]: ...
+        @overload
+        def __new__(cls, *, null: Literal[False] = ..., **kwargs: Any) -> TextField[str]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> TextField[Any]:
+            """Resolve the value type (``str`` or ``str | None``) from ``null``."""
+            ...
 
     def to_db(self, value: Any) -> Any:
         """Coerce a non-string scalar (e.g. ``int``) to ``str`` before binding.
@@ -696,16 +830,36 @@ class TextField(Field):
         return _str_to_db(value)
 
 
-class BinaryField(Field):
+class BinaryField(Field[VT]):
     """A binary (bytes) column."""
 
     field_kind = "bytes"
 
+    if TYPE_CHECKING:
 
-class BooleanField(Field):
+        @overload
+        def __new__(cls, *, null: Literal[True], **kwargs: Any) -> BinaryField[bytes | None]: ...
+        @overload
+        def __new__(cls, *, null: Literal[False] = ..., **kwargs: Any) -> BinaryField[bytes]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> BinaryField[Any]:
+            """Resolve the value type (``bytes`` or ``bytes | None``) from ``null``."""
+            ...
+
+
+class BooleanField(Field[VT]):
     """A boolean column."""
 
     field_kind = "bool"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(cls, *, null: Literal[True], **kwargs: Any) -> BooleanField[bool | None]: ...
+        @overload
+        def __new__(cls, *, null: Literal[False] = ..., **kwargs: Any) -> BooleanField[bool]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> BooleanField[Any]:
+            """Resolve the value type (``bool`` or ``bool | None``) from ``null``."""
+            ...
 
     #: String spellings accepted (case-insensitively) as boolean input.
     _TRUE_STRINGS = frozenset({"true", "t", "1", "yes", "y", "on"})
@@ -776,7 +930,7 @@ def _parse_iso_datetime(value: str) -> datetime:
     return datetime.fromisoformat(text)
 
 
-class _TemporalField(Field):
+class _TemporalField(Field[VT]):
     """Shared base for date/time columns.
 
     Assignment coercion and bind coercion are the same for these types, so
@@ -796,10 +950,36 @@ class _TemporalField(Field):
         return self.to_python_value(value)
 
 
-class DatetimeField(_TemporalField):
+class DatetimeField(_TemporalField[VT]):
     """A date-and-time column."""
 
     field_kind = "datetime"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls,
+            auto_now: bool = ...,
+            auto_now_add: bool = ...,
+            *,
+            null: Literal[True],
+            **kwargs: Any,
+        ) -> DatetimeField[datetime | None]: ...
+        @overload
+        def __new__(
+            cls,
+            auto_now: bool = ...,
+            auto_now_add: bool = ...,
+            *,
+            null: Literal[False] = ...,
+            **kwargs: Any,
+        ) -> DatetimeField[datetime]: ...
+        def __new__(
+            cls, auto_now: bool = ..., auto_now_add: bool = ..., *, null: bool = ..., **kwargs: Any
+        ) -> DatetimeField[Any]:
+            """Resolve the value type (``datetime`` or ``datetime | None``) from ``null``."""
+            ...
 
     def __init__(self, auto_now: bool = False, auto_now_add: bool = False, **kwargs: Any) -> None:
         """Initialize the field with its automatic-timestamp options.
@@ -836,10 +1016,20 @@ class DatetimeField(_TemporalField):
         return value
 
 
-class DateField(_TemporalField):
+class DateField(_TemporalField[VT]):
     """A calendar-date column."""
 
     field_kind = "date"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(cls, *, null: Literal[True], **kwargs: Any) -> DateField[date | None]: ...
+        @overload
+        def __new__(cls, *, null: Literal[False] = ..., **kwargs: Any) -> DateField[date]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> DateField[Any]:
+            """Resolve the value type (``date`` or ``date | None``) from ``null``."""
+            ...
 
     def to_python_value(self, value: Any) -> Any:
         """Coerce an ISO-8601 string (or ``datetime``) to a ``date``.
@@ -866,10 +1056,20 @@ class DateField(_TemporalField):
         return value
 
 
-class TimeField(_TemporalField):
+class TimeField(_TemporalField[VT]):
     """A time-of-day column."""
 
     field_kind = "time"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(cls, *, null: Literal[True], **kwargs: Any) -> TimeField[time | None]: ...
+        @overload
+        def __new__(cls, *, null: Literal[False] = ..., **kwargs: Any) -> TimeField[time]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> TimeField[Any]:
+            """Resolve the value type (``time`` or ``time | None``) from ``null``."""
+            ...
 
     def to_python_value(self, value: Any) -> Any:
         """Coerce an ISO-8601 string (or ``datetime``) to a ``time``.
@@ -889,11 +1089,25 @@ class TimeField(_TemporalField):
         return value
 
 
-class TimeDeltaField(Field):
+class TimeDeltaField(Field[VT]):
     """A duration column, stored as an integer number of microseconds."""
 
     field_kind = "timedelta"
     read_identity = False
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls, *, null: Literal[True], **kwargs: Any
+        ) -> TimeDeltaField[timedelta | None]: ...
+        @overload
+        def __new__(
+            cls, *, null: Literal[False] = ..., **kwargs: Any
+        ) -> TimeDeltaField[timedelta]: ...
+        def __new__(cls, *, null: bool = ..., **kwargs: Any) -> TimeDeltaField[Any]:
+            """Resolve the value type (``timedelta`` or ``timedelta | None``) from ``null``."""
+            ...
 
     def to_db(self, value: Any) -> int | None:
         """Convert a ``timedelta`` to its total microseconds for binding.
@@ -927,10 +1141,24 @@ class TimeDeltaField(Field):
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
-class UUIDField(Field):
+class UUIDField(Field[VT]):
     """A UUID column."""
 
     field_kind = "uuid"
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls, *, null: Literal[True], pk: bool = ..., **kwargs: Any
+        ) -> UUIDField[_uuid.UUID | None]: ...
+        @overload
+        def __new__(
+            cls, *, null: Literal[False] = ..., pk: bool = ..., **kwargs: Any
+        ) -> UUIDField[_uuid.UUID]: ...
+        def __new__(cls, *, null: bool = ..., pk: bool = ..., **kwargs: Any) -> UUIDField[Any]:
+            """Resolve the value type (``UUID`` or ``UUID | None``) from ``null``."""
+            ...
 
     def __init__(self, *, pk: bool = False, **kwargs: Any) -> None:
         """Initialize the field, defaulting primary keys to ``uuid4``.
@@ -964,7 +1192,7 @@ class UUIDField(Field):
         return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
 
 
-class JSONField(Field):
+class JSONField(Field[VT]):
     """A JSON column.
 
     ``encoder``/``decoder`` are optional Python value-transform hooks:
@@ -973,10 +1201,28 @@ class JSONField(Field):
     whatever string the encoder produced, yara serialises JSON in its engine,
     so these are value→value transforms (e.g. to make oversized integers
     JS-safe), not full (de)serialisers.
+
+    Genuinely generic: a bare ``JSONField()`` reveals ``Any`` for its values
+    (JSON is schemaless), while an annotated declaration such as
+    ``data: JSONField[list[dict] | None] = JSONField(null=True)`` types
+    instance access as the annotation's value type.
     """
 
     field_kind = "json"
     read_identity = False
+
+    if TYPE_CHECKING:
+
+        def __new__(
+            cls,
+            *,
+            encoder: Callable[[Any], Any] | None = ...,
+            decoder: Callable[[Any], Any] | None = ...,
+            null: bool = ...,
+            **kwargs: Any,
+        ) -> JSONField[Any]:
+            """Type JSON values as ``Any`` (JSON is schemaless) regardless of ``null``."""
+            ...
 
     def __init__(
         self,
@@ -1044,11 +1290,27 @@ class JSONField(Field):
 # ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
-class IntEnumField(Field):
+class IntEnumField(Field[VT]):
     """Stores an ``IntEnum`` as its integer value; reads back enum members."""
 
     field_kind = "int"
     read_identity = False
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls, enum_type: type[_IntEnumT], *, null: Literal[True], **kwargs: Any
+        ) -> IntEnumField[_IntEnumT | None]: ...
+        @overload
+        def __new__(
+            cls, enum_type: type[_IntEnumT], *, null: Literal[False] = ..., **kwargs: Any
+        ) -> IntEnumField[_IntEnumT]: ...
+        def __new__(
+            cls, enum_type: type[_IntEnumT], *, null: bool = ..., **kwargs: Any
+        ) -> IntEnumField[Any]:
+            """Resolve the value type from the stored enum class and ``null``."""
+            ...
 
     def __init__(self, enum_type: type[IntEnum], **kwargs: Any) -> None:
         """Initialize the field with its enum type.
@@ -1088,11 +1350,37 @@ class IntEnumField(Field):
         return None if value is None else self.enum_type(value)
 
 
-class CharEnumField(Field):
+class CharEnumField(Field[VT]):
     """Stores a string ``Enum`` as its ``.value``; reads back enum members."""
 
     field_kind = "varchar"
     read_identity = False
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __new__(
+            cls,
+            enum_type: type[_EnumT],
+            max_length: int = ...,
+            *,
+            null: Literal[True],
+            **kwargs: Any,
+        ) -> CharEnumField[_EnumT | None]: ...
+        @overload
+        def __new__(
+            cls,
+            enum_type: type[_EnumT],
+            max_length: int = ...,
+            *,
+            null: Literal[False] = ...,
+            **kwargs: Any,
+        ) -> CharEnumField[_EnumT]: ...
+        def __new__(
+            cls, enum_type: type[_EnumT], max_length: int = ..., *, null: bool = ..., **kwargs: Any
+        ) -> CharEnumField[Any]:
+            """Resolve the value type from the stored enum class and ``null``."""
+            ...
 
     def __init__(self, enum_type: type[Enum], max_length: int = 255, **kwargs: Any) -> None:
         """Initialize the field with its enum type and length.
@@ -1162,7 +1450,7 @@ _ON_DELETE_ACTIONS = frozenset(
 )
 
 
-class ForeignKeyFieldInstance(Field):
+class ForeignKeyFieldInstance(Field[Any]):
     """The field object behind a :func:`ForeignKeyField` declaration.
 
     Declared under the relation name (e.g. ``tournament``); the metaclass
@@ -1288,7 +1576,7 @@ class OneToOneFieldInstance(ForeignKeyFieldInstance):
         super().__init__(reference, **kwargs)
 
 
-class ManyToManyFieldInstance(Field):
+class ManyToManyFieldInstance(Field[Any]):
     """The field object behind a :func:`ManyToManyField` declaration.
 
     No column is added to the owning table; the metaclass installs a manager
