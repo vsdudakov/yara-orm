@@ -16,17 +16,29 @@ Workflow (see :class:`MigrationManager` and the ``python -m yara_orm`` CLI):
     sqlmigrate     -> print a migration's SQL without running it
 
 Generated migrations emit the **idempotent** analog of each operation
-(``CreateModelIfNotExists``, ``AddFieldIfNotExists``, ...), so re-applying a
-half-applied migration is safe. ``AlterField`` is detected automatically when a
-column's type or nullability changes. The ``*Concurrently`` index operations are
-for hand-written, ``atomic = False`` migrations (PostgreSQL builds those indexes
-outside a transaction).
+(``CreateModelIfNotExists``, ``AddFieldIfNotExists``, ...). An ``atomic``
+migration (the default) is all-or-nothing: a failure rolls the whole migration
+back, so it can simply be re-run. Re-applying a half-applied **non-atomic**
+migration is only safe for the guarded operations (``CreateModelIfNotExists``,
+``DeleteModelIfExists``, the ``*IfNotExists``/``*IfExists`` index and field
+ops on PostgreSQL); ``RenameField``/``RenameModel``, constraint ops, and — on
+SQLite, which has no ``IF [NOT] EXISTS`` for ``ADD``/``DROP COLUMN`` — the
+field ops are *not* re-run safe. On SQLite a column or constraint change
+rebuilds the table, and the rebuild must toggle ``PRAGMA foreign_keys``
+outside a transaction, so an atomic migration containing a rebuild commits the
+operations preceding it before the rebuild runs (the rebuild itself is still
+transactional). ``AlterField`` is detected automatically when a column's type,
+nullability, uniqueness, database default or foreign-key target changes. The
+``*Concurrently`` index operations are for hand-written, ``atomic = False``
+migrations (PostgreSQL builds those indexes outside a transaction).
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import re
+import sys
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -35,6 +47,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from . import registry
 from .connection import get_dialect, get_executor, in_transaction
+from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
+from .dialects import PRAGMA_FK_OFF, PRAGMA_FK_ON
+from .exceptions import ConfigurationError, UnSupportedError
 from .fields import ForeignKeyField, OnDelete
 
 if TYPE_CHECKING:
@@ -122,12 +137,145 @@ def _call(name: str, args: list[str]) -> str:
     return f"{name}(\n{body},\n    )"
 
 
+def _default_source(default: DatabaseDefault) -> str:
+    """Render a database-side default as ``db_defaults.Xxx(...)`` source.
+
+    Args:
+        default: The database default to render.
+
+    Returns:
+        The constructor-call source reconstructing an equivalent default.
+
+    Raises:
+        ConfigurationError: For a custom ``DatabaseDefault`` subclass migrations
+            cannot serialise (use ``SqlDefault`` instead).
+    """
+    if isinstance(default, RandomHex):
+        return f"db_defaults.RandomHex(size={default.size})"
+    if isinstance(default, SqlDefault):
+        return f"db_defaults.SqlDefault({default.sql!r})"
+    if isinstance(default, Now):
+        return "db_defaults.Now()"
+    raise ConfigurationError(
+        f"cannot serialise database default {type(default).__name__!r} into a migration; "
+        "use db_defaults.SqlDefault(...) (or Now/RandomHex) for migratable defaults"
+    )
+
+
+def _default_spec(default: Any) -> dict[str, Any] | None:
+    """Build the canonical, comparable spec for a column's database default.
+
+    Python-side defaults (values/callables) never reach the DDL, so they map to
+    ``None``; only :class:`~yara_orm.db_defaults.DatabaseDefault` instances are
+    captured.
+
+    Args:
+        default: The field's ``default`` attribute.
+
+    Returns:
+        The default spec mapping, or ``None`` when the column has no DB default.
+
+    Raises:
+        ConfigurationError: For a custom ``DatabaseDefault`` subclass migrations
+            cannot serialise.
+    """
+    if not isinstance(default, DatabaseDefault):
+        return None
+    if isinstance(default, RandomHex):
+        return {"kind": "random_hex", "size": default.size}
+    if isinstance(default, SqlDefault):
+        return {"kind": "sql", "sql": default.sql}
+    if isinstance(default, Now):
+        return {"kind": "now"}
+    raise ConfigurationError(
+        f"cannot serialise database default {type(default).__name__!r} into a migration; "
+        "use db_defaults.SqlDefault(...) (or Now/RandomHex) for migratable defaults"
+    )
+
+
+def resolved_fk(
+    field: Field,
+    *,
+    table: str,
+    pk: str,
+    kind: str,
+    type_params: dict[str, Any] | None = None,
+) -> Field:
+    """Stamp a foreign-key field with its resolved target (for migration files).
+
+    Generated migrations wrap foreign keys in this call so replaying them never
+    needs the live model registry: the target table, primary-key column and its
+    scalar type are recorded at ``makemigrations`` time. Older migration files
+    without the wrapper still work while the target model remains registered.
+
+    Args:
+        field: The foreign-key field to stamp.
+        table: The referenced table name.
+        pk: The referenced primary-key column name.
+        kind: The referenced primary key's abstract field kind.
+        type_params: The referenced primary key's type parameters, if any.
+
+    Returns:
+        The same field, carrying the resolved target info.
+    """
+    # Dynamic stamp: only fields routed through this wrapper carry it.
+    field._resolved_target = {  # ty: ignore[unresolved-attribute]
+        "table": table,
+        "pk": pk,
+        "kind": kind,
+        "type_params": dict(type_params or {}),
+    }
+    return field
+
+
+def _fk_target(field: Field, strict: bool = True) -> dict[str, Any] | None:
+    """Resolve a foreign key's target table/pk/type, preferring recorded info.
+
+    A field stamped by :func:`resolved_fk` answers from its recorded target;
+    otherwise the live registry is consulted (the pre-recording behaviour).
+
+    Args:
+        field: The foreign-key field to resolve.
+        strict: Whether an unresolvable target raises (or returns ``None``).
+
+    Returns:
+        A mapping with ``table``, ``pk``, ``kind`` and ``type_params``, or
+        ``None`` when unresolvable and ``strict`` is false.
+
+    Raises:
+        KeyError: When the target model is not registered and ``strict`` is set.
+    """
+    target = getattr(field, "_resolved_target", None)
+    if target is not None:
+        return target
+    reference: str = getattr(field, "reference", "")
+    try:
+        ref = registry.get_model(reference)
+    except KeyError:
+        if not strict:
+            return None
+        raise KeyError(
+            f"cannot resolve foreign-key target {reference!r}: the model is no longer "
+            "registered. This migration predates recorded FK targets (m.resolved_fk); either "
+            "keep the target model importable or stamp the field with m.resolved_fk(...)"
+        ) from None
+    pkf = ref._meta.pk_field
+    return {
+        "table": ref._meta.table,
+        "pk": pkf.db_column,
+        "kind": pkf.field_kind,
+        "type_params": dict(pkf.type_params),
+    }
+
+
 def _field_source(field: Field) -> str:
     """Render a field as a ``fields.XxxField(...)`` constructor call.
 
     Only schema-relevant arguments are emitted, so the rebuilt field produces the
     same column spec (Python-side defaults, validators and enum types are
-    irrelevant to DDL and intentionally dropped).
+    irrelevant to DDL and intentionally dropped; **database-side** defaults are
+    part of the DDL and are emitted). Foreign keys whose target is resolvable are
+    wrapped in :func:`resolved_fk` so the migration file is registry-independent.
 
     Args:
         field: The field to render as source.
@@ -146,7 +294,14 @@ def _field_source(field: Field) -> str:
             args.append("unique=True")
         if field.index:
             args.append("index=True")
-        return f"fields.{cls}({', '.join(args)})"
+        source = f"fields.{cls}({', '.join(args)})"
+        target = _fk_target(field, strict=False)
+        if target is None:
+            return source
+        extra = [f"table={target['table']!r}", f"pk={target['pk']!r}", f"kind={target['kind']!r}"]
+        if target["type_params"]:
+            extra.append(f"type_params={target['type_params']!r}")
+        return f"m.resolved_fk({source}, {', '.join(extra)})"
 
     args = []
     if field.field_kind == "varchar":
@@ -162,6 +317,8 @@ def _field_source(field: Field) -> str:
         args.append("unique=True")
     if field.index:
         args.append("index=True")
+    if isinstance(field.default, DatabaseDefault):
+        args.append(f"default={_default_source(field.default)}")
     return f"fields.{_KIND_FIELD[field.field_kind]}({', '.join(args)})"
 
 
@@ -190,20 +347,27 @@ def _column_spec(field: Field) -> dict[str, Any]:
 
     Args:
         field: The field to describe. Foreign keys resolve to their target
-            primary key's scalar type via the model registry.
+            primary key's scalar type via the recorded target (see
+            :func:`resolved_fk`) or, failing that, the model registry.
 
     Returns:
         The column specification mapping.
     """
     if isinstance(field, ForeignKeyField):
-        pkf = registry.get_model(field.reference)._meta.pk_field
+        target = cast(dict[str, Any], _fk_target(field))
         return {
-            "kind": pkf.field_kind,
-            "type_params": dict(pkf.type_params),
+            "kind": target["kind"],
+            "type_params": dict(target["type_params"]),
             "null": field.null,
             "unique": field.unique,
             "pk": field.pk,
             "auto_increment": False,
+            "default": None,
+            "fk": {
+                "table": target["table"],
+                "pk": target["pk"],
+                "on_delete": field.on_delete,
+            },
         }
     return {
         "kind": field.field_kind,
@@ -212,6 +376,7 @@ def _column_spec(field: Field) -> dict[str, Any]:
         "unique": field.unique,
         "pk": field.pk,
         "auto_increment": field.auto_increment,
+        "default": _default_spec(field.default),
     }
 
 
@@ -226,10 +391,10 @@ def _fk_spec(field: Field) -> dict[str, Any] | None:
     """
     if not isinstance(field, ForeignKeyField):
         return None
-    ref = registry.get_model(field.reference)
+    target = cast(dict[str, Any], _fk_target(field))
     return {
-        "table": ref._meta.table,
-        "pk": ref._meta.pk_field.db_column,
+        "table": target["table"],
+        "pk": target["pk"],
         "on_delete": field.on_delete,
     }
 
@@ -389,12 +554,44 @@ def _meta_unique_together_specs(meta: Any) -> list[dict[str, Any]]:
         One unique-constraint spec per ``unique_together`` group, each with a
         generated ``name`` and the group's resolved db columns.
     """
-    specs: list[dict[str, Any]] = []
-    for group in meta.unique_together:
-        cols = [meta.resolve_writable_field(n).db_column for n in group]
-        name = f"uniq_{meta.table}_" + "_".join(cols)
-        specs.append({"kind": "unique", "name": name, "fields": cols})
-    return specs
+    groups = [[meta.resolve_writable_field(n).db_column for n in g] for g in meta.unique_together]
+    names = [_unique_together_name(meta.table, cols, groups) for cols in groups]
+    return [
+        {"kind": "unique", "name": name, "fields": cols}
+        for name, cols in zip(names, groups, strict=True)
+    ]
+
+
+#: PostgreSQL truncates identifiers beyond this many bytes, silently colliding
+#: long constraint names; generated names are kept within it.
+_MAX_IDENTIFIER = 63
+
+
+def _unique_together_name(table: str, cols: list[str], groups: list[list[str]]) -> str:
+    """Build the deterministic constraint name for one ``unique_together`` group.
+
+    The common case keeps the historical ``uniq_<table>_<col>...`` join so
+    existing deployments' constraint names still match. A hash suffix is added
+    only when that join is ambiguous — two groups like ``("a", "b_c")`` and
+    ``("a_b", "c")`` join identically — or when the name would exceed
+    PostgreSQL's 63-character identifier limit (beyond which names silently
+    truncate and collide).
+
+    Args:
+        table: The table name.
+        cols: The group's resolved db columns.
+        groups: Every group on the table (to detect join collisions).
+
+    Returns:
+        The constraint name.
+    """
+    base = f"uniq_{table}_" + "_".join(cols)
+    joined = "_".join(cols)
+    ambiguous = sum(1 for g in groups if "_".join(g) == joined) > 1
+    if not ambiguous and len(base) <= _MAX_IDENTIFIER:
+        return base
+    digest = hashlib.sha1("\x1f".join(cols).encode()).hexdigest()[:8]
+    return f"{base[: _MAX_IDENTIFIER - 9]}_{digest}"
 
 
 def _constraint_from_spec(spec: dict[str, Any]) -> Constraint:
@@ -465,7 +662,12 @@ def _new_tstate(fields: dict[str, Field], composite_pk: list[str] | None) -> dic
 
 
 def _rename_in_table(tstate: dict[str, Any], old: str, new: str) -> None:
-    """Rename a column within a table state (fields, indexes, composite pk).
+    """Rename a column within a table state (fields, indexes, pk, constraints).
+
+    Composite-index column/include lists and unique-constraint field lists
+    follow the rename so a later diff does not spuriously re-emit them. Check
+    constraints hold raw SQL and cannot be rewritten reliably; a rename of a
+    column referenced by a ``CheckConstraint`` needs a hand-written migration.
 
     Args:
         tstate: The table state to mutate in place.
@@ -475,10 +677,29 @@ def _rename_in_table(tstate: dict[str, Any], old: str, new: str) -> None:
     Returns:
         None
     """
+
+    def follow(cols: list[str]) -> list[str]:
+        """Apply the rename to a column-name list.
+
+        Args:
+            cols: The column names to rewrite.
+
+        Returns:
+            The names with ``old`` replaced by ``new``.
+        """
+        return [new if c == old else c for c in cols]
+
     tstate["fields"] = {(new if c == old else c): f for c, f in tstate["fields"].items()}
-    tstate["indexes"] = [new if c == old else c for c in tstate.get("indexes", [])]
+    tstate["indexes"] = follow(tstate.get("indexes", []))
     if tstate.get("composite_pk"):
-        tstate["composite_pk"] = [new if c == old else c for c in tstate["composite_pk"]]
+        tstate["composite_pk"] = follow(tstate["composite_pk"])
+    for spec in (tstate.get("composite_indexes") or {}).values():
+        spec["columns"] = follow(spec["columns"])
+        if spec.get("include"):
+            spec["include"] = follow(spec["include"])
+    for constraint in tstate.get("constraints") or []:
+        if constraint.get("fields"):
+            constraint["fields"] = follow(constraint["fields"])
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +1087,8 @@ class DeleteModel(Operation):
         table: str,
         fields: dict[str, Field],
         composite_pk: list[str] | None = None,
+        composite_indexes: dict[str, Any] | None = None,
+        constraints: list[Constraint] | None = None,
     ) -> None:
         """Store the table name and the field set needed to recreate it.
 
@@ -873,6 +1096,10 @@ class DeleteModel(Operation):
             table: Name of the table to drop.
             fields: Mapping of column name to field, used to recreate on reverse.
             composite_pk: Column names forming a composite primary key, if any.
+            composite_indexes: The table's composite-index specs, kept so a
+                reverse (recreate) restores them instead of silently dropping
+                ``Meta.indexes``.
+            constraints: The table's named constraints, kept for the reverse.
 
         Returns:
             None
@@ -880,6 +1107,8 @@ class DeleteModel(Operation):
         self.table = table
         self.fields = fields
         self.composite_pk = composite_pk
+        self.composite_indexes = dict(composite_indexes or {})
+        self.constraints: list[Constraint] = list(constraints or [])
 
     def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
         """Render the ``DROP TABLE`` statements.
@@ -903,7 +1132,14 @@ class DeleteModel(Operation):
         Returns:
             The SQL statements that recreate the table.
         """
-        spec = _tspec({"fields": self.fields, "composite_pk": self.composite_pk})
+        spec = _tspec(
+            {
+                "fields": self.fields,
+                "composite_pk": self.composite_pk,
+                "composite_indexes": self.composite_indexes,
+                "constraints": [c.to_spec() for c in self.constraints],
+            }
+        )
         return dialect.render_create_table(self.table, spec, safe=False)
 
     def apply_state(self, state: dict[str, Any]) -> None:
@@ -926,7 +1162,10 @@ class DeleteModel(Operation):
         Returns:
             None
         """
-        state["tables"][self.table] = _new_tstate(self.fields, self.composite_pk)
+        tstate = _new_tstate(self.fields, self.composite_pk)
+        tstate["composite_indexes"] = dict(self.composite_indexes)
+        tstate["constraints"] = [c.to_spec() for c in self.constraints]
+        state["tables"][self.table] = tstate
 
     def to_source(self) -> str:
         """Render this operation as Python source for a migration file.
@@ -937,6 +1176,11 @@ class DeleteModel(Operation):
         args = [repr(self.table), f"fields={_fields_source(self.fields, 8)}"]
         if self.composite_pk:
             args.append(f"composite_pk={self.composite_pk!r}")
+        if self.composite_indexes:
+            args.append(f"composite_indexes={self.composite_indexes!r}")
+        if self.constraints:
+            cons_src = ", ".join(c.to_source() for c in self.constraints)
+            args.append(f"constraints=[{cons_src}]")
         return _call(f"m.{type(self).__name__}", args)
 
 
@@ -1082,7 +1326,15 @@ class AlterField(Operation):
         tstate = state["tables"][self.table]
         post_fields = dict(tstate["fields"])
         post_fields[self.name] = new
-        post_spec = _tspec({"fields": post_fields, "composite_pk": tstate.get("composite_pk")})
+        post_spec = _tspec(
+            {
+                "fields": post_fields,
+                "composite_pk": tstate.get("composite_pk"),
+                "indexes": tstate.get("indexes"),
+                "composite_indexes": tstate.get("composite_indexes"),
+                "constraints": tstate.get("constraints"),
+            }
+        )
         return dialect.render_alter_column(
             self.table, self.name, _column_spec(old), _column_spec(new), post_spec
         )
@@ -1624,7 +1876,12 @@ class RenameIndex(Operation):
 
 # -- constraint operations (hand-written; SQLite raises UnSupportedError) ----
 class _ConstraintOp(_ReversibleOp):
-    """Shared add/drop primitives for :class:`AddConstraint`/:class:`RemoveConstraint`."""
+    """Shared add/drop primitives for :class:`AddConstraint`/:class:`RemoveConstraint`.
+
+    On dialects without ``ALTER TABLE ... ADD/DROP CONSTRAINT`` (SQLite) the
+    operation falls back to a full table rebuild carrying the post-change
+    constraint set, using the table state replayed from prior migrations.
+    """
 
     def __init__(self, table: str, constraint: Constraint) -> None:
         """Store the table and the constraint definition.
@@ -1639,6 +1896,62 @@ class _ConstraintOp(_ReversibleOp):
         """
         self.table = table
         self.constraint = constraint
+
+    def forward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the forward SQL, rebuilding the table on SQLite.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (used for the rebuild fallback).
+
+        Returns:
+            The SQL statements that apply the operation.
+        """
+        if not dialect.alter_constraint_in_place:
+            return self._rebuild_sql(dialect, state, adding=not self._reverse)
+        return super().forward_sql(dialect, state)
+
+    def backward_sql(self, dialect: BaseDialect, state: dict[str, Any]) -> list[str]:
+        """Render the reverse SQL, rebuilding the table on SQLite.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (used for the rebuild fallback).
+
+        Returns:
+            The SQL statements that revert the operation.
+        """
+        if not dialect.alter_constraint_in_place:
+            return self._rebuild_sql(dialect, state, adding=self._reverse)
+        return super().backward_sql(dialect, state)
+
+    def _rebuild_sql(self, dialect: BaseDialect, state: dict[str, Any], adding: bool) -> list[str]:
+        """Render a table rebuild whose constraint set includes/omits this one.
+
+        Args:
+            dialect: Active dialect used to render SQL.
+            state: Current schema state (must contain the table).
+            adding: Whether the rebuilt table carries the constraint.
+
+        Raises:
+            UnSupportedError: When the table is unknown to the migration state
+                (e.g. it was created via ``RunSQL``), so no rebuild spec exists.
+
+        Returns:
+            The SQL statements rebuilding the table.
+        """
+        tstate = state["tables"].get(self.table)
+        if tstate is None:
+            raise UnSupportedError(
+                f"{dialect.name} cannot ALTER constraints in place and table {self.table!r} "
+                "is not tracked by the migration state; rebuild the table via RunSQL"
+            )
+        spec = self.constraint.to_spec()
+        constraints = [c for c in tstate.get("constraints", []) if c.get("name") != spec["name"]]
+        if adding:
+            constraints.append(spec)
+        table_spec = _tspec({**tstate, "constraints": constraints})
+        return dialect.render_rebuild_table(self.table, table_spec)
 
     def _do_sql(self, dialect: BaseDialect, safe: bool) -> list[str]:
         """Render the add-constraint statements.
@@ -1991,10 +2304,11 @@ def _alterable(old: dict[str, Any], new: dict[str, Any]) -> bool:
         new: The column spec after the change.
 
     Returns:
-        ``True`` if the column's type or nullability changed.
+        ``True`` if the column's type, nullability, uniqueness, database
+        default or foreign-key target/action changed.
     """
-    keys = ("kind", "type_params", "null")
-    return any(old[k] != new[k] for k in keys)
+    keys = ("kind", "type_params", "null", "unique", "default", "fk")
+    return any(old.get(k) != new.get(k) for k in keys)
 
 
 def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[Operation]:
@@ -2039,7 +2353,7 @@ def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[Operation]:
 
         # A column that disappears while an identical one appears is treated as a
         # rename (RENAME COLUMN), not a destructive drop+add that would lose data.
-        renames = _detect_renames(old_cols, new_cols, old_fks, new_fks)
+        renames = _detect_renames(table, old_cols, new_cols, old_fks, new_fks)
         renamed_old = {old_name for old_name, _ in renames}
         renamed_new = {new_name for _, new_name in renames}
 
@@ -2066,26 +2380,38 @@ def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[Operation]:
 
     for table in reversed(_topo_order([t for t in old_t if t not in new_t], old_specs)):
         ts = old_t[table]
-        ops.append(DeleteModelIfExists(table, ts["fields"], ts.get("composite_pk")))
+        ops.append(
+            DeleteModelIfExists(
+                table,
+                ts["fields"],
+                ts.get("composite_pk"),
+                composite_indexes=ts.get("composite_indexes") or None,
+                constraints=[_constraint_from_spec(c) for c in ts.get("constraints", [])] or None,
+            )
+        )
 
     return ops
 
 
 def _detect_renames(
+    table: str,
     old_cols: dict[str, Any],
     new_cols: dict[str, Any],
     old_fks: dict[str, Any],
     new_fks: dict[str, Any],
 ) -> list[tuple[str, str]]:
-    """Pair dropped columns with added ones that have an identical definition.
+    """Pair a dropped column with an added one of identical definition.
 
     A pair is only formed when the column spec **and** foreign-key spec match
     exactly, so a column whose type also changed is not mistaken for a rename
-    (it falls back to drop+add). Matching is greedy in sorted order; ambiguous
-    same-spec columns pair arbitrarily, which is harmless since they are
-    interchangeable.
+    (it falls back to drop+add). Pairing is deliberately conservative: a
+    dropped column is only matched when exactly one added column shares its
+    definition *and* no other dropped column does — an ambiguous set (e.g. two
+    same-typed columns renamed at once) is emitted as drop+add with a hint,
+    because guessing wrong would silently swap data between columns.
 
     Args:
+        table: The table being diffed (for the ambiguity hint).
         old_cols: Column specs before the change.
         new_cols: Column specs after the change.
         old_fks: Foreign-key specs before the change.
@@ -2094,18 +2420,38 @@ def _detect_renames(
     Returns:
         A list of ``(old_name, new_name)`` rename pairs.
     """
-    removed = [c for c in old_cols if c not in new_cols]
-    added_sorted = sorted(c for c in new_cols if c not in old_cols)
+
+    def same(r: str, a: str) -> bool:
+        """Report whether a dropped and an added column have identical specs.
+
+        Args:
+            r: The dropped column name.
+            a: The added column name.
+
+        Returns:
+            ``True`` when the column and foreign-key specs match exactly.
+        """
+        return old_cols[r] == new_cols[a] and old_fks.get(r) == new_fks.get(a)
+
+    removed = sorted(c for c in old_cols if c not in new_cols)
+    added = sorted(c for c in new_cols if c not in old_cols)
     pairs: list[tuple[str, str]] = []
-    taken: set[str] = set()
-    for r in sorted(removed):
-        for a in added_sorted:
-            if a in taken:
-                continue
-            if old_cols[r] == new_cols[a] and old_fks.get(r) == new_fks.get(a):
-                pairs.append((r, a))
-                taken.add(a)
-                break
+    ambiguous = False
+    for r in removed:
+        matches = [a for a in added if same(r, a)]
+        if not matches:
+            continue
+        if len(matches) > 1 or any(r2 != r and same(r2, matches[0]) for r2 in removed):
+            ambiguous = True
+            continue
+        pairs.append((r, matches[0]))
+    if ambiguous:
+        print(
+            f"hint: table {table!r} drops and adds several columns with identical definitions; "
+            "emitting drop+add. If these are renames, hand-write m.RenameField(...) operations "
+            "to preserve the data.",
+            file=sys.stderr,
+        )
     return pairs
 
 
@@ -2185,6 +2531,50 @@ def _diff_constraints(
     return ops
 
 
+def _table_recreate_warnings(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Warn when a diff drops a table and creates an identically-shaped one.
+
+    That pattern is what a bare ``Meta.table`` rename diffs to, and applying it
+    destroys the table's data (``DROP ... CASCADE`` on PostgreSQL). The pair is
+    still written — the drop may be intentional — but with a prominent warning
+    suggesting ``RenameModel``.
+
+    Args:
+        old: Previous schema state.
+        new: Target schema state.
+
+    Returns:
+        One warning message per same-shape drop+create table pair.
+    """
+
+    def shape(tstate: dict[str, Any]) -> tuple[Any, ...]:
+        """Reduce a table state to its comparable column/key shape.
+
+        Args:
+            tstate: The table state to reduce.
+
+        Returns:
+            A tuple of the spec parts that identify the table's structure.
+        """
+        spec = _tspec(tstate)
+        return (spec["columns"], spec["pk"], spec["fks"], spec.get("composite_pk"))
+
+    dropped = [t for t in old["tables"] if t not in new["tables"]]
+    created = [t for t in new["tables"] if t not in old["tables"]]
+    warnings = []
+    for old_table in dropped:
+        old_shape = shape(old["tables"][old_table])
+        for new_table in created:
+            if shape(new["tables"][new_table]) == old_shape:
+                warnings.append(
+                    f"table {old_table!r} is dropped while {new_table!r} is created with an "
+                    "identical definition; applying this migration DESTROYS the table's data. "
+                    f"If this is a Meta.table rename, replace the DeleteModel/CreateModel pair "
+                    f"with m.RenameModel({old_table!r}, {new_table!r})."
+                )
+    return warnings
+
+
 # ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
@@ -2221,7 +2611,9 @@ class MigrationManager:
         if not self.directory.exists():
             return []
         files = [p for p in self.directory.iterdir() if _FILENAME_RE.match(p.name)]
-        return sorted(files, key=lambda p: _file_number(p.name))
+        # The full name breaks number ties (e.g. two 0002_* files from a branch
+        # merge), so their relative order is at least deterministic.
+        return sorted(files, key=lambda p: (_file_number(p.name), p.name))
 
     @staticmethod
     def _load_module(path: Path) -> ModuleType:
@@ -2243,6 +2635,15 @@ class MigrationManager:
     def _load_all(self, files: list[Path] | None = None) -> list[tuple[str, type[Migration]]]:
         """Import every migration file in order and return its ``Migration``.
 
+        Sanity-checks the set on load and warns (stderr) about duplicate
+        numeric prefixes, unknown declared dependencies, and dependencies that
+        sort after their dependant. These are warnings, not errors: existing
+        directories legitimately contain such sets (e.g. two files sharing a
+        number after a branch merge, long since applied), and refusing to load
+        would block every command — including generating the fixing migration.
+        Ties in the numeric order are broken by file name, so the run order is
+        deterministic either way.
+
         Args:
             files: Pre-listed migration files to import, so a caller that already
                 scanned the directory does not scan it again. Defaults to
@@ -2252,7 +2653,33 @@ class MigrationManager:
             Pairs of migration name and its ``Migration`` class.
         """
         files = self._migration_files() if files is None else files
-        return [(p.stem, self._load_module(p).Migration) for p in files]
+        by_number: dict[int, str] = {}
+        for path in files:
+            number = _file_number(path.name)
+            if number in by_number:
+                print(
+                    f"WARNING: duplicate migration number {number:04d}: "
+                    f"{by_number[number]!r} and {path.name!r} (they run in name order; "
+                    "consider renumbering)",
+                    file=sys.stderr,
+                )
+            by_number[number] = path.name
+        loaded = [(p.stem, self._load_module(p).Migration) for p in files]
+        position = {name: i for i, (name, _) in enumerate(loaded)}
+        for i, (name, migration) in enumerate(loaded):
+            for dep in migration.dependencies:
+                if dep not in position:
+                    print(
+                        f"WARNING: migration {name!r} depends on unknown migration {dep!r}",
+                        file=sys.stderr,
+                    )
+                elif position[dep] >= i:
+                    print(
+                        f"WARNING: migration {name!r} depends on {dep!r}, which runs after it "
+                        "(migrations apply in numeric order)",
+                        file=sys.stderr,
+                    )
+        return loaded
 
     def _next_number(self, files: list[Path] | None = None) -> int:
         """Compute the next migration number.
@@ -2305,12 +2732,22 @@ class MigrationManager:
         if not init_py.exists():
             init_py.write_text("")
 
-    def make_migrations(self, name: str | None = None, empty: bool = False) -> str | None:
+    def make_migrations(
+        self, name: str | None = None, empty: bool = False, allow_destructive: bool = False
+    ) -> str | None:
         """Write a new migration from the model diff (or an empty one).
 
         Args:
             name: Optional label for the migration file.
             empty: When True, write a migration with no operations.
+            allow_destructive: Permit a diff that drops **every** recorded
+                table. Without it such a diff aborts, since it almost always
+                means the model modules were not imported (an empty registry
+                diffs to a drop of the whole schema).
+
+        Raises:
+            ConfigurationError: When the diff would drop every recorded table
+                and ``allow_destructive`` is not set.
 
         Returns:
             The new migration filename, or None when there are no changes.
@@ -2318,18 +2755,35 @@ class MigrationManager:
         self.init()
         files = self._migration_files()  # single directory scan, reused below
         recorded = self._replay(loaded=self._load_all(files))
-        operations = [] if empty else diff_states(recorded, model_state(self.models))
+        target = model_state(self.models)
+        operations = [] if empty else diff_states(recorded, target)
         if not operations and not empty:
             return None
+        if not empty and not allow_destructive:
+            kept = set(recorded["tables"]) & set(target["tables"])
+            if recorded["tables"] and not kept:
+                raise ConfigurationError(
+                    f"refusing to write a migration that drops every recorded table "
+                    f"({len(recorded['tables'])} tables). This usually means no models were "
+                    "imported — pass --models <module> (or models=[...]). Use "
+                    "--allow-destructive / allow_destructive=True to override."
+                )
+        warnings = [] if empty else _table_recreate_warnings(recorded, target)
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
         number = self._next_number(files)
         label = name or ("initial" if not files else "auto")
         filename = f"{number:04d}_{label}.py"
         dependencies = [files[-1].stem] if files else []
-        self._write_migration(filename, dependencies, operations)
+        self._write_migration(filename, dependencies, operations, warnings)
         return filename
 
     def _write_migration(
-        self, filename: str, dependencies: list[str], operations: list[Operation]
+        self,
+        filename: str,
+        dependencies: list[str],
+        operations: list[Operation],
+        warnings: list[str] | None = None,
     ) -> None:
         """Render and write a ``class Migration`` file to disk.
 
@@ -2337,20 +2791,31 @@ class MigrationManager:
             filename: Name of the migration file to create.
             dependencies: Names of migrations this one depends on.
             operations: Operations to serialise into the file.
+            warnings: Autodetector warnings, written as prominent comments at
+                the top of the file so a destructive diff is reviewed before it
+                is applied.
 
         Returns:
             None
         """
-        lines = [
+        sources = [op.to_source() for op in operations]
+        lines = []
+        if any("db_defaults." in source for source in sources):
+            lines.append("from yara_orm import db_defaults\n")
+        lines += [
             "from yara_orm import fields\n",
             "from yara_orm import migrations as m\n",
+        ]
+        for warning in warnings or []:
+            lines.append(f"\n# WARNING: {warning}")
+        lines += [
             "\n\nclass Migration(m.Migration):\n",
             "    atomic = True\n",
             f"    dependencies = {dependencies!r}\n",
             "    operations = [\n" if operations else "    operations = []\n",
         ]
-        for op in operations:
-            lines.append(f"        {op.to_source()},\n")
+        for source in sources:
+            lines.append(f"        {source},\n")
         if operations:
             lines.append("    ]\n")
         (self.directory / filename).write_text("".join(lines))
@@ -2443,7 +2908,12 @@ class MigrationManager:
         """Apply pending migrations up to an optional target, recording each.
 
         Args:
-            target: Migration name to stop after, or None to apply all.
+            target: Migration to stop after — a full name (``0002_auto``) or a
+                numeric prefix (``0002``/``2``) — or None to apply all.
+
+        Raises:
+            KeyError: When ``target`` matches no known migration (nothing is
+                applied in that case).
 
         Returns:
             The names of the migrations applied.
@@ -2451,6 +2921,8 @@ class MigrationManager:
         applied = await self._applied()
         dialect = get_dialect()
         loaded = self._load_all()  # imported once; reused for state replay + apply
+        if target is not None:
+            target = _resolve_target(target, [n for n, _ in loaded])
         state = self._replay(set(applied), loaded)
         table = dialect.quote(MIGRATION_TABLE)
         cols = ", ".join(dialect.quote(c) for c in ("app", "name", "applied_at"))
@@ -2465,8 +2937,7 @@ class MigrationManager:
                 for op in migration.operations:
                     if isinstance(op, RunPython):
                         await op.run_forward()
-                    for sql in op.forward_sql(dialect, state):
-                        await engine.execute(sql)
+                    await _apply_op_sql(engine, op.forward_sql(dialect, state), migration.atomic)
                     op.apply_state(state)
                 await engine.execute(insert_sql, [self.app, name, datetime.now(timezone.utc)])
             done.append(name)
@@ -2479,7 +2950,12 @@ class MigrationManager:
 
         Args:
             steps: Number of most-recent migrations to revert.
-            target: Migration name to revert down to, taking precedence.
+            target: Migration to revert down to (kept applied), taking
+                precedence — a full name or a numeric prefix, as in ``upgrade``.
+
+        Raises:
+            KeyError: When ``target`` matches no known migration (nothing is
+                reverted in that case).
 
         Returns:
             The names of the migrations reverted.
@@ -2489,6 +2965,7 @@ class MigrationManager:
         migrations = dict(loaded)
         state = self._replay(set(applied), loaded)
         if target is not None:
+            target = _resolve_target(target, [n for n, _ in loaded])
             to_revert = [n for n in applied if _num(n) > _num(target)]
         else:
             to_revert = applied[-steps:] if steps > 0 else []
@@ -2501,8 +2978,7 @@ class MigrationManager:
                 for op in reversed(migration.operations):
                     if isinstance(op, RunPython):
                         await op.run_backward()
-                    for sql in op.backward_sql(dialect, state):
-                        await engine.execute(sql)
+                    await _apply_op_sql(engine, op.backward_sql(dialect, state), migration.atomic)
                     op.revert_state(state)
                 await engine.execute(
                     f"DELETE FROM {dialect.quote(MIGRATION_TABLE)} "
@@ -2574,6 +3050,98 @@ class MigrationManager:
                 out.extend(op.forward_sql(dialect, state))
                 op.apply_state(state)
         return out
+
+
+async def _apply_op_sql(engine: Any, sqls: list[str], atomic: bool) -> None:
+    """Execute one operation's statements, honouring out-of-transaction pragmas.
+
+    SQLite's table rebuild brackets its statements with ``PRAGMA foreign_keys``
+    toggles (see :meth:`SqliteDialect.render_rebuild_table`), and that pragma is
+    a silent no-op inside a transaction. A non-atomic migration therefore wraps
+    such an operation in its own transaction (pinning one pooled connection, as
+    the pragma is per-connection); the pinned runner then closes and reopens the
+    transaction around each pragma so it actually takes effect.
+
+    Args:
+        engine: The executor to run statements on (pinned transaction wrapper
+            for atomic migrations, pooled proxy otherwise).
+        sqls: The operation's SQL statements.
+        atomic: Whether the caller already runs inside a pinned transaction.
+
+    Returns:
+        None
+    """
+    if atomic or not any(sql in (PRAGMA_FK_OFF, PRAGMA_FK_ON) for sql in sqls):
+        await _run_op_sql(engine, sqls, in_txn=atomic)
+        return
+    async with in_transaction():
+        await _run_op_sql(get_executor(), sqls, in_txn=True)
+
+
+async def _run_op_sql(engine: Any, sqls: list[str], in_txn: bool) -> None:
+    """Run statements, hoisting ``PRAGMA foreign_keys`` out of the transaction.
+
+    Inside a pinned transaction the pragma is executed between a ``COMMIT`` and
+    a fresh ``BEGIN`` on the same connection — the standard SQLite rebuild
+    recipe (enforcement off outside the transaction, rebuild inside). On a
+    failure after enforcement was switched off, the transaction is rolled back
+    and enforcement restored before re-raising, so the pooled connection is
+    never returned with foreign keys disabled.
+
+    Args:
+        engine: The executor to run statements on.
+        sqls: The SQL statements to execute in order.
+        in_txn: Whether ``engine`` is a pinned, open transaction.
+
+    Returns:
+        None
+    """
+    fk_off = False
+    try:
+        for sql in sqls:
+            if sql in (PRAGMA_FK_OFF, PRAGMA_FK_ON) and in_txn:
+                await engine.execute("COMMIT")
+                await engine.execute(sql)
+                await engine.execute("BEGIN")
+            else:
+                await engine.execute(sql)
+            if sql in (PRAGMA_FK_OFF, PRAGMA_FK_ON):
+                fk_off = sql == PRAGMA_FK_OFF
+    except BaseException:
+        if fk_off:
+            if in_txn:
+                await engine.execute("ROLLBACK")
+                await engine.execute(PRAGMA_FK_ON)
+                await engine.execute("BEGIN")
+            else:
+                await engine.execute(PRAGMA_FK_ON)
+        raise
+
+
+def _resolve_target(target: str, names: list[str]) -> str:
+    """Resolve an upgrade/downgrade target to a known migration name.
+
+    Accepts a full migration name (``0002_auto``) or a bare numeric prefix
+    (``0002`` / ``2``), the same forms in both directions.
+
+    Args:
+        target: The requested target.
+        names: The known migration names, in order.
+
+    Raises:
+        KeyError: When the target matches no known migration.
+
+    Returns:
+        The matching migration name.
+    """
+    if target in names:
+        return target
+    if target.isdigit():
+        matches = [n for n in names if _num(n) == int(target)]
+        if len(matches) == 1:
+            return matches[0]
+    available = ", ".join(names) if names else "(none)"
+    raise KeyError(f"unknown migration target {target!r}; available: {available}")
 
 
 def _num(name: str) -> int:

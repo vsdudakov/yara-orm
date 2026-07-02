@@ -413,11 +413,12 @@ def test_meta_index_over_relation_name():
         GenChild._meta.indexes = []
 
 
-def test_simultaneous_column_renames_detected():
+def test_simultaneous_column_renames_fall_back_to_drop_add():
     """
-    GIVEN two columns of identical type renamed at once
+    GIVEN two columns of identical type renamed at once (ambiguous pairing)
     WHEN the diff runs
-    THEN both are detected as RenameField (greedy one-to-one pairing)
+    THEN no RenameField is guessed (a wrong pair would swap data between
+         columns); the diff conservatively emits drop+add instead
     """
     before = model_state([GenParent, GenChild])
     _detach_field(GenChild, "a")
@@ -425,9 +426,9 @@ def test_simultaneous_column_renames_detected():
     _attach_field(GenChild, "x", fields.CharField(max_length=10))
     _attach_field(GenChild, "y", fields.CharField(max_length=10))
     try:
-        ops = diff_states(before, model_state([GenParent, GenChild]))
-        renamed = {(o.old, o.new) for o in ops if type(o).__name__ == "RenameField"}
-        assert renamed == {("a", "x"), ("b", "y")}
+        ops = set(_op_names(diff_states(before, model_state([GenParent, GenChild]))))
+        assert "RenameField" not in ops
+        assert {"RemoveFieldIfExists", "AddFieldIfNotExists"} <= ops
     finally:
         _detach_field(GenChild, "x")
         _detach_field(GenChild, "y")
