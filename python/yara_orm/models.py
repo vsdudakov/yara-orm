@@ -29,7 +29,7 @@ from .relations import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Callable, Generator, Sequence
 
     from typing_extensions import Self
 
@@ -193,6 +193,16 @@ class MetaInfo:
         self.db_default_fields = [
             f for f in self.field_list if isinstance(f.default, DatabaseDefault)
         ]
+        # Memoised SELECTs for the ``Model.get``/``get_or_none`` fast path
+        # (:meth:`Model._simple_equality_rows`), keyed by (dialect name, kwarg
+        # names in call order, which values are NULL, limit) — each maps to a
+        # fixed statement plus the ``to_db`` binder per non-NULL value. Rebuilt
+        # here alongside the decode plan, so a field-set change that forces a
+        # recompile (``_compiled_for`` reset) also drops the stale SQL.
+        self._simple_lookup_cache: dict[
+            tuple[str, tuple[str, ...], tuple[bool, ...], int],
+            tuple[str, list[Callable[[Any], Any]]],
+        ] = {}
 
     @property
     def db_table(self) -> str:
@@ -496,6 +506,32 @@ def _normalize_indexes(value: Any) -> list[Index]:
     return out
 
 
+def _setattr_unmark_db_default(self: Model, name: str, value: Any, /) -> None:
+    """Set the attribute, un-marking a pending database-default column.
+
+    An explicit assignment — including ``None`` — makes the in-memory value
+    authoritative again, so the next full ``save()`` writes it instead of
+    skipping the column as never-fetched.
+
+    Installed as ``__setattr__`` by the metaclass *only* on models that
+    declare a ``DatabaseDefault`` column; every other model keeps the plain
+    ``object.__setattr__`` (an override is ~20x slower and fires on every
+    attribute write, including each field assignment in ``__init__``).
+
+    Args:
+        self: The model instance being mutated.
+        name: The attribute name being assigned.
+        value: The value to assign.
+
+    Returns:
+        None
+    """
+    unfetched = self.__dict__.get("_unfetched_db_defaults")
+    if unfetched:
+        unfetched.discard(name)
+    object.__setattr__(self, name, value)
+
+
 class ModelMeta(type):
     """Metaclass that collects fields and installs relation descriptors."""
 
@@ -618,6 +654,15 @@ class ModelMeta(type):
             constraints=constraints,
         )
 
+        # Only a model with database-default columns needs the ``__setattr__``
+        # override that un-marks never-fetched columns on explicit assignment;
+        # installing it per class keeps plain models on ``object.__setattr__``.
+        # ``db_default_fields`` includes inherited fields (merged above), so a
+        # subclass of a db-default model gets the override too. A class body
+        # declaring its own ``__setattr__`` wins, as it would have via the MRO.
+        if cls._meta.db_default_fields and "__setattr__" not in namespace:
+            cls.__setattr__ = _setattr_unmark_db_default  # ty: ignore[invalid-assignment]
+
         # Additional Meta options are recorded (not silently dropped) so they
         # are introspectable via `_meta` / `describe()`. `default_connection`
         # also routes the model's statements (see connection._route); `schema`,
@@ -702,7 +747,13 @@ class Model(metaclass=ModelMeta):
         Returns:
             None
         """
-        self._in_db = False
+        # Field values land in ``__dict__`` directly: fields are non-data
+        # descriptors (instance ``__dict__`` wins attribute lookup), no
+        # ``_unfetched_db_defaults`` mark can exist during ``__init__`` (it is
+        # set only after an INSERT), and a per-write ``setattr`` — potentially
+        # through the db-default ``__setattr__`` override — costs ~20x more.
+        d = self.__dict__
+        d["_in_db"] = False
         meta = self._meta
         # Relation objects (e.g. tournament=<Tournament>) resolve to their id.
         rel_overrides = {}
@@ -726,7 +777,7 @@ class Model(metaclass=ModelMeta):
             # Normalise loose input (e.g. an ISO string for a date column) to the
             # field's canonical Python type, so the in-memory attribute matches a
             # fetched row (``create(created_at="...").created_at`` is a datetime).
-            setattr(self, name, field.to_python_value(value))
+            d[name] = field.to_python_value(value)
 
         for rel_name, (info, value) in rel_overrides.items():
             if value is None:
@@ -851,24 +902,9 @@ class Model(metaclass=ModelMeta):
             raise TypeError("Model instances without a primary key are unhashable")
         return hash((type(self), pk))
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        """Set the attribute, un-marking a pending database-default column.
-
-        An explicit assignment — including ``None`` — makes the in-memory value
-        authoritative again, so the next full ``save()`` writes it instead of
-        skipping the column as never-fetched.
-
-        Args:
-            name: The attribute name being assigned.
-            value: The value to assign.
-
-        Returns:
-            None
-        """
-        unfetched = self.__dict__.get("_unfetched_db_defaults")
-        if unfetched:
-            unfetched.discard(name)
-        super().__setattr__(name, value)
+    # NOTE: models with database-default columns get a ``__setattr__`` override
+    # (:func:`_setattr_unmark_db_default`) installed by the metaclass; every
+    # other model keeps ``object.__setattr__`` for plain attribute-write speed.
 
     def _mark_unfetched_db_defaults(self) -> None:
         """Record which database-default columns hold a never-fetched ``None``.
@@ -1561,31 +1597,44 @@ class Model(metaclass=ModelMeta):
         dialect = get_dialect(cls)
         engine = get_executor(cls)
         meta.compile(dialect)
-        clauses = []
-        params = []
-        idx = 1
-        for key, value in kwargs.items():
-            field = meta.get_field(key)
-            if value is None:
-                # ``field=None`` is NULL identity, not ``col = NULL`` (always
-                # UNKNOWN); mirror the QuerySet builder so get()/get_or_create
-                # match existing NULL rows instead of inserting duplicates.
-                clauses.append(f"{dialect.quote(field.db_column)} IS NULL")
-                continue
-            clauses.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
-            params.append(field.to_db(value))
-            idx += 1
-        # Honour ``Meta.ordering`` like the QuerySet fallback path does, so a
-        # multi-match lookup (``get_or_none``) picks the same deterministic row
-        # on either path instead of an arbitrary one.
-        order = ""
-        if meta.ordering:
-            parts = [
-                f"{dialect.quote(meta.get_field(name).db_column)} {'DESC' if desc else 'ASC'}"
-                for name, desc in meta.ordering
-            ]
-            order = f" ORDER BY {', '.join(parts)}"
-        sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)}{order} LIMIT {limit}"
+        # The rendered SELECT depends only on the kwarg names (in call order),
+        # which of the values are NULL, the dialect and the limit — memoise it
+        # (with the per-value ``to_db`` binders) so repeated lookups of the
+        # same shape skip re-quoting/re-rendering the identical statement.
+        cache_key = (dialect.name, tuple(kwargs), tuple(v is None for v in kwargs.values()), limit)
+        cached = meta._simple_lookup_cache.get(cache_key)
+        if cached is None:
+            clauses = []
+            converters: list[Callable[[Any], Any]] = []
+            idx = 1
+            for key, value in kwargs.items():
+                field = meta.get_field(key)
+                if value is None:
+                    # ``field=None`` is NULL identity, not ``col = NULL`` (always
+                    # UNKNOWN); mirror the QuerySet builder so get()/get_or_create
+                    # match existing NULL rows instead of inserting duplicates.
+                    clauses.append(f"{dialect.quote(field.db_column)} IS NULL")
+                    continue
+                clauses.append(f"{dialect.quote(field.db_column)} = {dialect.placeholder(idx)}")
+                converters.append(field.to_db)
+                idx += 1
+            # Honour ``Meta.ordering`` like the QuerySet fallback path does, so a
+            # multi-match lookup (``get_or_none``) picks the same deterministic row
+            # on either path instead of an arbitrary one.
+            order = ""
+            if meta.ordering:
+                parts = [
+                    f"{dialect.quote(meta.get_field(name).db_column)} {'DESC' if desc else 'ASC'}"
+                    for name, desc in meta.ordering
+                ]
+                order = f" ORDER BY {', '.join(parts)}"
+            sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)}{order} LIMIT {limit}"
+            cached = meta._simple_lookup_cache[cache_key] = (sql, converters)
+        sql, converters = cached
+        params = [
+            to_db(value)
+            for to_db, value in zip(converters, (v for v in kwargs.values() if v is not None))
+        ]
         return await engine.fetch_rows(sql, params)
 
     @classmethod
@@ -1607,7 +1656,11 @@ class Model(metaclass=ModelMeta):
         """
         if using_db is not None:
             return QuerySetSingle(cls.filter(**kwargs).using_db(using_db), _resolve_get)
-        return QuerySetSingle(cls.filter(**kwargs), _resolve_get, fast=lambda: cls._get_one(kwargs))
+        # The queryset is passed as a factory: the fast path resolves without
+        # ever building it, so its cost is paid only when the caller chains.
+        return QuerySetSingle(
+            lambda: cls.filter(**kwargs), _resolve_get, fast=lambda: cls._get_one(kwargs)
+        )
 
     @classmethod
     async def _get_one(cls, kwargs: dict[str, Any]) -> Self:
@@ -1991,6 +2044,13 @@ class Model(metaclass=ModelMeta):
         else:
             groups = {(): objects}
 
+        # ``auto_now``/``auto_now_add`` columns share one timestamp for the whole
+        # call (one ``now()`` instead of one per field per object) — all rows of
+        # a batch are inserted together, so a single creation instant is also
+        # the more faithful value.
+        auto_now_fields = meta.auto_now_fields
+        now = _tz.now() if auto_now_fields else None
+
         for sig, group in groups.items():
             insert_fields = base_fields + [meta.fields[name] for name in sig]
             ncols = len(insert_fields)
@@ -2040,8 +2100,11 @@ class Model(metaclass=ModelMeta):
                     f"VALUES {values_clause(nrows)}{conflict_sql}{ret}"
                 )
 
-            # Pre-build the statement shared by every full-size batch.
+            # Pre-build the statement shared by every full-size batch, and
+            # resolve the per-column binder/attribute pairs once per group
+            # instead of two attribute lookups per column per row.
             full_sql = build_sql(size) if len(group) >= size else None
+            bind_plan = [(f.to_db, f.model_field_name) for f in insert_fields]
 
             for start in range(0, len(group), size):
                 batch = group[start : start + size]
@@ -2049,10 +2112,24 @@ class Model(metaclass=ModelMeta):
                 # (len(batch) == size implies len(group) >= size).
                 sql = cast("str", full_sql) if len(batch) == size else build_sql(len(batch))
                 params: list = []
+                append = params.append
                 for obj in batch:
-                    obj._apply_auto_now()
-                    for field in insert_fields:
-                        params.append(field.to_db(getattr(obj, field.model_field_name, None)))
+                    if auto_now_fields:
+                        # Inline ``_apply_auto_now`` with the shared ``now`` and
+                        # direct ``__dict__`` writes; discard any unfetched-mark
+                        # first (mirroring the ``__setattr__`` override).
+                        d = obj.__dict__
+                        unfetched = d.get("_unfetched_db_defaults")
+                        in_db = obj._in_db
+                        for fname, f in auto_now_fields:
+                            # Same rule as ``_apply_auto_now``: an already-
+                            # persisted row never gets its add-stamp rewritten.
+                            if not (f.auto_now_add and in_db):
+                                if unfetched:
+                                    unfetched.discard(fname)
+                                d[fname] = now
+                    for to_db, attr in bind_plan:
+                        append(to_db(getattr(obj, attr, None)))
                 if upsert:
                     await engine.execute(sql, params)
                     continue
