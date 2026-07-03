@@ -25,15 +25,15 @@ PostgreSQL 18, Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower is bet
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
 |---------------|---------:|---------:|-----------:|------:|
-| bulk_insert   |     18.5 |     24.7 |       72.5 | 223.4 |
-| single_insert |     33.7 |     82.7 |      157.7 |  61.0 |
-| fetch_all     |      3.8 |     17.5 |       23.2 |  35.7 |
-| count         |      0.3 |      0.6 |        1.0 |   0.5 |
-| group_by      |      0.8 |      1.1 |        1.6 |   2.4 |
-| filter        |      2.3 |      9.3 |        8.2 |  17.8 |
-| get_by_pk     |     65.8 |    204.4 |      306.9 |  84.6 |
-| update        |      3.4 |      3.7 |        4.1 | 120.7 |
-| delete        |      0.7 |      0.9 |        1.1 |  95.1 |
+| bulk_insert   |     14.7 |     24.2 |       68.0 | 220.1 |
+| single_insert |     34.2 |     80.0 |      150.7 |  60.9 |
+| fetch_all     |      3.5 |     16.7 |       21.3 |  34.4 |
+| count         |      0.3 |      0.5 |        0.9 |   0.4 |
+| group_by      |      0.7 |      1.2 |        1.4 |   2.3 |
+| filter        |      2.2 |      8.5 |        7.5 |  17.6 |
+| get_by_pk     |     65.0 |    194.9 |      287.0 |  84.1 |
+| update        |      3.2 |      3.4 |        3.8 | 119.8 |
+| delete        |      0.7 |      0.8 |        1.1 |  92.8 |
 
 `group_by` is a `GROUP BY … COUNT/SUM … HAVING` aggregate query.
 
@@ -41,15 +41,15 @@ PostgreSQL 18, Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower is bet
 
 | operation     | tortoise | sqlalchemy |  pony |
 |---------------|---------:|-----------:|------:|
-| bulk_insert   |    1.3×  |      3.9×  | 12.1× |
-| single_insert |    2.5×  |      4.7×  |  1.8× |
-| fetch_all     |    4.6×  |      6.1×  |  9.4× |
-| count         |    1.7×  |      3.0×  |  1.4× |
-| group_by      |    1.4×  |      2.0×  |  2.9× |
-| filter        |    4.1×  |      3.6×  |  7.8× |
-| get_by_pk     |    3.1×  |      4.7×  |  1.3× |
-| update        |    1.1×  |      1.2×  | 35.0× |
-| delete        |    1.2×  |      1.5×  | 130.2× |
+| bulk_insert   |    1.6×  |      4.6×  | 14.9× |
+| single_insert |    2.3×  |      4.4×  |  1.8× |
+| fetch_all     |    4.8×  |      6.1×  |  9.8× |
+| count         |    1.9×  |      3.2×  |  1.5× |
+| group_by      |    1.6×  |      1.9×  |  3.1× |
+| filter        |    3.9×  |      3.5×  |  8.1× |
+| get_by_pk     |    3.0×  |      4.4×  |  1.3× |
+| update        |    1.1×  |      1.2×  | 37.3× |
+| delete        |    1.2×  |      1.6×  | 135.6× |
 
 Yara ORM is fastest on every operation in this configuration. `get_by_pk` and
 `single_insert` are latency-bound (one sequential round-trip per call) and sit near the raw
@@ -61,20 +61,24 @@ Python 3.12, N=5000, median of 5 (ms, lower is better).
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
 |---------------|---------:|---------:|-----------:|------:|
-| bulk_insert   |      7.5 |     13.2 |      607.7 |  47.2 |
-| single_insert |     35.1 |     27.6 |      235.2 | 117.2 |
-| fetch_all     |      4.9 |     38.2 |       11.0 |  48.7 |
-| count         |      0.1 |      0.3 |        0.6 |   0.2 |
-| filter        |      2.6 |     19.5 |       17.6 |  24.9 |
-| get_by_pk     |     54.1 |     79.2 |      329.3 |  30.1 |
-| update        |      0.5 |      0.5 |        1.8 |  41.5 |
+| bulk_insert   |      8.2 |     13.7 |      604.5 |  54.7 |
+| single_insert |     36.0 |     26.1 |      231.8 | 111.3 |
+| fetch_all     |      5.4 |     39.9 |       20.4 |  51.8 |
+| count         |      0.1 |      0.2 |        0.7 |   0.2 |
+| filter        |      3.0 |     20.4 |        7.0 |  26.1 |
+| get_by_pk     |     56.5 |     79.0 |      331.5 |  31.5 |
+| update        |      0.5 |      0.5 |        1.8 |  43.6 |
 
-Yara ORM wins the throughput-bound operations decisively (bulk, `fetch_all`, `filter`). It
-trails on the two **latency-bound** point operations: in-process Pony edges `get_by_pk`,
-and Tortoise edges `single_insert` — because the SQLite backend bridges synchronous
-`rusqlite` to async by hopping to a blocking thread per call, which costs a few microseconds
-that an in-process driver avoids on sequential point queries. Real workloads rarely fire
-thousands of sequential point reads, and everything throughput-shaped is far ahead.
+Yara ORM wins the throughput-bound operations decisively (bulk 1.7× vs Tortoise,
+`fetch_all` 7.4×, `filter` 6.9×). It trails on the two **latency-bound** point operations:
+in-process Pony edges `get_by_pk` (56.5 vs 31.5 ms), and Tortoise edges `single_insert`
+(36.0 vs 26.1 ms) — the cost is the per-statement asyncio bridge (scheduling the
+statement on the runtime and waking the event loop), tens of microseconds that a
+synchronous in-process driver avoids on sequential point queries. Real workloads rarely fire thousands of
+sequential point reads, and everything throughput-shaped is far ahead. If those point
+operations dominate your workload, the opt-in
+[sync fast path](#opt-in-sqlite-sync-fast-path) below removes exactly that per-statement
+bridge.
 
 ### Opt-in SQLite sync fast path
 

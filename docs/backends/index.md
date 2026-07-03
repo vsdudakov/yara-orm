@@ -83,8 +83,10 @@ in-memory databases always pin a single connection regardless of `max_size`.
 
 ## SQLite
 
-The SQLite backend is built on **rusqlite** (bundled SQLite), bridged to async by hopping
-to a blocking thread per call.
+The SQLite backend is built on **rusqlite** (bundled SQLite). Statements run inline on
+the async runtime (long-running work like `BEGIN` under contention and migration scripts
+hops to a blocking thread), and the async bridge itself can be removed entirely with the
+opt-in [sync fast path](#opt-in-synchronous-fast-path-sync_fast_path1).
 
 ```python
 await YaraOrm.init("sqlite:///app.db")     # file-backed

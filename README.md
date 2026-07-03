@@ -228,19 +228,22 @@ slowdown factor (>1 means Yara ORM is faster). Full methodology in
 
 | operation     | yara-orm | vs Tortoise | vs SQLAlchemy | vs Pony |
 |---------------|---------:|------------:|--------------:|--------:|
-| bulk_insert   | 18.5 ms  | 1.3×        | 3.9×          | 12.1×   |
-| single_insert | 33.7 ms  | 2.5×        | 4.7×          |  1.8×   |
-| fetch_all     |  3.8 ms  | 4.6×        | 6.1×          |  9.4×   |
-| count         |  0.3 ms  | 1.7×        | 3.0×          |  1.4×   |
-| group_by      |  0.8 ms  | 1.4×        | 2.0×          |  2.9×   |
-| filter        |  2.3 ms  | 4.1×        | 3.6×          |  7.8×   |
-| get_by_pk     | 65.8 ms  | 3.1×        | 4.7×          |  1.3×   |
-| update        |  3.4 ms  | 1.1×        | 1.2×          | 35.0×   |
-| delete        |  0.7 ms  | 1.2×        | 1.5×          | 130.2×  |
+| bulk_insert   | 14.7 ms  | 1.6×        | 4.6×          | 14.9×   |
+| single_insert | 34.2 ms  | 2.3×        | 4.4×          |  1.8×   |
+| fetch_all     |  3.5 ms  | 4.8×        | 6.1×          |  9.8×   |
+| count         |  0.3 ms  | 1.9×        | 3.2×          |  1.5×   |
+| group_by      |  0.7 ms  | 1.6×        | 1.9×          |  3.1×   |
+| filter        |  2.2 ms  | 3.9×        | 3.5×          |  8.1×   |
+| get_by_pk     | 65.0 ms  | 3.0×        | 4.4×          |  1.3×   |
+| update        |  3.2 ms  | 1.1×        | 1.2×          | 37.3×   |
+| delete        |  0.7 ms  | 1.2×        | 1.6×          | 135.6×  |
 
 Speed comes from the Rust hot path, **positional row decoding** (no per-row dict
 or column-name allocation), **compiled-SQL + prepared-statement caching**, and
-connection pooling. Run it yourself with `make bench`.
+connection pooling. On SQLite, the opt-in `sync_fast_path=1` URL flag removes
+the per-statement asyncio bridge entirely (point queries ~7× faster — see
+[Performance](https://vsdudakov.github.io/yara-orm/performance/)). Run it
+yourself with `make bench`.
 
 ## Architecture
 
