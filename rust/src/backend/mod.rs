@@ -55,6 +55,17 @@ pub trait Backend: Send + Sync {
     /// `isolation`, when set, names a SQL isolation level applied at BEGIN time
     /// (e.g. `"SERIALIZABLE"`); the Python layer validates it per dialect.
     async fn begin_tx(&self, isolation: Option<&str>) -> Result<Box<dyn TxConn>, EngineError>;
+
+    /// Whether statement futures may be driven to completion *synchronously*
+    /// on the calling Python thread (the engine's opt-in sync fast path).
+    ///
+    /// Only meaningful for backends whose statements complete without real
+    /// I/O waits (SQLite with `sync_fast_path=1` in the URL); network-backed
+    /// backends must keep the default `false` — blocking a Python thread on a
+    /// server round trip would stall the entire event loop for its duration.
+    fn sync_capable(&self) -> bool {
+        false
+    }
 }
 
 /// A transaction bound to a single connection. Statements run on that
@@ -83,12 +94,37 @@ pub trait TxConn: Send + Sync {
     async fn rollback_to(&self, name: &str) -> Result<(), EngineError>;
 }
 
+/// Whether the URL's query string carries a parameter named `key`.
+///
+/// Matches on the key only (everything before the first `=` of each
+/// `&`-separated pair), so a value or password merely *containing* the text
+/// does not trigger it.
+fn url_query_has_param(url: &str, key: &str) -> bool {
+    match url.split_once('?') {
+        Some((_, query)) => query
+            .split('&')
+            .any(|pair| pair.split('=').next() == Some(key)),
+        None => false,
+    }
+}
+
 /// Build the appropriate backend for a connection URL.
 ///
 /// This is the single extension point: match a new scheme here and return the
 /// matching backend implementation.
 pub async fn connect(url: &str) -> Result<Box<dyn Backend>, EngineError> {
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        // `sync_fast_path` is sqlite-only: on PostgreSQL every statement is a
+        // server round trip, so blocking the caller would stall the event
+        // loop. Reject it explicitly rather than letting the driver's own URL
+        // parser produce an obscure error (or silently ignore it).
+        if url_query_has_param(url, "sync_fast_path") {
+            return Err(EngineError::Config(
+                "sync_fast_path is a SQLite-only URL parameter; remove it from the \
+                 postgres URL"
+                    .to_string(),
+            ));
+        }
         let backend = postgres::PgBackend::connect(url).await?;
         Ok(Box::new(backend))
     } else if url.starts_with("sqlite:") {
@@ -96,5 +132,42 @@ pub async fn connect(url: &str) -> Result<Box<dyn Backend>, EngineError> {
         Ok(Box::new(backend))
     } else {
         Err(EngineError::UnsupportedUrl(url.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_query_has_param;
+
+    #[test]
+    fn query_param_is_matched_by_key_only() {
+        assert!(url_query_has_param(
+            "postgres://h/db?sync_fast_path=1",
+            "sync_fast_path"
+        ));
+        assert!(url_query_has_param(
+            "postgres://h/db?sslmode=require&sync_fast_path=0",
+            "sync_fast_path"
+        ));
+        // A bare key (no `=value`) still counts as present.
+        assert!(url_query_has_param(
+            "postgres://h/db?sync_fast_path",
+            "sync_fast_path"
+        ));
+    }
+
+    #[test]
+    fn text_outside_a_query_key_does_not_match() {
+        // No query string at all.
+        assert!(!url_query_has_param("postgres://h/db", "sync_fast_path"));
+        // The text appearing in a *value* or in the userinfo must not match.
+        assert!(!url_query_has_param(
+            "postgres://h/db?application_name=sync_fast_path",
+            "sync_fast_path"
+        ));
+        assert!(!url_query_has_param(
+            "postgres://sync_fast_path:pw@h/db",
+            "sync_fast_path"
+        ));
     }
 }

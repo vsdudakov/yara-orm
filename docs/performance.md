@@ -76,6 +76,59 @@ and Tortoise edges `single_insert` — because the SQLite backend bridges synchr
 that an in-process driver avoids on sequential point queries. Real workloads rarely fire
 thousands of sequential point reads, and everything throughput-shaped is far ahead.
 
+### Opt-in SQLite sync fast path
+
+On SQLite, per-statement work is microseconds, so the asyncio bridge dominates:
+scheduling the statement on the tokio runtime and waking the event loop costs
+~40µs around ~0.5–6µs of actual SQLite work. Adding **`sync_fast_path=1`** to
+the URL removes that bridge — statements run synchronously on the calling
+thread (GIL released) and return already-completed awaitables, cutting a warm
+point query from ~40µs to ~6µs (~7×):
+
+```python
+await YaraOrm.init("sqlite:///app.db?sync_fast_path=1")
+```
+
+`benchmarks/bench_features.py` (Apple Silicon, Python 3.13, median of 5),
+default vs fast path:
+
+| operation              | default (ms) | sync_fast_path=1 (ms) | speedup |
+|------------------------|-------------:|----------------------:|--------:|
+| insert_autocommit      |        17.26 |                  6.40 |    2.7× |
+| insert_one_tx          |        11.17 |                  1.58 |    7.1× |
+| insert_savepoint_each  |        31.79 |                  2.22 |   14.3× |
+| forward_n_plus_1       |        23.76 |                  5.29 |    4.5× |
+| forward_select_related |         0.73 |                  0.69 |    1.1× |
+| reverse_n_plus_1       |         5.98 |                  2.37 |    2.5× |
+| reverse_prefetch       |         0.48 |                  0.41 |    1.2× |
+| fetch_full             |         0.23 |                  0.19 |    1.2× |
+| values                 |         0.21 |                  0.16 |    1.3× |
+| values_list            |         0.13 |                  0.09 |    1.4× |
+
+The per-statement operations (point inserts, N+1 fan-outs, savepoints) win
+big; single-query bulk fetches only shed one bridge crossing each.
+
+!!! warning "Read the caveats before opting in"
+    The event loop is **blocked** for the duration of each statement, and
+    awaiting a completed awaitable may not yield to the loop (task fairness
+    changes). Opt in for microsecond-statement workloads — tests, scripts,
+    benchmarks, low-contention apps — and read
+    [the full caveat list](backends/index.md#opt-in-synchronous-fast-path-sync_fast_path1)
+    first. The flag is SQLite-only.
+
+### uvloop on the default async path
+
+Independently of the fast path: on the **default** async path, running your app
+under [uvloop](https://github.com/MagicStack/uvloop) cuts roughly 20% of the
+per-query overhead with zero code changes (the bridge's event-loop wakeups get
+cheaper), and it composes with every backend, PostgreSQL included:
+
+```python
+import uvloop
+
+uvloop.run(main())          # instead of asyncio.run(main())
+```
+
 ## Why it's fast
 
 - **Rust hot path** — parameter binding and row decoding happen in compiled code; the async

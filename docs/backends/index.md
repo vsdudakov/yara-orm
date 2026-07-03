@@ -119,9 +119,44 @@ await YaraOrm.init("sqlite:///app.db")     # file-backed
 - **Transactions begin with `BEGIN IMMEDIATE`**, taking the write lock up front so
   concurrent read-then-write transactions queue on the busy timeout instead of
   failing instantly with `database is locked`.
-- URL query parameters are validated: `sqlite://app.db?mode=memory` is supported,
-  and an unrecognised parameter raises `ValueError` instead of being read as part
-  of the file name.
+- URL query parameters are validated: `sqlite://app.db?mode=memory` and
+  `sqlite://app.db?sync_fast_path=1` are supported, and an unrecognised
+  parameter raises `ValueError` instead of being read as part of the file name.
+
+### Opt-in synchronous fast path (`sync_fast_path=1`)
+
+For microsecond-statement workloads, the per-query asyncio bridge (scheduling
+the statement on the runtime, waking the event loop, resuming the task) costs
+far more than the SQLite work itself. Opting in with:
+
+```python
+await YaraOrm.init("sqlite:///app.db?sync_fast_path=1")
+```
+
+makes every statement run **synchronously on the calling thread** (with the
+GIL released) and return an already-completed awaitable — your code still
+`await`s everything exactly as before, but each query is ~7× faster
+(~6µs instead of ~40µs per point query). `sync_fast_path=0` / `off` keep the
+default async bridge; any other value raises `ValueError`. The flag is
+SQLite-only — a postgres URL carrying it is rejected at `init()`.
+
+Two things stay async regardless: `BEGIN` (it can queue behind competing
+write transactions for up to the 5s busy timeout) and `execute_script`
+(arbitrary migration SQL can run for seconds).
+
+!!! warning "Semantics you are opting into"
+    - **The event loop is blocked for the duration of each statement.** Great
+      for tests, scripts, benchmarks and low-contention apps where every
+      statement is microseconds; wrong for anything that runs large table
+      scans or contended writes — a write parked on the 5s busy timeout
+      stalls **all** tasks on the loop, not just the caller.
+    - **`await` may no longer be a scheduling point.** Awaiting a completed
+      awaitable resumes immediately without yielding to the event loop, so
+      task interleaving/fairness changes. Code must not rely on
+      `await Model.get(...)` giving other tasks a turn (insert
+      `await asyncio.sleep(0)` where you need a guaranteed yield).
+    - Exception behaviour is unchanged: errors are stored and raised at the
+      `await`, exactly like the async path.
 
 !!! note "When to choose which"
     SQLite is ideal for tests, local development, embedded apps and small services;
