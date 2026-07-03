@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-03
+
 ### Added
 
 - **Opt-in SQLite synchronous fast path** — `sqlite:///app.db?sync_fast_path=1`.
