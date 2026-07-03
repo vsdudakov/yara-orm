@@ -1,13 +1,13 @@
 ---
 title: Transactions
-description: Database transactions in an async Python ORM — wrap writes in atomic blocks that commit on success and roll back on errors, on PostgreSQL & SQLite.
+description: Database transactions in an async Python ORM — wrap writes in atomic blocks that commit on success and roll back on errors, on PostgreSQL, MySQL & SQLite.
 ---
 
 # Transactions
 
 A **transaction** groups several statements into one **atomic** unit of work: either every change is **committed** together, or none of them are. `yara-orm` exposes transactions as first-class building blocks of the **async Python ORM**, so a block of model and queryset calls either persists as a whole or **rolls back** cleanly when something goes wrong.
 
-There are two ways to open a transaction, both imported from `yara_orm`: the `in_transaction` async context manager and the `@atomic` decorator. Both work identically on the **PostgreSQL** and **SQLite** backends.
+There are two ways to open a transaction, both imported from `yara_orm`: the `in_transaction` async context manager and the `@atomic` decorator. Both work identically on the **PostgreSQL**, **MySQL** and **SQLite** backends.
 
 ## `in_transaction` context manager
 
@@ -112,7 +112,7 @@ async with in_transaction():
 This makes it safe to wrap a risky sub-step in its own block: a failure there unwinds just that step. Savepoints nest to any depth — only the failing level rolls back. If the **outer** transaction later rolls back, everything goes with it, including savepoints that were already released.
 
 !!! note "Savepoints are automatic"
-    You do not name or manage savepoints yourself — nesting an `in_transaction` / `@atomic` block is enough. PostgreSQL and SQLite both support savepoints, so nesting behaves identically on either backend.
+    You do not name or manage savepoints yourself — nesting an `in_transaction` / `@atomic` block is enough. PostgreSQL, MySQL and SQLite all support savepoints, so nesting behaves identically on every backend.
 
 ## Isolation levels
 
@@ -129,7 +129,7 @@ async def report() -> None:
     ...
 ```
 
-The level is applied when the transaction begins (`BEGIN ISOLATION LEVEL …` on PostgreSQL). The four standard levels are available:
+The level is applied when the transaction begins (`BEGIN ISOLATION LEVEL …` on PostgreSQL; `SET TRANSACTION ISOLATION LEVEL …` just before the `BEGIN` on MySQL). The four standard levels are available:
 
 | Level | Constant |
 | --- | --- |
@@ -139,7 +139,7 @@ The level is applied when the transaction begins (`BEGIN ISOLATION LEVEL …` on
 | Serializable | `IsolationLevel.SERIALIZABLE` |
 
 !!! warning "Backend differences"
-    **PostgreSQL** honours all four levels. **SQLite** transactions are always serializable, so it accepts `SERIALIZABLE` and raises `UnSupportedError` for any other level. An unrecognised level name raises `ConfigurationError`. Isolation can only be set on the **outermost** transaction — requesting it on a nested (savepoint) block raises `TransactionManagementError`.
+    **PostgreSQL** and **MySQL** honour all four levels. **SQLite** transactions are always serializable, so it accepts `SERIALIZABLE` and raises `UnSupportedError` for any other level. An unrecognised level name raises `ConfigurationError`. Isolation can only be set on the **outermost** transaction — requesting it on a nested (savepoint) block raises `TransactionManagementError`.
 
 ## Choosing a connection
 
@@ -171,7 +171,7 @@ async with in_transaction():             # transaction on "default"
 
 ## Backend support
 
-Transactions are backed by the database's native transaction support and behave the same whether the ORM is initialised against **PostgreSQL** or **SQLite** — the same `in_transaction` and `@atomic` code runs unchanged across both.
+Transactions are backed by the database's native transaction support and behave the same whether the ORM is initialised against **PostgreSQL**, **MySQL** or **SQLite** — the same `in_transaction` and `@atomic` code runs unchanged across all three.
 
 On SQLite, transactions begin with `BEGIN IMMEDIATE`, so concurrent
 read-then-write transactions queue on the write lock (honouring the busy

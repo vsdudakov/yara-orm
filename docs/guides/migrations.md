@@ -1,6 +1,6 @@
 ---
 title: Migrations
-description: Database migrations for an async Python ORM — makemigrations, upgrade and downgrade with operation-based, backend-portable schemas rendered to PostgreSQL or SQLite.
+description: Database migrations for an async Python ORM — makemigrations, upgrade and downgrade with operation-based, backend-portable schemas rendered to PostgreSQL, MySQL or SQLite.
 ---
 
 # Migrations
@@ -14,7 +14,7 @@ revert those files in this **async Python ORM**.
 Crucially, migrations are **backend-portable**. A migration records *operations*
 (create table, add column, …), not raw DDL. The same operations render to the
 correct SQL for the active dialect **at apply time**, so one migration set runs
-unchanged on **PostgreSQL** or **SQLite**.
+unchanged on **PostgreSQL**, **MySQL** or **SQLite**.
 
 Each migration file declares a `class Migration(m.Migration)` with `operations`
 (and optional `dependencies` / `atomic`). Operations are built from **live field
@@ -43,15 +43,17 @@ carry a single `Field` — so a migration reads like your models.
     `makemigrations` emits the **idempotent** analog of each operation
     (`CreateModelIfNotExists`, `AddFieldIfNotExists`, `RemoveFieldIfExists`,
     `AddIndexIfNotExists`, …). A column whose definition changed is emitted as
-    `AlterField` automatically (PostgreSQL alters in place; SQLite rebuilds the
-    table, preserving rows, referencing rows, indexes and constraints).
+    `AlterField` automatically (PostgreSQL alters in place, MySQL restates the
+    definition with `MODIFY COLUMN`; SQLite rebuilds the table, preserving rows,
+    referencing rows, indexes and constraints).
 
     Atomic migrations (the default) are all-or-nothing: a failure rolls the
     whole file back, so re-running is always safe. For `atomic = False`
     migrations, re-running a half-applied file is safe only for the guarded
     `*IfExists` / `*IfNotExists` operations — `RenameField`, constraint changes
-    and concurrent index builds are not guarded (and SQLite cannot guard
-    add/drop column at all).
+    and concurrent index builds are not guarded (SQLite and MySQL cannot guard
+    add/drop column at all, and MySQL has no `CREATE INDEX IF NOT EXISTS`
+    either).
 
 !!! tip "What `makemigrations` auto-detects"
     Beyond create/drop table and add/drop/alter column, the diff also detects:
@@ -183,12 +185,19 @@ python -m yara_orm --models myapp.models sqlmigrate 0001_initial --backward
 
 Because operations render per dialect, `sqlmigrate` shows the **same migration**
 as different DDL depending on the `--db` URL. Choose a backend by pointing
-`--db` at PostgreSQL or SQLite:
+`--db` at PostgreSQL, MySQL or SQLite:
 
 === "PostgreSQL"
 
     ```bash
     python -m yara_orm --db postgres://localhost/app --models myapp.models \
+        sqlmigrate 0001_initial
+    ```
+
+=== "MySQL"
+
+    ```bash
+    python -m yara_orm --db mysql://root@localhost/app --models myapp.models \
         sqlmigrate 0001_initial
     ```
 
@@ -268,14 +277,14 @@ A migration file is plain Python: a `class Migration(m.Migration)` with an
 | `DeleteModel(table, fields, composite_pk=None)` | Drop a table (keeps its fields so it can be reversed). |
 | `AddField(table, name, field)` | Add a column from a field object. |
 | `RemoveField(table, name, field)` | Drop a column (keeps the field so it can be reversed). |
-| `AlterField(table, name, field, old)` | Change a column's definition (PostgreSQL in place; SQLite rebuilds the table, keeping rows, FK-referencing rows, indexes and constraints). |
+| `AlterField(table, name, field, old)` | Change a column's definition (PostgreSQL in place, MySQL in place via `MODIFY COLUMN`; SQLite rebuilds the table, keeping rows, FK-referencing rows, indexes and constraints). |
 | `AddIndex(table, column)` | Create an index on a single column. |
 | `RemoveIndex(table, column)` | Drop a single-column index. |
 | `AddCompositeIndex(table, name, columns, condition=None)` | Create a multi-column (optionally partial) index. |
 | `RemoveCompositeIndex(table, name, columns, condition=None)` | Drop a multi-column index. |
 | `RunSQL(sql, reverse_sql=None)` | Run literal SQL forward and, optionally, its reverse. |
 | `RunPython(forward, backward=None)` | Run async Python callables (hand-written migrations only). |
-| `CreateExtension(name)` | `CREATE EXTENSION IF NOT EXISTS <name>` on PostgreSQL; a no-op on SQLite (unlike `RunSQL`, it renders per dialect). Reverse is empty — the extension is never dropped. |
+| `CreateExtension(name)` | `CREATE EXTENSION IF NOT EXISTS <name>` on PostgreSQL; a no-op on MySQL and SQLite (unlike `RunSQL`, it renders per dialect). Reverse is empty — the extension is never dropped. |
 
 `makemigrations` generates the **idempotent** analogs of the schema operations —
 `CreateModelIfNotExists`, `DeleteModelIfExists`, `AddFieldIfNotExists`,
@@ -339,7 +348,7 @@ index renames are hand-written:
 | --- | --- |
 | `RenameModel(old, new)` | Rename a table. |
 | `RenameField(table, old, new)` | Rename a column (auto-detected, or hand-written). |
-| `RenameIndex(table, column, old_name, new_name, unique=False)` | Rename an index (PostgreSQL in place; SQLite drops/recreates). |
+| `RenameIndex(table, column, old_name, new_name, unique=False)` | Rename an index (PostgreSQL and MySQL in place; SQLite drops/recreates). |
 
 Named constraints in `Meta.constraints` are diffed automatically (added/removed
 constraints emit `AddConstraint` / `RemoveConstraint`). You can also manage them
@@ -364,7 +373,10 @@ class Migration(m.Migration):
 
 !!! note "Constraint changes across backends"
     `AddConstraint` / `RemoveConstraint` / `RenameConstraint` use
-    `ALTER TABLE … CONSTRAINT` on **PostgreSQL** (in place). **SQLite** has no
+    `ALTER TABLE … CONSTRAINT` on **PostgreSQL** (in place). **MySQL** also adds
+    and drops constraints in place, but has no `RENAME CONSTRAINT` —
+    `RenameConstraint` raises `UnSupportedError` there (drop and re-add
+    instead). **SQLite** has no
     such syntax, so on SQLite these rebuild the table with the new constraint
     set — data, indexes and other constraints preserved. (A table the migration
     system has no recorded state for — e.g. one created via `RunSQL` — still

@@ -185,8 +185,8 @@ counts the rows that survive the `HAVING` (with `group_by()`, the groups).
     `GROUP BY`. An **aggregate** annotation (or a `HAVING` filter) groups by
     the base table's primary key plus each joined relation's primary key, so a
     reverse-relation `Count` collapses back to one row per base row while the
-    joined columns stay selectable (PostgreSQL's functional-dependency rule;
-    SQLite allows bare columns). `select_for_update()` still raises
+    joined columns stay selectable (PostgreSQL's and MySQL's
+    functional-dependency rule; SQLite allows bare columns). `select_for_update()` still raises
     `UnSupportedError` on **every** annotated shape — grouped results cannot be
     locked, and even ungrouped annotations may carry a window expression (e.g.
     via `RawSQL`), which PostgreSQL also refuses to lock. Note that a `RawSQL`
@@ -238,7 +238,7 @@ for book in await Book.annotate(slug=Lower("title"), n=Length("title")):
     print(book.slug, book.n)
 ```
 
-`Concat` renders with the portable `||` operator, so it behaves the same on PostgreSQL and SQLite.
+`Concat` renders with the portable `||` operator on PostgreSQL and SQLite, and as `CONCAT(...)` on MySQL (where `||` is logical OR) — the behaviour is the same on all three.
 
 ### Composing scalar functions
 
@@ -297,7 +297,9 @@ bonus = Book.annotate(bonus=Case(When(rating__gte=4, then=F("rating")), default=
 ## Filtered and conditional aggregates
 
 Aggregates accept an optional `_filter=Q(...)` that restricts which rows feed them,
-compiling to PostgreSQL's `FILTER (WHERE ...)`. This is the clean way to count or sum
+compiling to `FILTER (WHERE ...)` on PostgreSQL and SQLite (MySQL has no `FILTER`,
+so the equivalent `AGG(CASE WHEN ... THEN ... END)` is rendered there). This is
+the clean way to count or sum
 a subset per group without a separate query:
 
 ```python

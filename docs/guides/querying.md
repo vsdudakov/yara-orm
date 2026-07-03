@@ -1,6 +1,6 @@
 ---
 title: Querying
-description: Query an async Python ORM with yara_orm — build lazy chainable querysets, filter with field lookups and Q objects, order and paginate on PostgreSQL or SQLite.
+description: Query an async Python ORM with yara_orm — build lazy chainable querysets, filter with field lookups and Q objects, order and paginate on PostgreSQL, MySQL or SQLite.
 ---
 
 # Querying
@@ -85,8 +85,8 @@ Append a double-underscore suffix to a field name to choose how it is compared. 
 | `endswith` | `LIKE '%v'` | `Book.filter(title__endswith="II")` |
 | `iendswith` | `ILIKE '%v'` | `Book.filter(title__iendswith="ii")` |
 | `year`/`quarter`/`month`/`week`/`day`/`hour`/`minute`/`second`/`microsecond` | extracted date part `=` | `Book.filter(published__year=2024)` |
-| `regex` / `iregex` (aliases `posix_regex` / `iposix_regex`) | POSIX regex (PostgreSQL) | `Book.filter(title__regex="^The")` |
-| `search` | full-text (PostgreSQL) | `Book.filter(title__search="ocean")` |
+| `regex` / `iregex` (aliases `posix_regex` / `iposix_regex`) | POSIX regex (PostgreSQL, MySQL) | `Book.filter(title__regex="^The")` |
+| `search` | full-text (PostgreSQL, MySQL) | `Book.filter(title__search="ocean")` |
 
 A few categories worth calling out:
 
@@ -116,7 +116,7 @@ await Book.filter(title__icontains="ocean")
     external system) binds as `int`, and an ISO date string binds as a `date`.
 
 !!! note "Case-insensitive lookups across dialects"
-    The `i*` lookups (`icontains`, `istartswith`, `iendswith`) use `ILIKE` on PostgreSQL. On SQLite they fall back to `LIKE`, which is already case-insensitive for ASCII — so the behaviour is consistent: a case-insensitive match on either backend.
+    The `i*` lookups (`icontains`, `istartswith`, `iendswith`) use `ILIKE` on PostgreSQL. On SQLite they fall back to `LIKE`, which is already case-insensitive for ASCII, and on MySQL plain `LIKE` is case-insensitive under the default utf8mb4 collation (the case-*sensitive* lookups use `LIKE BINARY` there) — so the behaviour is consistent: a case-insensitive match on every backend.
 
 !!! note "Pattern lookups treat the value literally"
     The value you pass to `contains` / `startswith` / `endswith` (and their `i*`
@@ -129,10 +129,10 @@ await Book.filter(title__icontains="ocean")
 !!! note "`__contains` on a JSON column is containment"
     For a text column `__contains` is a `LIKE '%v%'` substring match (the table
     above). For a [`JSONField`](json-fields.md) it is structural containment
-    (`@>`) instead — see [Working with JSON](json-fields.md#containment-__contains-postgresql).
+    (`@>`) instead — see [Working with JSON](json-fields.md#containment-__contains-postgresql-and-mysql).
 
-!!! warning "PostgreSQL-only lookups"
-    `regex`, `iregex` (and their `posix_regex`/`iposix_regex` aliases) and `search` are implemented for PostgreSQL only; on SQLite they raise `UnSupportedError`. The `microsecond` date part is likewise PostgreSQL-only.
+!!! warning "Lookups SQLite does not support"
+    `regex`, `iregex` (and their `posix_regex`/`iposix_regex` aliases) and `search` are implemented for PostgreSQL (`~`/`~*`, full-text `to_tsvector`) and MySQL (`REGEXP_LIKE`, `MATCH ... AGAINST` — the column needs a FULLTEXT index); on SQLite they raise `UnSupportedError`. The `microsecond` date part is likewise unavailable on SQLite.
 
 ## Spanning relations in filters
 
@@ -350,7 +350,7 @@ primary key:
 await Author.annotate(n=Count("books")).filter(n__gt=5).delete()
 ```
 
-`.select_for_update()` adds `FOR UPDATE` to lock the selected rows for the duration of the surrounding transaction on PostgreSQL; it is a no-op on SQLite. It applies to plain fetches, `select_related()` joins and `values()` / `values_list()` projections alike; combining it with `annotate()` or `group_by()` raises `UnSupportedError` (PostgreSQL forbids locking an aggregated result).
+`.select_for_update()` adds `FOR UPDATE` to lock the selected rows for the duration of the surrounding transaction on PostgreSQL and MySQL; it is a no-op on SQLite. It applies to plain fetches, `select_related()` joins and `values()` / `values_list()` projections alike; combining it with `annotate()` or `group_by()` raises `UnSupportedError` (the databases forbid locking an aggregated result).
 
 ```python
 async with in_transaction():
@@ -539,7 +539,9 @@ await Book.all().values_list("author__name", flat=True)   # ["Herbert", ...]
 ## Upserts with `bulk_create`
 
 `bulk_create` accepts conflict-handling arguments that emit an `ON CONFLICT`
-clause (PostgreSQL and SQLite):
+clause on PostgreSQL and SQLite; on MySQL the same arguments render
+`INSERT IGNORE` / `INSERT ... ON DUPLICATE KEY UPDATE` instead (MySQL matches
+against *any* unique key, so the `on_conflict` target is ignored there):
 
 ```python
 # Skip rows that collide with an existing unique value:

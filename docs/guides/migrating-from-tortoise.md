@@ -110,8 +110,11 @@ models; Yara ORM discovers them automatically and only wants a URL.
     await YaraOrm.close()
     ```
 
-The same code switches to SQLite by changing only the URL
-(`sqlite:///app.db`) — see [Backends](../backends/index.md).
+The same code switches to MySQL or SQLite by changing only the URL
+(`mysql://user:pass@localhost/app`, `sqlite:///app.db`) — Tortoise's three
+backends are all covered, and driver-qualified Tortoise URLs such as
+`mysql+aiomysql://` are normalised automatically. See
+[Backends](../backends/index.md).
 
 ## 3. Querying
 
@@ -228,7 +231,7 @@ fewer edits:
   round-trip), and **`Meta.extra_kwargs = "store"` is inherited** from a base/abstract
   `Meta` by subclasses that declare their own `Meta`.
 - **`Index(..., opclass="gin_trgm_ops")`** applies a per-column operator class (e.g.
-  `gin_trgm_ops`, `jsonb_path_ops`) on PostgreSQL — dropped on SQLite — replacing
+  `gin_trgm_ops`, `jsonb_path_ops`) on PostgreSQL — dropped on MySQL and SQLite — replacing
   Tortoise's `contrib.postgres.indexes.GinIndex(opclass=...)`.
 - **`_meta.db_table` is assignable** (`Model._meta.db_table = "..."`) alongside its
   read access.
