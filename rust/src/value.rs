@@ -4,7 +4,9 @@
 //! engine and the database driver. Keeping every conversion in one place means a
 //! new backend only has to map `Value` onto its own driver types.
 
+use std::borrow::Cow;
 use std::error::Error;
+use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::prelude::*;
@@ -465,8 +467,10 @@ impl ToSql for Value {
 // SQL row -> Value (decoding result columns)
 // ---------------------------------------------------------------------------
 
-/// A single result row as ordered (column-name, value) pairs.
-pub type Row = Vec<(String, Value)>;
+/// A single result row as ordered (column-name, value) pairs. Names are
+/// `Arc<str>` so the backends can decode them once per result set and share
+/// them across rows (a per-row clone is a refcount bump, not an allocation).
+pub type Row = Vec<(Arc<str>, Value)>;
 
 /// Wrapper so a result row converts straight into a Python `dict`.
 pub struct PyRow(pub Row);
@@ -479,9 +483,40 @@ impl<'py> IntoPyObject<'py> for PyRow {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let dict = PyDict::new(py);
         for (name, value) in self.0 {
-            dict.set_item(name, value.into_pyobject(py)?)?;
+            dict.set_item(&*name, value.into_pyobject(py)?)?;
         }
         Ok(dict)
+    }
+}
+
+/// Wrapper so a whole named result set converts into a Python list of dicts.
+///
+/// All rows of one result set share the same column names in the same order
+/// (both backends derive them from the statement's column list), so each name
+/// becomes a Python string once — interned, since column names are identifiers
+/// that recur across queries — and that one `PyString` keys every row's dict,
+/// instead of allocating a fresh key per cell per row.
+pub struct PyRows(pub Vec<Row>);
+
+impl<'py> IntoPyObject<'py> for PyRows {
+    type Target = PyList;
+    type Output = Bound<'py, PyList>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let list = PyList::empty(py);
+        let mut keys: Vec<Bound<'py, PyString>> = Vec::new();
+        for row in self.0 {
+            let dict = PyDict::new(py);
+            for (idx, (name, value)) in row.into_iter().enumerate() {
+                if idx >= keys.len() {
+                    keys.push(PyString::intern(py, &name));
+                }
+                dict.set_item(&keys[idx], value.into_pyobject(py)?)?;
+            }
+            list.append(dict)?;
+        }
+        Ok(list)
     }
 }
 
@@ -490,7 +525,7 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
     let mut out = Row::with_capacity(row.columns().len());
     for (idx, col) in row.columns().iter().enumerate() {
         out.push((
-            col.name().to_string(),
+            Arc::from(col.name()),
             decode_pg_cell(row, idx, col.type_())?,
         ));
     }
@@ -503,19 +538,19 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
 
 /// Convert a [`Value`] into JSON, used to store an array parameter as JSON text
 /// on SQLite (which has no array type). Element scalars map to their JSON form.
-fn value_to_json(v: Value) -> serde_json::Value {
+fn value_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Null => J::Null,
         // JSON has no byte type; base64 keeps bytes reversible and matches the
         // `py_to_json` encoding for bytes inside JSON parameters.
-        Value::Bytes(b) => J::String(base64_encode(&b)),
-        Value::Bool(b) => J::Bool(b),
-        Value::Int(i) => J::from(i),
-        Value::Float(f) => J::from(f),
-        Value::Text(s) => J::String(s),
-        Value::Json(j) => j,
-        Value::Array(items) => J::Array(items.into_iter().map(value_to_json).collect()),
+        Value::Bytes(b) => J::String(base64_encode(b)),
+        Value::Bool(b) => J::Bool(*b),
+        Value::Int(i) => J::from(*i),
+        Value::Float(f) => J::from(*f),
+        Value::Text(s) => J::String(s.clone()),
+        Value::Json(j) => j.clone(),
+        Value::Array(items) => J::Array(items.iter().map(value_to_json).collect()),
         Value::Uuid(u) => J::String(u.to_string()),
         Value::Decimal(d) => J::String(d.to_string()),
         Value::Timestamp(t) => J::String(t.format(FMT_TIMESTAMP).to_string()),
@@ -525,121 +560,249 @@ fn value_to_json(v: Value) -> serde_json::Value {
     }
 }
 
-/// Bind an owned [`Value`] as a SQLite parameter, moving (not cloning) the
-/// `String`/`Bytes` payloads. SQLite has few storage classes, so richer types
-/// are encoded as TEXT and reconstructed on read via the declared column type
+/// Bind a [`Value`] as a SQLite parameter. `Text`/`Bytes` payloads are lent to
+/// the statement (no copy); richer types are encoded as TEXT — SQLite has few
+/// storage classes — and reconstructed on read via the declared column type
 /// (see [`decode_sqlite`]).
-pub fn value_into_sqlite(v: Value) -> rusqlite::types::Value {
-    use rusqlite::types::Value as S;
-    match v {
-        Value::Null => S::Null,
-        Value::Bool(b) => S::Integer(if b { 1 } else { 0 }),
-        Value::Int(i) => S::Integer(i),
-        Value::Float(f) => S::Real(f),
-        Value::Text(s) => S::Text(s),
-        Value::Bytes(b) => S::Blob(b),
-        Value::Json(j) => S::Text(j.to_string()),
-        // SQLite has no array type; store as a JSON text array.
-        Value::Array(items) => S::Text(
-            serde_json::Value::Array(items.into_iter().map(value_to_json).collect()).to_string(),
-        ),
-        Value::Uuid(u) => S::Text(u.to_string()),
-        Value::Decimal(d) => S::Text(d.to_string()),
-        Value::Timestamp(dt) => S::Text(dt.format(FMT_TIMESTAMP).to_string()),
-        // Aware datetimes are UTC here; render them with the same fixed-width
-        // space-separated layout as naive values (plus the "+00:00" marker) so
-        // SQLite's lexicographic TEXT comparisons order naive and aware values
-        // consistently. (`to_rfc3339`'s 'T' separator would break that; the
-        // decoder still accepts the old RFC 3339 rows for existing databases.)
-        Value::TimestampTz(dt) => S::Text(dt.format(FMT_TIMESTAMPTZ_SQLITE).to_string()),
-        Value::Date(d) => S::Text(d.format(FMT_DATE).to_string()),
-        Value::Time(t) => S::Text(t.format(FMT_TIME).to_string()),
+impl rusqlite::types::ToSql for Value {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, Value as S, ValueRef as R};
+        Ok(match self {
+            Value::Null => ToSqlOutput::Owned(S::Null),
+            Value::Bool(b) => ToSqlOutput::Owned(S::Integer(if *b { 1 } else { 0 })),
+            Value::Int(i) => ToSqlOutput::Owned(S::Integer(*i)),
+            Value::Float(f) => ToSqlOutput::Owned(S::Real(*f)),
+            Value::Text(s) => ToSqlOutput::Borrowed(R::Text(s.as_bytes())),
+            Value::Bytes(b) => ToSqlOutput::Borrowed(R::Blob(b)),
+            Value::Json(j) => ToSqlOutput::Owned(S::Text(j.to_string())),
+            // SQLite has no array type; store as a JSON text array.
+            Value::Array(items) => ToSqlOutput::Owned(S::Text(
+                serde_json::Value::Array(items.iter().map(value_to_json).collect()).to_string(),
+            )),
+            Value::Uuid(u) => ToSqlOutput::Owned(S::Text(u.to_string())),
+            Value::Decimal(d) => ToSqlOutput::Owned(S::Text(d.to_string())),
+            Value::Timestamp(dt) => {
+                ToSqlOutput::Owned(S::Text(dt.format(FMT_TIMESTAMP).to_string()))
+            }
+            // Aware datetimes are UTC here; render them with the same
+            // fixed-width space-separated layout as naive values (plus the
+            // "+00:00" marker) so SQLite's lexicographic TEXT comparisons order
+            // naive and aware values consistently. (`to_rfc3339`'s 'T'
+            // separator would break that; the decoder still accepts the old
+            // RFC 3339 rows for existing databases.)
+            Value::TimestampTz(dt) => {
+                ToSqlOutput::Owned(S::Text(dt.format(FMT_TIMESTAMPTZ_SQLITE).to_string()))
+            }
+            Value::Date(d) => ToSqlOutput::Owned(S::Text(d.format(FMT_DATE).to_string())),
+            Value::Time(t) => ToSqlOutput::Owned(S::Text(t.format(FMT_TIME).to_string())),
+        })
     }
 }
 
-/// Decode a SQLite cell using the column's declared type so that uuid/json/
-/// datetime/decimal columns round-trip to native Python types — keeping the
-/// model layer identical across backends. Aggregates (no declared type) fall
-/// back to the storage class.
-pub fn decode_sqlite(decl: &str, vr: rusqlite::types::ValueRef) -> Value {
-    use rusqlite::types::ValueRef as R;
-    if let R::Null = vr {
-        return Value::Null;
+/// Per-column SQLite decode plan, computed once per result set by
+/// [`sqlite_decode_plan`]. The per-cell path in [`decode_sqlite`] then
+/// dispatches on this tag directly instead of re-scanning the declared type
+/// string (up to six substring searches) for every cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteDecode {
+    Bool,
+    Uuid,
+    Json,
+    DateTime,
+    Date,
+    Time,
+    Decimal,
+    /// No recognised declared type (aggregates, expressions, plain TEXT/
+    /// INTEGER/... columns): decode by storage class only.
+    Raw,
+}
+
+/// Classify a declared SQLite column type (any case) into its decode plan.
+///
+/// The keyword precedence mirrors the substring-scan chain this replaced:
+/// BOOL, UUID, JSON, TIMESTAMP/DATETIME, then DATE, then TIME — the timestamp
+/// keywords must win over DATE/TIME because "DATETIME" contains both and
+/// "TIMESTAMP" contains "TIME" — then DECIMAL/NUMERIC.
+pub fn sqlite_decode_plan(decl: &str) -> SqliteDecode {
+    let decl = decl.to_ascii_uppercase();
+    if decl.contains("BOOL") {
+        SqliteDecode::Bool
+    } else if decl.contains("UUID") {
+        SqliteDecode::Uuid
+    } else if decl.contains("JSON") {
+        SqliteDecode::Json
+    } else if decl.contains("TIMESTAMP") || decl.contains("DATETIME") {
+        SqliteDecode::DateTime
+    } else if decl.contains("DATE") {
+        SqliteDecode::Date
+    } else if decl.contains("TIME") {
+        SqliteDecode::Time
+    } else if decl.contains("DECIMAL") || decl.contains("NUMERIC") {
+        SqliteDecode::Decimal
+    } else {
+        SqliteDecode::Raw
     }
-    // `decl` is already upper-cased once per column by `column_meta`, so the
-    // per-cell path here only does substring scans, no allocation.
-    let text = |vr: R| -> Option<String> {
-        match vr {
-            R::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
-            _ => None,
+}
+
+/// Parse a SQLite datetime TEXT cell, accepting every format previous releases
+/// wrote (each is still attempted, so the accepted set is unchanged):
+///
+/// - `%Y-%m-%d %H:%M:%S%.f%:z` — the canonical aware layout (space separator,
+///   explicit offset) written for `TimestampTz` values;
+/// - RFC 3339 (`T` separator) — aware rows written by older releases;
+/// - `%Y-%m-%d %H:%M:%S%.f` / `%Y-%m-%dT%H:%M:%S%.f` / `%Y-%m-%d %H:%M:%S` —
+///   naive layouts.
+///
+/// A cheap shape probe *orders* the attempts so a well-formed value parses on
+/// its first try instead of paying for failed trial parses: an offset can only
+/// occur after the seconds field (byte 19 of the fixed-width prefix), where a
+/// naive value holds only digits and `.`; the byte at index 10 separates date
+/// from time. The probe never excludes a parser — oddly-shaped strings (e.g.
+/// chrono's tolerance for 1-digit month/day) still walk the full chain, and
+/// since no string is accepted by two of these parsers with different results,
+/// reordering cannot change what a given string decodes to.
+fn parse_sqlite_datetime(s: &str) -> Option<Value> {
+    const AWARE_SPACE: &str = "%Y-%m-%d %H:%M:%S%.f%:z";
+    let bytes = s.as_bytes();
+    let aware_hint = bytes.len() > 19
+        && bytes[19..]
+            .iter()
+            .any(|c| matches!(c, b'+' | b'-' | b'Z' | b'z'));
+    let t_sep_hint = bytes.get(10) == Some(&b'T');
+
+    let parse_aware = |first_rfc3339: bool| -> Option<DateTime<Utc>> {
+        let space = || {
+            DateTime::parse_from_str(s, AWARE_SPACE)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        };
+        let rfc3339 = || {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        };
+        if first_rfc3339 {
+            rfc3339().or_else(space)
+        } else {
+            space().or_else(rfc3339)
         }
     };
 
-    if decl.contains("BOOL") {
-        if let R::Integer(i) = vr {
-            return Value::Bool(i != 0);
+    if aware_hint {
+        if let Some(dt) = parse_aware(t_sep_hint) {
+            return Some(Value::TimestampTz(dt));
         }
     }
-    if decl.contains("UUID") {
-        if let Some(s) = text(vr) {
-            if let Ok(u) = uuid::Uuid::parse_str(&s) {
-                return Value::Uuid(u);
-            }
+    let naive_fmts = if t_sep_hint {
+        [
+            "%Y-%m-%dT%H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S",
+        ]
+    } else {
+        [
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%dT%H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S",
+        ]
+    };
+    for fmt in naive_fmts {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(Value::Timestamp(ndt));
         }
     }
-    if decl.contains("JSON") {
-        if let Some(s) = text(vr) {
-            if let Ok(j) = serde_json::from_str(&s) {
-                return Value::Json(j);
-            }
+    if !aware_hint {
+        // The probe guessed "naive" but nothing matched: still try the aware
+        // parsers (chrono accepts e.g. 1-digit month/day, which shifts the
+        // offset before byte 19), so the probe can never reject a string the
+        // exhaustive chain used to accept.
+        if let Some(dt) = parse_aware(false) {
+            return Some(Value::TimestampTz(dt));
         }
     }
-    if decl.contains("TIMESTAMP") || decl.contains("DATETIME") {
-        if let Some(s) = text(vr) {
-            // Canonical aware layout (space-separated, explicit offset) first;
-            // RFC 3339 ('T' separator) next, accepting rows written by older
-            // releases so existing databases keep decoding as aware values.
-            if let Ok(dt) = chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%:z") {
-                return Value::TimestampTz(dt.with_timezone(&chrono::Utc));
+    None
+}
+
+/// Decode a SQLite cell using the column's decode plan (derived from its
+/// declared type) so that uuid/json/datetime/decimal columns round-trip to
+/// native Python types — keeping the model layer identical across backends.
+/// Aggregates (no declared type) fall back to the storage class, as does any
+/// cell whose content fails its column's typed decode.
+pub fn decode_sqlite(plan: SqliteDecode, vr: rusqlite::types::ValueRef) -> Value {
+    use rusqlite::types::ValueRef as R;
+
+    // Borrow the cell's text instead of copying it for each typed decode
+    // attempt. SQLite does not enforce UTF-8, so invalid bytes take the lossy
+    // (allocating) path — exactly the string the previous
+    // `from_utf8_lossy(..).into_owned()` produced.
+    fn text(vr: rusqlite::types::ValueRef<'_>) -> Option<Cow<'_, str>> {
+        match vr {
+            rusqlite::types::ValueRef::Text(t) => Some(String::from_utf8_lossy(t)),
+            _ => None,
+        }
+    }
+
+    if let R::Null = vr {
+        return Value::Null;
+    }
+
+    match plan {
+        SqliteDecode::Bool => {
+            if let R::Integer(i) = vr {
+                return Value::Bool(i != 0);
             }
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
-                return Value::TimestampTz(dt.with_timezone(&chrono::Utc));
-            }
-            for fmt in [
-                "%Y-%m-%d %H:%M:%S%.f",
-                "%Y-%m-%dT%H:%M:%S%.f",
-                "%Y-%m-%d %H:%M:%S",
-            ] {
-                if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&s, fmt) {
-                    return Value::Timestamp(ndt);
+        }
+        SqliteDecode::Uuid => {
+            if let Some(s) = text(vr) {
+                if let Ok(u) = uuid::Uuid::parse_str(&s) {
+                    return Value::Uuid(u);
                 }
             }
         }
-    } else if decl.contains("DATE") {
-        if let Some(s) = text(vr) {
-            if let Ok(nd) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-                return Value::Date(nd);
-            }
-        }
-    } else if decl.contains("TIME") {
-        if let Some(s) = text(vr) {
-            for fmt in ["%H:%M:%S%.f", "%H:%M:%S"] {
-                if let Ok(nt) = chrono::NaiveTime::parse_from_str(&s, fmt) {
-                    return Value::Time(nt);
+        SqliteDecode::Json => {
+            if let Some(s) = text(vr) {
+                if let Ok(j) = serde_json::from_str(&s) {
+                    return Value::Json(j);
                 }
             }
         }
-    }
-    if decl.contains("DECIMAL") || decl.contains("NUMERIC") {
-        let raw = match vr {
-            R::Text(t) => String::from_utf8_lossy(t).into_owned(),
-            R::Real(r) => r.to_string(),
-            R::Integer(i) => i.to_string(),
-            _ => String::new(),
-        };
-        if let Ok(d) = rust_decimal::Decimal::from_str_exact(&raw) {
-            return Value::Decimal(d);
+        SqliteDecode::DateTime => {
+            if let Some(s) = text(vr) {
+                if let Some(v) = parse_sqlite_datetime(&s) {
+                    return v;
+                }
+            }
         }
+        SqliteDecode::Date => {
+            if let Some(s) = text(vr) {
+                if let Ok(nd) = NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+                    return Value::Date(nd);
+                }
+            }
+        }
+        SqliteDecode::Time => {
+            if let Some(s) = text(vr) {
+                for fmt in ["%H:%M:%S%.f", "%H:%M:%S"] {
+                    if let Ok(nt) = NaiveTime::parse_from_str(&s, fmt) {
+                        return Value::Time(nt);
+                    }
+                }
+            }
+        }
+        SqliteDecode::Decimal => {
+            let parsed = match vr {
+                R::Text(t) => {
+                    rust_decimal::Decimal::from_str_exact(&String::from_utf8_lossy(t)).ok()
+                }
+                R::Real(r) => rust_decimal::Decimal::from_str_exact(&r.to_string()).ok(),
+                R::Integer(i) => rust_decimal::Decimal::from_str_exact(&i.to_string()).ok(),
+                _ => None,
+            };
+            if let Some(d) = parsed {
+                return Value::Decimal(d);
+            }
+        }
+        SqliteDecode::Raw => {}
     }
 
     match vr {
@@ -777,5 +940,211 @@ impl<'a> tokio_postgres::types::FromSql<'a> for NullProbe {
 
     fn accepts(_ty: &Type) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::types::ValueRef as R;
+
+    #[test]
+    fn decode_plan_maps_declared_types_to_tags() {
+        assert_eq!(sqlite_decode_plan("BOOLEAN"), SqliteDecode::Bool);
+        assert_eq!(sqlite_decode_plan("UUID"), SqliteDecode::Uuid);
+        assert_eq!(sqlite_decode_plan("uuid"), SqliteDecode::Uuid); // any case
+        assert_eq!(sqlite_decode_plan("JSON"), SqliteDecode::Json);
+        assert_eq!(sqlite_decode_plan("JSONB"), SqliteDecode::Json);
+        assert_eq!(sqlite_decode_plan("DATE"), SqliteDecode::Date);
+        assert_eq!(sqlite_decode_plan("TIME"), SqliteDecode::Time);
+        assert_eq!(sqlite_decode_plan("DECIMAL(10,2)"), SqliteDecode::Decimal);
+        assert_eq!(sqlite_decode_plan("NUMERIC"), SqliteDecode::Decimal);
+        // Aggregates / expressions have no declared type; plain storage-class
+        // declarations carry no recognised keyword.
+        assert_eq!(sqlite_decode_plan(""), SqliteDecode::Raw);
+        assert_eq!(sqlite_decode_plan("TEXT"), SqliteDecode::Raw);
+        assert_eq!(sqlite_decode_plan("VARCHAR(255)"), SqliteDecode::Raw);
+        assert_eq!(sqlite_decode_plan("INTEGER"), SqliteDecode::Raw);
+    }
+
+    #[test]
+    fn decode_plan_timestamp_keywords_beat_their_date_time_substrings() {
+        // "TIMESTAMP" contains "TIME" and "DATETIME" contains both "DATE" and
+        // "TIME": the datetime tag must win.
+        assert_eq!(sqlite_decode_plan("TIMESTAMP"), SqliteDecode::DateTime);
+        assert_eq!(sqlite_decode_plan("TIMESTAMPTZ"), SqliteDecode::DateTime);
+        assert_eq!(sqlite_decode_plan("DATETIME"), SqliteDecode::DateTime);
+    }
+
+    fn dt_text(s: &str) -> Value {
+        decode_sqlite(SqliteDecode::DateTime, R::Text(s.as_bytes()))
+    }
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn datetime_decodes_the_canonical_aware_layout() {
+        // Space-separated with explicit offset: what `TimestampTz` binds write.
+        match dt_text("2024-01-02 03:04:05.123456+00:00") {
+            Value::TimestampTz(dt) => assert_eq!(dt, utc("2024-01-02T03:04:05.123456+00:00")),
+            other => panic!("expected TimestampTz, got {other:?}"),
+        }
+        // A non-UTC offset must normalise to UTC.
+        match dt_text("2024-01-02 03:04:05+02:00") {
+            Value::TimestampTz(dt) => assert_eq!(dt, utc("2024-01-02T01:04:05+00:00")),
+            other => panic!("expected TimestampTz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_decodes_legacy_rfc3339_rows() {
+        // 'T'-separated rows written by older releases stay decodable as aware.
+        match dt_text("2024-01-02T03:04:05.123456+00:00") {
+            Value::TimestampTz(dt) => assert_eq!(dt, utc("2024-01-02T03:04:05.123456+00:00")),
+            other => panic!("expected TimestampTz, got {other:?}"),
+        }
+        match dt_text("2024-01-02T03:04:05Z") {
+            Value::TimestampTz(dt) => assert_eq!(dt, utc("2024-01-02T03:04:05+00:00")),
+            other => panic!("expected TimestampTz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_decodes_naive_layouts() {
+        let expected = NaiveDate::from_ymd_opt(2024, 1, 2)
+            .unwrap()
+            .and_hms_micro_opt(3, 4, 5, 123_456)
+            .unwrap();
+        for s in [
+            "2024-01-02 03:04:05.123456", // canonical naive (space, fraction)
+            "2024-01-02T03:04:05.123456", // legacy 'T' separator
+        ] {
+            match dt_text(s) {
+                Value::Timestamp(ndt) => assert_eq!(ndt, expected, "{s}"),
+                other => panic!("expected Timestamp for {s}, got {other:?}"),
+            }
+        }
+        // No fractional part at all.
+        match dt_text("2024-01-02 03:04:05") {
+            Value::Timestamp(ndt) => {
+                assert_eq!(
+                    ndt,
+                    NaiveDate::from_ymd_opt(2024, 1, 2)
+                        .unwrap()
+                        .and_hms_opt(3, 4, 5)
+                        .unwrap()
+                )
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_shape_probe_never_rejects_flexible_chrono_forms() {
+        // chrono tolerates 1-digit month/day, which shifts the offset before
+        // byte 19 — the probe's fallback chain must still accept it.
+        match dt_text("2024-1-2 03:04:05+02:00") {
+            Value::TimestampTz(dt) => assert_eq!(dt, utc("2024-01-02T01:04:05+00:00")),
+            other => panic!("expected TimestampTz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undecodable_cells_fall_back_to_the_storage_class() {
+        match dt_text("not a datetime") {
+            Value::Text(s) => assert_eq!(s, "not a datetime"),
+            other => panic!("expected Text fallback, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Uuid, R::Text(b"not-a-uuid")) {
+            Value::Text(s) => assert_eq!(s, "not-a-uuid"),
+            other => panic!("expected Text fallback, got {other:?}"),
+        }
+        // A BOOL-tagged TEXT cell keeps its text (only INTEGER maps to bool).
+        match decode_sqlite(SqliteDecode::Bool, R::Text(b"true")) {
+            Value::Text(s) => assert_eq!(s, "true"),
+            other => panic!("expected Text fallback, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Decimal, R::Blob(b"\x01")) {
+            Value::Bytes(b) => assert_eq!(b, vec![1]),
+            other => panic!("expected Bytes fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_tags_decode_their_cells() {
+        assert!(matches!(
+            decode_sqlite(SqliteDecode::Bool, R::Integer(1)),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            decode_sqlite(SqliteDecode::Bool, R::Integer(0)),
+            Value::Bool(false)
+        ));
+        match decode_sqlite(
+            SqliteDecode::Uuid,
+            R::Text(b"6a3e93b6-16f6-4d9b-9c07-4d5a3f5d2a10"),
+        ) {
+            Value::Uuid(u) => {
+                assert_eq!(u.to_string(), "6a3e93b6-16f6-4d9b-9c07-4d5a3f5d2a10")
+            }
+            other => panic!("expected Uuid, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Json, R::Text(br#"{"a": 1}"#)) {
+            Value::Json(j) => assert_eq!(j, serde_json::json!({"a": 1})),
+            other => panic!("expected Json, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Date, R::Text(b"2024-01-02")) {
+            Value::Date(d) => assert_eq!(d, NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()),
+            other => panic!("expected Date, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Time, R::Text(b"03:04:05.123456")) {
+            Value::Time(t) => {
+                assert_eq!(t, NaiveTime::from_hms_micro_opt(3, 4, 5, 123_456).unwrap())
+            }
+            other => panic!("expected Time, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Time, R::Text(b"03:04:05")) {
+            Value::Time(t) => assert_eq!(t, NaiveTime::from_hms_opt(3, 4, 5).unwrap()),
+            other => panic!("expected Time, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Decimal, R::Text(b"12.34")) {
+            Value::Decimal(d) => assert_eq!(d.to_string(), "12.34"),
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        // DECIMAL columns also accept numeric storage classes.
+        match decode_sqlite(SqliteDecode::Decimal, R::Integer(7)) {
+            Value::Decimal(d) => assert_eq!(d.to_string(), "7"),
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Decimal, R::Real(2.5)) {
+            Value::Decimal(d) => assert_eq!(d.to_string(), "2.5"),
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_tag_decodes_by_storage_class() {
+        assert!(matches!(
+            decode_sqlite(SqliteDecode::Raw, R::Null),
+            Value::Null
+        ));
+        assert!(matches!(
+            decode_sqlite(SqliteDecode::Raw, R::Integer(42)),
+            Value::Int(42)
+        ));
+        assert!(matches!(
+            decode_sqlite(SqliteDecode::Raw, R::Real(1.5)),
+            Value::Float(f) if f == 1.5
+        ));
+        match decode_sqlite(SqliteDecode::Raw, R::Text(b"hello")) {
+            Value::Text(s) => assert_eq!(s, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match decode_sqlite(SqliteDecode::Raw, R::Blob(b"\x00\x01")) {
+            Value::Bytes(b) => assert_eq!(b, vec![0, 1]),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
     }
 }

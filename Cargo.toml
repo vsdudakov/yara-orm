@@ -34,4 +34,9 @@ rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# Fat LTO + a single codegen unit measurably speed up the decode hot paths
+# (+7-12% on fetch benchmarks) at the cost of longer release builds. Do not add
+# `panic = "abort"`: pyo3 needs unwinding to translate Rust panics into Python
+# exceptions.
+lto = "fat"
+codegen-units = 1
