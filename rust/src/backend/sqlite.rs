@@ -1,7 +1,16 @@
 //! SQLite backend built on rusqlite + deadpool-sqlite.
 //!
-//! rusqlite is synchronous, so each operation runs on deadpool's blocking
-//! thread via `Object::interact`, keeping the async `Backend` contract.
+//! rusqlite is synchronous. Ordinary statements run *inline* on the tokio
+//! worker (via deadpool-sync's `Object::lock`): a pooled SQLite statement
+//! completes in microseconds, and the `interact()` alternative costs a full
+//! `spawn_blocking` round trip per statement (measured at ~17% of total query
+//! time). The blocking thread (`interact`) is kept only for work that can
+//! plausibly park on SQLite's locks or run long — see the notes on
+//! `begin_tx` (BEGIN IMMEDIATE waits on `busy_timeout`, up to 5s) and
+//! `execute_script` (arbitrary migration scripts) — where stalling a tokio
+//! worker would stall unrelated queries.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use deadpool_sqlite::{Config, Hook, HookError, Object, Pool, Runtime};
@@ -10,7 +19,7 @@ use rusqlite::Connection;
 use crate::backend::pool::extract_pool_params;
 use crate::backend::{Backend, TxConn};
 use crate::error::EngineError;
-use crate::value::{decode_sqlite, value_into_sqlite, Row, Value};
+use crate::value::{decode_sqlite, sqlite_decode_plan, Row, SqliteDecode, Value};
 
 /// Default pool size for file-backed databases when the URL omits `max_size`.
 const DEFAULT_MAX_SIZE: usize = 8;
@@ -86,32 +95,39 @@ fn sqlite_path(url: &str) -> Result<String, EngineError> {
     }
 }
 
-// --- synchronous primitives, run inside `interact` -------------------------
+// --- synchronous primitives ------------------------------------------------
+// Run inline on the tokio worker (see the module docs and `lock_conn` for why
+// that is safe); `sql` and `params` are borrowed from the caller instead of
+// being cloned into a `'static` closure for `interact`.
 
 fn sql_execute(
     conn: &Connection,
     sql: &str,
-    params: Vec<Value>,
+    params: &[Value],
     cache: bool,
 ) -> Result<u64, EngineError> {
-    let bound: Vec<rusqlite::types::Value> = params.into_iter().map(value_into_sqlite).collect();
     with_stmt(conn, sql, cache, |stmt| {
         let n = stmt
-            .execute(rusqlite::params_from_iter(bound))
+            .execute(rusqlite::params_from_iter(params))
             .map_err(map_sqlite)?;
         Ok(n as u64)
     })
 }
 
-fn column_meta(stmt: &rusqlite::Statement) -> Vec<(String, String)> {
-    // Upper-case the declared type once per column here; `decode_sqlite` then
-    // matches against it per cell without re-allocating an uppercased string.
+/// Per-result-set column metadata: shared column name + decode plan.
+type ColumnMeta = Vec<(Arc<str>, SqliteDecode)>;
+
+fn column_meta(stmt: &rusqlite::Statement) -> ColumnMeta {
+    // Resolve each column's decode plan from its declared type once per result
+    // set; `decode_sqlite` then dispatches on the tag per cell without any
+    // substring scans. Names are `Arc<str>` so `to_named` shares one
+    // allocation across all rows.
     stmt.columns()
         .iter()
         .map(|c| {
             (
-                c.name().to_string(),
-                c.decl_type().unwrap_or("").to_ascii_uppercase(),
+                Arc::from(c.name()),
+                sqlite_decode_plan(c.decl_type().unwrap_or("")),
             )
         })
         .collect()
@@ -120,22 +136,21 @@ fn column_meta(stmt: &rusqlite::Statement) -> Vec<(String, String)> {
 fn sql_fetch_rows(
     conn: &Connection,
     sql: &str,
-    params: Vec<Value>,
+    params: &[Value],
     with_names: bool,
     cache: bool,
-) -> Result<(Vec<(String, String)>, Vec<Vec<Value>>), EngineError> {
-    let bound: Vec<rusqlite::types::Value> = params.into_iter().map(value_into_sqlite).collect();
+) -> Result<(ColumnMeta, Vec<Vec<Value>>), EngineError> {
     with_stmt(conn, sql, cache, |stmt| {
         let meta = column_meta(stmt);
         let mut rows = stmt
-            .query(rusqlite::params_from_iter(bound))
+            .query(rusqlite::params_from_iter(params))
             .map_err(map_sqlite)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(map_sqlite)? {
             let mut values = Vec::with_capacity(meta.len());
-            for (idx, (_, decl)) in meta.iter().enumerate() {
+            for (idx, (_, plan)) in meta.iter().enumerate() {
                 let vr = row.get_ref(idx).map_err(map_interact)?;
-                values.push(decode_sqlite(decl, vr));
+                values.push(decode_sqlite(*plan, vr));
             }
             out.push(values);
         }
@@ -145,12 +160,12 @@ fn sql_fetch_rows(
 }
 
 /// Run the whole batch inside one transaction so a mid-batch failure applies
-/// nothing. The transaction begins/ends within this synchronous closure (one
-/// `interact` call), so a cancelled Python future cannot leave it half-open.
+/// nothing. The transaction begins/ends within this one synchronous call (no
+/// await points), so a cancelled Python future cannot leave it half-open.
 fn sql_execute_many(
     conn: &Connection,
     sql: &str,
-    rows: Vec<Vec<Value>>,
+    rows: &[Vec<Value>],
     cache: bool,
 ) -> Result<Vec<Row>, EngineError> {
     conn.execute_batch("BEGIN IMMEDIATE").map_err(map_sqlite)?;
@@ -169,23 +184,21 @@ fn sql_execute_many(
 fn sql_execute_many_inner(
     conn: &Connection,
     sql: &str,
-    rows: Vec<Vec<Value>>,
+    rows: &[Vec<Value>],
     cache: bool,
 ) -> Result<Vec<Row>, EngineError> {
     with_stmt(conn, sql, cache, |stmt| {
         let meta = column_meta(stmt);
         let mut out = Vec::with_capacity(rows.len());
         for row_params in rows {
-            let bound: Vec<rusqlite::types::Value> =
-                row_params.into_iter().map(value_into_sqlite).collect();
             let mut qrows = stmt
-                .query(rusqlite::params_from_iter(bound))
+                .query(rusqlite::params_from_iter(row_params))
                 .map_err(map_sqlite)?;
             if let Some(row) = qrows.next().map_err(map_sqlite)? {
                 let mut r = Vec::with_capacity(meta.len());
-                for (idx, (name, decl)) in meta.iter().enumerate() {
+                for (idx, (name, plan)) in meta.iter().enumerate() {
                     let vr = row.get_ref(idx).map_err(map_interact)?;
-                    r.push((name.clone(), decode_sqlite(decl, vr)));
+                    r.push((name.clone(), decode_sqlite(*plan, vr)));
                 }
                 out.push(r);
             } else {
@@ -196,7 +209,7 @@ fn sql_execute_many_inner(
     })
 }
 
-fn to_named(meta: &[(String, String)], rows: Vec<Vec<Value>>) -> Vec<Row> {
+fn to_named(meta: &[(Arc<str>, SqliteDecode)], rows: Vec<Vec<Value>>) -> Vec<Row> {
     rows.into_iter()
         .map(|vals| {
             meta.iter()
@@ -292,23 +305,43 @@ impl SqliteBackend {
     }
 }
 
+/// Lock a pooled connection for *inline* use on the tokio worker, instead of
+/// shipping a closure to the blocking pool with `interact()`.
+///
+/// This is safe here because the mutex is effectively uncontended: the pool
+/// hands each `Object` to one task at a time, so the only other lockers are a
+/// finished `interact()` (already released) — the lock itself never parks.
+/// What can stall inline is SQLite: a write statement may wait on
+/// `busy_timeout` while another connection holds the write lock. That wait is
+/// normally far below a millisecond for the autocommit statements run this
+/// way (WAL writers hold the lock only for the statement itself), and the
+/// per-statement `spawn_blocking` round trip it replaces measured ~17% of
+/// total query time. Work that *plausibly* parks for longer stays on
+/// `interact()`: `begin_tx`'s BEGIN IMMEDIATE (queues behind whole
+/// transactions, up to the full 5s `busy_timeout`) and `execute_script`
+/// (arbitrary long migration scripts).
+///
+/// Poisoning (a panic inside a previous `interact`) surfaces as a query error.
+fn lock_conn(obj: &Object) -> Result<impl std::ops::Deref<Target = Connection> + '_, EngineError> {
+    obj.lock().map_err(map_interact)
+}
+
 #[async_trait]
 impl Backend for SqliteBackend {
+    // Statement methods run inline on the tokio worker (see `lock_conn`): no
+    // per-statement `spawn_blocking` hop, and `sql`/`params` are borrowed
+    // instead of cloned into a `'static` closure.
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
         let obj = self.obj().await?;
-        let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        obj.interact(move |conn| sql_execute(conn, &sql, params, cache))
-            .await
-            .map_err(map_interact)?
+        let conn = lock_conn(&obj)?;
+        sql_execute(&conn, sql, params, self.cache_statements)
     }
 
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
         let obj = self.obj().await?;
-        let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        let (meta, rows) = obj
-            .interact(move |conn| sql_fetch_rows(conn, &sql, params, true, cache))
-            .await
-            .map_err(map_interact)??;
+        let conn = lock_conn(&obj)?;
+        let (meta, rows) = sql_fetch_rows(&conn, sql, params, true, self.cache_statements)?;
         Ok(to_named(&meta, rows))
     }
 
@@ -318,25 +351,28 @@ impl Backend for SqliteBackend {
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>, EngineError> {
         let obj = self.obj().await?;
-        let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        let (_, rows) = obj
-            .interact(move |conn| sql_fetch_rows(conn, &sql, params, false, cache))
-            .await
-            .map_err(map_interact)??;
+        let conn = lock_conn(&obj)?;
+        let (_, rows) = sql_fetch_rows(&conn, sql, params, false, self.cache_statements)?;
         Ok(rows)
     }
 
     async fn execute_many(&self, sql: &str, rows: &[Vec<Value>]) -> Result<Vec<Row>, EngineError> {
+        // Inline like the other statement methods: the batch's own BEGIN
+        // IMMEDIATE contends for the write lock exactly like an autocommit
+        // INSERT does, and the whole batch runs without await points so a
+        // cancelled Python future cannot abandon it half-applied.
         let obj = self.obj().await?;
-        let (sql, rows, cache) = (sql.to_string(), rows.to_vec(), self.cache_statements);
-        obj.interact(move |conn| sql_execute_many(conn, &sql, rows, cache))
-            .await
-            .map_err(map_interact)?
+        let conn = lock_conn(&obj)?;
+        sql_execute_many(&conn, sql, rows, self.cache_statements)
     }
 
     async fn execute_script(&self, statements: &[String]) -> Result<(), EngineError> {
         let obj = self.obj().await?;
         let statements = statements.to_vec();
+        // Deliberately stays on `interact()` (the blocking thread pool):
+        // scripts are arbitrary user SQL (migrations, bulk DDL) that can run
+        // for seconds — inline they would stall a tokio worker and every task
+        // scheduled on it.
         obj.interact(move |conn| {
             let mut result = Ok(());
             for statement in &statements {
@@ -384,6 +420,11 @@ impl Backend for SqliteBackend {
         // SQLITE_BUSY_SNAPSHOT at their first write. The trade-off — writers
         // serialize from BEGIN rather than from their first write — is the
         // right one for an ORM's in_transaction(), which usually writes.
+        //
+        // This one deliberately stays on `interact()` (unlike the statement
+        // methods, which run inline): queuing behind *whole transactions* here
+        // can park for the full 5s `busy_timeout`, and that must happen on the
+        // blocking pool, not a tokio worker.
         tx.obj()
             .interact(|conn| conn.execute_batch("BEGIN IMMEDIATE"))
             .await
@@ -426,13 +467,13 @@ impl SqliteTx {
             .expect("SqliteTx connection is present until drop")
     }
 
-    async fn control(mut self: Box<Self>, sql: &'static str) -> Result<(), EngineError> {
-        let result = self
-            .obj()
-            .interact(move |conn| conn.execute_batch(sql))
-            .await
-            .map_err(map_interact)
-            .and_then(|r| r.map_err(map_sqlite));
+    /// Run a COMMIT/ROLLBACK inline and settle the drop-guard state. Inline is
+    /// safe for these: the transaction has held the write lock since BEGIN
+    /// IMMEDIATE, so neither statement waits on other connections (a WAL
+    /// commit appends to the log; it does not wait for readers).
+    fn control(&mut self, sql: &'static str) -> Result<(), EngineError> {
+        let result =
+            lock_conn(self.obj()).and_then(|conn| conn.execute_batch(sql).map_err(map_sqlite));
         self.state = if result.is_ok() {
             TxState::Finished
         } else {
@@ -476,21 +517,19 @@ impl Drop for SqliteTx {
 
 #[async_trait]
 impl TxConn for SqliteTx {
+    // All statement and savepoint methods run inline (see `lock_conn`): the
+    // transaction acquired the write lock at BEGIN IMMEDIATE, so nothing here
+    // waits on other connections — inline they only cost the statement itself,
+    // not a `spawn_blocking` round trip each.
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
-        let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        self.obj()
-            .interact(move |conn| sql_execute(conn, &sql, params, cache))
-            .await
-            .map_err(map_interact)?
+        let conn = lock_conn(self.obj())?;
+        sql_execute(&conn, sql, params, self.cache_statements)
     }
 
     async fn fetch_all(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, EngineError> {
-        let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        let (meta, rows) = self
-            .obj()
-            .interact(move |conn| sql_fetch_rows(conn, &sql, params, true, cache))
-            .await
-            .map_err(map_interact)??;
+        let conn = lock_conn(self.obj())?;
+        let (meta, rows) = sql_fetch_rows(&conn, sql, params, true, self.cache_statements)?;
         Ok(to_named(&meta, rows))
     }
 
@@ -499,48 +538,35 @@ impl TxConn for SqliteTx {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>, EngineError> {
-        let (sql, params, cache) = (sql.to_string(), params.to_vec(), self.cache_statements);
-        let (_, rows) = self
-            .obj()
-            .interact(move |conn| sql_fetch_rows(conn, &sql, params, false, cache))
-            .await
-            .map_err(map_interact)??;
+        let conn = lock_conn(self.obj())?;
+        let (_, rows) = sql_fetch_rows(&conn, sql, params, false, self.cache_statements)?;
         Ok(rows)
     }
 
-    async fn commit(self: Box<Self>) -> Result<(), EngineError> {
-        self.control("COMMIT").await
+    async fn commit(mut self: Box<Self>) -> Result<(), EngineError> {
+        self.control("COMMIT")
     }
 
-    async fn rollback(self: Box<Self>) -> Result<(), EngineError> {
-        self.control("ROLLBACK").await
+    async fn rollback(mut self: Box<Self>) -> Result<(), EngineError> {
+        self.control("ROLLBACK")
     }
 
     async fn savepoint(&self, name: &str) -> Result<(), EngineError> {
         let sql = format!("SAVEPOINT {name}");
-        self.obj()
-            .interact(move |conn| conn.execute_batch(&sql))
-            .await
-            .map_err(map_interact)?
-            .map_err(map_sqlite)
+        let conn = lock_conn(self.obj())?;
+        conn.execute_batch(&sql).map_err(map_sqlite)
     }
 
     async fn release(&self, name: &str) -> Result<(), EngineError> {
         let sql = format!("RELEASE SAVEPOINT {name}");
-        self.obj()
-            .interact(move |conn| conn.execute_batch(&sql))
-            .await
-            .map_err(map_interact)?
-            .map_err(map_sqlite)
+        let conn = lock_conn(self.obj())?;
+        conn.execute_batch(&sql).map_err(map_sqlite)
     }
 
     async fn rollback_to(&self, name: &str) -> Result<(), EngineError> {
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
-        self.obj()
-            .interact(move |conn| conn.execute_batch(&sql))
-            .await
-            .map_err(map_interact)?
-            .map_err(map_sqlite)
+        let conn = lock_conn(self.obj())?;
+        conn.execute_batch(&sql).map_err(map_sqlite)
     }
 }
 

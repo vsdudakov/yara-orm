@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::backend::{self, Backend, TxConn};
 use crate::error::{to_pyerr, typed_pyerr};
-use crate::value::{PyRow, Value};
+use crate::value::{PyRow, PyRows, Value};
 
 #[pyclass]
 pub struct Engine {
@@ -48,7 +48,7 @@ impl Engine {
         let backend = self.backend.clone();
         future_into_py(py, async move {
             let rows = backend.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
-            Ok(rows.into_iter().map(PyRow).collect::<Vec<_>>())
+            Ok(PyRows(rows))
         })
     }
 
@@ -100,7 +100,7 @@ impl Engine {
         let backend = self.backend.clone();
         future_into_py(py, async move {
             let out = backend.execute_many(&sql, &rows).await.map_err(to_pyerr)?;
-            Ok(out.into_iter().map(PyRow).collect::<Vec<_>>())
+            Ok(PyRows(out))
         })
     }
 
@@ -263,7 +263,7 @@ impl Transaction {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(tx_finished)?;
             let rows = tx.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
-            Ok(rows.into_iter().map(PyRow).collect::<Vec<_>>())
+            Ok(PyRows(rows))
         })
     }
 
