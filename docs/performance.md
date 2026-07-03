@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: Yara ORM benchmarks — a fast async Python ORM that runs 2–9× faster than Tortoise ORM, async SQLAlchemy and Pony on PostgreSQL and SQLite.
+description: Yara ORM benchmarks — a fast async Python ORM that runs 2–9× faster than Tortoise ORM, async SQLAlchemy and Pony on PostgreSQL, MySQL and SQLite.
 ---
 
 # Performance
@@ -55,24 +55,53 @@ Yara ORM is fastest on every operation in this configuration. `get_by_pk` and
 `single_insert` are latency-bound (one sequential round-trip per call) and sit near the raw
 client⇄PostgreSQL round-trip floor.
 
+## MySQL
+
+![Yara ORM vs Tortoise, SQLAlchemy and Pony on MySQL — latency per operation, log scale, lower is better](assets/benchmark-mysql.png)
+
+MySQL 8.4 (Docker), Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower
+is better). Tortoise runs over asyncmy, SQLAlchemy over aiomysql, Pony over
+pymysql:
+
+| operation     | yara-orm | tortoise | sqlalchemy |  pony |
+|---------------|---------:|---------:|-----------:|------:|
+| bulk_insert   |     46.0 |     47.3 |      799.7 | 432.7 |
+| single_insert |    693.7 |    753.7 |      904.4 | 737.4 |
+| fetch_all     |      5.6 |     34.2 |       38.9 |  47.5 |
+| count         |      0.7 |      1.1 |        1.3 |   0.8 |
+| group_by      |      1.2 |      1.5 |        2.1 |   2.5 |
+| filter        |      3.4 |     17.9 |       16.4 |  24.9 |
+| get_by_pk     |    110.9 |    227.7 |      544.2 | 312.4 |
+| update        |      7.2 |      7.8 |       11.0 | 235.5 |
+| delete        |      4.9 |      5.1 |        5.6 | 211.5 |
+
+Yara ORM is fastest or tied on every operation here too (`get_by_pk` 2.1–4.9×,
+`fetch_all` 6.0–8.4×, `filter` 4.8–7.3×). The two latency-bound operations
+include the Docker-network round trip, and `single_insert` is dominated by
+InnoDB's per-commit fsync — a durability cost every ORM pays equally.
+
 ## SQLite
+
+![Yara ORM vs Tortoise, SQLAlchemy and Pony on SQLite — latency per operation, log scale, lower is better](assets/benchmark-sqlite.png)
 
 Python 3.12, N=5000, median of 5 (ms, lower is better).
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
 |---------------|---------:|---------:|-----------:|------:|
-| bulk_insert   |      8.2 |     13.7 |      604.5 |  54.7 |
-| single_insert |     36.0 |     26.1 |      231.8 | 111.3 |
-| fetch_all     |      5.4 |     39.9 |       20.4 |  51.8 |
-| count         |      0.1 |      0.2 |        0.7 |   0.2 |
-| filter        |      3.0 |     20.4 |        7.0 |  26.1 |
-| get_by_pk     |     56.5 |     79.0 |      331.5 |  31.5 |
-| update        |      0.5 |      0.5 |        1.8 |  43.6 |
+| bulk_insert   |      7.7 |     13.8 |      615.4 |  51.5 |
+| single_insert |     33.1 |     26.6 |      245.0 | 109.2 |
+| fetch_all     |      3.3 |     39.2 |       21.0 |  53.1 |
+| count         |      0.1 |      0.3 |        0.7 |   0.2 |
+| group_by      |      0.5 |      0.7 |        1.4 |   1.5 |
+| filter        |      1.9 |     20.2 |        7.6 |  26.6 |
+| get_by_pk     |     47.7 |     82.0 |      335.7 |  31.2 |
+| update        |      0.5 |      0.5 |        1.9 |  43.5 |
+| delete        |      0.4 |      0.3 |        1.3 |  37.0 |
 
-Yara ORM wins the throughput-bound operations decisively (bulk 1.7× vs Tortoise,
-`fetch_all` 7.4×, `filter` 6.9×). It trails on the two **latency-bound** point operations:
-in-process Pony edges `get_by_pk` (56.5 vs 31.5 ms), and Tortoise edges `single_insert`
-(36.0 vs 26.1 ms) — the cost is the per-statement asyncio bridge (scheduling the
+Yara ORM wins the throughput-bound operations decisively (bulk 1.8× vs Tortoise,
+`fetch_all` 11.9×, `filter` 10.6×). It trails on the two **latency-bound** point operations:
+in-process Pony edges `get_by_pk` (47.7 vs 31.2 ms), and Tortoise edges `single_insert`
+(33.1 vs 26.6 ms) — the cost is the per-statement asyncio bridge (scheduling the
 statement on the runtime and waking the event loop), tens of microseconds that a
 synchronous in-process driver avoids on sequential point queries. Real workloads rarely fire thousands of
 sequential point reads, and everything throughput-shaped is far ahead. If those point
@@ -153,7 +182,8 @@ uvloop.run(main())          # instead of asyncio.run(main())
 
 ```bash
 make bench          # PostgreSQL 4-way benchmark
-BENCH_BACKEND=sqlite make bench
+make bench-mysql    # same comparison on MySQL
+make bench-sqlite   # same comparison on SQLite
 ```
 
 See [`benchmarks/README.md`](https://github.com/vsdudakov/yara-orm/tree/main/benchmarks)

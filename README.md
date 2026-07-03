@@ -220,10 +220,13 @@ idempotent analogs (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …) and de
 
 ## Performance
 
-Median of 5 runs, PostgreSQL 18, Python 3.12, 5000 rows — Yara ORM is fastest on
-every operation measured. Cells show Yara ORM's time and each competitor's
-slowdown factor (>1 means Yara ORM is faster). Full methodology in
+Median of 5 runs, Python 3.12, 5000 rows — Yara ORM is fastest (or tied) on
+every operation measured on PostgreSQL **and MySQL**, and wins everything
+throughput-shaped on SQLite. Cells show Yara ORM's time and each competitor's
+slowdown factor (>1 means Yara ORM is faster). Full methodology and tables in
 [`benchmarks/`](benchmarks/).
+
+### PostgreSQL 18
 
 ![Yara ORM vs Tortoise, SQLAlchemy and Pony on PostgreSQL — latency per operation, log scale, lower is better](docs/assets/benchmark-postgres.png)
 
@@ -239,12 +242,43 @@ slowdown factor (>1 means Yara ORM is faster). Full methodology in
 | update        |  3.2 ms  | 1.1×        | 1.2×          | 37.3×   |
 | delete        |  0.7 ms  | 1.2×        | 1.6×          | 135.6×  |
 
+### MySQL 8.4
+
+Same workload against MySQL (Tortoise over asyncmy, SQLAlchemy over aiomysql,
+Pony over pymysql):
+
+![Yara ORM vs Tortoise, SQLAlchemy and Pony on MySQL — latency per operation, log scale, lower is better](docs/assets/benchmark-mysql.png)
+
+| operation     | yara-orm  | vs Tortoise | vs SQLAlchemy | vs Pony |
+|---------------|----------:|------------:|--------------:|--------:|
+| bulk_insert   |  46.0 ms  | 1.0×        | 17.4×         |  9.4×   |
+| single_insert | 693.7 ms  | 1.1×        | 1.3×          |  1.1×   |
+| fetch_all     |   5.6 ms  | 6.0×        | 6.9×          |  8.4×   |
+| count         |   0.7 ms  | 1.4×        | 1.7×          |  1.1×   |
+| group_by      |   1.2 ms  | 1.2×        | 1.7×          |  2.0×   |
+| filter        |   3.4 ms  | 5.3×        | 4.8×          |  7.3×   |
+| get_by_pk     | 110.9 ms  | 2.1×        | 4.9×          |  2.8×   |
+| update        |   7.2 ms  | 1.1×        | 1.5×          | 32.5×   |
+| delete        |   4.9 ms  | 1.0×        | 1.1×          | 42.9×   |
+
+(`single_insert` is dominated by InnoDB's per-commit fsync — every ORM pays
+it; `get_by_pk` and `single_insert` include the Docker-network round trip.)
+
+### SQLite
+
+![Yara ORM vs Tortoise, SQLAlchemy and Pony on SQLite — latency per operation, log scale, lower is better](docs/assets/benchmark-sqlite.png)
+
+Yara ORM wins everything throughput-shaped (fetch_all 6–16×, filter 4–14×,
+bulk_insert 1.8–80×) and trails only the two latency-bound point ops, where
+the per-statement asyncio bridge costs tens of µs against in-process sync
+drivers — the opt-in `sqlite://...?sync_fast_path=1` URL flag removes that
+bridge entirely (point queries ~7× faster).
+
 Speed comes from the Rust hot path, **positional row decoding** (no per-row dict
 or column-name allocation), **compiled-SQL + prepared-statement caching**, and
-connection pooling. On SQLite, the opt-in `sync_fast_path=1` URL flag removes
-the per-statement asyncio bridge entirely (point queries ~7× faster — see
+connection pooling (see
 [Performance](https://vsdudakov.github.io/yara-orm/performance/)). Run it
-yourself with `make bench`.
+yourself with `make bench` / `make bench-mysql` / `make bench-sqlite`.
 
 ## Architecture
 
@@ -262,6 +296,7 @@ yourself with `make bench`.
 │   Engine ...................... async facade│
 │   Backend trait .............. pluggable DBs│
 │     PgBackend ............... tokio-postgres│
+│     MySqlBackend ................ mysql_async│
 │     SqliteBackend ................. rusqlite│
 │   Value .................. Py⇆Rust⇆SQL types│
 └─────────────────────────────────────────────┘
@@ -284,6 +319,8 @@ make lint       # ruff check + ruff format --check + ty
 make test       # pytest against $DB (default postgres://localhost/orm_demo)
 make cov        # tests with the 100% coverage gate
 make bench      # 4-way benchmark (needs `make bench-setup` once; Python ≤ 3.12 for Pony)
+make bench-mysql   # same 4-way comparison on MySQL
+make bench-sqlite  # same 4-way comparison on SQLite
 ```
 
 Requires a Rust toolchain (`rustup`) and a local PostgreSQL for the Postgres
