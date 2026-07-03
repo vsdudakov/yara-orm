@@ -57,15 +57,28 @@ fn with_stmt<T>(
     }
 }
 
-/// Resolve the database path from a sqlite URL, honouring its query string.
+/// Options parsed from a sqlite URL by [`sqlite_path`].
+#[derive(Debug, PartialEq, Eq)]
+struct SqliteUrl {
+    /// The database file path, or `":memory:"`.
+    path: String,
+    /// Whether the URL opted into the synchronous fast path
+    /// (`sync_fast_path=1`); see [`SqliteBackend::sync_capable`].
+    sync_fast_path: bool,
+}
+
+/// Resolve the database path (and sqlite-only options) from a sqlite URL,
+/// honouring its query string.
 ///
 /// The pool parameters (`max_size`/...) were already stripped by
 /// `extract_pool_params`; whatever query string remains is parsed here rather
 /// than being treated as part of the file name (`sqlite://data.db?cache=shared`
 /// must not open a literal file named `data.db?cache=shared`). `mode=memory`
-/// selects an in-memory database; any other parameter is rejected so a typo
-/// cannot silently corrupt the path.
-fn sqlite_path(url: &str) -> Result<String, EngineError> {
+/// selects an in-memory database and `sync_fast_path=1` opts into the
+/// synchronous engine fast path (`0`/`off` keep the default async bridge); any
+/// other parameter — or a bad `sync_fast_path` value — is rejected so a typo
+/// cannot silently corrupt the path or silently drop the opt-in.
+fn sqlite_path(url: &str) -> Result<SqliteUrl, EngineError> {
     let raw = url
         .strip_prefix("sqlite://")
         .or_else(|| url.strip_prefix("sqlite:"))
@@ -75,24 +88,39 @@ fn sqlite_path(url: &str) -> Result<String, EngineError> {
         None => (raw, None),
     };
     let mut memory = false;
+    let mut sync_fast_path = false;
     if let Some(q) = query {
         for pair in q.split('&').filter(|p| !p.is_empty()) {
             let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
             if key == "mode" && val == "memory" {
                 memory = true;
+            } else if key == "sync_fast_path" {
+                sync_fast_path = match val {
+                    "1" => true,
+                    "0" | "off" => false,
+                    _ => {
+                        return Err(EngineError::Config(format!(
+                            "invalid sync_fast_path value {val:?} (supported: 1, 0, off)"
+                        )))
+                    }
+                };
             } else {
                 return Err(EngineError::Config(format!(
                     "unsupported sqlite URL parameter {pair:?} (supported: mode=memory, \
-                     max_size, min_size, statement_cache_size)"
+                     sync_fast_path, max_size, min_size, statement_cache_size)"
                 )));
             }
         }
     }
-    if memory || path.is_empty() {
-        Ok(":memory:".to_string())
+    let path = if memory || path.is_empty() {
+        ":memory:".to_string()
     } else {
-        Ok(path.to_string())
-    }
+        path.to_string()
+    };
+    Ok(SqliteUrl {
+        path,
+        sync_fast_path,
+    })
 }
 
 // --- synchronous primitives ------------------------------------------------
@@ -228,12 +256,16 @@ pub struct SqliteBackend {
     /// cached per connection. Kept for parity with the Postgres backend; SQLite
     /// has no connection proxy, so this is mainly a knob for predictable memory.
     cache_statements: bool,
+    /// URL `sync_fast_path=1`: the engine may drive this backend's statement
+    /// futures to completion synchronously on the calling Python thread.
+    sync_fast_path: bool,
 }
 
 impl SqliteBackend {
     pub async fn connect(url: &str) -> Result<Self, EngineError> {
         let (clean_url, params) = extract_pool_params(url)?;
-        let path = sqlite_path(&clean_url)?;
+        let parsed = sqlite_path(&clean_url)?;
+        let (path, sync_fast_path) = (parsed.path, parsed.sync_fast_path);
         let in_memory = path == ":memory:";
         let cfg = Config::new(path);
         // In-memory databases are per-connection, so they must pin a single one;
@@ -294,6 +326,7 @@ impl SqliteBackend {
         Ok(Self {
             pool,
             cache_statements: params.cache_statements,
+            sync_fast_path,
         })
     }
 
@@ -397,6 +430,16 @@ impl Backend for SqliteBackend {
 
     fn dialect(&self) -> &'static str {
         "sqlite"
+    }
+
+    fn sync_capable(&self) -> bool {
+        // Opt-in via `sqlite://...?sync_fast_path=1`. Statement futures on this
+        // backend complete in microseconds (pool checkout + an in-process
+        // rusqlite call, no real I/O awaits), so the engine may legally drive
+        // them with `block_on` from the Python caller thread. `begin_tx` is
+        // exempt — the engine always keeps it async, because BEGIN IMMEDIATE
+        // can park on `busy_timeout` for up to 5s.
+        self.sync_fast_path
     }
 
     async fn close(&self) {
@@ -575,20 +618,24 @@ mod tests {
     use super::sqlite_path;
     use crate::error::EngineError;
 
+    /// The resolved path of a URL that parses cleanly.
+    fn path(url: &str) -> String {
+        sqlite_path(url).unwrap().path
+    }
+
     #[test]
     fn plain_paths_and_memory_defaults() {
-        assert_eq!(sqlite_path("sqlite://./data.db").unwrap(), "./data.db");
-        assert_eq!(sqlite_path("sqlite:/tmp/x.db").unwrap(), "/tmp/x.db");
-        assert_eq!(sqlite_path("sqlite://").unwrap(), ":memory:");
-        assert_eq!(sqlite_path("sqlite://:memory:").unwrap(), ":memory:");
+        assert_eq!(path("sqlite://./data.db"), "./data.db");
+        assert_eq!(path("sqlite:/tmp/x.db"), "/tmp/x.db");
+        assert_eq!(path("sqlite://"), ":memory:");
+        assert_eq!(path("sqlite://:memory:"), ":memory:");
+        // No query string: the fast path stays off.
+        assert!(!sqlite_path("sqlite://./data.db").unwrap().sync_fast_path);
     }
 
     #[test]
     fn mode_memory_is_honoured() {
-        assert_eq!(
-            sqlite_path("sqlite://x.db?mode=memory").unwrap(),
-            ":memory:"
-        );
+        assert_eq!(path("sqlite://x.db?mode=memory"), ":memory:");
     }
 
     #[test]
@@ -596,5 +643,40 @@ mod tests {
         let err = sqlite_path("sqlite://data.db?cache=shared").unwrap_err();
         assert!(matches!(err, EngineError::Config(_)));
         assert!(err.to_string().contains("cache=shared"));
+        // The error names the newly supported parameter so users discover it.
+        assert!(err.to_string().contains("sync_fast_path"));
+    }
+
+    #[test]
+    fn sync_fast_path_accepts_1_0_and_off() {
+        let parsed = sqlite_path("sqlite://data.db?sync_fast_path=1").unwrap();
+        assert_eq!(parsed.path, "data.db");
+        assert!(parsed.sync_fast_path);
+        assert!(
+            !sqlite_path("sqlite://data.db?sync_fast_path=0")
+                .unwrap()
+                .sync_fast_path
+        );
+        assert!(
+            !sqlite_path("sqlite://data.db?sync_fast_path=off")
+                .unwrap()
+                .sync_fast_path
+        );
+    }
+
+    #[test]
+    fn sync_fast_path_combines_with_mode_memory() {
+        let parsed = sqlite_path("sqlite://x.db?mode=memory&sync_fast_path=1").unwrap();
+        assert_eq!(parsed.path, ":memory:");
+        assert!(parsed.sync_fast_path);
+    }
+
+    #[test]
+    fn sync_fast_path_rejects_other_values() {
+        for bad in ["true", "yes", "on", "2", ""] {
+            let err = sqlite_path(&format!("sqlite://data.db?sync_fast_path={bad}")).unwrap_err();
+            assert!(matches!(err, EngineError::Config(_)), "value {bad:?}");
+            assert!(err.to_string().contains("sync_fast_path"), "value {bad:?}");
+        }
     }
 }

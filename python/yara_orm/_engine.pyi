@@ -3,6 +3,11 @@
 The real module is built by maturin from `rust/src`. Its async methods return
 awaitables that resolve to Python rows; they are typed loosely here because the
 values cross the PyO3 boundary dynamically.
+
+On a SQLite engine opened with ``sync_fast_path=1`` in the URL, the statement
+methods return *already-completed* awaitables (the work ran synchronously with
+the GIL released); the signatures are identical — callers just ``await`` them.
+``begin`` and ``execute_script`` always return pending awaitables.
 """
 
 from collections.abc import Awaitable

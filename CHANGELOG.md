@@ -8,6 +8,24 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Added
 
+- **Opt-in SQLite synchronous fast path** — `sqlite:///app.db?sync_fast_path=1`.
+  Statement calls (queries, transaction statements, commit/rollback,
+  savepoints, `execute_many`) run the SQLite work synchronously on the calling
+  thread with the GIL released and return an already-completed awaitable, so
+  `await` resumes immediately instead of round-tripping the event loop —
+  ~7× faster warm point queries (~6µs vs ~40µs) and 2.7–14× on
+  per-statement benchmark ops. Code changes: none — everything is still
+  `await`ed; errors still raise at the `await`. `sync_fast_path=0`/`off` keep
+  the default async bridge; other values raise `ValueError`, and the flag is
+  rejected on postgres URLs. **Caveats (deliberate trade-offs):** the event
+  loop is blocked for the duration of each statement (opt in only for
+  microsecond-statement workloads — tests, scripts, benchmarks,
+  low-contention apps; a long scan or a write parked on the 5s busy timeout
+  stalls *all* tasks), and awaiting a completed awaitable may not yield to
+  the event loop, changing task interleaving (don't rely on `await` as a
+  scheduling point). `begin()` and `execute_script` always stay async
+  (`BEGIN IMMEDIATE` can park on the busy timeout; scripts can run long).
+
 - **Fully-typed model attributes and generic querysets.** Scalar fields are
   now generic over their Python value type with `null=True` folding `None`
   in, so `call.to_number` reveals `str`, `call.duration` (from
