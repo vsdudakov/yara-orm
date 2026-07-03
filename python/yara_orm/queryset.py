@@ -738,7 +738,7 @@ class QuerySet(Generic[ModelT]):
         tmeta = info.resolve_target()._meta
         src = q(cur_meta.get_field(info.source_attr).db_column)
         join = (
-            f" LEFT JOIN {q(tmeta.table)} AS {alias} "
+            f" LEFT JOIN {q(tmeta.table)} {alias} "
             f"ON {cur_table}.{src} = {alias}.{q(tmeta.pk_field.db_column)}"
         )
         return tmeta, join
@@ -932,9 +932,15 @@ class QuerySet(Generic[ModelT]):
             if field is not None and field.field_kind not in _TEXT_KINDS:
                 col = dialect.cast_text(col)
             # The pattern builder backslash-escapes %/_ in the value; the
-            # dialect's ESCAPE clause makes every backend honour that escaping
-            # (MySQL spells the literal differently).
-            return f"{col} {sql_op} {placeholder}{dialect.like_escape}", [pattern(value)], idx
+            # dialect renders the operator + ESCAPE clause (MySQL spells the
+            # literal differently; Oracle folds both operands with UPPER for
+            # the case-insensitive lookups, having no ILIKE operator).
+            case_insensitive = _OPERATORS[op][0] == "ILIKE"
+            return (
+                dialect.like_pattern_sql(case_insensitive, col, placeholder),
+                [pattern(value)],
+                idx,
+            )
         clause = f"{col} {sql_op} {placeholder}"
         if op == "not":
             # ``!=`` drops NULL rows (``NULL != x`` is UNKNOWN); keep them,
@@ -1369,7 +1375,7 @@ class QuerySet(Generic[ModelT]):
         # row (arbitrary ordering); a distinct alias keeps the correlation to the
         # outer ``meta.table``.
         cur_alias = "_ord0"
-        from_table = f"{q(cur_meta.table)} AS {q(cur_alias)}"
+        from_table = f"{q(cur_meta.table)} {q(cur_alias)}"
         correlation = f"{q(cur_alias)}.{q(cur_meta.pk_field.db_column)} = {q(meta.table)}.{base_fk}"
         joins = ""
         for depth, seg in enumerate(segments[1:-1], start=1):
@@ -1382,7 +1388,7 @@ class QuerySet(Generic[ModelT]):
             next_alias = f"_ord{depth}"
             src = q(cur_meta.get_field(info.source_attr).db_column)
             joins += (
-                f" JOIN {q(next_meta.table)} AS {q(next_alias)} ON {q(cur_alias)}.{src} = "
+                f" JOIN {q(next_meta.table)} {q(next_alias)} ON {q(cur_alias)}.{src} = "
                 f"{q(next_alias)}.{q(next_meta.pk_field.db_column)}"
             )
             cur_meta, cur_alias = next_meta, next_alias
@@ -1400,19 +1406,11 @@ class QuerySet(Generic[ModelT]):
             The ``LIMIT``/``OFFSET`` fragment, or an empty string when neither
             is set.
         """
-        tail = ""
-        limit = self._limit
-        if limit is None and self._offset is not None and dialect.offset_requires_limit:
-            # SQLite and MySQL reject ``OFFSET`` without a preceding ``LIMIT``;
-            # each dialect supplies its own "no limit" sentinel (-1 on SQLite,
-            # the max row count on MySQL), so an offset-only slice (``qs[3:]``)
-            # stays valid. PostgreSQL accepts a bare ``OFFSET`` and skips this.
-            limit = dialect.no_limit
-        if limit is not None:
-            tail += f" LIMIT {int(limit)}"
-        if self._offset is not None:
-            tail += f" OFFSET {int(self._offset)}"
-        return tail
+        # The dialect renders the clause: ``LIMIT n OFFSET m`` on
+        # PostgreSQL/SQLite/MySQL (SQLite and MySQL need a leading ``LIMIT``
+        # before a bare ``OFFSET``, supplied via their "no limit" sentinel),
+        # ``OFFSET m ROWS FETCH NEXT n ROWS ONLY`` on Oracle.
+        return dialect.limit_offset_sql(self._limit, self._offset)
 
     def _distinct_prefix(self, prefix: str) -> str:
         """Inject ``DISTINCT`` into a ``SELECT`` prefix when requested.
@@ -1483,7 +1481,7 @@ class QuerySet(Generic[ModelT]):
             source = registry.get_model(descriptor.source_reference)
             smeta = source._meta
             joins[rel] = (
-                f" LEFT JOIN {q(smeta.table)} AS {alias} ON {alias}."
+                f" LEFT JOIN {q(smeta.table)} {alias} ON {alias}."
                 f"{q(descriptor.source_attr)} = {table}.{pk}"
             )
             return smeta, alias
@@ -1498,11 +1496,11 @@ class QuerySet(Generic[ModelT]):
                 tmeta = info.resolve_target()._meta
             through_alias = q(rel + "#t")
             joins[rel + "#t"] = (
-                f" LEFT JOIN {q(info.through)} AS {through_alias} "
+                f" LEFT JOIN {q(info.through)} {through_alias} "
                 f"ON {through_alias}.{q(near)} = {table}.{pk}"
             )
             joins[rel] = (
-                f" LEFT JOIN {q(tmeta.table)} AS {alias} ON {alias}."
+                f" LEFT JOIN {q(tmeta.table)} {alias} ON {alias}."
                 f"{q(tmeta.pk_field.db_column)} = {through_alias}.{q(far)}"
             )
             return tmeta, alias
@@ -1959,7 +1957,7 @@ class QuerySet(Generic[ModelT]):
             alias = q(path)
             fk_col = q(parent_meta.get_field(info.source_attr).db_column)
             joins.append(
-                f" LEFT JOIN {q(tmeta.table)} AS {alias} "
+                f" LEFT JOIN {q(tmeta.table)} {alias} "
                 f"ON {left_alias}.{fk_col} = {alias}.{q(tmeta.pk_field.db_column)}"
             )
             proj_fields, partial = self._related_projected_fields(path, tmeta)
@@ -1989,6 +1987,10 @@ class QuerySet(Generic[ModelT]):
         select_params: list[Any] = []
         ann_joins: dict[str, str] = {}
         idx = 1
+        # The non-aggregate (base + selected-relation) columns, snapshotted
+        # before the aggregate expressions are appended — Oracle groups by all
+        # of them (no functional-dependency shortcut).
+        non_agg_select = list(select)
         for name, agg in self._annotations.items():
             expr, idx = self._aggregate_expr(agg, dialect, ann_joins, select_params, idx)
             select.append(f"{expr} AS {q(name)}")
@@ -2004,10 +2006,15 @@ class QuerySet(Generic[ModelT]):
             # rule; SQLite allows bare columns), so the wide join projection
             # stays selectable while a reverse-relation aggregate still
             # collapses to one row per base row.
-            group_refs = [f"{table}.{q(meta.pk_field.db_column)}"]
-            group_refs += [
-                f"{q(path)}.{q(nodes[path]['target']._meta.pk_field.db_column)}" for path in order
-            ]
+            if dialect.group_by_functional_dependency:
+                group_refs = [f"{table}.{q(meta.pk_field.db_column)}"]
+                group_refs += [
+                    f"{q(path)}.{q(nodes[path]['target']._meta.pk_field.db_column)}"
+                    for path in order
+                ]
+            else:
+                # Oracle: every selected non-aggregate column must be grouped.
+                group_refs = non_agg_select
             group = " GROUP BY " + ", ".join(group_refs)
         lock = self._lock_sql(dialect)
         if lock and joins and not self._for_update_of and dialect.supports_for_update_of:
@@ -2160,7 +2167,8 @@ class QuerySet(Generic[ModelT]):
         q = dialect.quote
         table = q(meta.table)
         joins: dict[str, str] = {}
-        select = [f"{table}.{q(f.db_column)}" for f in self._selected_fields()]
+        base_cols = [f"{table}.{q(f.db_column)}" for f in self._selected_fields()]
+        select = list(base_cols)
         select_params: list[Any] = []
         idx = 1
         for name in self._annotations:
@@ -2171,7 +2179,14 @@ class QuerySet(Generic[ModelT]):
         where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
         params = select_params + wparams + hparams
-        group = f" GROUP BY {table}.{q(meta.pk_field.db_column)}"
+        # PostgreSQL/SQLite/MySQL let the pk group make the other base columns
+        # functionally dependent; Oracle requires every selected column grouped.
+        group_refs = (
+            [f"{table}.{q(meta.pk_field.db_column)}"]
+            if dialect.group_by_functional_dependency
+            else base_cols
+        )
+        group = " GROUP BY " + ", ".join(group_refs)
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"
             f"{''.join(joins.values())}{where}{group}{having}"
@@ -2308,9 +2323,13 @@ class QuerySet(Generic[ModelT]):
             # matching the annotated model fetch. The pk group makes the base
             # columns functionally dependent, so they need no explicit grouping.
             for f in meta.field_list:
-                select.append(f"{table}.{q(f.db_column)}")
+                col = f"{table}.{q(f.db_column)}"
+                select.append(col)
                 names.append(f.model_field_name)
-            group_cols.append(f"{table}.{q(meta.pk_field.db_column)}")
+                if not dialect.group_by_functional_dependency:
+                    group_cols.append(col)
+            if dialect.group_by_functional_dependency:
+                group_cols.append(f"{table}.{q(meta.pk_field.db_column)}")
         else:
             # ``_resolve_column`` handles both own columns and forward-relation
             # paths (``bearworks_disposition__user_defined``), adding the needed
@@ -2705,7 +2724,7 @@ class QuerySet(Generic[ModelT]):
         if self._needs_wrapped_terminal():
             inner, params = self._wrapped_terminal_inner()
             sub = dialect.quote("sub")
-            row = await engine.fetch_row(f"SELECT COUNT(*) FROM ({inner}) AS {sub}", params)
+            row = await engine.fetch_row(f"SELECT COUNT(*) FROM ({inner}) {sub}", params)
             return int(row[0]) if row else 0
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
@@ -2744,11 +2763,13 @@ class QuerySet(Generic[ModelT]):
         if self._needs_wrapped_terminal():
             inner, params = self._wrapped_terminal_inner()
             sub = dialect.quote("sub")
-            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) AS {sub} LIMIT 1", params)
+            tail = dialect.limit_offset_sql(1, None)
+            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) {sub}{tail}", params)
             return bool(rows)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
-        rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where} LIMIT 1", params)
+        tail = dialect.limit_offset_sql(1, None)
+        rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where}{tail}", params)
         return bool(rows)
 
     def _pk_having_subselect(self, dialect: BaseDialect, start: int = 1) -> tuple[str, list[Any]]:
@@ -2794,7 +2815,7 @@ class QuerySet(Generic[ModelT]):
         """
         if not dialect.modifying_subquery_needs_wrap:
             return sub
-        return f"SELECT * FROM ({sub}) AS {dialect.quote('_yara_having')}"
+        return f"SELECT * FROM ({sub}) {dialect.quote('_yara_having')}"
 
     async def delete(self) -> int:
         """Delete all rows matching the current conditions.

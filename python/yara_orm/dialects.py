@@ -132,9 +132,6 @@ class BaseDialect:
     #: ``INSERT IGNORE``) override this; the others keep plain ``INSERT`` and
     #: render an ``ON CONFLICT ... DO NOTHING`` clause instead.
     insert_ignore_verb = "INSERT"
-    #: Statement tail inserting a row of column defaults, rendered as
-    #: ``INSERT INTO t <this>`` (MySQL has no ``DEFAULT VALUES``).
-    insert_default_values = "DEFAULT VALUES"
     #: Whether ``ADD COLUMN`` / ``DROP COLUMN`` accept an ``IF [NOT] EXISTS``
     #: guard (PostgreSQL does; SQLite has no such syntax).
     column_if_exists = True
@@ -176,6 +173,15 @@ class BaseDialect:
     #: SQLite 3.30+). MySQL lacks it; the compiler falls back to the
     #: equivalent ``AGG(CASE WHEN ... THEN col END)`` there.
     supports_aggregate_filter = True
+    #: Whether a single ``INSERT`` can carry multiple ``VALUES (...)`` rows.
+    #: Oracle cannot (its multi-row insert is ``INSERT ALL`` / a MERGE source),
+    #: so ``bulk_create`` falls back to one statement per row there.
+    supports_multirow_insert = True
+    #: Whether grouping by a table's primary key lets the other selected columns
+    #: of that table appear unaggregated (functional dependency — PostgreSQL's
+    #: rule, and SQLite/MySQL allow bare columns too). Oracle enforces the strict
+    #: SQL rule, so every selected non-aggregate column must be grouped.
+    group_by_functional_dependency = True
 
     # -- identifiers & placeholders --------------------------------------
     def quote(self, identifier: str) -> str:
@@ -350,6 +356,60 @@ class BaseDialect:
         sets = ", ".join(f"{self.quote(c)} = EXCLUDED.{self.quote(c)}" for c in update_columns)
         return f" ON CONFLICT{target} DO UPDATE SET {sets}"
 
+    def _values_placeholders(self, nrows: int, ncols: int, start: int = 1) -> str:
+        """Render ``(?, ?), (?, ?), ...`` placeholder groups for a bulk INSERT.
+
+        Args:
+            nrows: Number of value rows.
+            ncols: Number of columns per row.
+            start: The 1-based index of the first placeholder.
+
+        Returns:
+            The comma-separated parenthesised placeholder groups.
+        """
+        rows = []
+        idx = start
+        for _ in range(nrows):
+            holes = ", ".join(self.placeholder(idx + j) for j in range(ncols))
+            rows.append(f"({holes})")
+            idx += ncols
+        return ", ".join(rows)
+
+    def render_upsert(
+        self,
+        table: str,
+        columns: Sequence[str],
+        nrows: int,
+        conflict_columns: Sequence[str],
+        update_columns: Sequence[str],
+        pk_columns: Sequence[str],
+    ) -> str:
+        """Render a multi-row INSERT that skips or updates conflicting rows.
+
+        The default is an ``INSERT ... VALUES ...`` with the dialect's
+        ``ON CONFLICT`` clause (or ``INSERT IGNORE`` verb on MySQL). Oracle,
+        which has neither, renders an equivalent ``MERGE`` (see its override).
+
+        Args:
+            table: The already-quoted target table.
+            columns: The unquoted column names, in insert (and bind) order.
+            nrows: Number of value rows.
+            conflict_columns: The unquoted conflict-target columns (may be
+                empty for a bare "skip any duplicate").
+            update_columns: The unquoted columns to overwrite on conflict
+                (empty means ignore the conflicting row).
+            pk_columns: The unquoted primary-key columns, a conflict-target
+                fallback for dialects (Oracle) that require one.
+
+        Returns:
+            The complete upsert statement.
+        """
+        cols_sql = ", ".join(self.quote(c) for c in columns)
+        values = self._values_placeholders(nrows, len(columns))
+        verb = self.insert_ignore_verb if not update_columns else "INSERT"
+        conflict = self.on_conflict_sql(list(conflict_columns), list(update_columns))
+        return f"{verb} INTO {table} ({cols_sql}) VALUES {values}{conflict}"
+
     def search_sql(self, col: str, placeholder: str) -> str:
         """Render a full-text ``__search`` condition.
 
@@ -388,6 +448,79 @@ class BaseDialect:
         if regex_op is None:
             raise UnSupportedError(f"{self.name} does not support the __{op} lookup")
         return f"{col} {regex_op} {placeholder}"
+
+    def like_pattern_sql(self, case_insensitive: bool, col: str, placeholder: str) -> str:
+        """Render a ``LIKE``/``ILIKE`` pattern condition with its ESCAPE clause.
+
+        The default spells the case-sensitive/insensitive match with the
+        dialect's :attr:`like`/:attr:`ilike` operator. Oracle has no ``ILIKE``
+        operator, so its dialect folds both operands with ``UPPER()`` instead.
+
+        Args:
+            case_insensitive: Whether the lookup ignores case (``i*`` lookups).
+            col: The already-qualified (already text-cast) column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A boolean SQL expression matching ``col`` against the pattern.
+        """
+        op = self.ilike if case_insensitive else self.like
+        return f"{col} {op} {placeholder}{self.like_escape}"
+
+    def limit_offset_sql(self, limit: int | None, offset: int | None) -> str:
+        """Render the trailing row-limit / row-offset clause.
+
+        The default is the portable ``LIMIT n OFFSET m`` (supplying the
+        dialect's "no limit" sentinel when an offset-only slice needs a leading
+        ``LIMIT``). Oracle has no ``LIMIT``; its dialect renders the SQL-standard
+        ``OFFSET m ROWS FETCH NEXT n ROWS ONLY`` instead.
+
+        Args:
+            limit: The maximum row count, or None.
+            offset: The number of leading rows to skip, or None.
+
+        Returns:
+            The clause fragment (leading space included), or ``""``.
+        """
+        tail = ""
+        if limit is None and offset is not None and self.offset_requires_limit:
+            limit = self.no_limit
+        if limit is not None:
+            tail += f" LIMIT {int(limit)}"
+        if offset is not None:
+            tail += f" OFFSET {int(offset)}"
+        return tail
+
+    def insert_default_values_sql(self, pk_column: str) -> str:
+        """Render the statement tail that inserts a row of column defaults.
+
+        Rendered as ``INSERT INTO t <this>`` for a model with no writable
+        columns (only an auto-increment pk). The default is ``DEFAULT VALUES``;
+        MySQL has no such syntax, and Oracle spells it ``(pk) VALUES (DEFAULT)``.
+
+        Args:
+            pk_column: The primary-key column name (used by dialects that must
+                name a column, e.g. Oracle).
+
+        Returns:
+            The statement tail following the table name.
+        """
+        return "DEFAULT VALUES"
+
+    def insert_returning_clause(self, fields: Sequence[Field]) -> str:
+        """Render the ``RETURNING`` clause appended to an INSERT.
+
+        The default is PostgreSQL's result-set form (``RETURNING a, b``); Oracle
+        spells it with OUT binds (``RETURNING a, b INTO :ret_0, :ret_1``), which
+        its backend routes through the driver's OUT-bind path.
+
+        Args:
+            fields: The fields whose columns are returned (pk first).
+
+        Returns:
+            The clause fragment with a leading space.
+        """
+        return " RETURNING " + ", ".join(self.quote(f.db_column) for f in fields)
 
     # -- type rendering ---------------------------------------------------
     def _kind_template(self, kind: str) -> str:
@@ -649,10 +782,7 @@ class BaseDialect:
                 col = self.quote(field.db_column)
                 ref_tbl = self.quote(ref._meta.table)
                 ref_pk = self.quote(ref._meta.pk_field.db_column)
-                lines.append(
-                    f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) "
-                    f"ON DELETE {field.on_delete}"
-                )
+                lines.append(self._fk_clause(col, ref_tbl, ref_pk, field.on_delete))
         lines.extend(self._unique_together_lines(meta))
         for constraint in meta.constraints:
             lines.append(self._constraint_clause(constraint.to_spec()))
@@ -688,6 +818,24 @@ class BaseDialect:
             The ``PRIMARY KEY (...)`` clause, or None to omit it.
         """
         return f"PRIMARY KEY ({self.quote(meta.pk_field.db_column)})"
+
+    def _fk_clause(self, col: str, ref_tbl: str, ref_pk: str, on_delete: str) -> str:
+        """Render a table-level ``FOREIGN KEY`` clause with its ``ON DELETE``.
+
+        The default emits the action verbatim. Oracle accepts only ``CASCADE``
+        and ``SET NULL`` there, so its dialect drops an unsupported
+        ``RESTRICT``/``NO ACTION`` (which is Oracle's default behaviour anyway).
+
+        Args:
+            col: The already-quoted referencing column.
+            ref_tbl: The already-quoted referenced table.
+            ref_pk: The already-quoted referenced primary key column.
+            on_delete: The ``ON DELETE`` action.
+
+        Returns:
+            The ``FOREIGN KEY (...) REFERENCES ... ON DELETE ...`` clause.
+        """
+        return f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) ON DELETE {on_delete}"
 
     def _comment_sql(self, meta: MetaInfo) -> list[str]:
         """Render ``COMMENT ON`` statements for a table and its columns.
@@ -1744,7 +1892,6 @@ class MySQLDialect(BaseDialect):
     like_escape = " ESCAPE '\\\\'"
     supports_insert_returning = False
     insert_ignore_verb = "INSERT IGNORE"
-    insert_default_values = "() VALUES ()"
     random_function = "RAND()"
     supports_for_update = True
     modifying_subquery_needs_wrap = True
@@ -1788,6 +1935,17 @@ class MySQLDialect(BaseDialect):
         "int": "INT AUTO_INCREMENT",
         "bigint": "BIGINT AUTO_INCREMENT",
     }
+
+    def insert_default_values_sql(self, pk_column: str) -> str:
+        """Render MySQL's empty-column-list defaults insert (no ``DEFAULT VALUES``).
+
+        Args:
+            pk_column: The primary-key column name (unused).
+
+        Returns:
+            ``"() VALUES ()"``.
+        """
+        return "() VALUES ()"
 
     def placeholder(self, index: int) -> str:
         """Render MySQL's unnumbered ``?`` placeholder.
@@ -2446,11 +2604,663 @@ class MariaDbDialect(MySQLDialect):
         return f" ON DUPLICATE KEY UPDATE {sets}"
 
 
+def _json_from_db(value: Any) -> Any:
+    """Parse the JSON text an Oracle CLOB column returns into Python.
+
+    Args:
+        value: The raw column value (str from Oracle, already parsed elsewhere).
+
+    Returns:
+        The decoded JSON value (None passes through).
+    """
+    if isinstance(value, str):
+        return _json.loads(value)
+    return value
+
+
+def _time_from_db(value: Any) -> Any:
+    """Reconstruct a ``time`` from the ``HH:MM:SS.ffffff`` text Oracle stores.
+
+    Args:
+        value: The raw column value (str from Oracle, already a time elsewhere).
+
+    Returns:
+        The value as a ``datetime.time`` (None passes through).
+    """
+    if isinstance(value, str):
+        return _dt.time.fromisoformat(value)
+    return value
+
+
+def _float_from_db(value: Any) -> Any:
+    """Coerce a NUMBER-backed ``FLOAT`` column (a ``Decimal``) to a Python ``float``.
+
+    Args:
+        value: The raw column value (a ``Decimal`` from Oracle, or None).
+
+    Returns:
+        The value as a ``float`` (None passes through).
+    """
+    return None if value is None else float(value)
+
+
+class OracleDialect(BaseDialect):
+    """Dialect rendering SQL for Oracle Database (23ai and compatible).
+
+    Key departures from the base dialect: ``:N`` bind placeholders; the
+    ``NUMBER``/``VARCHAR2``/``CLOB``/``BLOB`` type family (with ``NUMBER(1)``
+    booleans and ``VARCHAR2(36)`` uuids reconstructed on read); IDENTITY
+    columns for auto-increment; ``RETURNING ... INTO`` OUT binds instead of the
+    PostgreSQL result-set form; the SQL-standard ``OFFSET ... ROWS FETCH NEXT
+    ... ROWS ONLY`` in place of ``LIMIT``; ``UPPER()`` folding for the
+    case-insensitive pattern lookups (Oracle has no ``ILIKE``); ``REGEXP_LIKE``
+    for regex; and ``DBMS_RANDOM.VALUE`` for random ordering.
+    """
+
+    name = "oracle"
+
+    # Regex lookups render through REGEXP_LIKE with a case flag (see
+    # ``regex_sql``); the keys advertise which lookups resolve.
+    regex_ops = {
+        "regex": "REGEXP_LIKE",
+        "iregex": "REGEXP_LIKE",
+        "posix_regex": "REGEXP_LIKE",
+        "iposix_regex": "REGEXP_LIKE",
+    }
+    supports_insert_returning = True
+    # Oracle has no INSERT IGNORE / ON CONFLICT; bulk-create conflict handling
+    # would need MERGE (not yet implemented — see ``on_conflict_sql``).
+    insert_ignore_verb = "INSERT"
+    random_function = "DBMS_RANDOM.VALUE"
+    supports_for_update = True
+    # Oracle rejects modifying a table that also appears in a subquery's FROM
+    # ("ORA-01732"-class); wrap the subquery, like MySQL.
+    modifying_subquery_needs_wrap = True
+    # No aggregate FILTER clause; the compiler falls back to CASE WHEN.
+    supports_aggregate_filter = False
+    # Oracle has no multi-row ``VALUES (...), (...)`` INSERT; bulk_create inserts
+    # one row per statement (the MERGE upsert path is multi-row via UNION ALL).
+    supports_multirow_insert = False
+    # Oracle enforces the strict GROUP BY rule (no functional-dependency
+    # shortcut): every selected non-aggregate column must be grouped.
+    group_by_functional_dependency = False
+    # ``OFFSET/FETCH`` is rendered directly (see ``limit_offset_sql``), so the
+    # base "no limit" machinery is unused.
+    offset_requires_limit = False
+    # The PostgreSQL-only index options have no Oracle spelling.
+    index_concurrently = False
+    index_using = False
+    index_include = False
+    index_opclass = False
+    supports_extensions = False
+    # Oracle 23ai supports ADD/DROP COLUMN IF [NOT] EXISTS and in-place column,
+    # index and constraint changes (MODIFY / ALTER INDEX / RENAME CONSTRAINT).
+    column_if_exists = True
+    alter_column_in_place = True
+    rename_index_in_place = True
+    alter_constraint_in_place = True
+    # Oracle has no ILIKE operator; the case-insensitive lookups fold both
+    # operands with UPPER() in ``like_pattern_sql``. ``ilike``/``like`` remain
+    # plain LIKE for the (rare) subquery-valued pattern path.
+    ilike = "LIKE"
+    like = "LIKE"
+    # Oracle string literals do not process backslash escapes, so a single
+    # backslash is the escape character (same rendered form as the base).
+    like_escape = " ESCAPE '\\'"
+
+    type_map = {
+        "smallint": "NUMBER(5)",
+        "int": "NUMBER(10)",
+        "bigint": "NUMBER(19)",
+        "varchar": "VARCHAR2({max_length})",
+        "text": "CLOB",
+        "bool": "NUMBER(1)",
+        # NUMBER-based FLOAT rather than BINARY_DOUBLE: the driver (0.1.x) hands
+        # BINARY_DOUBLE/BINARY_FLOAT back as undecoded raw bytes, whereas a
+        # NUMBER decodes cleanly (and ``read_decoder`` coerces it to ``float``).
+        "float": "FLOAT",
+        "decimal": "NUMBER({max_digits}, {decimal_places})",
+        "datetime": "TIMESTAMP(6)",
+        "date": "DATE",
+        # 'HH:MM:SS.ffffff' text (Oracle has no time-of-day type).
+        "time": "VARCHAR2(15)",
+        "timedelta": "NUMBER(19)",
+        "uuid": "VARCHAR2(36)",
+        "json": "CLOB",
+        "bytes": "BLOB",
+    }
+    # ``GENERATED BY DEFAULT ON NULL AS IDENTITY``: the database assigns the pk
+    # when the INSERT omits it (or binds NULL), while still allowing an explicit
+    # value — exactly the ORM's contract.
+    serial_map = {
+        "smallint": "NUMBER(5) GENERATED BY DEFAULT ON NULL AS IDENTITY",
+        "int": "NUMBER(10) GENERATED BY DEFAULT ON NULL AS IDENTITY",
+        "bigint": "NUMBER(19) GENERATED BY DEFAULT ON NULL AS IDENTITY",
+    }
+    # EXTRACT covers the calendar/clock parts; quarter/week/microsecond go
+    # through TO_CHAR (see ``date_part_sql``).
+    _extract_parts = {
+        "year": "YEAR",
+        "month": "MONTH",
+        "day": "DAY",
+        "hour": "HOUR",
+        "minute": "MINUTE",
+        "second": "SECOND",
+    }
+    _tochar_parts = {"quarter": "Q", "week": "IW", "microsecond": "FF6"}
+
+    def insert_default_values_sql(self, pk_column: str) -> str:
+        """Render Oracle's defaults insert (``(pk) VALUES (DEFAULT)``; no ``DEFAULT VALUES``).
+
+        Args:
+            pk_column: The primary-key column name.
+
+        Returns:
+            ``'("pk") VALUES (DEFAULT)'``.
+        """
+        return f"({self.quote(pk_column)}) VALUES (DEFAULT)"
+
+    def placeholder(self, index: int) -> str:
+        """Render Oracle's numbered ``:N`` bind placeholder.
+
+        Args:
+            index: The 1-based parameter position.
+
+        Returns:
+            ``":<index>"``.
+        """
+        return f":{index}"
+
+    # -- row decoding -------------------------------------------------------
+    def read_decoder(self, field: Field) -> Callable[[Any], Any] | None:
+        """Reconstruct types Oracle's columns store as text/number.
+
+        ``VARCHAR2(36)`` uuids, ``CLOB`` json and ``VARCHAR2`` times come back
+        as strings; ``TIMESTAMP`` is naive (re-labelled UTC under ``use_tz``).
+        An FK column adopts the referenced primary key's kind.
+
+        Args:
+            field: The field whose column is being decoded.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        base = super().read_decoder(field)
+        kind = field.field_kind
+        if isinstance(field, ForeignKeyFieldInstance):
+            kind = get_model(field.reference)._meta.pk_field.field_kind
+        extra: Callable[[Any], Any] | None = {
+            "uuid": _uuid_from_db,
+            "datetime": _datetime_from_db,
+            "json": _json_from_db,
+            "time": _time_from_db,
+            "float": _float_from_db,
+        }.get(kind)
+        if extra is None:
+            return base
+        if base is None:
+            return extra
+        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+
+    # -- query lookups ------------------------------------------------------
+    def like_pattern_sql(self, case_insensitive: bool, col: str, placeholder: str) -> str:
+        """Render a pattern lookup, folding both operands with UPPER for case-insensitivity.
+
+        Args:
+            case_insensitive: Whether the lookup ignores case.
+            col: The already-qualified (already text-cast) column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A boolean SQL expression matching ``col`` against the pattern.
+        """
+        if case_insensitive:
+            return f"UPPER({col}) LIKE UPPER({placeholder}){self.like_escape}"
+        return f"{col} LIKE {placeholder}{self.like_escape}"
+
+    def limit_offset_sql(self, limit: int | None, offset: int | None) -> str:
+        """Render Oracle's ``OFFSET m ROWS FETCH NEXT n ROWS ONLY``.
+
+        Args:
+            limit: The maximum row count, or None.
+            offset: The number of leading rows to skip, or None.
+
+        Returns:
+            The clause fragment (leading space included), or ``""``.
+        """
+        tail = ""
+        if offset is not None:
+            tail += f" OFFSET {int(offset)} ROWS"
+        if limit is not None:
+            tail += f" FETCH NEXT {int(limit)} ROWS ONLY"
+        return tail
+
+    def insert_returning_clause(self, fields: Sequence[Field]) -> str:
+        """Render ``RETURNING cols INTO :ret_N`` OUT binds.
+
+        The backend detects the ``INTO`` binds and runs the insert through the
+        driver's OUT-bind path, handing the values back as a synthetic row.
+
+        Args:
+            fields: The fields whose columns are returned (pk first).
+
+        Returns:
+            The clause fragment with a leading space.
+        """
+        cols = ", ".join(self.quote(f.db_column) for f in fields)
+        outs = ", ".join(f":ret_{i}" for i in range(len(fields)))
+        return f" RETURNING {cols} INTO {outs}"
+
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render a date/time part via ``EXTRACT`` (``TO_CHAR`` for quarter/week/microsecond).
+
+        Args:
+            part: A supported date/time part name.
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the integer part.
+        """
+        if part in self._extract_parts:
+            return f"EXTRACT({self._extract_parts[part]} FROM {col})"
+        fmt = self._tochar_parts.get(part)
+        if fmt is not None:
+            return f"TO_NUMBER(TO_CHAR({col}, '{fmt}'))"
+        raise UnSupportedError(f"oracle does not support the __{part} lookup")
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render ``TRUNC(col)`` (drops the time-of-day for the ``__date`` lookup).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the date part.
+        """
+        return f"TRUNC({col})"
+
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render a JSON key path as text via ``JSON_VALUE``.
+
+        Args:
+            col: The already-qualified JSON (CLOB) column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            ``JSON_VALUE(col, '$."a"."b"')`` (the column itself with no keys).
+        """
+        if not keys:
+            return col
+        legs = "".join('."' + key.replace('"', '\\"') + '"' for key in keys)
+        return f"JSON_VALUE({col}, {self._literal('$' + legs)})"
+
+    def cast_text(self, col: str) -> str:
+        """Render a text cast; Oracle spells the target ``VARCHAR2(4000)``.
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            ``CAST(col AS VARCHAR2(4000))``.
+        """
+        return f"CAST({col} AS VARCHAR2(4000))"
+
+    def regex_sql(self, op: str, col: str, placeholder: str) -> str:
+        """Render a regex lookup through ``REGEXP_LIKE`` with a case flag.
+
+        Args:
+            op: The lookup name.
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A ``REGEXP_LIKE(col, ?, flag)`` expression.
+        """
+        flag = "i" if op in ("iregex", "iposix_regex") else "c"
+        return f"REGEXP_LIKE({col}, {placeholder}, '{flag}')"
+
+    def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
+        """Reject the ``ON CONFLICT`` suffix; Oracle renders a ``MERGE`` via ``render_upsert``.
+
+        Args:
+            conflict_columns: The conflict-target columns.
+            update_columns: The columns to overwrite on conflict.
+
+        Raises:
+            UnSupportedError: Always — the ``MERGE`` path supersedes this hook.
+        """
+        raise UnSupportedError(  # pragma: no cover - superseded by render_upsert
+            "oracle renders conflict handling as MERGE via render_upsert, not an ON CONFLICT suffix"
+        )
+
+    def render_upsert(
+        self,
+        table: str,
+        columns: Sequence[str],
+        nrows: int,
+        conflict_columns: Sequence[str],
+        update_columns: Sequence[str],
+        pk_columns: Sequence[str],
+    ) -> str:
+        """Render a conflict-skipping/updating bulk insert as an Oracle ``MERGE``.
+
+        Oracle has no ``INSERT ... ON CONFLICT`` / ``INSERT IGNORE``; a ``MERGE``
+        against a ``SELECT ... FROM dual`` row source is the equivalent that also
+        avoids raising a duplicate-key error (which the driver surfaces as a
+        connection close). ``WHEN NOT MATCHED THEN INSERT`` covers the ignore
+        case; ``WHEN MATCHED THEN UPDATE`` adds the upsert. When no conflict
+        target is given, the primary key is used (a ``MERGE`` requires one).
+
+        Args:
+            table: The already-quoted target table.
+            columns: The unquoted column names, in insert (and bind) order.
+            nrows: Number of value rows.
+            conflict_columns: The unquoted conflict-target columns.
+            update_columns: The unquoted columns to overwrite on conflict.
+            pk_columns: The unquoted primary-key columns (target fallback).
+
+        Returns:
+            The complete ``MERGE`` statement.
+        """
+        # A MERGE needs a conflict key that is present in the inserted columns
+        # (its ON clause references the row source). An auto-increment pk is not
+        # inserted, so fall back to any inserted pk columns; if none remain the
+        # target is unknown (a bare "ignore any duplicate" cannot be expressed).
+        targets = [c for c in (list(conflict_columns) or list(pk_columns)) if c in columns]
+        if not targets:  # pragma: no cover - exercised only by oracle-skipped tests
+            raise UnSupportedError(
+                "oracle bulk upsert needs a conflict target present in the inserted "
+                "columns; pass on_conflict=[...] (a bare ignore_conflicts on an "
+                "auto-increment table has no MERGE key)"
+            )
+        alias = [f"c{j}" for j in range(len(columns))]
+        pos = {c: j for j, c in enumerate(columns)}
+        rows = []
+        idx = 1
+        for _ in range(nrows):
+            sel = ", ".join(f"{self.placeholder(idx + j)} {alias[j]}" for j in range(len(columns)))
+            rows.append(f"SELECT {sel} FROM dual")
+            idx += len(columns)
+        src = " UNION ALL ".join(rows)
+        on = " AND ".join(f"d.{self.quote(c)} = s.{alias[pos[c]]}" for c in targets)
+        merge = f"MERGE INTO {table} d USING ({src}) s ON ({on}) "
+        # Oracle forbids updating a column referenced in the ON clause.
+        updates = [c for c in update_columns if c not in targets]
+        if updates:
+            sets = ", ".join(f"d.{self.quote(c)} = s.{alias[pos[c]]}" for c in updates)
+            merge += f"WHEN MATCHED THEN UPDATE SET {sets} "
+        insert_cols = ", ".join(self.quote(c) for c in columns)
+        insert_vals = ", ".join(f"s.{a}" for a in alias)
+        merge += f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+        return merge
+
+    # -- DDL ------------------------------------------------------------------
+    def column_sql(self, field: Field) -> str:
+        """Render a column definition with ``DEFAULT`` before the null/unique constraints.
+
+        Oracle accepts either order, but the driver (0.1.x) desyncs its protocol
+        stream on the ``NOT NULL DEFAULT (...)`` ordering when the statement is
+        not the first on a connection — closing the connection mid-batch. The
+        equivalent ``DEFAULT (...) NOT NULL`` ordering parses cleanly, so it is
+        emitted here.
+
+        Args:
+            field: The field to render as a column definition.
+
+        Returns:
+            The column definition SQL fragment.
+        """
+        parts = [self.quote(field.db_column), self.column_type(field)]
+        if isinstance(field.default, DatabaseDefault):
+            parts.append(f"DEFAULT ({field.default.to_sql(self)})")
+        if field.pk:
+            pass
+        elif field.null:
+            parts.append("NULL")
+        else:
+            parts.append("NOT NULL")
+        if field.unique and not field.pk:
+            parts.append("UNIQUE")
+        return " ".join(parts)
+
+    def _fk_clause(self, col: str, ref_tbl: str, ref_pk: str, on_delete: str) -> str:
+        """Render an FK clause, dropping an ``ON DELETE RESTRICT``/``NO ACTION`` Oracle rejects.
+
+        Args:
+            col: The already-quoted referencing column.
+            ref_tbl: The already-quoted referenced table.
+            ref_pk: The already-quoted referenced primary key column.
+            on_delete: The ``ON DELETE`` action.
+
+        Returns:
+            The ``FOREIGN KEY`` clause.
+        """
+        tail = "" if on_delete in ("RESTRICT", "NO ACTION") else f" ON DELETE {on_delete}"
+        return f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}){tail}"
+
+    # -- migration rendering overrides ---------------------------------------
+    def render_drop_table(self, table: str) -> list[str]:
+        """Render a drop-table statement (``CASCADE CONSTRAINTS`` to sever FKs).
+
+        Args:
+            table: The table name.
+
+        Returns:
+            The list with the drop-table statement.
+        """
+        return [f"DROP TABLE IF EXISTS {self.quote(table)} CASCADE CONSTRAINTS"]
+
+    def render_alter_column(
+        self,
+        table: str,
+        name: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+        table_spec: dict[str, Any],
+    ) -> list[str]:
+        """Render column changes with Oracle's ``MODIFY`` spelling.
+
+        Args:
+            table: The table name.
+            name: The column being altered.
+            old: The column spec before the change.
+            new: The column spec after the change.
+            table_spec: The full table spec (unused; Oracle alters in place).
+
+        Returns:
+            The list of SQL statements applying the column change.
+        """
+        t = self.quote(table)
+        col = self.quote(name)
+        out: list[str] = []
+        type_changed = old.get("kind") != new.get("kind") or old.get("type_params") != new.get(
+            "type_params"
+        )
+        null_changed = bool(old.get("null")) != bool(new.get("null"))
+        if type_changed or null_changed:
+            parts = [self._spec_type(new)] if type_changed else []
+            if null_changed:
+                parts.append("NULL" if new.get("null") else "NOT NULL")
+            out.append(f"ALTER TABLE {t} MODIFY ({col} {' '.join(parts)})")
+        if old.get("default") != new.get("default"):
+            if new.get("default"):
+                out.append(
+                    f"ALTER TABLE {t} MODIFY ({col} DEFAULT {self._render_default(new['default'])})"
+                )
+            else:
+                out.append(f"ALTER TABLE {t} MODIFY ({col} DEFAULT NULL)")
+        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
+            uq = self.quote(f"{table}_{name}_key")
+            if new.get("unique"):
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
+            else:
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {uq}")
+        if old.get("fk") != new.get("fk"):
+            fk = self.quote(f"{table}_{name}_fkey")
+            if old.get("fk"):
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {fk}")
+            ref = new.get("fk")
+            if ref:
+                clause = self._fk_clause(
+                    col,
+                    self.quote(ref["table"]),
+                    self.quote(ref["pk"]),
+                    ref.get("on_delete", "CASCADE"),
+                )
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {fk} {clause}")
+        return out
+
+    def render_create_index(
+        self,
+        table: str,
+        column: str,
+        safe: bool = True,
+        unique: bool = False,
+        concurrently: bool = False,
+        name: str | None = None,
+    ) -> list[str]:
+        """Render a create-index statement.
+
+        Args:
+            table: The table name.
+            column: The column to index.
+            safe: Whether to emit an ``IF NOT EXISTS`` guard.
+            unique: Whether to create a ``UNIQUE`` index.
+            concurrently: Ignored (no ``CONCURRENTLY`` on Oracle).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        ine = "IF NOT EXISTS " if safe else ""
+        return [
+            f"CREATE {uniq}INDEX {ine}{self.quote(name or f'idx_{table}_{column}')} "
+            f"ON {self.quote(table)} ({self.quote(column)})"
+        ]
+
+    def render_drop_index(
+        self, table: str, column: str, concurrently: bool = False, name: str | None = None
+    ) -> list[str]:
+        """Render a drop-index statement (Oracle drops by bare index name).
+
+        Args:
+            table: The table owning the index (unused; not needed by Oracle).
+            column: The indexed column.
+            concurrently: Ignored (no ``CONCURRENTLY`` on Oracle).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the drop-index statement.
+        """
+        idx = self.quote(name or f"idx_{table}_{column}")
+        return [f"DROP INDEX IF EXISTS {idx}"]
+
+    def render_create_composite_index(
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        safe: bool = True,
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
+        opclass: str | None = None,
+    ) -> list[str]:
+        """Render a multi-column create-index statement.
+
+        The PostgreSQL-only options (``condition``/``using``/``include``/
+        ``opclass``) are dropped, matching the capability flags.
+
+        Args:
+            table: The table to index.
+            name: The index name.
+            columns: The ordered columns covered by the index.
+            safe: Whether to emit an ``IF NOT EXISTS`` guard.
+            condition: Ignored (no partial indexes).
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Ignored.
+            include: Ignored.
+            opclass: Ignored.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        ine = "IF NOT EXISTS " if safe else ""
+        cols = ", ".join(self.quote(c) for c in columns)
+        return [f"CREATE {uniq}INDEX {ine}{self.quote(name)} ON {self.quote(table)} ({cols})"]
+
+    def render_drop_composite_index(self, name: str, table: str | None = None) -> list[str]:
+        """Render a named-index drop (Oracle drops by bare name).
+
+        Args:
+            name: The index name.
+            table: The owning table (unused).
+
+        Returns:
+            The list with the drop-index statement.
+        """
+        return [f"DROP INDEX IF EXISTS {self.quote(name)}"]
+
+    def render_rename_index(
+        self,
+        table: str,
+        column: str,
+        old_name: str,
+        new_name: str,
+        unique: bool = False,
+    ) -> list[str]:
+        """Render an in-place index rename (``ALTER INDEX ... RENAME TO``).
+
+        Args:
+            table: The table owning the index (unused).
+            column: The indexed column (unused).
+            old_name: The current index name.
+            new_name: The new index name.
+            unique: Unused (the index definition is unchanged).
+
+        Returns:
+            The list with the rename-index statement.
+        """
+        return [f"ALTER INDEX {self.quote(old_name)} RENAME TO {self.quote(new_name)}"]
+
+    def render_drop_constraint(self, table: str, name: str) -> list[str]:
+        """Render a drop-constraint statement.
+
+        Args:
+            table: The table name.
+            name: The constraint name to drop.
+
+        Returns:
+            The list with the drop-constraint statement.
+        """
+        return [f"ALTER TABLE {self.quote(table)} DROP CONSTRAINT {self.quote(name)}"]
+
+    def render_rename_constraint(self, table: str, old: str, new: str) -> list[str]:
+        """Render a constraint rename (``ALTER TABLE ... RENAME CONSTRAINT``).
+
+        Args:
+            table: The table name.
+            old: The current constraint name.
+            new: The new constraint name.
+
+        Returns:
+            The list with the rename-constraint statement.
+        """
+        return [
+            f"ALTER TABLE {self.quote(table)} "
+            f"RENAME CONSTRAINT {self.quote(old)} TO {self.quote(new)}"
+        ]
+
+
 _DIALECTS: dict[str, type[BaseDialect]] = {
     "postgres": PostgresDialect,
     "sqlite": SqliteDialect,
     "mysql": MySQLDialect,
     "mariadb": MariaDbDialect,
+    "oracle": OracleDialect,
 }
 
 

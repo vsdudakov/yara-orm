@@ -173,7 +173,7 @@ async def test_select_for_update_sql_per_backend(db):
     none (no-op)
     """
     base = MtTxAcct.filter(balance__gt=0)
-    if db in ("postgres", "mysql", "mariadb"):
+    if db in ("postgres", "mysql", "mariadb", "oracle"):
         assert base.select_for_update().sql().rstrip().endswith("FOR UPDATE")
         assert "NOWAIT" in base.select_for_update(nowait=True).sql()
         assert "SKIP LOCKED" in base.select_for_update(skip_locked=True).sql()

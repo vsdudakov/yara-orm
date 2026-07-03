@@ -74,11 +74,26 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      oracle:
+        image: gvenzl/oracle-free:slim
+        env:
+          ORACLE_PASSWORD: oracle
+          APP_USER: orm
+          APP_USER_PASSWORD: orm
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 60s
     env:
       ORM_TEST_DB: postgres://postgres:postgres@localhost:5432/orm_test
       ORM_TEST_DB2: postgres://postgres:postgres@localhost:5432/orm_test2
       ORM_TEST_MYSQL: mysql://root:root@localhost:3306/orm_test
       ORM_TEST_MARIADB: mariadb://root:root@localhost:3307/orm_test
+      ORM_TEST_ORACLE: oracle://orm:orm@localhost:1521/FREEPDB1
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v7

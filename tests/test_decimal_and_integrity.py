@@ -85,7 +85,8 @@ async def test_decimal_column_type(db):
             "WHERE table_name = 'dec_acct' AND column_name = 'balance'"
         )
         data_type, precision, scale = rows[0]
-        assert data_type.lower() == ("decimal" if db in ("mysql", "mariadb") else "numeric")
+        expected = {"mysql": "decimal", "mariadb": "decimal", "oracle": "number"}.get(db, "numeric")
+        assert data_type.lower() == expected
         assert (int(precision), int(scale)) == (30, 10)
     else:
         rows = await engine.fetch_rows("SELECT sql FROM sqlite_master WHERE name = 'dec_acct'")

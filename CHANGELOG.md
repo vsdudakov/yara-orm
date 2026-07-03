@@ -24,6 +24,35 @@ All notable changes to **yara-orm** are documented here. The format is based on
   compares yara-orm against Django, Peewee, SQLObject, Ormar and Piccolo in
   addition to Tortoise, SQLAlchemy and Pony, across PostgreSQL, MySQL, MariaDB
   and SQLite (`BENCH_BACKEND=mariadb`).
+- **Oracle backend (experimental).**
+  `await YaraOrm.init("oracle://user:pass@host:1521/FREEPDB1")` connects to
+  Oracle Database 23ai. Built on the **pure-Rust `oracle-rs`** driver (a native
+  TNS implementation — no OCI / ODPI-C / Instant Client, so manylinux wheels
+  stay self-contained) with a custom `deadpool` pool honouring
+  `max_size`/`min_size`/`statement_cache_size` and `require_ssl=true` (rustls).
+  Sessions are pinned to UTC; auto-increment pks use IDENTITY columns read back
+  through a `RETURNING ... INTO` OUT bind; the type map is the
+  `NUMBER`/`VARCHAR2`/`TIMESTAMP`/`CLOB`/`BLOB` family (`NUMBER(1)` booleans,
+  `VARCHAR2(36)` uuids). Slicing uses `OFFSET ... FETCH NEXT`, case-insensitive
+  lookups fold with `UPPER()`, regex uses `REGEXP_LIKE`, upserts and m2m links
+  render `MERGE`, and `GROUP BY` lists every selected column (Oracle's strict
+  rule). The shared cross-backend suite runs on Oracle via `ORM_TEST_ORACLE`.
+
+  Known limitations of the young `oracle-rs 0.1.x` driver (documented, their
+  tests skipped): bind values above ~1&nbsp;KB are rejected (large
+  text/JSON/binary values cannot be inserted); a constraint violation closes the
+  connection without surfacing the `ORA-` code, so `IntegrityError` cannot be
+  raised; `__search` and JSON `__contains` are unimplemented; `bulk_create`
+  inserts one row per statement and connections are retired periodically to
+  dodge a driver protocol-desync. See `docs/backends` for the full list.
+
+### Changed
+
+- Dialect gains a few capability hooks used by the Oracle backend and shared by
+  all backends: `insert_returning_clause`, `limit_offset_sql`,
+  `like_pattern_sql`, `render_upsert`, `supports_multirow_insert` and
+  `group_by_functional_dependency`. `UUIDField.to_python` now reconstructs a
+  `uuid.UUID` from text (backends that return uuid columns as strings).
 
 ### Fixed
 
@@ -47,6 +76,7 @@ All notable changes to **yara-orm** are documented here. The format is based on
   parsed once. Repeated `init()` on the TLS path now matches the plaintext
   baseline (measured: first init ~157ms → subsequent ~33ms, same as
   `sslmode=disable`).
+
 
 ## [1.13.0] - 2026-07-03
 

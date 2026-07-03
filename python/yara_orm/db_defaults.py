@@ -94,6 +94,13 @@ class RandomHex(DatabaseDefault):
             # ``size`` random bytes -> 2*size hex chars, same width as the
             # PostgreSQL and SQLite renderings.
             return f"lower(hex(random_bytes({self.size})))"
+        if dialect.name == "oracle":
+            # ``SYS_GUID()`` yields 16 random bytes -> 32 hex chars; concatenate
+            # enough to cover ``size`` bytes, then trim to the same 2*size width.
+            hex_len = self.size * 2
+            chunks = -(-hex_len // 32)  # ceil division
+            expr = " || ".join("RAWTOHEX(SYS_GUID())" for _ in range(chunks))
+            return f"LOWER(SUBSTR({expr}, 1, {hex_len}))"
         return f"lower(hex(randomblob({self.size})))"
 
 

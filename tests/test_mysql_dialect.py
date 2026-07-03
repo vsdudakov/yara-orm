@@ -96,7 +96,7 @@ def test_capability_flags_match_mysql_8():
     """
     assert MY.supports_insert_returning is False
     assert MY.insert_ignore_verb == "INSERT IGNORE"
-    assert MY.insert_default_values == "() VALUES ()"
+    assert MY.insert_default_values_sql("id") == "() VALUES ()"
     assert MY.offset_requires_limit is True
     assert MY.no_limit == 18446744073709551615
     assert MY.column_if_exists is False

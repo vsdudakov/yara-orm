@@ -173,8 +173,8 @@ async def test_full_field_round_trip(db):
     assert got.ratio == 2.5
     assert got.price == Decimal("12345.678")
     expected_utc = aware.astimezone(dt.timezone.utc)
-    if db in ("mysql", "mariadb"):
-        # DATETIME is naive: the aware value is stored as its UTC instant.
+    if db in ("mysql", "mariadb", "oracle"):
+        # DATETIME/TIMESTAMP is naive: the aware value is stored as its UTC instant.
         assert got.when == expected_utc.replace(tzinfo=None)
     else:
         assert got.when == expected_utc
@@ -407,7 +407,9 @@ async def test_search_lookup_per_backend(db):
     THEN PostgreSQL matches via to_tsvector, MySQL via MATCH ... AGAINST over a
          FULLTEXT index, and SQLite raises UnSupportedError
     """
-    if db == "sqlite":
+    if db in ("sqlite", "oracle"):
+        # SQLite has no full-text lookup; Oracle Text (CONTAINS) needs a context
+        # index and is not implemented here.
         with pytest.raises(UnSupportedError):
             await MyEverything.filter(body__search="foxes").count()
         return
