@@ -194,10 +194,11 @@ async def test_isolation_serializable_both_backends(db):
 async def test_isolation_repeatable_read_per_backend(db):
     """
     GIVEN a transaction requesting REPEATABLE READ isolation
-    WHEN it runs on PostgreSQL (supported) versus SQLite (serializable-only)
-    THEN PostgreSQL applies it and SQLite raises UnSupportedError
+    WHEN it runs on PostgreSQL/MySQL (supported) versus SQLite
+    (serializable-only)
+    THEN PostgreSQL and MySQL apply it and SQLite raises UnSupportedError
     """
-    if db == "postgres":
+    if db in ("postgres", "mysql"):
         async with in_transaction(isolation=IsolationLevel.REPEATABLE_READ):
             await TxAccount.create(name="R", balance=1)
         assert await TxAccount.all().count() == 1

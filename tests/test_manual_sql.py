@@ -23,8 +23,9 @@ async def test_raw_execute_and_fetch(db):
     THEN execute() reports affected rows and fetch_all() returns dict rows
     """
     conn = connections.get("default")
-    await conn.execute("INSERT INTO m_thing (name) VALUES ($1)", ["x"])
-    affected = await conn.execute("INSERT INTO m_thing (name) VALUES ($1)", ["y"])
+    ph = "?" if db == "mysql" else "$1"  # raw SQL carries the driver's placeholder
+    await conn.execute(f"INSERT INTO m_thing (name) VALUES ({ph})", ["x"])
+    affected = await conn.execute(f"INSERT INTO m_thing (name) VALUES ({ph})", ["y"])
     assert affected == 1
     rows = await conn.fetch_all("SELECT name FROM m_thing ORDER BY name")
     assert [r["name"] for r in rows] == ["x", "y"]
@@ -40,7 +41,8 @@ async def test_model_raw_returns_instances(db):
     await Thing.create(name="alpha")
     await Thing.create(name="beta")
 
-    objs = await Thing.raw("SELECT * FROM m_thing WHERE name = $1", ["alpha"])
+    ph = "?" if db == "mysql" else "$1"
+    objs = await Thing.raw(f"SELECT * FROM m_thing WHERE name = {ph}", ["alpha"])
     assert len(objs) == 1
     assert isinstance(objs[0], Thing)
     assert objs[0].name == "alpha"

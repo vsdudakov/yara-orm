@@ -50,9 +50,22 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: orm_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       ORM_TEST_DB: postgres://postgres:postgres@localhost:5432/orm_test
       ORM_TEST_DB2: postgres://postgres:postgres@localhost:5432/orm_test2
+      ORM_TEST_MYSQL: mysql://root:root@localhost:3306/orm_test
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v7

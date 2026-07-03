@@ -1,9 +1,9 @@
 ---
-title: Backends — PostgreSQL & SQLite
-description: Yara ORM backends — connect the async Python ORM to PostgreSQL (tokio-postgres) or SQLite (rusqlite) by URL, with identical model code across both.
+title: Backends — PostgreSQL, MySQL & SQLite
+description: Yara ORM backends — connect the async Python ORM to PostgreSQL (tokio-postgres), MySQL (mysql_async) or SQLite (rusqlite) by URL, with identical model code across all of them.
 ---
 
-# Backends: PostgreSQL & SQLite
+# Backends: PostgreSQL, MySQL & SQLite
 
 Yara ORM selects a database **backend by connection URL**. The same model and queryset
 code runs unchanged across backends — only the URL you pass to `YaraOrm.init()` differs.
@@ -12,6 +12,7 @@ code runs unchanged across backends — only the URL you pass to `YaraOrm.init()
 from yara_orm import YaraOrm
 
 await YaraOrm.init("postgres://user:pass@localhost/db")   # PostgreSQL (tokio-postgres)
+await YaraOrm.init("mysql://user:pass@localhost/db")       # MySQL/MariaDB (mysql_async)
 await YaraOrm.init("sqlite:///path/to/app.db")             # SQLite (rusqlite)
 ```
 
@@ -80,6 +81,47 @@ await YaraOrm.init(
 
 These parameters apply to SQLite too (`max_size`/`min_size`/`statement_cache_size`);
 in-memory databases always pin a single connection regardless of `max_size`.
+
+## MySQL
+
+The MySQL backend is built on the pure-Rust **mysql_async** driver and its own
+connection pool. It targets MySQL 8.x and also speaks the MariaDB protocol;
+driver-qualified schemes (`mysql+aiomysql://`, `mariadb://`, ...) are
+normalised automatically.
+
+```python
+await YaraOrm.init("mysql://user:password@host:3306/dbname")
+```
+
+- The same `max_size` / `min_size` / `statement_cache_size` URL parameters as
+  the other backends; everything else passes through to the driver (e.g.
+  `require_ssl=true` for TLS, served by rustls — no system OpenSSL needed).
+  On MySQL, `min_size` also bounds the *idle connections the pool retains*
+  (the driver closes idle connections beyond it); it defaults to `max_size`
+  so pooled statements never pay a reconnect handshake.
+- Every session is pinned to **UTC** and to **`ANSI_QUOTES`**, so portable raw
+  SQL with double-quoted identifiers runs unchanged. String literals must use
+  single quotes (everything the ORM emits already does).
+- **No `INSERT ... RETURNING`**: new auto-increment primary keys come from the
+  driver-reported last-insert id (single inserts and `bulk_create`, which
+  backfills a batch from its first id under the default consecutive
+  `innodb_autoinc_lock_mode`). `Meta.fetch_db_defaults` is honoured with a
+  follow-up `SELECT` by primary key.
+- Upserts render `INSERT IGNORE` (`ignore_conflicts`) and the 8.4-safe
+  `INSERT ... AS new ON DUPLICATE KEY UPDATE` (`update_fields`); MySQL matches
+  against *any* unique key, so an explicit `on_conflict` target is ignored.
+- Case semantics: the default utf8mb4 collation makes `LIKE` case-insensitive,
+  so `icontains`/`iexact`/... use plain `LIKE` while the case-sensitive
+  lookups use `LIKE BINARY`. Regex lookups render `REGEXP_LIKE(col, ?, 'c')`
+  (or `'i'`).
+- `__search` renders `MATCH ... AGAINST`; the column needs a FULLTEXT index —
+  declare `Index(fields=["col"], using="fulltext")` on the model.
+- Aware datetimes are stored as their UTC instant in a naive `DATETIME(6)`
+  column and read back naive (aware UTC under `use_tz=True`). `CHAR(36)` uuid
+  columns are reconstructed to `uuid.UUID` on read.
+- JSON columns cannot be indexed directly on MySQL; a JSON `Index`
+  (e.g. a PostgreSQL GIN declaration) is dropped like the other
+  PostgreSQL-only index options.
 
 ## SQLite
 
@@ -162,13 +204,13 @@ write transactions for up to the 5s busy timeout) and `execute_script`
 
 !!! note "When to choose which"
     SQLite is ideal for tests, local development, embedded apps and small services;
-    PostgreSQL for concurrent, production workloads. Because the model layer is identical,
+    PostgreSQL and MySQL for concurrent, production workloads. Because the model layer is identical,
     you can develop against SQLite and deploy on PostgreSQL.
 
 ## Mixing backends
 
-Each named connection has its own backend, so a single app can talk to a PostgreSQL
-database and a SQLite database at once. See [Multiple databases](../guides/multiple-databases.md).
+Each named connection has its own backend, so a single app can talk to PostgreSQL,
+MySQL and SQLite databases at once. See [Multiple databases](../guides/multiple-databases.md).
 
 ```python
 await YaraOrm.init("postgres://localhost/primary")     # default

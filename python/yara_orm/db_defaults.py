@@ -35,11 +35,15 @@ class Now(DatabaseDefault):
         """Render the current-timestamp default.
 
         Args:
-            dialect: The active SQL dialect (unused; portable expression).
+            dialect: The active SQL dialect.
 
         Returns:
-            The ``CURRENT_TIMESTAMP`` expression.
+            The ``CURRENT_TIMESTAMP`` expression (``CURRENT_TIMESTAMP(6)`` on
+            MySQL, whose bare spelling would truncate a ``DATETIME(6)``
+            column's default to whole seconds).
         """
+        if dialect.name == "mysql":
+            return "CURRENT_TIMESTAMP(6)"
         return "CURRENT_TIMESTAMP"
 
 
@@ -48,7 +52,8 @@ class RandomHex(DatabaseDefault):
 
     .. warning::
         The value is produced by non-cryptographic database randomness
-        (PostgreSQL ``md5(random() ...)``, SQLite ``randomblob``). It is fine
+        (PostgreSQL ``md5(random() ...)``, SQLite ``randomblob``, MySQL
+        ``random_bytes``). It is fine
         for identifiers, slugs or de-duplication keys, but must **not** be used
         for security tokens (session ids, password-reset or API keys) — generate
         those in Python with :mod:`secrets` instead.
@@ -85,6 +90,10 @@ class RandomHex(DatabaseDefault):
                 f"md5(random()::text || clock_timestamp()::text || {i})" for i in range(chunks)
             )
             return f"substr({expr}, 1, {hex_len})"
+        if dialect.name == "mysql":
+            # ``size`` random bytes -> 2*size hex chars, same width as the
+            # PostgreSQL and SQLite renderings.
+            return f"lower(hex(random_bytes({self.size})))"
         return f"lower(hex(randomblob({self.size})))"
 
 

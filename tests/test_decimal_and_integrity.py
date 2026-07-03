@@ -74,19 +74,19 @@ async def test_decimal_column_type(db):
     """
     GIVEN a DecimalField model whose schema is generated
     WHEN the column's declared type is inspected
-    THEN PostgreSQL uses NUMERIC(p, s) and SQLite a TEXT-affinity VARCHAR (never
-    a lossy floating type)
+    THEN PostgreSQL uses NUMERIC(p, s), MySQL DECIMAL(p, s) and SQLite a
+    TEXT-affinity VARCHAR (never a lossy floating type)
     """
     engine = get_engine()
-    if db == "postgres":
+    if db in ("postgres", "mysql"):
         rows = await engine.fetch_rows(
             "SELECT data_type, numeric_precision, numeric_scale "
             "FROM information_schema.columns "
             "WHERE table_name = 'dec_acct' AND column_name = 'balance'"
         )
         data_type, precision, scale = rows[0]
-        assert data_type == "numeric"
-        assert (precision, scale) == (30, 10)
+        assert data_type.lower() == ("decimal" if db == "mysql" else "numeric")
+        assert (int(precision), int(scale)) == (30, 10)
     else:
         rows = await engine.fetch_rows("SELECT sql FROM sqlite_master WHERE name = 'dec_acct'")
         assert "VARCHAR" in rows[0][0].upper()

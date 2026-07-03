@@ -34,6 +34,19 @@ for Tortoise and SQLAlchemy:
 BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
 ```
 
+### MySQL
+
+Set `BENCH_BACKEND=mysql` to run the same 4-way workload on MySQL
+(`ORM_TEST_MYSQL`, default `mysql://root:root@localhost:3306/orm_demo`).
+Competitor drivers: `asyncmy` (Tortoise), `aiomysql` (SQLAlchemy) and
+`pymysql` + `cryptography` (Pony; MySQL 8's `caching_sha2_password` needs it) —
+any missing driver is simply reported as `-`:
+
+```bash
+.venv312/bin/pip install -U asyncmy aiomysql pymysql cryptography
+BENCH_BACKEND=mysql .venv312/bin/python benchmarks/bench.py
+```
+
 ## Methodology
 
 * Each ORM gets its own table and the **same** workload and data.
@@ -86,18 +99,42 @@ Speedup vs `yara-orm` (competitor_time / yara_orm_time; >1 means `yara-orm` fast
 `single_insert` are latency-bound (one sequential round-trip per call) and sit
 near the raw client⇄PostgreSQL round-trip floor.
 
-### Chart
+### Charts
 
-The grouped-bar chart shown in the README and docs is rendered from these
-PostgreSQL numbers by `plot_benchmarks.py` (the values are embedded in the
-script, so it needs no database — just `pip install matplotlib`):
+The grouped-bar charts shown in the README and docs are rendered from these
+numbers by `plot_benchmarks.py` (the values are embedded in the script, so it
+needs no database — just `pip install matplotlib`):
 
 ```bash
-python benchmarks/plot_benchmarks.py   # writes docs/assets/benchmark-postgres.png
+python benchmarks/plot_benchmarks.py
+# writes docs/assets/benchmark-{postgres,mysql,sqlite}.png
 ```
 
-If you re-run `bench.py`, update the table above **and** the `TIMES_MS` dict in
-`plot_benchmarks.py` so the chart stays in sync.
+If you re-run `bench.py`, update the tables here **and** the `BACKENDS` dict in
+`plot_benchmarks.py` so the charts stay in sync.
+
+### MySQL results
+
+`BENCH_BACKEND=mysql`, MySQL 8.4 (Docker), Apple Silicon, Python 3.12, N=5000,
+median of 5 (ms, lower is better). Tortoise runs over asyncmy, SQLAlchemy over
+aiomysql, Pony over pymysql:
+
+| operation     | yara-orm | tortoise | sqlalchemy |  pony |
+|---------------|---------:|---------:|-----------:|------:|
+| bulk_insert   |     46.0 |     47.3 |      799.7 | 432.7 |
+| single_insert |    693.7 |    753.7 |      904.4 | 737.4 |
+| fetch_all     |      5.6 |     34.2 |       38.9 |  47.5 |
+| count         |      0.7 |      1.1 |        1.3 |   0.8 |
+| group_by      |      1.2 |      1.5 |        2.1 |   2.5 |
+| filter        |      3.4 |     17.9 |       16.4 |  24.9 |
+| get_by_pk     |    110.9 |    227.7 |      544.2 | 312.4 |
+| update        |      7.2 |      7.8 |       11.0 | 235.5 |
+| delete        |      4.9 |      5.1 |        5.6 | 211.5 |
+
+`yara-orm` is fastest or tied on every operation (`get_by_pk` 2.1–4.9×,
+`fetch_all` 6.0–8.4×, `filter` 4.8–7.3× vs the competitors). The two
+latency-bound ops carry the Docker-network round trip, and `single_insert` is
+dominated by InnoDB's per-commit fsync — a cost every ORM pays equally.
 
 ### SQLite results
 
@@ -105,19 +142,20 @@ If you re-run `bench.py`, update the table above **and** the `TIMES_MS` dict in
 
 | operation     | yara-orm | tortoise | sqlalchemy |  pony |
 |---------------|---------:|---------:|-----------:|------:|
-| bulk_insert   |      8.2 |     13.7 |      604.5 |  54.7 |
-| single_insert |     36.0 |     26.1 |      231.8 | 111.3 |
-| fetch_all     |      5.4 |     39.9 |       20.4 |  51.8 |
-| count         |      0.1 |      0.2 |        0.7 |   0.2 |
-| filter        |      3.0 |     20.4 |        7.0 |  26.1 |
-| get_by_pk     |     56.5 |     79.0 |      331.5 |  31.5 |
-| update        |      0.5 |      0.5 |        1.8 |  43.6 |
-| delete        |      0.4 |      0.4 |        1.2 |  36.0 |
+| bulk_insert   |      7.7 |     13.8 |      615.4 |  51.5 |
+| single_insert |     33.1 |     26.6 |      245.0 | 109.2 |
+| fetch_all     |      3.3 |     39.2 |       21.0 |  53.1 |
+| count         |      0.1 |      0.3 |        0.7 |   0.2 |
+| group_by      |      0.5 |      0.7 |        1.4 |   1.5 |
+| filter        |      1.9 |     20.2 |        7.6 |  26.6 |
+| get_by_pk     |     47.7 |     82.0 |      335.7 |  31.2 |
+| update        |      0.5 |      0.5 |        1.9 |  43.5 |
+| delete        |      0.4 |      0.3 |        1.3 |  37.0 |
 
-`yara-orm` wins the throughput-bound operations decisively (bulk 1.7×/74×/6.7×,
-fetch_all 7.4×/3.8×/9.6×, filter 6.9×/2.4×/8.8× vs Tortoise/SQLAlchemy/Pony).
+`yara-orm` wins the throughput-bound operations decisively (bulk 1.8×/80×/6.7×,
+fetch_all 11.9×/6.4×/16.1×, filter 10.6×/4.0×/14.0× vs Tortoise/SQLAlchemy/Pony).
 It trails on the two **latency-bound** ops: in-process Pony beats us on
-`get_by_pk` (0.6×) and Tortoise edges `single_insert` (0.7×) — the cost is
+`get_by_pk` (0.7×) and Tortoise edges `single_insert` (0.8×) — the cost is
 the per-statement asyncio bridge (scheduling on the runtime + waking the
 event loop), tens of µs that a synchronous in-process driver avoids on
 sequential point queries. Real workloads rarely fire thousands of

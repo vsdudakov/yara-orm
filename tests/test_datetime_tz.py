@@ -48,12 +48,18 @@ async def test_aware_offset_roundtrip(db):
     """
     GIVEN a tz-aware datetime with a +05:00 offset
     WHEN it is written and re-read
-    THEN it round-trips to the same instant as an aware value (regression)
+    THEN it round-trips to the same instant as an aware value (regression);
+    MySQL's DATETIME has no timezone, so there the UTC instant returns naive
+    (aware under ``use_tz``)
     """
     value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456, tzinfo=PLUS5)
     out = await _roundtrip(value)
-    assert out.tzinfo is not None
-    assert out == value  # same instant, even though stored/returned as UTC
+    if db == "mysql":
+        assert out.tzinfo is None
+        assert out == value.astimezone(UTC).replace(tzinfo=None)
+    else:
+        assert out.tzinfo is not None
+        assert out == value  # same instant, even though stored/returned as UTC
 
 
 @pytest.mark.asyncio
@@ -66,8 +72,12 @@ async def test_various_offsets_same_instant(db, tz):
     """
     value = dt.datetime(2022, 1, 1, 0, 0, 0, tzinfo=tz)
     out = await _roundtrip(value)
-    assert out == value
-    assert out.utcoffset() == dt.timedelta(0)  # surfaced in UTC
+    if db == "mysql":
+        # DATETIME is naive: every offset stores as the same UTC instant.
+        assert out == value.astimezone(UTC).replace(tzinfo=None)
+    else:
+        assert out == value
+        assert out.utcoffset() == dt.timedelta(0)  # surfaced in UTC
 
 
 @pytest.mark.asyncio

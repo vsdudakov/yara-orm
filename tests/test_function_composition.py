@@ -6,14 +6,17 @@ function. These render-level unit tests pin every operand branch.
 """
 
 from yara_orm import F
-from yara_orm.functions import Coalesce, Concat, Lower, Trim
+from yara_orm.functions import Coalesce, Concat, Function, Lower, Trim
 
 
 class _Dialect:
-    """Minimal stand-in exposing just the placeholder renderer."""
+    """Minimal stand-in exposing the placeholder and concatenation renderers."""
 
     def placeholder(self, index: int) -> str:
         return f"${index}"
+
+    def concat_sql(self, parts: list) -> str:
+        return "(" + " || ".join(parts) + ")"
 
 
 def _resolve(name: str) -> str:
@@ -24,6 +27,23 @@ def _render(fn):
     params: list = []
     sql, idx = fn.render_params(_resolve, _Dialect(), params, 1)
     return sql, params, idx
+
+
+def test_custom_function_render_params_defaults_to_render():
+    """
+    GIVEN a custom Function subclass that only implements render()
+    WHEN render_params runs (the compile entry point)
+    THEN the base class delegates to render() and binds nothing
+    """
+
+    class Version(Function):
+        def render(self, resolve):
+            return "VERSION()"
+
+    sql, params, idx = _render(Version())
+    assert sql == "VERSION()"
+    assert params == []
+    assert idx == 1
 
 
 def test_unary_string_operand_uses_render():

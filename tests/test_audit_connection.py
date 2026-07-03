@@ -540,9 +540,10 @@ async def test_execute_many_applies_nothing_on_failure(db):
     THEN the whole batch rolls back — the first row is not applied
     """
     engine = get_engine()
+    ph = ("?", "?") if db == "mysql" else ("$1", "$2")
     with pytest.raises(IntegrityError):
         await engine.execute_many(
-            "INSERT INTO ac_item (id, name) VALUES ($1, $2)",
+            f"INSERT INTO ac_item (id, name) VALUES ({ph[0]}, {ph[1]})",
             [[1, "a"], [1, "b"]],
         )
     assert await AcItem.all().count() == 0

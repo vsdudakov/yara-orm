@@ -87,7 +87,8 @@ async def test_unsupported_url_rejected():
     THEN the engine rejects it with a ValueError
     """
     with pytest.raises(ValueError):
-        await YaraOrm.init("mysql://localhost/nope")
+        # mysql:// is supported now; oracle stays the canonical unknown scheme.
+        await YaraOrm.init("oracle://localhost/nope")
 
 
 def test_dialect_registry():
@@ -154,9 +155,10 @@ async def test_set_router_and_transaction_fetch_all(db):
     """
     YaraOrm.set_router(None)
     await CvStar.create(name="x")
+    ph = "?" if db == "mysql" else "$1"  # raw SQL carries the driver's placeholder
     async with in_transaction():
         conn = connections.get("default")
-        await conn.execute("INSERT INTO cov_star (name) VALUES ($1)", ["y"])
+        await conn.execute(f"INSERT INTO cov_star (name) VALUES ({ph})", ["y"])
         rows = await conn.fetch_all("SELECT name FROM cov_star ORDER BY name")
         assert [r["name"] for r in rows] == ["x", "y"]
         assert (await conn.fetch_row("SELECT count(*) FROM cov_star"))[0] == 2
