@@ -1,13 +1,13 @@
 ---
 title: Quick start
-description: Build your first app with Yara ORM, the async Python ORM with a Rust engine — define models, run queries and traverse relations on PostgreSQL or SQLite.
+description: Build your first app with Yara ORM, the async Python ORM with a Rust engine — define models, run queries and traverse relations on PostgreSQL, MySQL or SQLite.
 ---
 
 # Quick start
 
 This guide takes you from an empty file to a working async app: define models, create the
-schema, run queries and traverse relations. It works the same on **PostgreSQL** and
-**SQLite** — only the connection URL changes.
+schema, run queries and traverse relations. It works the same on **PostgreSQL**, **MySQL**
+and **SQLite** — only the connection URL changes.
 
 ## 1. Install
 
@@ -46,6 +46,15 @@ Pick a backend by URL — the rest of your code is identical.
     from yara_orm import YaraOrm
 
     await YaraOrm.init("postgres://user:pass@localhost/app")
+    await YaraOrm.generate_schemas()
+    ```
+
+=== "MySQL"
+
+    ```python
+    from yara_orm import YaraOrm
+
+    await YaraOrm.init("mysql://user:pass@localhost/app")
     await YaraOrm.generate_schemas()
     ```
 

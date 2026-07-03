@@ -13,7 +13,8 @@ virtualenv.
 
 - A [Rust toolchain](https://rustup.rs/) (`rustup`)
 - Python 3.9 – 3.14
-- A local **PostgreSQL** for the Postgres tests (the SQLite tests are self-contained)
+- A local **PostgreSQL** for the Postgres tests and a local **MySQL** for the MySQL tests
+  (the SQLite tests are self-contained)
 
 ## Set up
 
@@ -37,14 +38,14 @@ make bench      # 4-way benchmark (see benchmarks/)
 !!! warning "Both must be green before a PR"
     Pull requests are expected to pass **`make lint`** (ruff + ty clean) and **`make cov`**
     (100% statement *and* branch coverage). CI runs the same checks on Python 3.12–3.14
-    against both PostgreSQL and SQLite.
+    against PostgreSQL, MySQL and SQLite.
 
 ## Project layout
 
 | Path | Contents |
 |------|----------|
 | `python/yara_orm/` | The Python ORM layer (models, fields, queryset, dialects, migrations). |
-| `rust/src/` | The Rust engine (Engine, Backend trait, Pg/SQLite backends, Value). |
+| `rust/src/` | The Rust engine (Engine, Backend trait, Pg/MySQL/SQLite backends, Value). |
 | `tests/` | End-to-end tests (mocks kept to a minimum). |
 | `benchmarks/` | The 4-way benchmark script and methodology. |
 | `docs/` | This documentation site (MkDocs Material). |
@@ -59,7 +60,8 @@ otherwise.
 ## Adding a backend
 
 The backend abstraction is a two-seam extension point — a Rust `Backend` impl plus a Python
-`BaseDialect` subclass. See [Architecture](architecture.md) and [Backends](backends/index.md).
+`BaseDialect` subclass; the MySQL backend is a complete worked example of both seams.
+See [Architecture](architecture.md) and [Backends](backends/index.md).
 
 ## Working on the docs
 

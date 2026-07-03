@@ -1,12 +1,13 @@
 ---
 title: Working with JSON
-description: Store and query JSON in yara_orm — JSONField declaration, automatic value coercion (UUID/Decimal/datetime/bytes/enum), key-path lookups (data__key, data__a__b), full-text search, and encoder/decoder hooks on PostgreSQL and SQLite.
+description: Store and query JSON in yara_orm — JSONField declaration, automatic value coercion (UUID/Decimal/datetime/bytes/enum), key-path lookups (data__key, data__a__b), full-text search, and encoder/decoder hooks on PostgreSQL, MySQL and SQLite.
 ---
 
 # Working with JSON
 
 `JSONField` stores a JSON document per row — a dict, a list, or any nested
-mixture of JSON-native values. On PostgreSQL it maps to `JSONB`; on SQLite it is
+mixture of JSON-native values. On PostgreSQL it maps to `JSONB`; on MySQL to the
+native `JSON` type; on SQLite it is
 stored as JSON text. The engine serialises and parses the JSON itself, so you
 work with ordinary Python `dict`/`list` values on both sides.
 
@@ -70,7 +71,7 @@ await Event.create(payload={"bad": object()})
 
 Filter on a key inside the document with a `__`-separated path. The leading
 segment is the `JSONField`; the rest are object keys, extracted per dialect
-(PostgreSQL `->`/`->>`, SQLite `json_extract`):
+(PostgreSQL `->`/`->>`, MySQL `JSON_UNQUOTE(JSON_EXTRACT(...))`, SQLite `json_extract`):
 
 ```python
 await Event.filter(payload__kind="signup")          # top-level key
@@ -110,7 +111,7 @@ searches the serialised JSON — the column is cast to text automatically, so
 await Event.filter(payload__icontains="signup")   # CAST(payload AS TEXT) ILIKE '%signup%'
 ```
 
-## Containment: `__contains` (PostgreSQL)
+## Containment: `__contains` (PostgreSQL and MySQL)
 
 `__contains` on the `JSONField` itself is **structural containment** (`@>`), not
 a text search — it matches an object subset, an array element, or an
@@ -124,7 +125,8 @@ await Call.filter(contact__tags__contains=[{"name": "vip"}])
 ```
 
 !!! note
-    `@>` is PostgreSQL-only; `__contains` on a JSON column raises `UnSupportedError`
+    `@>` is PostgreSQL-only; MySQL renders the same semantics with
+    `JSON_CONTAINS(...)`. `__contains` on a JSON column raises `UnSupportedError`
     on SQLite. (A key-path `payload__key__contains="x"` is still a text `LIKE` on
     the extracted value.)
 

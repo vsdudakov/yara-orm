@@ -1,13 +1,13 @@
 ---
 title: Models & Fields
-description: Define async Python ORM models and fields with yara_orm — typed columns, primary keys, enums, defaults and comments mapped to PostgreSQL and SQLite.
+description: Define async Python ORM models and fields with yara_orm — typed columns, primary keys, enums, defaults and comments mapped to PostgreSQL, MySQL and SQLite.
 ---
 
 # Models & fields
 
 `yara_orm` is an async Python ORM with a Rust engine. You describe your schema as
 plain Python classes: subclass `Model`, declare typed fields as class attributes,
-and the ORM maps each one onto a column for your database (PostgreSQL or SQLite).
+and the ORM maps each one onto a column for your database (PostgreSQL, MySQL or SQLite).
 Field declarations read like type hints, so models stay concise and self-documenting.
 
 ## Defining a model
@@ -107,8 +107,9 @@ class Job(Model):
         ]
 ```
 
-Partial indexes are supported on both PostgreSQL and SQLite, and the condition
-round-trips through [migrations](migrations.md).
+Partial indexes are supported on PostgreSQL and SQLite, and the condition
+round-trips through [migrations](migrations.md). MySQL has no partial indexes,
+so the condition is dropped there and the index covers every row.
 
 To introspect the DDL an `Index` produces, call
 `index.get_sql(model, dialect=None, safe=True)`. It renders the `CREATE INDEX`
@@ -324,10 +325,13 @@ class Session(Model):
 ```
 
 `Now()` and `SqlDefault(...)` are portable; `RandomHex` renders per backend
-(SQLite honours the byte count, PostgreSQL uses a 32-char `md5`). By default the
+(`randomblob` on SQLite, `random_bytes` on MySQL, concatenated `md5()` chunks
+on PostgreSQL — all honouring the byte count). By default the
 value is filled on insert and left off the in-memory instance — set
 `Meta.fetch_db_defaults = True` to have `create()` / `save()` read the computed
-values back onto the instance via `INSERT ... RETURNING` (both backends):
+values back onto the instance via `INSERT ... RETURNING` on PostgreSQL and
+SQLite, or a follow-up `SELECT` by primary key on MySQL (which has no
+`RETURNING`):
 
 ```python
 class Session(Model):
@@ -417,10 +421,14 @@ class Described(Model):
         table_description = "a fully described table"
 ```
 
-!!! note "PostgreSQL comments"
+!!! note "PostgreSQL and MySQL comments"
     On PostgreSQL these become real SQL `COMMENT` statements: the table comment is
     readable via `obj_description(...)` and the column comment via
-    `col_description(...)`. They document your schema directly in the database.
+    `col_description(...)`. On MySQL, column descriptions ride along as inline
+    `COMMENT` clauses in the column definition and the table description renders
+    as `ALTER TABLE ... COMMENT`. Either way they document your schema directly
+    in the database. SQLite has no comment statement, so descriptions are
+    dropped there.
 
 ## Primary keys
 

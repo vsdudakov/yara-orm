@@ -1,6 +1,6 @@
 ---
 title: Multiple databases
-description: Connect to multiple databases and route reads/writes in an async Python ORM, sending queries across PostgreSQL and SQLite read-replica connections.
+description: Connect to multiple databases and route reads/writes in an async Python ORM, sending queries across PostgreSQL, MySQL and SQLite read-replica connections.
 ---
 
 # Multiple databases
@@ -141,7 +141,8 @@ async with in_transaction():                # on "default"
 ## Mixed backends
 
 Each connection resolves its own SQL dialect from its URL, so backends are
-independent per connection. A PostgreSQL primary can sit beside a SQLite
+independent per connection — a single app can talk to PostgreSQL, MySQL and
+SQLite at once. A PostgreSQL primary can sit beside a SQLite
 connection with no extra configuration:
 
 ```python

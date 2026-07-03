@@ -232,4 +232,4 @@ full picture.
 ## See also
 
 - [Migrations](../guides/migrations.md) — backend-portable schema changes.
-- [Performance](../performance.md) — PostgreSQL and SQLite benchmark results.
+- [Performance](../performance.md) — PostgreSQL, MySQL and SQLite benchmark results.

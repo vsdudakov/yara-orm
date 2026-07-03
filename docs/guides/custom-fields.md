@@ -6,7 +6,7 @@ public call: `register_field_kind()`. It wires the new *kind* into every layer
 at once:
 
 - **DDL** — the dialects render the column type from your SQL template (per
-  dialect, so the same model works on PostgreSQL and SQLite),
+  dialect, so the same model works on PostgreSQL, MySQL and SQLite),
 - **migrations** — `makemigrations` serialises the field as
   `fields.<ClassName>(...)` and diffs its `type_params` like any built-in
   (a changed parameter becomes an `AlterField`),
@@ -36,7 +36,7 @@ class VectorField(fields.Field):
 register_field_kind(
     "vector",
     field_cls=VectorField,
-    sql={"postgres": "vector({dim})", "sqlite": "TEXT"},
+    sql={"postgres": "vector({dim})", "mysql": "TEXT", "sqlite": "TEXT"},
     requires_extension="vector",  # pgvector; omit when none is needed
 )
 
@@ -95,7 +95,7 @@ returning the constructor source string:
 register_field_kind(
     "vector",
     field_cls=VectorField,
-    sql={"postgres": "vector({dim})", "sqlite": "TEXT"},
+    sql={"postgres": "vector({dim})", "mysql": "TEXT", "sqlite": "TEXT"},
     source=lambda f: f"fields.VectorField(dim={f.type_params['dim']})",
 )
 ```
@@ -111,11 +111,11 @@ property of the schema:
 
 - `YaraOrm.generate_schemas()` emits
   `CREATE EXTENSION IF NOT EXISTS "vector"` before creating tables (via
-  `dialect.extensions_sql(models)`; empty on SQLite).
+  `dialect.extensions_sql(models)`; empty on MySQL and SQLite).
 - `makemigrations` prepends an `m.CreateExtension("vector")` operation to any
   migration that creates or retypes a column of the kind. The operation
   renders per dialect — the guarded `CREATE EXTENSION` on PostgreSQL, nothing
-  on SQLite — so one migration file applies cleanly on both backends. Its
+  on MySQL or SQLite — so one migration file applies cleanly on every backend. Its
   reverse is deliberately empty: other tables may rely on the extension.
 
 The database role applying the schema needs the privilege to create the

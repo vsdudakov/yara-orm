@@ -120,7 +120,8 @@ resolve as `fields.<ClassName>` so generated migrations import cleanly;
 Database-side column defaults (pass as a field `default`): `Now()`,
 `RandomHex(size)`, `SqlDefault(sql)` (base `DatabaseDefault`). The database fills
 the value on insert; set `Meta.fetch_db_defaults = True` to read it back onto the
-instance via `INSERT … RETURNING`. `Manager` is the base queryset provider;
+instance via `INSERT … RETURNING` (a follow-up `SELECT` by primary key on
+MySQL, which has no `RETURNING`). `Manager` is the base queryset provider;
 subclass it and set `Meta.manager` to scope every query (inherited from abstract
 bases). See [Models & fields](guides/models-and-fields.md).
 
@@ -143,9 +144,10 @@ or `filter(a__gt=F("b"))`.
 **Lookups:** `exact` (default), `iexact`, `not`, `gt`, `gte`, `lt`, `lte`, `in`,
 `not_in`, `range`, `isnull`, `not_isnull`, `contains`, `icontains`, `startswith`,
 `istartswith`, `endswith`, `iendswith`, `date`, the date-parts (`year`, `quarter`,
-`month`, `week`, `day`, `hour`, `minute`, `second`, `microsecond`), and the
-PostgreSQL-only `regex` / `iregex` (aliases `posix_regex` / `iposix_regex`) and
-`search`. See [Querying](guides/querying.md#field-lookups-with-__) for the full
+`month`, `week`, `day`, `hour`, `minute`, `second`, `microsecond`), and
+`regex` / `iregex` (aliases `posix_regex` / `iposix_regex`) and
+`search` — the last group on PostgreSQL and MySQL only (SQLite raises
+`UnSupportedError`). See [Querying](guides/querying.md#field-lookups-with-__) for the full
 table with per-lookup SQL and examples.
 
 ## Aggregations & functions
@@ -187,7 +189,7 @@ See [Testing with factories](guides/testing-factories.md).
 `atomic(connection_name="default", isolation=None)` (decorator). Nested blocks on the same
 connection name open savepoints automatically; a different name opens an independent
 transaction on that connection. `isolation` takes an `IsolationLevel` constant (PostgreSQL
-honours all four, SQLite is serializable-only). See [Transactions](guides/transactions.md).
+and MySQL honour all four, SQLite is serializable-only). See [Transactions](guides/transactions.md).
 
 ## Query hooks & annotators
 
@@ -211,19 +213,21 @@ operation classes `CreateModel`, `DeleteModel`, `AddField`, `RemoveField`, `Alte
 `RenameField`, `RenameIndex`, `AddConstraint`,
 `RemoveConstraint`, `RenameConstraint`, `RunSQL`, `RunPython`, `CreateExtension`
 (the last renders `CREATE EXTENSION IF NOT EXISTS` on PostgreSQL and nothing on
-SQLite; constraints built with
+MySQL or SQLite; constraints built with
 `UniqueConstraint` / `CheckConstraint`). Generated migrations use the idempotent analogs
 (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …); `AddIndexConcurrently`,
 `AddUniqueIndexConcurrently` and `RemoveIndexConcurrently` are for hand-written non-atomic
-migrations. Constraint operations alter in place on PostgreSQL and rebuild the table on
+migrations. Constraint operations alter in place on PostgreSQL and MySQL (which has no
+`RENAME CONSTRAINT` — `RenameConstraint` raises there) and rebuild the table on
 SQLite. CLI: `python -m yara_orm …`. See [Migrations](guides/migrations.md).
 
 ## Dialects
 
-`BaseDialect`, `PostgresDialect`, `SqliteDialect`, and `register_dialect(name, cls)` for
+`BaseDialect`, `PostgresDialect`, `SqliteDialect` (the MySQL dialect lives at
+`yara_orm.dialects.MySQLDialect`), and `register_dialect(name, cls)` for
 adding a backend. `dialect.extensions_sql(models)` returns the
 `CREATE EXTENSION IF NOT EXISTS` statements required by the models' registered
-field kinds (deduped, sorted; empty on SQLite) — `generate_schemas` runs them
+field kinds (deduped, sorted; empty on MySQL and SQLite) — `generate_schemas` runs them
 before creating tables. See [Backends](backends/index.md) and
 [Architecture](architecture.md).
 

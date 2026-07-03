@@ -83,7 +83,7 @@ class Event(Model):
 
 
 async def main() -> None:
-    await YaraOrm.init("postgres://localhost/app")   # or "sqlite:///app.db"
+    await YaraOrm.init("postgres://localhost/app")   # or "mysql://…", "sqlite:///app.db"
     await YaraOrm.generate_schemas()
 
     cup = await Tournament.create(name="World Cup")
@@ -160,7 +160,7 @@ async with in_transaction():            # commit on success, rollback on error
     async with in_transaction():        # nesting opens a savepoint
         await Account.create(name="B")  # rolls back independently on error
 
-@atomic(isolation="SERIALIZABLE")       # isolation levels (PostgreSQL)
+@atomic(isolation="SERIALIZABLE")       # isolation levels (PostgreSQL/MySQL)
 async def transfer(): ...
 
 @pre_save(User)                          # lifecycle signals
@@ -323,8 +323,8 @@ make bench-mysql   # same 4-way comparison on MySQL
 make bench-sqlite  # same 4-way comparison on SQLite
 ```
 
-Requires a Rust toolchain (`rustup`) and a local PostgreSQL for the Postgres
-tests; the SQLite tests are self-contained.
+Requires a Rust toolchain (`rustup`), a local PostgreSQL for the Postgres tests
+and a local MySQL for the MySQL tests; the SQLite tests are self-contained.
 
 ## Contributing
 

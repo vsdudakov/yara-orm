@@ -3,7 +3,7 @@
 site_name: Yara ORM
 site_description: >-
   Fast async Python ORM with a Rust engine — Tortoise-style models, querysets,
-  relations and migrations for PostgreSQL and SQLite. A 2–9× faster, fully-typed
+  relations and migrations for PostgreSQL, MySQL and SQLite. A 2–9× faster, fully-typed
   alternative to Tortoise ORM and async SQLAlchemy.
 site_author: yara-orm contributors
 # Canonical site URL — drives sitemap.xml, canonical <link> tags and social cards.
@@ -113,7 +113,7 @@ nav:
       - Migrations: guides/migrations.md
       - Migrating from Tortoise: guides/migrating-from-tortoise.md
   - Backends:
-      - PostgreSQL & SQLite: backends/index.md
+      - PostgreSQL, MySQL & SQLite: backends/index.md
   - Performance: performance.md
   - Architecture: architecture.md
   - API reference: api-reference.md

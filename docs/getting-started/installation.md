@@ -11,7 +11,7 @@ normal `pip install` needs **no Rust toolchain** on supported platforms.
 ## Requirements
 
 - **Python 3.9 – 3.14**
-- A database: **PostgreSQL** or **SQLite** (SQLite ships with Python — nothing to install)
+- A database: **PostgreSQL**, **MySQL** or **SQLite** (SQLite ships with Python — nothing to install)
 
 ## Install from PyPI
 
@@ -73,4 +73,4 @@ See [Contributing](../contributing.md) for the full developer workflow.
 
 - [Quick start](quickstart.md) — build your first app.
 - [Models & fields](../guides/models-and-fields.md) — define your schema.
-- [Backends](../backends/index.md) — PostgreSQL and SQLite connection URLs.
+- [Backends](../backends/index.md) — PostgreSQL, MySQL and SQLite connection URLs.

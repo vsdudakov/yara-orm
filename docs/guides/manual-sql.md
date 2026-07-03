@@ -1,6 +1,6 @@
 ---
 title: Manual SQL
-description: Run raw SQL in an async Python ORM — use Model.raw and connections.get for parameterized queries with bind parameters on PostgreSQL and SQLite.
+description: Run raw SQL in an async Python ORM — use Model.raw and connections.get for parameterized queries with bind parameters on PostgreSQL, MySQL and SQLite.
 ---
 
 # Manual SQL
@@ -96,7 +96,8 @@ names = [r["name"] for r in rows]
 
 ## Parameter placeholders per backend
 
-Placeholder syntax is **dialect-specific**. PostgreSQL uses `$1, $2, ...`; SQLite
+Placeholder syntax is **dialect-specific**. PostgreSQL uses `$1, $2, ...`; MySQL
+uses unnumbered `?` placeholders (bound in order); SQLite
 uses `?1, ?2, ...`. Use the form that matches the backend you connected to.
 
 === "PostgreSQL"
@@ -105,6 +106,16 @@ uses `?1, ?2, ...`. Use the form that matches the backend you connected to.
     conn = connections.get("default")
     rows = await conn.fetch_all(
         "SELECT name FROM m_thing WHERE name = $1 OR name = $2",
+        ["alpha", "beta"],
+    )
+    ```
+
+=== "MySQL"
+
+    ```python
+    conn = connections.get("default")
+    rows = await conn.fetch_all(
+        "SELECT name FROM m_thing WHERE name = ? OR name = ?",
         ["alpha", "beta"],
     )
     ```
