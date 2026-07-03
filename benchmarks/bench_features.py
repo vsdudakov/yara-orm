@@ -10,7 +10,8 @@ not comparable across ORMs and feature sets:
 * **projection** — full model construction vs ``values`` / ``values_list``.
 
 Runs on SQLite by default (zero setup, a throwaway temp file). Set
-``BENCH_BACKEND=postgres`` and ``ORM_TEST_DB=...`` to run on PostgreSQL.
+``BENCH_BACKEND=postgres`` and ``ORM_TEST_DB=...`` to run on PostgreSQL, or
+``BENCH_BACKEND=mysql`` and ``ORM_TEST_MYSQL=...`` to run on MySQL.
 
 Usage:
     python benchmarks/bench_features.py
@@ -36,6 +37,7 @@ S = int(os.environ.get("BENCH_S", "300"))
 REPEAT = int(os.environ.get("BENCH_REPEAT", "5"))
 BACKEND = os.environ.get("BENCH_BACKEND", "sqlite")
 URL = os.environ.get("ORM_TEST_DB", "postgres://localhost/orm_demo")
+MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/orm_demo")
 SQLITE_DIR = os.environ.get("BENCH_SQLITE_DIR", "/tmp")
 
 BOOKS = AUTHORS * BOOKS_PER
@@ -79,11 +81,14 @@ class _Stopwatch:
 def clear_sql(table: str) -> str:
     if BACKEND == "sqlite":
         return f"DELETE FROM {table}"
+    if BACKEND == "mysql":
+        # TRUNCATE cannot touch an FK parent on MySQL; DELETE keeps it simple.
+        return f"DELETE FROM {table}"
     return f"TRUNCATE {table} RESTART IDENTITY CASCADE"
 
 
 def drop_sql(table: str) -> str:
-    if BACKEND == "sqlite":
+    if BACKEND in ("sqlite", "mysql"):  # MySQL accepts no CASCADE here
         return f"DROP TABLE IF EXISTS {table}"
     return f"DROP TABLE IF EXISTS {table} CASCADE"
 
@@ -203,6 +208,10 @@ def main() -> None:
         os.remove(path)
         db_url = f"sqlite://{path}"
         target = f"sqlite ({path})"
+    elif BACKEND == "mysql":
+        db_url = MYSQL_URL
+        path = None
+        target = MYSQL_URL
     else:
         db_url = URL
         path = None

@@ -51,8 +51,14 @@ async def test_aware_datetime_roundtrips_aware(db):
     value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456, tzinfo=PLUS5)
     row = await AvStamp.create(name="rt", at=value)
     out = (await AvStamp.get(id=row.id)).at
-    assert out.tzinfo is not None
-    assert out == value
+    if db == "mysql":
+        # DATETIME has no timezone: the UTC instant returns naive (aware
+        # under ``use_tz``).
+        assert out.tzinfo is None
+        assert out == value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    else:
+        assert out.tzinfo is not None
+        assert out == value
 
 
 @pytest.mark.asyncio

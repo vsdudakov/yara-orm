@@ -261,10 +261,13 @@ async def test_random_function(db):
 def test_random_renders_sql():
     """
     GIVEN the Random function
-    WHEN rendered
-    THEN it produces RANDOM()
+    WHEN rendered per dialect
+    THEN it produces RANDOM() (PostgreSQL/SQLite) and RAND() (MySQL)
     """
-    assert Random().render(lambda n: n) == "RANDOM()"
+    from yara_orm.dialects import MySQLDialect, PostgresDialect
+
+    assert Random().render_params(lambda n: n, PostgresDialect(), [], 1) == ("RANDOM()", 1)
+    assert Random().render_params(lambda n: n, MySQLDialect(), [], 1) == ("RAND()", 1)
 
 
 # -- validators ---------------------------------------------------------------

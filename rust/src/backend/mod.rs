@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use crate::error::EngineError;
 use crate::value::{Row, Value};
 
+pub mod mysql;
 pub mod pool;
 pub mod postgres;
 pub mod sqlite;
@@ -129,6 +130,17 @@ pub async fn connect(url: &str) -> Result<Box<dyn Backend>, EngineError> {
         Ok(Box::new(backend))
     } else if url.starts_with("sqlite:") {
         let backend = sqlite::SqliteBackend::connect(url).await?;
+        Ok(Box::new(backend))
+    } else if url.starts_with("mysql://") {
+        // `sync_fast_path` is sqlite-only (see the postgres branch above).
+        if url_query_has_param(url, "sync_fast_path") {
+            return Err(EngineError::Config(
+                "sync_fast_path is a SQLite-only URL parameter; remove it from the \
+                 mysql URL"
+                    .to_string(),
+            ));
+        }
+        let backend = mysql::MySqlBackend::connect(url).await?;
         Ok(Box::new(backend))
     } else {
         Err(EngineError::UnsupportedUrl(url.to_string()))

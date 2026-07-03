@@ -801,9 +801,12 @@ class M2MManager(_ChainableManager[MODEL]):
         for far in fars:
             params.append(near)
             params.append(far)
+        # "Skip already-linked pairs" is dialect-specific: an ON CONFLICT DO
+        # NOTHING clause on PostgreSQL/SQLite, the INSERT IGNORE verb on MySQL.
         sql = (
-            f"INSERT INTO {parts['through']} ({parts['near']}, {parts['far']}) "
-            f"VALUES {values} ON CONFLICT DO NOTHING"
+            f"{dialect.insert_ignore_verb} INTO {parts['through']} "
+            f"({parts['near']}, {parts['far']}) "
+            f"VALUES {values}{dialect.on_conflict_sql([], [])}"
         )
         await engine.execute(sql, params)
 
