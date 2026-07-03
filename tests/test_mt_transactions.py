@@ -169,10 +169,11 @@ async def test_select_for_update_sql_per_backend(db):
     """
     GIVEN a select_for_update() query with NOWAIT / SKIP LOCKED / OF variants
     WHEN its SQL is rendered
-    THEN PostgreSQL emits the FOR UPDATE clauses and SQLite emits none (no-op)
+    THEN PostgreSQL and MySQL emit the FOR UPDATE clauses and SQLite emits
+    none (no-op)
     """
     base = MtTxAcct.filter(balance__gt=0)
-    if db == "postgres":
+    if db in ("postgres", "mysql"):
         assert base.select_for_update().sql().rstrip().endswith("FOR UPDATE")
         assert "NOWAIT" in base.select_for_update(nowait=True).sql()
         assert "SKIP LOCKED" in base.select_for_update(skip_locked=True).sql()

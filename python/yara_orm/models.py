@@ -10,7 +10,7 @@ from . import registry, signals
 from . import timezone as _tz
 from .connection import get_dialect, get_executor
 from .db_defaults import DatabaseDefault
-from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
+from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned, UnSupportedError
 from .fields import (
     DatetimeField,
     Field,
@@ -121,8 +121,15 @@ class MetaInfo:
         self.m2m = m2m if m2m is not None else {}
         self.description = description
         # Decode plan: (attr_name, converter-or-None). None => assign directly.
+        # The converters start from the fields' own contract; ``compile``
+        # rebuilds them through ``dialect.read_decoder`` so a backend whose
+        # driver cannot express a type natively (MySQL's CHAR(36) uuids) can
+        # add its reconstruction step.
+        self._read_decoders: dict[str, Any] = {
+            f.model_field_name: (None if f.read_identity else f.to_python) for f in self.field_list
+        }
         self.decoders = [
-            (f.model_field_name, None if f.read_identity else f.to_python) for f in self.field_list
+            (f.model_field_name, self._read_decoders[f.model_field_name]) for f in self.field_list
         ]
         self._build_decode_plan()
         self._compiled_for: str | None = None
@@ -152,11 +159,16 @@ class MetaInfo:
         plan = self._partial_plan_cache.get(key)
         if plan is None:
             names = [f.model_field_name for f in fields]
-            active = [
-                (i, f.model_field_name, f.to_python)
-                for i, f in enumerate(fields)
-                if not f.read_identity
-            ]
+            # Same dialect-aware converters as the full-row plan (the cache is
+            # cleared when ``compile`` switches dialects).
+            active = []
+            for i, f in enumerate(fields):
+                if f.model_field_name in self._read_decoders:
+                    decoder = self._read_decoders[f.model_field_name]
+                else:  # pragma: no cover - fields outside the model's own set
+                    decoder = None if f.read_identity else f.to_python
+                if decoder is not None:
+                    active.append((i, f.model_field_name, decoder))
             plan = (names, active)
             self._partial_plan_cache[key] = plan
         return plan
@@ -282,7 +294,15 @@ class MetaInfo:
         if self._compiled_for == dialect.name:
             return
         # The field set may have changed since construction (migrations); refresh
-        # the hydration plan so it stays in sync with the current columns.
+        # the hydration plan so it stays in sync with the current columns. The
+        # converters come from the dialect (``read_decoder``) so a backend can
+        # add its own reconstruction step (MySQL: CHAR(36) -> uuid.UUID); the
+        # partial-plan cache is dropped alongside, since its entries embed them.
+        self._read_decoders = {f.model_field_name: dialect.read_decoder(f) for f in self.field_list}
+        self.decoders = [
+            (f.model_field_name, self._read_decoders[f.model_field_name]) for f in self.field_list
+        ]
+        self._partial_plan_cache.clear()
         self._build_decode_plan()
         q = dialect.quote
         self.columns_sql = ", ".join(q(f.db_column) for f in self.field_list)
@@ -304,15 +324,25 @@ class MetaInfo:
             self.insert_returning_fields += [
                 f for f in self.db_default_fields if f is not self.pk_field
             ]
-        ret = ", ".join(q(f.db_column) for f in self.insert_returning_fields)
+        if dialect.supports_insert_returning:
+            ret = " RETURNING " + ", ".join(q(f.db_column) for f in self.insert_returning_fields)
+        else:
+            # No RETURNING (MySQL): the backend hands the new auto-increment pk
+            # back as a synthetic single-value row, which covers exactly the
+            # ``[pk]`` returning list. Database-default refresh has no such
+            # channel yet.
+            if self.fetch_db_defaults and len(self.insert_returning_fields) > 1:
+                raise UnSupportedError(
+                    f"Meta.fetch_db_defaults is not supported on {dialect.name} yet "
+                    "(no INSERT ... RETURNING); read the defaults back with a re-fetch"
+                )
+            ret = ""
         if self.insert_fields:
             cols = ", ".join(q(f.db_column) for f in self.insert_fields)
             holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(self.insert_fields)))
-            self.insert_sql = (
-                f"INSERT INTO {q(self.table)} ({cols}) VALUES ({holes}) RETURNING {ret}"
-            )
+            self.insert_sql = f"INSERT INTO {q(self.table)} ({cols}) VALUES ({holes}){ret}"
         else:
-            self.insert_sql = f"INSERT INTO {q(self.table)} DEFAULT VALUES RETURNING {ret}"
+            self.insert_sql = f"INSERT INTO {q(self.table)} {dialect.insert_default_values}{ret}"
 
         # Single-instance UPDATE (all non-pk columns) and DELETE, both keyed by
         # the primary key. These are static per (model, dialect) — exactly like
@@ -1187,14 +1217,22 @@ class Model(metaclass=ModelMeta):
                 params.append(field.to_db(value))
                 idx += 1
 
-            returning = ", ".join(dialect.quote(f.db_column) for f in meta.insert_returning_fields)
-            sql = (
-                f"INSERT INTO {table} ({', '.join(columns)}) "
-                f"VALUES ({', '.join(placeholders)}) RETURNING {returning}"
-            )
-            row = await executor.fetch_row(sql, params)
-            for field, value in zip(meta.insert_returning_fields, row):
-                setattr(self, field.model_field_name, field.to_python(value))
+            sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+            if dialect.supports_insert_returning:
+                returning = ", ".join(
+                    dialect.quote(f.db_column) for f in meta.insert_returning_fields
+                )
+                row = await executor.fetch_row(f"{sql} RETURNING {returning}", params)
+                for field, value in zip(meta.insert_returning_fields, row):
+                    setattr(self, field.model_field_name, field.to_python(value))
+            elif pk_unset:
+                # No RETURNING (MySQL): the backend returns the auto-increment
+                # id as a synthetic single-value row.
+                row = await executor.fetch_row(sql, params)
+                setattr(self, pk_attr, pk_field.to_python(row[0]))
+            else:
+                # The pk was supplied by the caller; nothing to read back.
+                await executor.execute(sql, params)
             self._in_db = True
             self._mark_unfetched_db_defaults()
         elif update_fields is not None:
@@ -1974,6 +2012,14 @@ class Model(metaclass=ModelMeta):
         ``ON CONFLICT`` clause is emitted and primary keys are **not** written
         back (the database may insert, skip or update each row).
 
+        MySQL caveats: without ``INSERT ... RETURNING``, generated primary
+        keys are backfilled arithmetically from the batch's first
+        auto-increment id — correct under the default
+        ``innodb_autoinc_lock_mode`` consecutive allocation, but not with a
+        non-default interleaved mode. Conflict handling matches against *any*
+        unique key (``INSERT IGNORE`` / ``ON DUPLICATE KEY UPDATE``): an
+        explicit ``on_conflict`` target cannot be narrowed there.
+
         Args:
             objects: The instances to insert.
             batch_size: Maximum number of rows per INSERT statement.
@@ -2006,6 +2052,7 @@ class Model(metaclass=ModelMeta):
 
         upsert = ignore_conflicts or update_fields is not None
         conflict_sql = ""
+        insert_verb = "INSERT"
         if upsert:
             update_cols = [column_of(n) for n in (update_fields or ())]
             if on_conflict is not None:
@@ -2015,6 +2062,10 @@ class Model(metaclass=ModelMeta):
             else:
                 conflict_cols = []
             conflict_sql = dialect.on_conflict_sql(conflict_cols, update_cols)
+            if not update_cols:
+                # Some dialects (MySQL) spell "skip duplicates" on the INSERT
+                # verb (INSERT IGNORE) instead of an ON CONFLICT clause.
+                insert_verb = dialect.insert_ignore_verb
 
         base_fields = [
             f
@@ -2092,11 +2143,17 @@ class Model(metaclass=ModelMeta):
                 Returns:
                     The complete INSERT SQL string (with conflict/RETURNING).
                 """
-                # RETURNING is omitted under ON CONFLICT: skipped rows would not
-                # be returned, so the row order could not be matched to objects.
-                ret = "" if upsert else f" RETURNING {returning}"
+                # RETURNING is omitted under ON CONFLICT (skipped rows would not
+                # be returned, so the row order could not be matched to objects)
+                # and on dialects without it (MySQL reports the batch's first
+                # auto-increment id instead; see the backfill below).
+                ret = (
+                    f" RETURNING {returning}"
+                    if not upsert and dialect.supports_insert_returning
+                    else ""
+                )
                 return (
-                    f"INSERT INTO {table} ({columns}) "
+                    f"{insert_verb} INTO {table} ({columns}) "
                     f"VALUES {values_clause(nrows)}{conflict_sql}{ret}"
                 )
 
@@ -2133,11 +2190,36 @@ class Model(metaclass=ModelMeta):
                 if upsert:
                     await engine.execute(sql, params)
                     continue
-                returned = await engine.fetch_rows(sql, params)
-                for obj, row in zip(batch, returned):
-                    setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
-                    obj._in_db = True
-                    obj._mark_unfetched_db_defaults()
+                if dialect.supports_insert_returning:
+                    returned = await engine.fetch_rows(sql, params)
+                    for obj, row in zip(batch, returned):
+                        setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
+                        obj._in_db = True
+                        obj._mark_unfetched_db_defaults()
+                elif pk_field.auto_increment:
+                    # No RETURNING (MySQL): a multi-row INSERT reports the
+                    # *first* generated id. With the default
+                    # innodb_autoinc_lock_mode (consecutive allocation for a
+                    # simple INSERT), the batch's ids are first..first+n-1 in
+                    # row order, so they are backfilled arithmetically — the
+                    # same assumption Django and SQLAlchemy make on MySQL.
+                    row = await engine.fetch_row(sql, params)
+                    first = int(row[0])
+                    for offset, obj in enumerate(batch):
+                        setattr(
+                            obj,
+                            pk_field.model_field_name,
+                            pk_field.to_python(first + offset),
+                        )
+                        obj._in_db = True
+                        obj._mark_unfetched_db_defaults()
+                else:
+                    # Client-supplied pks (uuid, natural keys): nothing to read
+                    # back — the objects already carry their primary keys.
+                    await engine.execute(sql, params)
+                    for obj in batch:
+                        obj._in_db = True
+                        obj._mark_unfetched_db_defaults()
         return objects
 
     @classmethod

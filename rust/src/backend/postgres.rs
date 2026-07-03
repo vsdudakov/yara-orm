@@ -35,7 +35,7 @@ fn make_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
 }
 
 /// The password embedded in a `scheme://user:password@host...` URL, if present.
-fn url_password(url: &str) -> Option<&str> {
+pub(crate) fn url_password(url: &str) -> Option<&str> {
     let authority = url.split_once("://")?.1.split(['/', '?']).next()?;
     let userinfo = authority.rsplit_once('@')?.0;
     match userinfo.split_once(':') {
@@ -46,7 +46,8 @@ fn url_password(url: &str) -> Option<&str> {
 
 /// Redact the connection URL's password (if any) from an error message, so a
 /// driver/config error surfaced to Python cannot leak the credential.
-fn redact(msg: String, url: &str) -> String {
+/// Shared with the MySQL backend (URL layout is identical for this purpose).
+pub(crate) fn redact(msg: String, url: &str) -> String {
     match url_password(url) {
         Some(pw) => msg.replace(pw, "***"),
         None => msg,

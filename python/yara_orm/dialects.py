@@ -8,8 +8,10 @@ registering it -- the model and queryset layers never change.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
-from collections.abc import Sequence
+import uuid as _uuid
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from .db_defaults import DatabaseDefault, Now, RandomHex, SqlDefault
@@ -81,6 +83,15 @@ class BaseDialect:
     serial_map: dict[str, str] = {}
     #: Operator used for case-insensitive ``LIKE`` lookups.
     ilike = "ILIKE"
+    #: Operator used for case-*sensitive* ``LIKE`` lookups. MySQL's default
+    #: utf8mb4 collation makes plain ``LIKE`` case-insensitive, so it overrides
+    #: this with ``LIKE BINARY`` (the inverse of SQLite's ``ilike`` situation).
+    like = "LIKE"
+    #: Clause declaring backslash as the LIKE escape character, appended to
+    #: every pattern lookup (the pattern builder backslash-escapes ``%``/``_``).
+    #: Renders ``ESCAPE '\'``; MySQL overrides it because backslash is an
+    #: escape inside its string literals and must be doubled there.
+    like_escape = " ESCAPE '\\'"
     #: Lookup name -> SQL operator for regular-expression matches. Empty when
     #: the backend has no regex operator (the lookup then raises).
     regex_ops: dict[str, str] = {}
@@ -107,6 +118,22 @@ class BaseDialect:
     #: ``OFFSET`` is a syntax error there, so an offset-only slice needs
     #: ``LIMIT -1``). PostgreSQL accepts ``OFFSET`` alone.
     offset_requires_limit = False
+    #: The LIMIT value meaning "no limit", used when ``offset_requires_limit``
+    #: forces a LIMIT onto an offset-only slice (SQLite's sentinel is ``-1``;
+    #: MySQL's documented spelling is the maximum row count).
+    no_limit = -1
+    #: Whether ``INSERT ... RETURNING`` is available (PostgreSQL, SQLite >=
+    #: 3.35). When False the model layer compiles inserts without RETURNING and
+    #: reads the new auto-increment pk from the driver-reported last-insert id.
+    supports_insert_returning = True
+    #: The INSERT verb used when conflicting rows should be silently skipped.
+    #: Backends that spell "ignore duplicates" on the verb (MySQL's
+    #: ``INSERT IGNORE``) override this; the others keep plain ``INSERT`` and
+    #: render an ``ON CONFLICT ... DO NOTHING`` clause instead.
+    insert_ignore_verb = "INSERT"
+    #: Statement tail inserting a row of column defaults, rendered as
+    #: ``INSERT INTO t <this>`` (MySQL has no ``DEFAULT VALUES``).
+    insert_default_values = "DEFAULT VALUES"
     #: Whether ``ADD COLUMN`` / ``DROP COLUMN`` accept an ``IF [NOT] EXISTS``
     #: guard (PostgreSQL does; SQLite has no such syntax).
     column_if_exists = True
@@ -132,6 +159,18 @@ class BaseDialect:
     index_opclass = True
     #: Whether the backend supports ``CREATE EXTENSION`` (PostgreSQL only).
     supports_extensions = False
+    #: Whether ``SELECT ... FOR UPDATE`` row locks are supported
+    #: (PostgreSQL/MySQL); on SQLite the whole database locks instead, so the
+    #: clause is dropped.
+    supports_for_update = False
+    #: Whether an UPDATE/DELETE that subqueries its *own* table must wrap that
+    #: subquery in a derived table. MySQL rejects the direct form ("You can't
+    #: specify target table ... for update in FROM clause", error 1093).
+    modifying_subquery_needs_wrap = False
+    #: Whether aggregates accept a ``FILTER (WHERE ...)`` clause (PostgreSQL,
+    #: SQLite 3.30+). MySQL lacks it; the compiler falls back to the
+    #: equivalent ``AGG(CASE WHEN ... THEN col END)`` there.
+    supports_aggregate_filter = True
 
     # -- identifiers & placeholders --------------------------------------
     def quote(self, identifier: str) -> str:
@@ -249,6 +288,38 @@ class BaseDialect:
             A SQL expression yielding the column as text.
         """
         return f"CAST({col} AS TEXT)"
+
+    # -- row decoding -------------------------------------------------------
+    def read_decoder(self, field: Field) -> Callable[[Any], Any] | None:
+        """Return the per-value converter hydration applies to ``field``.
+
+        The default honours the field's own contract: identity for
+        ``read_identity`` fields (the engine already returns the native type),
+        ``to_python`` otherwise. A dialect whose driver cannot express a type
+        natively (MySQL returns ``CHAR(36)`` uuid columns as ``str``) overrides
+        this to reconstruct the Python value on read.
+
+        Args:
+            field: The field whose column is being decoded.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        return None if field.read_identity else field.to_python
+
+    def concat_sql(self, parts: list[str]) -> str:
+        """Render string concatenation of already-rendered SQL operands.
+
+        PostgreSQL and SQLite use the portable ``||`` operator; MySQL treats
+        ``||`` as logical OR by default, so its dialect renders ``CONCAT``.
+
+        Args:
+            parts: The rendered SQL operand expressions.
+
+        Returns:
+            The concatenation SQL expression.
+        """
+        return "(" + " || ".join(parts) + ")"
 
     def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
         """Render an ``ON CONFLICT`` clause for ``bulk_create`` upserts.
@@ -1207,6 +1278,7 @@ class PostgresDialect(BaseDialect):
     regex_ops = {"regex": "~", "iregex": "~*", "posix_regex": "~", "iposix_regex": "~*"}
     supports_search = True
     supports_extensions = True
+    supports_for_update = True
 
     def date_part_sql(self, part: str, col: str) -> str:
         """Render ``EXTRACT(<part> FROM col)``.
@@ -1571,9 +1643,622 @@ class SqliteDialect(BaseDialect):
         return super()._pk_line(meta)
 
 
+def _uuid_from_db(value: Any) -> Any:
+    """Reconstruct a ``uuid.UUID`` from the text a CHAR(36) column returns.
+
+    Args:
+        value: The raw column value (str on MySQL, already a UUID elsewhere).
+
+    Returns:
+        The value as a ``uuid.UUID`` (None passes through).
+    """
+    if value is None or isinstance(value, _uuid.UUID):
+        return value
+    return _uuid.UUID(str(value))
+
+
+def _datetime_from_db(value: Any) -> Any:
+    """Re-attach UTC to a naive datetime read from MySQL when ``use_tz`` is on.
+
+    MySQL's DATETIME has no timezone; aware values are stored as UTC-naive, so
+    under ``use_tz`` the stored instant is re-labelled UTC on read (matching
+    what PostgreSQL/SQLite return for aware columns). With ``use_tz`` off the
+    naive value passes through.
+
+    Args:
+        value: The raw column value.
+
+    Returns:
+        The datetime, aware UTC under ``use_tz``.
+    """
+    from . import timezone as _tz
+
+    if isinstance(value, _dt.datetime) and value.tzinfo is None and _tz.get_use_tz():
+        return value.replace(tzinfo=_dt.timezone.utc)
+    return value
+
+
+class MySQLDialect(BaseDialect):
+    """Dialect rendering SQL for MySQL 8.x (and compatible servers).
+
+    Key departures from the base dialect: backtick identifier quoting,
+    unnumbered ``?`` placeholders, no ``INSERT ... RETURNING`` (the new pk
+    arrives via the driver's last-insert id), upserts spelled
+    ``INSERT IGNORE`` / ``INSERT ... AS new ON DUPLICATE KEY UPDATE`` (the
+    8.4-safe alias form — the ``VALUES()`` function is removed), and
+    case-sensitivity handled per lookup: the default utf8mb4 collation makes
+    plain ``LIKE`` case-insensitive, so case-sensitive pattern lookups use
+    ``LIKE BINARY``.
+    """
+
+    name = "mysql"
+    # utf8mb4's default *_ai_ci collation is case-insensitive, so plain LIKE
+    # covers icontains/istartswith/iexact; BINARY restores case sensitivity.
+    ilike = "LIKE"
+    like = "LIKE BINARY"
+    # ``ESCAPE '\\'``: MySQL string literals treat backslash as an escape, so
+    # the single-backslash escape character is spelled with two backslashes.
+    like_escape = " ESCAPE '\\\\'"
+    supports_insert_returning = False
+    insert_ignore_verb = "INSERT IGNORE"
+    insert_default_values = "() VALUES ()"
+    random_function = "RAND()"
+    supports_for_update = True
+    modifying_subquery_needs_wrap = True
+    supports_aggregate_filter = False
+    # MySQL requires LIMIT before OFFSET; its documented "no limit" sentinel is
+    # the maximum row count (LIMIT -1 is a syntax error here).
+    offset_requires_limit = True
+    no_limit = 18446744073709551615
+    # MySQL 8 has no ADD/DROP COLUMN IF [NOT] EXISTS, no CONCURRENTLY, and its
+    # index DDL differs enough (no CREATE INDEX IF NOT EXISTS, USING in another
+    # position, DROP INDEX needs the table) that the PostgreSQL-only options
+    # are dropped and index creation is folded into CREATE TABLE.
+    column_if_exists = False
+    index_concurrently = False
+    index_using = False
+    index_include = False
+    index_opclass = False
+    # EXTRACT(...) works, but the microseconds part is spelled MICROSECOND.
+    _extract_parts = {**BaseDialect._extract_parts, "microsecond": "MICROSECOND"}
+
+    type_map = {
+        "smallint": "SMALLINT",
+        "int": "INT",
+        "bigint": "BIGINT",
+        "varchar": "VARCHAR({max_length})",
+        "text": "LONGTEXT",
+        "bool": "TINYINT(1)",
+        "float": "DOUBLE",
+        "decimal": "DECIMAL({max_digits}, {decimal_places})",
+        # DATETIME(6)/TIME(6) keep microseconds (bare DATETIME truncates).
+        "datetime": "DATETIME(6)",
+        "date": "DATE",
+        "time": "TIME(6)",
+        "timedelta": "BIGINT",
+        "uuid": "CHAR(36)",
+        "json": "JSON",
+        "bytes": "LONGBLOB",
+    }
+    serial_map = {
+        "smallint": "SMALLINT AUTO_INCREMENT",
+        "int": "INT AUTO_INCREMENT",
+        "bigint": "BIGINT AUTO_INCREMENT",
+    }
+
+    def placeholder(self, index: int) -> str:
+        """Render MySQL's unnumbered ``?`` placeholder.
+
+        Every compile path appends parameters in SQL text order, so the
+        position alone identifies the parameter.
+
+        Args:
+            index: The 1-based parameter position (unused).
+
+        Returns:
+            ``"?"``.
+        """
+        return "?"
+
+    def quote(self, identifier: str) -> str:
+        """Quote an identifier with backticks, doubling embedded backticks.
+
+        Not memoised in the shared cache: that cache holds the double-quoted
+        form the other dialects share.
+
+        Args:
+            identifier: The identifier (table or column name) to quote.
+
+        Returns:
+            The backtick-quoted, escaped identifier.
+        """
+        return "`{}`".format(identifier.replace("`", "``"))
+
+    # -- row decoding -------------------------------------------------------
+    def read_decoder(self, field: Field) -> Callable[[Any], Any] | None:
+        """Reconstruct types MySQL's wire protocol cannot express natively.
+
+        ``CHAR(36)`` uuid columns come back as ``str`` (parsed back to
+        ``uuid.UUID``), and ``DATETIME(6)`` is always naive (re-labelled UTC
+        under ``use_tz``, matching the aware values other backends return). An
+        FK column adopts the referenced primary key's kind.
+
+        Args:
+            field: The field whose column is being decoded.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        base = super().read_decoder(field)
+        kind = field.field_kind
+        if isinstance(field, ForeignKeyFieldInstance):
+            kind = get_model(field.reference)._meta.pk_field.field_kind
+        extra: Callable[[Any], Any] | None = None
+        if kind == "uuid":
+            extra = _uuid_from_db
+        elif kind == "datetime":
+            extra = _datetime_from_db
+        if extra is None:
+            return base
+        if base is None:
+            return extra
+        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+
+    # -- query lookups ------------------------------------------------------
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render ``EXTRACT(<part> FROM col)`` (MySQL spells all parts).
+
+        Args:
+            part: A supported date/time part name.
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the integer part.
+        """
+        return f"EXTRACT({self._extract_parts[part]} FROM {col})"
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render ``CAST(col AS DATE)`` (for the ``__date`` lookup).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the date part.
+        """
+        return f"CAST({col} AS DATE)"
+
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render a JSON key path as unquoted text via ``JSON_EXTRACT``.
+
+        Every path leg is double-quoted: MySQL rejects bare non-ASCII (and
+        otherwise special) member names in a JSON path, and quoting is always
+        valid. Backslashes are doubled once for the JSON-path escaping and once
+        more so they survive MySQL's backslash-escaped string literals.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            ``JSON_UNQUOTE(JSON_EXTRACT(col, '$."a"."b"'))`` (the column
+            itself with no keys).
+        """
+        if not keys:
+            return col
+        legs = ".".join('"' + key.replace("\\", "\\\\").replace('"', '\\"') + '"' for key in keys)
+        path = ("$." + legs).replace("\\", "\\\\")
+        return f"JSON_UNQUOTE(JSON_EXTRACT({col}, {self._literal(path)}))"
+
+    def json_contains_sql(self, col: str, placeholder: str) -> str:
+        """Render a JSON containment test with ``JSON_CONTAINS``.
+
+        The bound value is JSON text; MySQL parses string arguments to JSON
+        functions. Semantics track PostgreSQL's ``@>`` for objects and arrays.
+
+        Args:
+            col: The already-qualified JSON column reference.
+            placeholder: The bound-parameter placeholder for the JSON value.
+
+        Returns:
+            A boolean SQL expression testing containment.
+        """
+        return f"JSON_CONTAINS({col}, {placeholder})"
+
+    def cast_text(self, col: str) -> str:
+        """Render a text cast; MySQL spells the target type ``CHAR``.
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            ``CAST(col AS CHAR)``.
+        """
+        return f"CAST({col} AS CHAR)"
+
+    def concat_sql(self, parts: list[str]) -> str:
+        """Render concatenation as ``CONCAT(...)`` (``||`` is logical OR here).
+
+        Args:
+            parts: The rendered SQL operand expressions.
+
+        Returns:
+            The ``CONCAT(...)`` expression.
+        """
+        return "CONCAT(" + ", ".join(parts) + ")"
+
+    def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
+        """Render the MySQL upsert clause for ``bulk_create``.
+
+        With ``update_columns`` this is the 8.4-safe alias form
+        ``AS new ON DUPLICATE KEY UPDATE col = new.col`` (the ``VALUES()``
+        function is removed in 8.4). MySQL always matches against *any* unique
+        key, so an explicit conflict target cannot be honoured and is ignored.
+        Without update columns, conflict skipping is spelled on the INSERT verb
+        (``INSERT IGNORE`` via :attr:`insert_ignore_verb`), so the clause is
+        empty.
+
+        Args:
+            conflict_columns: Ignored — MySQL has no conflict-target syntax.
+            update_columns: The columns to overwrite on a duplicate key.
+
+        Returns:
+            The upsert clause (leading space included), or ``""``.
+        """
+        if not update_columns:
+            return ""
+        alias = self.quote("new")
+        sets = ", ".join(f"{self.quote(c)} = {alias}.{self.quote(c)}" for c in update_columns)
+        return f" AS {alias} ON DUPLICATE KEY UPDATE {sets}"
+
+    # -- DDL ------------------------------------------------------------------
+    def column_sql(self, field: Field) -> str:
+        """Render a column definition, adding the inline ``COMMENT`` clause.
+
+        MySQL has no ``COMMENT ON COLUMN`` statement; column descriptions ride
+        on the column definition instead.
+
+        Args:
+            field: The field to render as a column definition.
+
+        Returns:
+            The column definition SQL fragment.
+        """
+        sql = super().column_sql(field)
+        if field.description:
+            sql += f" COMMENT {self._literal(field.description)}"
+        return sql
+
+    def create_table_sql(self, meta: MetaInfo, safe: bool = True) -> list[str]:
+        """Render the ``CREATE TABLE`` statement with indexes folded inline.
+
+        MySQL has no ``CREATE INDEX IF NOT EXISTS``, so separate index
+        statements would break idempotent ``generate_schemas`` re-runs; inline
+        ``INDEX``/``UNIQUE INDEX`` lines ride the table's own ``IF NOT
+        EXISTS``. Partial-index conditions (unsupported on MySQL) are dropped,
+        like the other PostgreSQL-only index options.
+
+        Args:
+            meta: The model metadata describing the table.
+            safe: Whether to emit an ``IF NOT EXISTS`` guard.
+
+        Returns:
+            The list of SQL statements creating the table.
+        """
+        lines = [self.column_sql(f) for f in meta.fields.values()]
+        pk_line = self._pk_line(meta)
+        if pk_line:  # pragma: no branch - always table-level on MySQL
+            lines.append(pk_line)
+        # Foreign keys MUST be table-level clauses: MySQL silently ignores a
+        # column-level inline REFERENCES.
+        for field in meta.fields.values():
+            if isinstance(field, ForeignKeyFieldInstance) and field.db_constraint:
+                ref = get_model(field.reference)
+                col = self.quote(field.db_column)
+                ref_tbl = self.quote(ref._meta.table)
+                ref_pk = self.quote(ref._meta.pk_field.db_column)
+                lines.append(
+                    f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) "
+                    f"ON DELETE {field.on_delete}"
+                )
+        lines.extend(self._unique_together_lines(meta))
+        for constraint in meta.constraints:
+            lines.append(self._constraint_clause(constraint.to_spec()))
+        for field in meta.fields.values():
+            if field.index and not field.unique and not field.pk and field.field_kind != "json":
+                idx_name = self.quote(f"idx_{meta.table}_{field.db_column}")
+                lines.append(f"INDEX {idx_name} ({self.quote(field.db_column)})")
+        for index in meta.indexes:
+            # MySQL cannot index a JSON column directly (only via generated
+            # columns on a path), so JSON indexes — typically PostgreSQL GIN
+            # declarations — are dropped like the other pg-only index options.
+            if any(self._index_field_kind(meta, name) == "json" for name in index.fields):
+                continue
+            uniq = "UNIQUE " if index.unique else ""
+            cols = ", ".join(self._group_columns(meta, index.fields))
+            lines.append(f"{uniq}INDEX {self.quote(index.resolve_name(meta.table))} ({cols})")
+
+        ine = "IF NOT EXISTS " if safe else ""
+        body = ",\n  ".join(lines)
+        statements = [f"CREATE TABLE {ine}{self.quote(meta.table)} (\n  {body}\n)"]
+        statements.extend(self._comment_sql(meta))
+        return statements
+
+    @staticmethod
+    def _index_field_kind(meta: MetaInfo, name: str) -> str:
+        """Resolve the field kind behind an index member (relations included).
+
+        Args:
+            meta: The model metadata.
+            name: A field name (or forward relation name) from an index.
+
+        Returns:
+            The member's abstract field kind.
+        """
+        if name in meta.relations:
+            return meta.get_field(meta.relations[name].source_attr).field_kind
+        return meta.get_field(name).field_kind
+
+    def _comment_sql(self, meta: MetaInfo) -> list[str]:
+        """Render the table comment; column comments are inline (``column_sql``).
+
+        Args:
+            meta: The model metadata carrying descriptions.
+
+        Returns:
+            The ``ALTER TABLE ... COMMENT`` statement, or an empty list.
+        """
+        if not meta.description:
+            return []
+        return [f"ALTER TABLE {self.quote(meta.table)} COMMENT = {self._literal(meta.description)}"]
+
+    def render_index(self, meta: MetaInfo, index: Index, safe: bool = True) -> str:
+        """Render one ``CREATE INDEX`` statement for :meth:`Index.get_sql`.
+
+        MySQL has no ``CREATE INDEX IF NOT EXISTS``, partial indexes, or the
+        PostgreSQL index options, so only name/columns/unique survive.
+
+        Args:
+            meta: The owning model's metadata.
+            index: The index to render.
+            safe: Ignored — the statement is never guarded on MySQL.
+
+        Returns:
+            The ``CREATE INDEX`` statement.
+        """
+        uniq = "UNIQUE " if index.unique else ""
+        cols = ", ".join(self._group_columns(meta, index.fields))
+        return (
+            f"CREATE {uniq}INDEX {self.quote(index.resolve_name(meta.table))} "
+            f"ON {self.quote(meta.table)} ({cols})"
+        )
+
+    # -- migration rendering overrides ---------------------------------------
+    def render_drop_table(self, table: str) -> list[str]:
+        """Render a drop-table statement (MySQL has no ``CASCADE``).
+
+        Args:
+            table: The table name.
+
+        Returns:
+            The list with the drop-table statement.
+        """
+        return [f"DROP TABLE IF EXISTS {self.quote(table)}"]
+
+    def render_alter_column(
+        self,
+        table: str,
+        name: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+        table_spec: dict[str, Any],
+    ) -> list[str]:
+        """Render column changes with MySQL's ``MODIFY COLUMN`` spelling.
+
+        Type and nullability changes restate the full definition in one
+        ``MODIFY COLUMN``; defaults use ``ALTER COLUMN SET/DROP DEFAULT``;
+        the inline-UNIQUE and FK constraints toggle via ``ADD CONSTRAINT`` /
+        ``DROP INDEX`` / ``DROP FOREIGN KEY`` (MySQL has no ``DROP CONSTRAINT
+        IF EXISTS``).
+
+        Args:
+            table: The table name.
+            name: The column being altered.
+            old: The column spec before the change.
+            new: The column spec after the change.
+            table_spec: The full table spec (unused; MySQL alters in place).
+
+        Returns:
+            The list of SQL statements applying the column change.
+        """
+        t = self.quote(table)
+        col = self.quote(name)
+        out: list[str] = []
+        type_changed = old.get("kind") != new.get("kind") or old.get("type_params") != new.get(
+            "type_params"
+        )
+        if type_changed or bool(old.get("null")) != bool(new.get("null")):
+            nullable = "NULL" if new.get("null") else "NOT NULL"
+            out.append(f"ALTER TABLE {t} MODIFY COLUMN {col} {self._spec_type(new)} {nullable}")
+        if old.get("default") != new.get("default"):
+            if new.get("default"):
+                expr = self._render_default(new["default"])
+                out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
+            else:
+                out.append(f"ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT")
+        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
+            uq = self.quote(f"{table}_{name}_key")
+            if new.get("unique"):
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
+            else:
+                # A UNIQUE constraint is an index in MySQL; DROP INDEX removes it.
+                out.append(f"ALTER TABLE {t} DROP INDEX {uq}")
+        if old.get("fk") != new.get("fk"):
+            fk = self.quote(f"{table}_{name}_fkey")
+            if old.get("fk"):
+                out.append(f"ALTER TABLE {t} DROP FOREIGN KEY {fk}")
+            ref = new.get("fk")
+            if ref:
+                out.append(
+                    f"ALTER TABLE {t} ADD CONSTRAINT {fk} FOREIGN KEY ({col}) "
+                    f"REFERENCES {self.quote(ref['table'])} ({self.quote(ref['pk'])}) "
+                    f"ON DELETE {ref.get('on_delete', 'CASCADE')}"
+                )
+        return out
+
+    def render_create_index(
+        self,
+        table: str,
+        column: str,
+        safe: bool = True,
+        unique: bool = False,
+        concurrently: bool = False,
+        name: str | None = None,
+    ) -> list[str]:
+        """Render a create-index statement (no ``IF NOT EXISTS`` on MySQL).
+
+        Args:
+            table: The table name.
+            column: The column to index.
+            safe: Ignored — MySQL has no ``CREATE INDEX IF NOT EXISTS``, so the
+                statement is never guarded (re-running it raises 1061).
+            unique: Whether to create a ``UNIQUE`` index.
+            concurrently: Ignored (no ``CONCURRENTLY`` on MySQL).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        return [
+            f"CREATE {uniq}INDEX {self.quote(name or f'idx_{table}_{column}')} "
+            f"ON {self.quote(table)} ({self.quote(column)})"
+        ]
+
+    def render_drop_index(
+        self, table: str, column: str, concurrently: bool = False, name: str | None = None
+    ) -> list[str]:
+        """Render a drop-index statement (MySQL's needs the owning table).
+
+        Args:
+            table: The table name.
+            column: The indexed column.
+            concurrently: Ignored (no ``CONCURRENTLY`` on MySQL).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the drop-index statement.
+        """
+        idx = self.quote(name or f"idx_{table}_{column}")
+        return [f"ALTER TABLE {self.quote(table)} DROP INDEX {idx}"]
+
+    def render_create_composite_index(
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        safe: bool = True,
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
+        opclass: str | None = None,
+    ) -> list[str]:
+        """Render a multi-column create-index statement without the guard.
+
+        The PostgreSQL-only options (``condition``/``using``/``include``/
+        ``opclass``) are dropped, matching the capability flags.
+
+        Args:
+            table: The table to index.
+            name: The index name.
+            columns: The ordered columns covered by the index.
+            safe: Ignored — no ``CREATE INDEX IF NOT EXISTS`` on MySQL.
+            condition: Ignored (no partial indexes).
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Ignored.
+            include: Ignored.
+            opclass: Ignored.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        cols = ", ".join(self.quote(c) for c in columns)
+        return [f"CREATE {uniq}INDEX {self.quote(name)} ON {self.quote(table)} ({cols})"]
+
+    def render_drop_composite_index(self, name: str) -> list[str]:
+        """Reject a by-name index drop.
+
+        MySQL's ``DROP INDEX`` needs the owning table, which this signature
+        does not carry; deferred to the MySQL migrations phase.
+
+        Args:
+            name: The index name.
+
+        Raises:
+            UnSupportedError: Always, until migrations land for MySQL.
+        """
+        raise UnSupportedError(
+            "mysql cannot DROP INDEX by name alone (the owning table is required); "
+            "use RunSQL with ALTER TABLE ... DROP INDEX"
+        )
+
+    def render_rename_index(
+        self,
+        table: str,
+        column: str,
+        old_name: str,
+        new_name: str,
+        unique: bool = False,
+    ) -> list[str]:
+        """Render an in-place index rename (``ALTER TABLE ... RENAME INDEX``).
+
+        Args:
+            table: The table owning the index.
+            column: The indexed column (unused; MySQL renames in place).
+            old_name: The current index name.
+            new_name: The new index name.
+            unique: Unused (the index definition is unchanged).
+
+        Returns:
+            The list with the rename-index statement.
+        """
+        return [
+            f"ALTER TABLE {self.quote(table)} "
+            f"RENAME INDEX {self.quote(old_name)} TO {self.quote(new_name)}"
+        ]
+
+    def render_drop_constraint(self, table: str, name: str) -> list[str]:
+        """Render a drop-constraint statement (no ``IF EXISTS`` on MySQL).
+
+        Args:
+            table: The table name.
+            name: The constraint name to drop.
+
+        Returns:
+            The list with the drop-constraint statement.
+        """
+        return [f"ALTER TABLE {self.quote(table)} DROP CONSTRAINT {self.quote(name)}"]
+
+    def render_rename_constraint(self, table: str, old: str, new: str) -> list[str]:
+        """MySQL has no ``RENAME CONSTRAINT``.
+
+        Args:
+            table: The table name.
+            old: The current constraint name.
+            new: The new constraint name.
+
+        Raises:
+            UnSupportedError: Always — drop and re-add the constraint instead.
+        """
+        raise UnSupportedError("mysql cannot RENAME a constraint; drop and re-add it")
+
+
 _DIALECTS: dict[str, type[BaseDialect]] = {
     "postgres": PostgresDialect,
     "sqlite": SqliteDialect,
+    "mysql": MySQLDialect,
 }
 
 

@@ -57,8 +57,8 @@ async def test_raw_int_list_binds_as_array(db):
     WHEN a bare list is passed as the parameter
     THEN it binds as an array (unnest yields the elements)
     """
-    if db == "sqlite":
-        pytest.skip("PostgreSQL arrays / unnest are not available on SQLite")
+    if db != "postgres":
+        pytest.skip("arrays / unnest are PostgreSQL-only")
     conn = connections.get()
     rows = await conn.execute_query_dict("SELECT unnest($1::int[]) AS x", [[1, 2, 3]])
     assert sorted(r["x"] for r in rows) == [1, 2, 3]
@@ -71,8 +71,8 @@ async def test_raw_uuid_list_any_filter(db):
     WHEN filtered with `id = ANY($1)` and a bare list of UUIDs
     THEN the UUID elements are coerced and the matching rows return
     """
-    if db == "sqlite":
-        pytest.skip("PostgreSQL ANY(array) is not available on SQLite")
+    if db != "postgres":
+        pytest.skip("ANY(array) is PostgreSQL-only")
     t1 = await ArThing.create()
     t2 = await ArThing.create()
     await ArThing.create()
@@ -90,8 +90,8 @@ async def test_uuid_and_array_params_mixed(db):
     WHEN executed in either order (uuid + int[], text + uuid[], int[] + uuid)
     THEN the mixed binary encoding is correct (no 22P03)
     """
-    if db == "sqlite":
-        pytest.skip("PostgreSQL arrays / ::uuid casts are not available on SQLite")
+    if db != "postgres":
+        pytest.skip("arrays / ::uuid casts are PostgreSQL-only")
     import uuid
 
     conn = connections.get()

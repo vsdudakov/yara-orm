@@ -95,6 +95,10 @@ _QUERY_ANNOTATORS: list[Callable[[], str | None]] = []
 #: URL schemes treated as PostgreSQL (driver aliases normalised to ``postgres``).
 _POSTGRES_URL_SCHEMES = frozenset({"postgres", "postgresql", "psycopg", "psycopg2", "asyncpg"})
 
+#: URL schemes treated as MySQL (driver aliases normalised to ``mysql``; the
+#: engine's driver also speaks the MariaDB protocol).
+_MYSQL_URL_SCHEMES = frozenset({"mysql", "mariadb", "aiomysql", "asyncmy", "pymysql"})
+
 
 def register_query_hook(hook: Callable[[str, list[Any] | None], object]) -> None:
     """Register a callable invoked as ``hook(sql, params)`` before each query.
@@ -869,22 +873,29 @@ class YaraOrm:
 
     @staticmethod
     def _normalize_url(db_url: str) -> str:
-        """Rewrite diff-style postgres URL schemes to ``postgres://``.
+        """Rewrite driver-qualified URL schemes to their canonical form.
 
         Existing ``DATABASE_URI`` values often use a driver-qualified
-        scheme (``psycopg://``, ``asyncpg://``, ``postgresql+asyncpg://``); the
-        engine only understands ``postgres``/``postgresql``, so the driver alias
-        is normalised away. Non-postgres URLs (e.g. ``sqlite://``) pass through.
+        scheme (``psycopg://``, ``postgresql+asyncpg://``,
+        ``mysql+aiomysql://``); the engine only understands
+        ``postgres``/``postgresql``/``sqlite``/``mysql``, so the driver alias
+        is normalised away. Other URLs (e.g. ``sqlite://``) pass through.
 
         Args:
             db_url: The connection URL as provided by the caller.
 
         Returns:
-            The URL with a postgres-family scheme rewritten to ``postgres://``.
+            The URL with a postgres-/mysql-family scheme rewritten to its
+            canonical ``postgres://`` / ``mysql://`` form.
         """
         scheme, sep, rest = db_url.partition("://")
-        if sep and scheme.split("+", 1)[0].lower() in _POSTGRES_URL_SCHEMES:
+        if not sep:
+            return db_url
+        base = scheme.split("+", 1)[0].lower()
+        if base in _POSTGRES_URL_SCHEMES:
             return f"postgres://{rest}"
+        if base in _MYSQL_URL_SCHEMES:
+            return f"mysql://{rest}"
         return db_url
 
     @staticmethod

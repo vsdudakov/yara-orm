@@ -38,7 +38,7 @@ class VectorField(fields.Field):
 register_field_kind(
     "vector",
     field_cls=VectorField,
-    sql={"postgres": "vector({dim})", "sqlite": "TEXT"},
+    sql={"postgres": "vector({dim})", "sqlite": "TEXT", "mysql": "LONGTEXT"},
 )
 
 
@@ -55,7 +55,7 @@ class MoneyField(fields.Field):
 register_field_kind(
     "money",
     field_cls=MoneyField,
-    sql={"postgres": "DOUBLE PRECISION", "sqlite": "REAL"},
+    sql={"postgres": "DOUBLE PRECISION", "sqlite": "REAL", "mysql": "DOUBLE"},
 )
 
 

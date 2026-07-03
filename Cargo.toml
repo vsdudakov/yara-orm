@@ -31,6 +31,10 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 rust_decimal = { version = "1.42", features = ["db-tokio-postgres"] }
 deadpool-sqlite = "0.13.0"
 rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
+# Pure-Rust MySQL driver (ships its own pool). `minimal-rust` keeps the build
+# free of C dependencies (rust-backend flate2, no TLS); enable its
+# `rustls-tls`/`ring` features if TLS support is wanted later, never native-tls.
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
 
 [profile.release]
 opt-level = 3

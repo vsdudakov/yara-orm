@@ -537,8 +537,9 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
 // ---------------------------------------------------------------------------
 
 /// Convert a [`Value`] into JSON, used to store an array parameter as JSON text
-/// on SQLite (which has no array type). Element scalars map to their JSON form.
-fn value_to_json(v: &Value) -> serde_json::Value {
+/// on SQLite and MySQL (which have no array type). Element scalars map to their
+/// JSON form.
+pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Null => J::Null,

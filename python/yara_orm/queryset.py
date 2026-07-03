@@ -502,8 +502,8 @@ class QuerySet(Generic[ModelT]):
     ) -> QuerySet[ModelT]:
         """Return a new query set that locks matched rows (``FOR UPDATE``).
 
-        The lock is emitted on backends that support it (PostgreSQL) and is a
-        no-op on SQLite; it only takes effect inside a transaction.
+        The lock is emitted on backends that support it (PostgreSQL, MySQL)
+        and is a no-op on SQLite; it only takes effect inside a transaction.
 
         Args:
             nowait: Emit ``NOWAIT`` so a contended lock errors instead of waiting.
@@ -853,7 +853,11 @@ class QuerySet(Generic[ModelT]):
             if op in ("in", "not_in"):
                 membership = "NOT IN" if op == "not_in" else "IN"
                 return f"{col} {membership} {vsql}", vparams, idx
-            sql_op = dialect.ilike if _OPERATORS[op][0] == "ILIKE" else _OPERATORS[op][0]
+            sql_op = _OPERATORS[op][0]
+            if sql_op == "ILIKE":
+                sql_op = dialect.ilike
+            elif sql_op == "LIKE":
+                sql_op = dialect.like
             return f"{col} {sql_op} {vsql}", vparams, idx
 
         # When ``col`` is a bare expression (e.g. a HAVING aggregate) there is no
@@ -904,8 +908,13 @@ class QuerySet(Generic[ModelT]):
 
         sql_op, pattern = _OPERATORS[op]
         if sql_op == "ILIKE":
-            # ILIKE is PostgreSQL-only; SQLite's LIKE is already case-insensitive.
+            # ILIKE is PostgreSQL-only; SQLite's and MySQL's LIKE are already
+            # case-insensitive.
             sql_op = dialect.ilike
+        elif sql_op == "LIKE":
+            # Case-*sensitive* pattern lookups: MySQL's collation makes plain
+            # LIKE case-insensitive, so its dialect spells this LIKE BINARY.
+            sql_op = dialect.like
         if isinstance(value, Expression):
             # Compare the column against another column expression (e.g. F).
             meta = self.model._meta
@@ -923,9 +932,10 @@ class QuerySet(Generic[ModelT]):
             # not exist: uuid ~~* text'.
             if field is not None and field.field_kind not in _TEXT_KINDS:
                 col = dialect.cast_text(col)
-            # The pattern builder backslash-escapes %/_ in the value; ESCAPE
-            # makes both backends honour that escaping.
-            return f"{col} {sql_op} {placeholder} ESCAPE '\\'", [pattern(value)], idx
+            # The pattern builder backslash-escapes %/_ in the value; the
+            # dialect's ESCAPE clause makes every backend honour that escaping
+            # (MySQL spells the literal differently).
+            return f"{col} {sql_op} {placeholder}{dialect.like_escape}", [pattern(value)], idx
         clause = f"{col} {sql_op} {placeholder}"
         if op == "not":
             # ``!=`` drops NULL rows (``NULL != x`` is UNKNOWN); keep them,
@@ -1394,10 +1404,11 @@ class QuerySet(Generic[ModelT]):
         tail = ""
         limit = self._limit
         if limit is None and self._offset is not None and dialect.offset_requires_limit:
-            # SQLite rejects ``OFFSET`` without a preceding ``LIMIT``; ``-1`` is
-            # its "no limit" sentinel, so an offset-only slice (``qs[3:]``) stays
-            # valid. PostgreSQL accepts a bare ``OFFSET`` and skips this.
-            limit = -1
+            # SQLite and MySQL reject ``OFFSET`` without a preceding ``LIMIT``;
+            # each dialect supplies its own "no limit" sentinel (-1 on SQLite,
+            # the max row count on MySQL), so an offset-only slice (``qs[3:]``)
+            # stays valid. PostgreSQL accepts a bare ``OFFSET`` and skips this.
+            limit = dialect.no_limit
         if limit is not None:
             tail += f" LIMIT {int(limit)}"
         if self._offset is not None:
@@ -1425,7 +1436,7 @@ class QuerySet(Generic[ModelT]):
             The ``FOR UPDATE [OF ...] [NOWAIT|SKIP LOCKED]`` clause on backends
             that support it, else an empty string.
         """
-        if not (self._for_update and dialect.name == "postgres"):
+        if not (self._for_update and dialect.supports_for_update):
             return ""
         parts = ["FOR UPDATE"]
         if self._for_update_of:
@@ -1537,6 +1548,16 @@ class QuerySet(Generic[ModelT]):
         # An aggregate (Count/Sum/...) over a column name, a column expression
         # (F / arithmetic) or a Case; with an optional FILTER (WHERE ...) Q.
         inner = agg.field
+        filt = getattr(agg, "filter", None)
+        # Dialects without FILTER (MySQL) get the equivalent
+        # ``AGG(CASE WHEN <q> THEN <col> END)`` — aggregates ignore NULLs. The
+        # filter is compiled *first* there because it precedes the column in
+        # the SQL text, and MySQL's `?` placeholders bind strictly by position.
+        case_form = filt is not None and not dialect.supports_aggregate_filter
+        case_sql = ""
+        if case_form:
+            case_sql, fparams, idx = self._compile_q(filt, dialect, idx)
+            params.extend(fparams)
         if isinstance(inner, Expression):
             inner_sql, idx = inner.resolve(resolve, dialect, params, idx)
         elif hasattr(inner, "as_sql"):
@@ -1544,9 +1565,11 @@ class QuerySet(Generic[ModelT]):
         else:
             inner_sql = resolve(inner)
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
+        if case_form and case_sql:
+            counted = "1" if inner_sql == "*" else inner_sql
+            return f"{agg.function}({distinct}CASE WHEN {case_sql} THEN {counted} END)", idx
         sql = f"{agg.function}({distinct}{inner_sql})"
-        filt = getattr(agg, "filter", None)
-        if filt is not None:
+        if filt is not None and not case_form:
             # Reuse the WHERE compiler so the filter's Q binds correctly and
             # shares the surrounding statement's placeholder numbering.
             fsql, fparams, idx = self._compile_q(filt, dialect, idx)
@@ -2677,7 +2700,7 @@ class QuerySet(Generic[ModelT]):
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         if self._needs_wrapped_terminal():
-            inner, params = self.get_parameterized_sql()
+            inner, params = self._wrapped_terminal_inner()
             sub = dialect.quote("sub")
             row = await engine.fetch_row(f"SELECT COUNT(*) FROM ({inner}) AS {sub}", params)
             return int(row[0]) if row else 0
@@ -2685,6 +2708,26 @@ class QuerySet(Generic[ModelT]):
         table = dialect.quote(self.model._meta.table)
         row = await engine.fetch_row(f"SELECT COUNT(*) FROM {table}{where}", params)
         return int(row[0]) if row else 0
+
+    def _wrapped_terminal_inner(self) -> tuple[str, list[Any]]:
+        """Compile the subquery ``count()``/``exists()`` wrap when needed.
+
+        The eager-loading options are dropped from the inner query first: their
+        1:1 LEFT JOIN columns never change row multiplicity, but they can
+        collide by name inside a derived table (both tables select ``id``),
+        which MySQL rejects outright — and the extra columns are dead weight
+        for counting on every backend.
+
+        Returns:
+            The ``(sql, params)`` pair of the inner query.
+        """
+        inner_qs = self
+        if self._select_related or self._only_related or self._defer_related:
+            inner_qs = self._clone()
+            inner_qs._select_related = []
+            inner_qs._only_related = {}
+            inner_qs._defer_related = {}
+        return inner_qs.get_parameterized_sql()
 
     async def exists(self) -> bool:
         """Report whether any row matches the current conditions.
@@ -2696,7 +2739,7 @@ class QuerySet(Generic[ModelT]):
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         if self._needs_wrapped_terminal():
-            inner, params = self.get_parameterized_sql()
+            inner, params = self._wrapped_terminal_inner()
             sub = dialect.quote("sub")
             rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) AS {sub} LIMIT 1", params)
             return bool(rows)
@@ -2731,6 +2774,25 @@ class QuerySet(Generic[ModelT]):
         sql = f"SELECT {pk} FROM {table}{''.join(joins.values())}{where} GROUP BY {pk}{having}"
         return sql, wparams + hparams
 
+    @staticmethod
+    def _wrap_modifying_subquery(dialect: BaseDialect, sub: str) -> str:
+        """Wrap a self-referencing UPDATE/DELETE subquery when the dialect needs it.
+
+        MySQL cannot subquery the statement's own target table directly
+        (error 1093); routing the subselect through a derived table
+        materialises it first, which the server accepts.
+
+        Args:
+            dialect: The active SQL dialect.
+            sub: The compiled subselect SQL.
+
+        Returns:
+            The subselect, wrapped in a derived table when required.
+        """
+        if not dialect.modifying_subquery_needs_wrap:
+            return sub
+        return f"SELECT * FROM ({sub}) AS {dialect.quote('_yara_having')}"
+
     async def delete(self) -> int:
         """Delete all rows matching the current conditions.
 
@@ -2751,6 +2813,7 @@ class QuerySet(Generic[ModelT]):
             # Annotation filters compile to HAVING (which DELETE cannot carry);
             # without this restriction they were dropped — a full-table wipe.
             sub, params = self._pk_having_subselect(dialect)
+            sub = self._wrap_modifying_subquery(dialect, sub)
             pk = f"{table}.{dialect.quote(meta.pk_field.db_column)}"
             return await engine.execute(f"DELETE FROM {table} WHERE {pk} IN ({sub})", params)
         where, params, _ = self._compile_conditions(dialect)
@@ -2806,6 +2869,7 @@ class QuerySet(Generic[ModelT]):
             # Annotation filters compile to HAVING (which UPDATE cannot carry);
             # restrict to the pks of the groups that survive them instead.
             sub, sub_params = self._pk_having_subselect(dialect, start=idx)
+            sub = self._wrap_modifying_subquery(dialect, sub)
             params.extend(sub_params)
             pk = f"{table}.{dialect.quote(meta.pk_field.db_column)}"
             where = f" WHERE {pk} IN ({sub})"

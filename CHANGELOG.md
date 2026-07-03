@@ -6,6 +6,49 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **MySQL backend (phase A: driver, dialect, core CRUD).**
+  `await YaraOrm.init("mysql://user:pass@host:3306/db")` now works end to end
+  against MySQL 8.x (the driver also speaks MariaDB; `mysql+aiomysql://`-style
+  scheme aliases are normalised). Built on the pure-Rust `mysql_async` driver
+  and its own connection pool — `max_size`/`min_size`/`statement_cache_size`
+  URL parameters are honoured like on the other backends, and every session is
+  pinned to UTC with `ANSI_QUOTES` enabled so portable double-quoted raw SQL
+  runs unchanged.
+  - **No `RETURNING` needed:** inserts compile without it on MySQL; the new
+    auto-increment pk is read from the driver-reported last-insert id (single
+    inserts and `bulk_create`, which backfills a batch arithmetically from its
+    first id under the default consecutive `innodb_autoinc_lock_mode`).
+    `Meta.fetch_db_defaults` raises `UnSupportedError` on MySQL for now.
+  - **Dialect:** backtick quoting, `?` placeholders, `DATETIME(6)`/`TIME(6)`,
+    `TINYINT(1)` booleans, `CHAR(36)` uuids (reconstructed to `uuid.UUID` on
+    read), `JSON`, `LONGTEXT`/`LONGBLOB`, table-level `FOREIGN KEY` clauses,
+    indexes folded into `CREATE TABLE` (MySQL has no
+    `CREATE INDEX IF NOT EXISTS`), `INSERT IGNORE` and the 8.4-safe
+    `INSERT ... AS new ON DUPLICATE KEY UPDATE` upsert forms.
+  - **Case semantics:** `icontains`/`istartswith`/`iexact` use MySQL's
+    collation-insensitive `LIKE`; case-sensitive pattern lookups use
+    `LIKE BINARY`; pattern escaping works despite MySQL's backslash-escaped
+    string literals.
+  - **Aware datetimes** are stored as their UTC instant in the naive
+    `DATETIME(6)` column and decode naive (aware UTC under `use_tz=True`).
+  - Cross-backend parity fixes that came with it (all backends benefit):
+    `Concat`/`Random()` and aggregate `_filter=Q(...)` now render per dialect,
+    `count()`/`exists()` on wrapped shapes no longer drag eager-load columns
+    into the derived table, JSON path lookups quote their key legs on MySQL
+    (non-ASCII keys work), `update()`/`delete()` with annotation filters work
+    around MySQL's self-referencing subquery restriction, and
+    `select_for_update()` is now driven by a dialect capability
+    (PostgreSQL + MySQL emit it, SQLite stays a no-op).
+  - The test matrix default is now `sqlite,postgres,mysql`
+    (`ORM_TEST_BACKENDS` still overrides; the MySQL leg skips itself when no
+    server is reachable at `ORM_TEST_MYSQL`, default
+    `mysql://root:root@localhost:3306/orm_demo`).
+  - Known gaps deferred to phase B: migrations on MySQL, `__search`/regex
+    lookups, JSON-column indexes (generated columns), array parameters beyond
+    JSON storage, TLS (`rustls` feature of the driver), CI service wiring.
+
 ## [1.12.0] - 2026-07-03
 
 ### Added

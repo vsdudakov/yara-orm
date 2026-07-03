@@ -167,7 +167,11 @@ class Trim(_Unary):
 
 
 class Concat(Function):
-    """Concatenate two or more columns via the portable ``||`` operator."""
+    """Concatenate two or more columns.
+
+    Rendered through the dialect: the portable ``||`` operator on PostgreSQL
+    and SQLite, ``CONCAT(...)`` on MySQL (where ``||`` is logical OR).
+    """
 
     def __init__(self, *fields: str) -> None:
         """Store the field names to concatenate.
@@ -180,38 +184,25 @@ class Concat(Function):
         """
         self.fields = fields
 
-    def render(self, resolve: ColumnResolver) -> str:
-        """Render ``(a || b || ...)``.
-
-        Args:
-            resolve: Maps a field name to its qualified SQL column reference.
-
-        Returns:
-            The SQL expression text.
-        """
-        return "(" + " || ".join(resolve(f) for f in self.fields) + ")"
-
     def render_params(
         self, resolve: ColumnResolver, dialect: BaseDialect, params: list[Any], idx: int
     ) -> tuple[str, int]:
-        """Render ``(a || b || ...)``, accepting ``F``/expression operands.
+        """Render the dialect's concatenation, accepting ``F``/expression operands.
 
         Args:
             resolve: Maps a field name to its qualified SQL column reference.
-            dialect: The active dialect (provides ``placeholder``).
+            dialect: The active dialect (provides the concatenation spelling).
             params: Bound-parameter list, extended in place.
             idx: The next available 1-based bind-parameter index.
 
         Returns:
             A ``(sql, next_index)`` tuple.
         """
-        if not any(isinstance(f, (Expression, Function)) for f in self.fields):
-            return self.render(resolve), idx
         parts = []
         for field in self.fields:
             sql, idx = _render_operand(field, resolve, dialect, params, idx, str_is_column=True)
             parts.append(sql)
-        return "(" + " || ".join(parts) + ")", idx
+        return dialect.concat_sql(parts), idx
 
 
 class Coalesce(Function):
@@ -260,22 +251,27 @@ class Coalesce(Function):
 
 
 class Random(Function):
-    """A random value in ``[0, 1)`` via ``RANDOM()`` (PostgreSQL and SQLite).
+    """A random value in ``[0, 1)`` (``RANDOM()``; ``RAND()`` on MySQL).
 
     Takes no column; useful for random ordering, e.g.
     ``Model.annotate(r=Random()).order_by("r")``.
     """
 
-    def render(self, resolve: ColumnResolver) -> str:
-        """Render ``RANDOM()``.
+    def render_params(
+        self, resolve: ColumnResolver, dialect: BaseDialect, params: list[Any], idx: int
+    ) -> tuple[str, int]:
+        """Render the dialect's random function.
 
         Args:
             resolve: Column resolver (unused; the function takes no column).
+            dialect: The active dialect (provides ``random_function``).
+            params: Bound-parameter list (unused).
+            idx: The next available 1-based bind-parameter index.
 
         Returns:
-            The SQL expression text.
+            A ``(sql, next_index)`` tuple.
         """
-        return "RANDOM()"
+        return dialect.random_function, idx
 
 
 __all__ = ["Function", "Lower", "Upper", "Length", "Trim", "Concat", "Coalesce", "Random"]

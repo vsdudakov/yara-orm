@@ -1,24 +1,81 @@
 import contextlib
+import functools
 import os
+import socket
 import tempfile
+import urllib.parse
 
+import pytest
 import pytest_asyncio
 
 from yara_orm import YaraOrm
 from yara_orm.connection import get_engine
 
-DB_URL = os.environ.get("ORM_TEST_DB", "postgres://localhost/orm_demo")
+# Per-backend connection URLs, overridable via the environment.
+PG_URL = os.environ.get("ORM_TEST_DB", "postgres://localhost/orm_demo")
+MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/orm_demo")
 
 # Backends every ``db``-parametrised test runs against. Override to scope a run
 # (e.g. ``ORM_TEST_BACKENDS=sqlite``); extend by adding a branch in
-# ``_setup_backend`` when a new backend (MySQL, ...) lands.
-TEST_BACKENDS = os.environ.get("ORM_TEST_BACKENDS", "sqlite,postgres").split(",")
+# ``_setup_backend`` when a new backend lands. The mysql backend skips itself
+# when no server is reachable at MYSQL_URL (see ``mysql_reachable``).
+TEST_BACKENDS = os.environ.get("ORM_TEST_BACKENDS", "sqlite,postgres,mysql").split(",")
+
+
+def _tcp_reachable(url: str, default_port: int) -> bool:
+    """Report whether a TCP connection to the URL's host/port succeeds.
+
+    Args:
+        url: The connection URL whose host/port to probe.
+        default_port: Port used when the URL does not carry one.
+
+    Returns:
+        True when the server accepts a TCP connection.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        with socket.create_connection(
+            (parsed.hostname or "localhost", parsed.port or default_port), timeout=1
+        ):
+            return True
+    except OSError:
+        return False
+
+
+@functools.cache
+def sqlite_reachable() -> bool:
+    """SQLite is file-based and always available.
+
+    Returns:
+        True.
+    """
+    return True
+
+
+@functools.cache
+def pg_reachable() -> bool:
+    """Probe the configured PostgreSQL host/port once per test session.
+
+    Returns:
+        True when a TCP connection to the PG_URL host/port succeeds.
+    """
+    return _tcp_reachable(PG_URL, 5432)
+
+
+@functools.cache
+def mysql_reachable() -> bool:
+    """Probe the configured MySQL host/port once per test session.
+
+    Returns:
+        True when a TCP connection to the MYSQL_URL host/port succeeds.
+    """
+    return _tcp_reachable(MYSQL_URL, 3306)
 
 
 @pytest_asyncio.fixture
 async def orm():
     """Initialise the ORM against PostgreSQL and tear it down per test."""
-    await YaraOrm.init(DB_URL)
+    await YaraOrm.init(PG_URL)
     try:
         yield
     finally:
@@ -97,6 +154,25 @@ async def _drop_tables(tables: list[str]) -> None:
         await engine.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
 
 
+async def _drop_tables_mysql(tables: list[str]) -> None:
+    """Drop the given tables on MySQL, which has no ``DROP ... CASCADE``.
+
+    Runs as one script on a single pinned connection so the
+    ``FOREIGN_KEY_CHECKS`` session toggle applies to every drop regardless of
+    foreign-key order.
+
+    Args:
+        tables: Table names to drop.
+
+    Returns:
+        None
+    """
+    statements = ["SET FOREIGN_KEY_CHECKS=0"]
+    statements += [f"DROP TABLE IF EXISTS `{table}`" for table in tables]
+    statements.append("SET FOREIGN_KEY_CHECKS=1")
+    await get_engine().execute_script(statements)
+
+
 async def _setup_backend(backend: str, models: list):
     """Initialise one backend with the module's schema and tear it down after.
 
@@ -113,6 +189,8 @@ async def _setup_backend(backend: str, models: list):
     """
     tables = _module_tables(models)
     if backend == "sqlite":
+        if not sqlite_reachable():  # pragma: no cover - always available
+            pytest.skip("SQLite unavailable")
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         os.remove(path)
@@ -128,13 +206,26 @@ async def _setup_backend(backend: str, models: list):
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(path + suffix)
     elif backend == "postgres":
-        await YaraOrm.init(DB_URL)
+        if not pg_reachable():
+            pytest.skip(f"PostgreSQL server not reachable at {PG_URL}")
+        await YaraOrm.init(PG_URL)
         await _drop_tables(tables)
         await YaraOrm.generate_schemas(models=models)
         try:
             yield backend
         finally:
             await _drop_tables(tables)
+            await YaraOrm.close()
+    elif backend == "mysql":
+        if not mysql_reachable():
+            pytest.skip(f"MySQL server not reachable at {MYSQL_URL}")
+        await YaraOrm.init(MYSQL_URL)
+        await _drop_tables_mysql(tables)
+        await YaraOrm.generate_schemas(models=models)
+        try:
+            yield backend
+        finally:
+            await _drop_tables_mysql(tables)
             await YaraOrm.close()
     else:  # pragma: no cover - guards a misconfigured ORM_TEST_BACKENDS
         raise ValueError(f"unknown test backend: {backend!r}")
