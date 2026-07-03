@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install lint tools
-        run: pip install ruff ty
+        # factory-boy: optional runtime dep of yara_orm.contrib.factory — ty
+        # must be able to resolve its import.
+        run: pip install ruff ty factory-boy
       - name: ruff check
         run: ruff check python tests benchmarks examples
       - name: ruff format --check
@@ -62,7 +64,7 @@ jobs:
       - name: Create the second test database (two-database tests)
         run: psql "$ORM_TEST_DB" -c 'CREATE DATABASE orm_test2;'
       - name: Install Python deps
-        run: pip install maturin pytest pytest-asyncio pytest-cov
+        run: pip install maturin pytest pytest-asyncio pytest-cov factory-boy
       - name: Build and install the Rust engine
         run: |
           maturin build --release --out dist --interpreter python
