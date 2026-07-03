@@ -15,7 +15,13 @@ All notable changes to **yara-orm** are documented here. The format is based on
   and its own connection pool — `max_size`/`min_size`/`statement_cache_size`
   URL parameters are honoured like on the other backends, and every session is
   pinned to UTC with `ANSI_QUOTES` enabled so portable double-quoted raw SQL
-  runs unchanged.
+  runs unchanged. The pool retains idle connections up to `max_size` (an
+  explicit `min_size` lowers the retained count) and skips the driver's
+  per-check-in session reset, so pooled statements never pay reconnect or
+  reset round trips — ~7x faster point queries than the driver defaults,
+  putting yara-orm ahead of Tortoise/SQLAlchemy/Pony on every benchmark
+  operation on MySQL as well (`make bench-mysql`; `bench.py` and
+  `bench_features.py` now take `BENCH_BACKEND=mysql`).
   - **No `RETURNING` needed:** inserts compile without it on MySQL; the new
     auto-increment pk is read from the driver-reported last-insert id (single
     inserts and `bulk_create`, which backfills a batch arithmetically from its

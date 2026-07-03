@@ -347,14 +347,31 @@ impl MySqlBackend {
         let opts = Opts::from_url(&clean_url)
             .map_err(|e| EngineError::Config(redact(e.to_string(), url)))?;
         let max = params.max_size.unwrap_or(DEFAULT_MAX_SIZE).max(1);
-        let min = params.min_size.unwrap_or(0).min(max);
+        // The `min` constraint is how many *idle* connections the pool
+        // retains: mysql_async DISCONNECTS a returned connection beyond it, so
+        // a low floor would make every pooled statement pay a fresh TCP +
+        // auth + setup handshake (measured ~14x on point queries). Default to
+        // `max` — keep every connection, like the deadpool-backed postgres
+        // backend — and let an explicit `min_size` lower the retained count.
+        let min = params.min_size.unwrap_or(max).min(max);
         let constraints = PoolConstraints::new(min, max).ok_or_else(|| {
             EngineError::Config(format!(
                 "invalid pool sizes: min_size={min} must not exceed max_size={max}"
             ))
         })?;
         let mut builder = OptsBuilder::from_opts(opts)
-            .pool_opts(PoolOpts::default().with_constraints(constraints))
+            // No per-check-in session reset: the driver's default fires a
+            // COM_RESET_CONNECTION *and* re-runs the `setup` statements on
+            // every return to the pool — ~3 extra round trips per pooled
+            // statement (measured ~4x on point queries). The postgres backend
+            // made the same call (`RecyclingMethod::Fast`); an abandoned
+            // transaction is the tx guard's job (explicit ROLLBACK), and the
+            // only session state the engine sets is idempotent.
+            .pool_opts(
+                PoolOpts::default()
+                    .with_constraints(constraints)
+                    .with_reset_connection(false),
+            )
             // Pin every session to UTC, matching the postgres backend's
             // `SET TIME ZONE 'UTC'`: the engine stores/returns timestamps in
             // UTC, so CURRENT_TIMESTAMP(6) defaults and EXTRACT(...) must not
@@ -362,8 +379,8 @@ impl MySqlBackend {
             // identifiers valid, so portable raw SQL written for
             // PostgreSQL/SQLite ("table"."column") runs unchanged; string
             // literals must use single quotes (which everything the ORM emits
-            // already does). `setup` (unlike `init`) re-runs after the pool's
-            // COM_RESET_CONNECTION recycling reset.
+            // already does). `setup` runs on each new connection (and would
+            // re-run after a reset, were resets enabled).
             .setup(vec![
                 "SET time_zone = '+00:00'".to_string(),
                 "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',ANSI_QUOTES')".to_string(),
@@ -376,8 +393,10 @@ impl MySqlBackend {
         let pool = Pool::new(builder);
 
         // Pre-warm connections: always at least one (fail fast on an
-        // unreachable server / bad credentials), up to `min_size`.
-        let warm = min.max(1);
+        // unreachable server / bad credentials), up to the URL's `min_size`
+        // (the retained-idle constraint above defaults higher; opening that
+        // many connections up front would slow every connect()).
+        let warm = params.min_size.unwrap_or(0).clamp(1, max);
         let mut held = Vec::with_capacity(warm);
         for _ in 0..warm {
             held.push(
@@ -505,12 +524,12 @@ enum TxState {
 
 /// A pinned-connection MySQL transaction, mirroring the PgTx guard.
 ///
-/// mysql_async's pool *does* reset a returned connection by default
-/// (COM_RESET_CONNECTION, which rolls back an open transaction), so simply
-/// dropping the `Conn` would usually be safe — but that safety net is
-/// URL-configurable (`reset_connection=false`) and implicit, so the guard
-/// still rolls back explicitly on the background runtime and disconnects the
-/// connection outright when even that fails, exactly like the PostgreSQL twin.
+/// The pool's per-check-in COM_RESET_CONNECTION (which would roll back an
+/// open transaction) is disabled for round-trip economy — see `connect` — so
+/// this guard is the *only* safety net: dropped in any state other than a
+/// clean COMMIT/ROLLBACK it rolls back explicitly on the background runtime,
+/// and disconnects the connection outright when even that fails, exactly like
+/// the PostgreSQL twin.
 ///
 /// The connection lives in a tokio `Mutex` because mysql_async statements need
 /// `&mut Conn` while `TxConn` methods take `&self`; the engine layer already

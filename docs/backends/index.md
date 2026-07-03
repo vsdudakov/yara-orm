@@ -96,6 +96,9 @@ await YaraOrm.init("mysql://user:password@host:3306/dbname")
 - The same `max_size` / `min_size` / `statement_cache_size` URL parameters as
   the other backends; everything else passes through to the driver (e.g.
   `require_ssl=true` for TLS, served by rustls — no system OpenSSL needed).
+  On MySQL, `min_size` also bounds the *idle connections the pool retains*
+  (the driver closes idle connections beyond it); it defaults to `max_size`
+  so pooled statements never pay a reconnect handshake.
 - Every session is pinned to **UTC** and to **`ANSI_QUOTES`**, so portable raw
   SQL with double-quoted identifiers runs unchanged. String literals must use
   single quotes (everything the ORM emits already does).

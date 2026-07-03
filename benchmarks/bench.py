@@ -1,4 +1,4 @@
-"""Benchmark: this library (`yara-orm`) vs Tortoise ORM vs Pony ORM on PostgreSQL.
+"""Benchmark: this library (`yara-orm`) vs Tortoise ORM vs Pony ORM.
 
 Identical workloads run against the same database, each ORM in its own table.
 Times are wall-clock for the warm path (drivers/prepared-statement caches are
@@ -8,6 +8,9 @@ results are indicative, not absolute. Methodology is printed with the results.
 
 Usage:
     ORM_TEST_DB=postgres://user@localhost/orm_demo python benchmarks/bench.py
+    BENCH_BACKEND=sqlite python benchmarks/bench.py
+    BENCH_BACKEND=mysql ORM_TEST_MYSQL=mysql://root:root@localhost:3306/orm_demo \
+        python benchmarks/bench.py
 Env: BENCH_N (bulk rows), BENCH_S (single-insert rows), BENCH_GETS (pk lookups).
 """
 
@@ -41,31 +44,39 @@ CATS = 20
 TH = (N // CATS) // 2
 
 
-#: Which database to benchmark: "postgres" (default) or "sqlite".
+#: Which database to benchmark: "postgres" (default), "mysql" or "sqlite".
 BACKEND = os.environ.get("BENCH_BACKEND", "postgres")
 SQLITE_DIR = os.environ.get("BENCH_SQLITE_DIR", "/tmp")
+MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/orm_demo")
 
 
-def pg_parts(url: str) -> dict:
+def pg_parts(url: str, default_port: int = 5432) -> dict:
     u = urlparse(url)
     return {
         "user": u.username or os.environ.get("USER"),
         "password": u.password,
         "host": u.hostname or "localhost",
-        "port": u.port or 5432,
+        "port": u.port or default_port,
         "database": (u.path or "").lstrip("/"),
     }
+
+
+def mysql_parts() -> dict:
+    return pg_parts(MYSQL_URL, default_port=3306)
 
 
 def clear_sql(table: str) -> str:
     """Statement that empties a table (SQLite has no TRUNCATE)."""
     if BACKEND == "sqlite":
         return f"DELETE FROM {table}"
+    if BACKEND == "mysql":
+        # MySQL's TRUNCATE resets AUTO_INCREMENT by itself (no RESTART IDENTITY).
+        return f"TRUNCATE TABLE {table}"
     return f"TRUNCATE {table} RESTART IDENTITY"
 
 
 def drop_sql(table: str) -> str:
-    if BACKEND == "sqlite":
+    if BACKEND in ("sqlite", "mysql"):  # MySQL accepts no CASCADE here
         return f"DROP TABLE IF EXISTS {table}"
     return f"DROP TABLE IF EXISTS {table} CASCADE"
 
@@ -73,6 +84,8 @@ def drop_sql(table: str) -> str:
 def ours_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite://{SQLITE_DIR}/bench_ours.db"
+    if BACKEND == "mysql":
+        return MYSQL_URL
     return URL
 
 
@@ -91,6 +104,9 @@ def _pg_userinfo(p: dict) -> str:
 def tortoise_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite://{SQLITE_DIR}/bench_tortoise.db"
+    if BACKEND == "mysql":
+        p = mysql_parts()
+        return f"mysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
     p = pg_parts(URL)
     return f"asyncpg://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
 
@@ -98,6 +114,9 @@ def tortoise_url() -> str:
 def sqla_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite+aiosqlite:///{SQLITE_DIR}/bench_sqla.db"
+    if BACKEND == "mysql":
+        p = mysql_parts()
+        return f"mysql+aiomysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
     p = pg_parts(URL)
     return f"postgresql+asyncpg://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
 
@@ -302,6 +321,28 @@ def run_pony() -> dict:
         with contextlib.suppress(FileNotFoundError):
             os.remove(f"{SQLITE_DIR}/bench_pony.db")
         db.bind(provider="sqlite", filename=f"{SQLITE_DIR}/bench_pony.db", create_db=True)
+    elif BACKEND == "mysql":
+        import pymysql
+
+        parts = mysql_parts()
+        conn = pymysql.connect(
+            host=parts["host"],
+            port=parts["port"],
+            user=parts["user"],
+            password=parts["password"] or "",
+            database=parts["database"],
+            autocommit=True,
+        )
+        conn.cursor().execute(drop_sql("bench_pony"))
+        conn.close()
+        db.bind(
+            provider="mysql",
+            user=parts["user"],
+            passwd=parts["password"] or "",
+            host=parts["host"],
+            port=parts["port"],
+            db=parts["database"],
+        )
     else:
         import psycopg2
 
@@ -526,7 +567,12 @@ def _median_runs(runner, is_async: bool) -> dict:
 
 
 def main():
-    target = URL if BACKEND == "postgres" else f"sqlite ({SQLITE_DIR})"
+    if BACKEND == "postgres":
+        target = URL
+    elif BACKEND == "mysql":
+        target = MYSQL_URL
+    else:
+        target = f"sqlite ({SQLITE_DIR})"
     print(
         f"BACKEND={BACKEND}  target={target}  N={N}  S={S}  GETS={GETS}  REPEAT={REPEAT} (median)\n"
     )

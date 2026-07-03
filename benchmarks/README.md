@@ -34,6 +34,19 @@ for Tortoise and SQLAlchemy:
 BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
 ```
 
+### MySQL
+
+Set `BENCH_BACKEND=mysql` to run the same 4-way workload on MySQL
+(`ORM_TEST_MYSQL`, default `mysql://root:root@localhost:3306/orm_demo`).
+Competitor drivers: `asyncmy` (Tortoise), `aiomysql` (SQLAlchemy) and
+`pymysql` + `cryptography` (Pony; MySQL 8's `caching_sha2_password` needs it) —
+any missing driver is simply reported as `-`:
+
+```bash
+.venv312/bin/pip install -U asyncmy aiomysql pymysql cryptography
+BENCH_BACKEND=mysql .venv312/bin/python benchmarks/bench.py
+```
+
 ## Methodology
 
 * Each ORM gets its own table and the **same** workload and data.
