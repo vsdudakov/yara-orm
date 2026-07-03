@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-07-03
+
 ### Added
 
 - **MySQL backend.**
