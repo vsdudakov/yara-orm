@@ -6,6 +6,18 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Performance
+
+- **PostgreSQL: TLS connector is built once per process, not per `init()`.**
+  tokio-postgres defaults to `sslmode=prefer`, so every connection took the TLS
+  path — and each `YaraOrm.init()` rebuilt the rustls connector, re-parsing the
+  entire OS trust store (`rustls_native_certs::load_native_certs`, ~100–150 CA
+  certs, tens of milliseconds) every time. The connector (an `Arc<ClientConfig>`)
+  is now cached in a `OnceLock` and cloned per connection, so the trust store is
+  parsed once. Repeated `init()` on the TLS path now matches the plaintext
+  baseline (measured: first init ~157ms → subsequent ~33ms, same as
+  `sslmode=disable`).
+
 ## [1.13.0] - 2026-07-03
 
 ### Added
