@@ -1,7 +1,7 @@
 # Yara ORM
 
 **A fast, async Python ORM with a Rust engine — [Tortoise](https://tortoise.github.io/)-style
-models, querysets, relations and migrations for PostgreSQL and SQLite.**
+models, querysets, relations and migrations for PostgreSQL, MySQL and SQLite.**
 
 [![CI](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml/badge.svg)](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/yara-orm.svg)](https://pypi.org/project/yara-orm/)
@@ -20,7 +20,7 @@ of a Django/Tortoise-style API — models, querysets, relations, aggregation and
 migrations — with a hot path (connection pooling, parameter binding, row decoding)
 written in compiled **Rust** (PyO3 + tokio). It is a drop-in-feel **alternative to
 Tortoise ORM and async SQLAlchemy**: **2–9× faster** than popular pure-Python ORMs
-on common operations, with first-class **PostgreSQL** and **SQLite** backends, full
+on common operations, with first-class **PostgreSQL**, **MySQL** and **SQLite** backends, full
 type hints, and **100% test coverage**.
 
 ```python
@@ -46,8 +46,8 @@ print(await User.filter(name__icontains="ad").count())
   `Q` objects, aggregation, `prefetch_related`, transactions, signals. Coming from
   Tortoise? Most code moves across unchanged — see
   [Migrating from Tortoise ORM](https://vsdudakov.github.io/yara-orm/guides/migrating-from-tortoise/).
-- 🗄️ **Pluggable backends** — PostgreSQL and SQLite today, selected by URL; a new
-  database is one Rust trait + one Python dialect.
+- 🗄️ **Pluggable backends** — PostgreSQL, MySQL/MariaDB and SQLite today, selected by
+  URL; a new database is one Rust trait + one Python dialect.
 - 🚚 **Migrations** — operation-based, auto-generated, backend-portable
   (`makemigrations` / `upgrade` / `downgrade`).
 - 🧪 **Quality** — fully typed, linted (ruff + ty) and **100% test coverage**.
@@ -179,8 +179,9 @@ Backends are selected by the connection URL; the abstraction is a single Rust
 trait (`Backend`) plus a Python `BaseDialect` subclass:
 
 ```python
-await YaraOrm.init("postgres://user@localhost/db")   # PostgreSQL (tokio-postgres)
-await YaraOrm.init("sqlite:///path/to/app.db")        # SQLite (rusqlite)
+await YaraOrm.init("postgres://user@localhost/db")     # PostgreSQL (tokio-postgres)
+await YaraOrm.init("mysql://user:pass@localhost/db")   # MySQL/MariaDB (mysql_async)
+await YaraOrm.init("sqlite:///path/to/app.db")          # SQLite (rusqlite)
 ```
 
 The SQLite backend maps rich types (uuid/json/datetime/decimal) onto SQLite's
@@ -191,7 +192,7 @@ the model layer is identical across backends.
 
 A Django/Tortoise-style, operation-based migration system. Migrations are
 auto-generated from model changes and **backend-portable** — the same operations
-render to PostgreSQL or SQLite DDL at apply time. Applied migrations are tracked
+render to PostgreSQL, MySQL or SQLite DDL at apply time. Applied migrations are tracked
 in an `orm_migrations` table.
 
 ```bash

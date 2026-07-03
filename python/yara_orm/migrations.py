@@ -1640,7 +1640,7 @@ class _CompositeIndexOp(_ReversibleOp):
         Returns:
             The SQL statements that drop the index.
         """
-        return dialect.render_drop_composite_index(self.name)
+        return dialect.render_drop_composite_index(self.name, table=self.table)
 
     def _do_state(self, state: dict[str, Any]) -> None:
         """Record the composite index in the schema state.

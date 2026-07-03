@@ -288,13 +288,47 @@ def test_query_expression_renderers():
     assert MY.cast_text("`c`") == "CAST(`c` AS CHAR)"
 
 
-def test_regex_lookups_are_not_supported_yet():
+def test_regex_lookups_render_regexp_like_with_case_flags():
     """
-    GIVEN the MySQL dialect
-    WHEN its regex operator table is read
-    THEN it is empty, so __regex lookups raise UnSupportedError upstream
+    GIVEN regex lookups on MySQL (whose infix REGEXP follows the collation and
+          rejects BINARY under ICU)
+    WHEN they render
+    THEN REGEXP_LIKE carries the 'c' (sensitive) or 'i' (insensitive) flag
     """
-    assert MY.regex_ops == {}
+    assert MY.regex_sql("regex", "`c`", "?") == "REGEXP_LIKE(`c`, ?, 'c')"
+    assert MY.regex_sql("posix_regex", "`c`", "?") == "REGEXP_LIKE(`c`, ?, 'c')"
+    assert MY.regex_sql("iregex", "`c`", "?") == "REGEXP_LIKE(`c`, ?, 'i')"
+    assert MY.regex_sql("iposix_regex", "`c`", "?") == "REGEXP_LIKE(`c`, ?, 'i')"
+
+
+def test_search_renders_match_against():
+    """
+    GIVEN the __search lookup on MySQL
+    WHEN it renders
+    THEN it emits MATCH ... AGAINST (natural language mode) and the dialect
+         advertises search support
+    """
+    assert MY.supports_search is True
+    assert MY.search_sql("`t`.`body`", "?") == "MATCH (`t`.`body`) AGAINST (?)"
+
+
+def test_fulltext_index_renders_inline_and_standalone():
+    """
+    GIVEN an Index declared with using="fulltext"
+    WHEN it renders on MySQL
+    THEN both the standalone statement and the CREATE TABLE line spell
+         FULLTEXT INDEX (what MATCH ... AGAINST requires)
+    """
+    ft = Index(fields=["title"], using="fulltext", name="ft_title")
+    assert ft.get_sql(MyDlBook, MY) == (
+        "CREATE FULLTEXT INDEX `ft_title` ON `my_dl_book` (`title`)"
+    )
+    MyDlPage._meta.indexes = [Index(fields=["number"], using="fulltext", name="ft_num")]
+    try:
+        create = MY.create_table_sql(MyDlPage._meta, safe=False)[0]
+    finally:
+        MyDlPage._meta.indexes = []
+    assert "FULLTEXT INDEX `ft_num` (`number`)" in create
 
 
 # -- row decoding -------------------------------------------------------------------
@@ -473,15 +507,24 @@ def test_index_ddl_uses_mysql_spellings():
     ]
 
 
+def test_drop_composite_index_needs_the_owning_table():
+    """
+    GIVEN a named-index drop (as the DropIndex migration op renders it)
+    WHEN the owning table is supplied versus omitted
+    THEN MySQL renders ALTER TABLE ... DROP INDEX, and raises without a table
+         (its DROP INDEX has no by-name form)
+    """
+    assert MY.render_drop_composite_index("i", table="t") == ["ALTER TABLE `t` DROP INDEX `i`"]
+    with pytest.raises(UnSupportedError):
+        MY.render_drop_composite_index("i")
+
+
 def test_unsupported_ddl_raises_clearly():
     """
-    GIVEN DDL MySQL cannot express (drop composite index by bare name, rename
-          constraint)
+    GIVEN DDL MySQL cannot express (rename constraint)
     WHEN it renders
     THEN UnSupportedError is raised instead of emitting invalid SQL
     """
-    with pytest.raises(UnSupportedError):
-        MY.render_drop_composite_index("i")
     with pytest.raises(UnSupportedError):
         MY.render_rename_constraint("t", "a", "b")
 
@@ -530,11 +573,12 @@ def test_compile_renders_insert_without_returning():
         MyDlBook._meta._compiled_for = None
 
 
-def test_compile_rejects_fetch_db_defaults_without_returning():
+def test_compile_builds_a_refresh_select_for_fetch_db_defaults():
     """
     GIVEN a model with Meta.fetch_db_defaults and a database-default column
     WHEN it compiles for MySQL (which has no INSERT ... RETURNING)
-    THEN UnSupportedError explains the limitation
+    THEN a follow-up SELECT-by-pk statement is cached to read the
+         database-filled defaults back after the insert
     """
 
     class MyDlStamped(Model):
@@ -545,5 +589,12 @@ def test_compile_rejects_fetch_db_defaults_without_returning():
             table = "my_dl_stamped"
             fetch_db_defaults = True
 
-    with pytest.raises(UnSupportedError, match="fetch_db_defaults is not supported on mysql"):
-        MyDlStamped._meta.compile(MY)
+    MyDlStamped._meta.compile(MY)
+    try:
+        assert "RETURNING" not in MyDlStamped._meta.insert_sql
+        assert MyDlStamped._meta.insert_refresh_sql == (
+            "SELECT `created` FROM `my_dl_stamped` WHERE `id` = ?"
+        )
+        assert [f.model_field_name for f in MyDlStamped._meta.insert_refresh_fields] == ["created"]
+    finally:
+        MyDlStamped._meta._compiled_for = None

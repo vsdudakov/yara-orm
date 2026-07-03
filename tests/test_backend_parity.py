@@ -15,9 +15,10 @@ from decimal import Decimal
 
 import pytest
 
-from yara_orm import Model, RawSQL, fields, in_transaction
-from yara_orm.db_defaults import RandomHex
-from yara_orm.exceptions import IntegrityError
+from yara_orm import MigrationManager, Model, RawSQL, fields, in_transaction
+from yara_orm.connection import get_engine
+from yara_orm.db_defaults import Now, RandomHex
+from yara_orm.exceptions import IntegrityError, UnSupportedError
 
 
 class MyColor(str, enum.Enum):
@@ -103,7 +104,29 @@ class MyStamped(Model):
         table = "my_be_stamped"
 
 
-MODELS = [MyAuthor, MyTag, MyPost, MyEverything, MyGuidRow, MyStamped]
+class MyStampedFetch(Model):
+    """Database-default columns refreshed onto the instance after insert."""
+
+    id = fields.IntField(pk=True)
+    code = fields.CharField(max_length=32, db_default=RandomHex(4))
+    created = fields.DatetimeField(db_default=Now())
+
+    class Meta:
+        table = "my_be_stamped_fetch"
+        fetch_db_defaults = True
+
+
+class MyMigThing(Model):
+    """Created/dropped via the migration manager, not by the fixture."""
+
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=40)
+
+    class Meta:
+        table = "my_be_mig_thing"
+
+
+MODELS = [MyAuthor, MyTag, MyPost, MyEverything, MyGuidRow, MyStamped, MyStampedFetch]
 
 
 # -- schema + CRUD round-trip --------------------------------------------------
@@ -209,6 +232,24 @@ async def test_db_default_column_fills_and_accepts_explicit_values(db):
     explicit = await MyStamped.create(code="fixedval")
     assert isinstance(explicit.pk, int) and explicit.pk != filled.pk
     assert (await MyStamped.get(id=explicit.pk)).code == "fixedval"
+
+
+@pytest.mark.asyncio
+async def test_fetch_db_defaults_refreshes_the_instance(db):
+    """
+    GIVEN Meta.fetch_db_defaults with database-side default columns
+    WHEN an instance is created
+    THEN the database-filled values are present on the instance immediately —
+         via RETURNING where available, via a follow-up SELECT by pk on MySQL
+    """
+    row = await MyStampedFetch.create()
+    assert isinstance(row.pk, int)
+    assert row.code is not None and len(row.code) == 8  # RandomHex(4)
+    assert row.created is not None
+    # Explicitly supplied values take the dynamic insert path and survive.
+    explicit = await MyStampedFetch.create(code="fixedval")
+    assert explicit.code == "fixedval"
+    assert explicit.created is not None
 
 
 # -- bulk_create -----------------------------------------------------------------
@@ -338,6 +379,47 @@ async def test_like_lookups_accept_sql_expression_values(db):
     assert sensitive == (both if db == "sqlite" else {"Hello World"})
     insensitive = {a.name for a in await MyAuthor.filter(name__icontains=RawSQL("'%HELLO%'"))}
     assert insensitive == both
+
+
+@pytest.mark.asyncio
+async def test_regex_lookups_per_backend(db):
+    """
+    GIVEN case-sensitive and case-insensitive regex lookups
+    WHEN they run per backend
+    THEN PostgreSQL (~ / ~*) and MySQL (REGEXP_LIKE with 'c'/'i' flags) honour
+         the case semantics, and SQLite raises UnSupportedError
+    """
+    if db == "sqlite":
+        with pytest.raises(UnSupportedError):
+            await MyAuthor.filter(name__regex="^al").count()
+        return
+    await MyAuthor.create(name="Alpha")
+    await MyAuthor.create(name="alpine")
+    assert {a.name for a in await MyAuthor.filter(name__regex="^al")} == {"alpine"}
+    assert {a.name for a in await MyAuthor.filter(name__iregex="^al")} == {"Alpha", "alpine"}
+
+
+@pytest.mark.asyncio
+async def test_search_lookup_per_backend(db):
+    """
+    GIVEN a full-text __search lookup
+    WHEN it runs per backend
+    THEN PostgreSQL matches via to_tsvector, MySQL via MATCH ... AGAINST over a
+         FULLTEXT index, and SQLite raises UnSupportedError
+    """
+    if db == "sqlite":
+        with pytest.raises(UnSupportedError):
+            await MyEverything.filter(body__search="foxes").count()
+        return
+    if db == "mysql":
+        # MATCH ... AGAINST needs a FULLTEXT index; models can declare it as
+        # Index(fields=["body"], using="fulltext") — added here via ALTER so
+        # the shared model stays creatable on PostgreSQL (no fulltext method).
+        await get_engine().execute("ALTER TABLE my_be_everything ADD FULLTEXT INDEX ft_body (body)")
+    await MyEverything.create(name="a", body="quick brown foxes jump nightly")
+    await MyEverything.create(name="b", body="lazy dogs sleep quietly")
+    got = [e.name for e in await MyEverything.filter(body__search="foxes")]
+    assert got == ["a"]
 
 
 @pytest.mark.asyncio
@@ -514,3 +596,35 @@ async def test_get_or_create(db):
     assert created is False
     assert again.pk == first.pk
     assert await MyAuthor.all().count() == 1
+
+
+# -- migrations ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_manager_end_to_end(db, tmp_path):
+    """
+    GIVEN a model managed by the migration manager (not the test fixture)
+    WHEN makemigrations, upgrade, a write and downgrade run on each backend
+    THEN the table is created, usable, tracked and dropped everywhere — incl.
+         MySQL's RETURNING-less bookkeeping and its DDL spellings
+    """
+    engine = get_engine()
+
+    async def _cleanup() -> None:
+        # ANSI_QUOTES (set per MySQL session) makes the quoting portable.
+        for tbl in ("my_be_mig_thing", "orm_migrations"):
+            await engine.execute(f'DROP TABLE IF EXISTS "{tbl}"')
+
+    await _cleanup()  # tolerate leftovers from an interrupted earlier run
+    mgr = MigrationManager(directory=str(tmp_path), app="parity", models=[MyMigThing])
+    try:
+        assert mgr.make_migrations(name="initial") == "0001_initial.py"
+        assert await mgr.upgrade() == ["0001_initial"]
+        await MyMigThing.create(name="row")
+        assert await MyMigThing.all().count() == 1
+        heads = await mgr.heads()
+        assert heads and all(h["applied"] for h in heads)
+        assert await mgr.downgrade(steps=1) == ["0001_initial"]
+    finally:
+        await _cleanup()

@@ -33,7 +33,7 @@ _QUOTE_CACHE: dict[str, str] = {}
 #: and the safe shape of an operator-class identifier. Both are spliced into
 #: index DDL verbatim (they cannot be bound), so they are validated to keep
 #: arbitrary SQL out of ``CREATE INDEX``.
-_INDEX_METHODS = frozenset({"btree", "hash", "gist", "gin", "spgist", "brin"})
+_INDEX_METHODS = frozenset({"btree", "hash", "gist", "gin", "spgist", "brin", "fulltext"})
 _OPCLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
 #: Statements bracketing SQLite's table rebuild. ``PRAGMA foreign_keys`` is a
@@ -359,6 +359,30 @@ class BaseDialect:
             A boolean SQL expression matching ``col`` against the query.
         """
         raise UnSupportedError(f"{self.name} does not support the __search lookup")
+
+    def regex_sql(self, op: str, col: str, placeholder: str) -> str:
+        """Render a regular-expression lookup condition.
+
+        The default renders the infix operator registered in
+        :attr:`regex_ops` (``~``/``~*`` on PostgreSQL); dialects whose regex
+        match is a function call (MySQL's ``REGEXP_LIKE``) override this.
+
+        Args:
+            op: The lookup name (``regex``/``iregex``/``posix_regex``/
+                ``iposix_regex``).
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Raises:
+            UnSupportedError: On backends without a regex operator.
+
+        Returns:
+            A boolean SQL expression matching ``col`` against the pattern.
+        """
+        regex_op = self.regex_ops.get(op)
+        if regex_op is None:
+            raise UnSupportedError(f"{self.name} does not support the __{op} lookup")
+        return f"{col} {regex_op} {placeholder}"
 
     # -- type rendering ---------------------------------------------------
     def _kind_template(self, kind: str) -> str:
@@ -1122,11 +1146,14 @@ class BaseDialect:
             )
         ]
 
-    def render_drop_composite_index(self, name: str) -> list[str]:
+    def render_drop_composite_index(self, name: str, table: str | None = None) -> list[str]:
         """Render a statement dropping a named index.
 
         Args:
             name: The index name.
+            table: The owning table; unused here (PostgreSQL/SQLite drop by
+                name), required by dialects whose ``DROP INDEX`` needs it
+                (MySQL).
 
         Returns:
             The list with the drop-index statement.
@@ -1692,6 +1719,17 @@ class MySQLDialect(BaseDialect):
     """
 
     name = "mysql"
+    # Regex lookups are supported (via REGEXP_LIKE with a case flag; see
+    # ``regex_sql``); the keys here advertise which lookups resolve.
+    regex_ops = {
+        "regex": "REGEXP",
+        "iregex": "REGEXP",
+        "posix_regex": "REGEXP",
+        "iposix_regex": "REGEXP",
+    }
+    # ``__search`` renders MATCH ... AGAINST; the column needs a FULLTEXT
+    # index (declare ``Index(fields=[...], using="fulltext")``).
+    supports_search = True
     # utf8mb4's default *_ai_ci collation is case-insensitive, so plain LIKE
     # covers icontains/istartswith/iexact; BINARY restores case sensitivity.
     ilike = "LIKE"
@@ -1887,6 +1925,44 @@ class MySQLDialect(BaseDialect):
         """
         return "CONCAT(" + ", ".join(parts) + ")"
 
+    def regex_sql(self, op: str, col: str, placeholder: str) -> str:
+        """Render a regex lookup through ``REGEXP_LIKE`` with a case flag.
+
+        The infix ``REGEXP`` operator follows the column collation (typically
+        case-insensitive), and ``REGEXP BINARY`` is rejected by MySQL 8's ICU
+        engine — so case sensitivity is spelled with the function's match
+        flag instead: ``'c'`` (sensitive) for ``regex``/``posix_regex``,
+        ``'i'`` for the ``i``-variants.
+
+        Args:
+            op: The lookup name.
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A ``REGEXP_LIKE(col, ?, flag)`` expression.
+        """
+        flag = "i" if op in ("iregex", "iposix_regex") else "c"
+        return f"REGEXP_LIKE({col}, {placeholder}, '{flag}')"
+
+    def search_sql(self, col: str, placeholder: str) -> str:
+        """Render a MySQL full-text ``__search`` via ``MATCH ... AGAINST``.
+
+        The column must carry a FULLTEXT index — declare
+        ``Index(fields=["col"], using="fulltext")`` on the model (rendered
+        inline as ``FULLTEXT INDEX`` in the CREATE TABLE); MySQL errors
+        otherwise.
+
+        Args:
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the search query.
+
+        Returns:
+            A ``MATCH (col) AGAINST (?)`` boolean expression (natural
+            language mode, MySQL's default).
+        """
+        return f"MATCH ({col}) AGAINST ({placeholder})"
+
     def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
         """Render the MySQL upsert clause for ``bulk_create``.
 
@@ -1974,9 +2050,11 @@ class MySQLDialect(BaseDialect):
             # declarations — are dropped like the other pg-only index options.
             if any(self._index_field_kind(meta, name) == "json" for name in index.fields):
                 continue
-            uniq = "UNIQUE " if index.unique else ""
             cols = ", ".join(self._group_columns(meta, index.fields))
-            lines.append(f"{uniq}INDEX {self.quote(index.resolve_name(meta.table))} ({cols})")
+            lines.append(
+                f"{self._index_prefix(index)}INDEX "
+                f"{self.quote(index.resolve_name(meta.table))} ({cols})"
+            )
 
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)
@@ -2012,11 +2090,30 @@ class MySQLDialect(BaseDialect):
             return []
         return [f"ALTER TABLE {self.quote(meta.table)} COMMENT = {self._literal(meta.description)}"]
 
+    @staticmethod
+    def _index_prefix(index: Index) -> str:
+        """The keyword preceding ``INDEX`` for one :class:`Index` declaration.
+
+        ``using="fulltext"`` renders MySQL's ``FULLTEXT INDEX`` (what
+        ``MATCH ... AGAINST`` searches require); otherwise ``UNIQUE`` when set.
+
+        Args:
+            index: The index being rendered.
+
+        Returns:
+            ``"FULLTEXT "``, ``"UNIQUE "`` or ``""``.
+        """
+        _validate_index_using(index.using)
+        if index.using == "fulltext":
+            return "FULLTEXT "
+        return "UNIQUE " if index.unique else ""
+
     def render_index(self, meta: MetaInfo, index: Index, safe: bool = True) -> str:
         """Render one ``CREATE INDEX`` statement for :meth:`Index.get_sql`.
 
         MySQL has no ``CREATE INDEX IF NOT EXISTS``, partial indexes, or the
-        PostgreSQL index options, so only name/columns/unique survive.
+        PostgreSQL index options, so only name/columns/unique — plus the
+        MySQL-specific ``using="fulltext"`` — survive.
 
         Args:
             meta: The owning model's metadata.
@@ -2026,10 +2123,10 @@ class MySQLDialect(BaseDialect):
         Returns:
             The ``CREATE INDEX`` statement.
         """
-        uniq = "UNIQUE " if index.unique else ""
         cols = ", ".join(self._group_columns(meta, index.fields))
         return (
-            f"CREATE {uniq}INDEX {self.quote(index.resolve_name(meta.table))} "
+            f"CREATE {self._index_prefix(index)}INDEX "
+            f"{self.quote(index.resolve_name(meta.table))} "
             f"ON {self.quote(meta.table)} ({cols})"
         )
 
@@ -2187,22 +2284,26 @@ class MySQLDialect(BaseDialect):
         cols = ", ".join(self.quote(c) for c in columns)
         return [f"CREATE {uniq}INDEX {self.quote(name)} ON {self.quote(table)} ({cols})"]
 
-    def render_drop_composite_index(self, name: str) -> list[str]:
-        """Reject a by-name index drop.
-
-        MySQL's ``DROP INDEX`` needs the owning table, which this signature
-        does not carry; deferred to the MySQL migrations phase.
+    def render_drop_composite_index(self, name: str, table: str | None = None) -> list[str]:
+        """Render a named-index drop; MySQL's form needs the owning table.
 
         Args:
             name: The index name.
+            table: The owning table (the migration ops carry it).
 
         Raises:
-            UnSupportedError: Always, until migrations land for MySQL.
+            UnSupportedError: When no table is given — MySQL cannot drop an
+                index by bare name.
+
+        Returns:
+            The list with the drop-index statement.
         """
-        raise UnSupportedError(
-            "mysql cannot DROP INDEX by name alone (the owning table is required); "
-            "use RunSQL with ALTER TABLE ... DROP INDEX"
-        )
+        if table is None:
+            raise UnSupportedError(
+                "mysql cannot DROP INDEX by name alone (the owning table is required); "
+                "use RunSQL with ALTER TABLE ... DROP INDEX"
+            )
+        return [f"ALTER TABLE {self.quote(table)} DROP INDEX {self.quote(name)}"]
 
     def render_rename_index(
         self,

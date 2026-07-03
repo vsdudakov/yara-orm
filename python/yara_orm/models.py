@@ -10,7 +10,7 @@ from . import registry, signals
 from . import timezone as _tz
 from .connection import get_dialect, get_executor
 from .db_defaults import DatabaseDefault
-from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned, UnSupportedError
+from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
 from .fields import (
     DatetimeField,
     Field,
@@ -326,17 +326,23 @@ class MetaInfo:
             ]
         if dialect.supports_insert_returning:
             ret = " RETURNING " + ", ".join(q(f.db_column) for f in self.insert_returning_fields)
+            self.insert_refresh_fields: list[Field] = []
+            self.insert_refresh_sql: str | None = None
         else:
             # No RETURNING (MySQL): the backend hands the new auto-increment pk
             # back as a synthetic single-value row, which covers exactly the
-            # ``[pk]`` returning list. Database-default refresh has no such
-            # channel yet.
-            if self.fetch_db_defaults and len(self.insert_returning_fields) > 1:
-                raise UnSupportedError(
-                    f"Meta.fetch_db_defaults is not supported on {dialect.name} yet "
-                    "(no INSERT ... RETURNING); read the defaults back with a re-fetch"
-                )
+            # ``[pk]`` returning list. ``Meta.fetch_db_defaults`` columns are
+            # read back with a follow-up SELECT by pk instead.
             ret = ""
+            self.insert_refresh_fields = self.insert_returning_fields[1:]
+            if self.insert_refresh_fields:
+                cols = ", ".join(q(f.db_column) for f in self.insert_refresh_fields)
+                self.insert_refresh_sql = (
+                    f"SELECT {cols} FROM {q(self.table)} "  # noqa: S608 - quoted identifiers
+                    f"WHERE {q(self.pk_field.db_column)} = {dialect.placeholder(1)}"
+                )
+            else:
+                self.insert_refresh_sql = None
         if self.insert_fields:
             cols = ", ".join(q(f.db_column) for f in self.insert_fields)
             holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(self.insert_fields)))
@@ -936,6 +942,28 @@ class Model(metaclass=ModelMeta):
     # (:func:`_setattr_unmark_db_default`) installed by the metaclass; every
     # other model keeps ``object.__setattr__`` for plain attribute-write speed.
 
+    async def _refresh_inserted_defaults(self, executor: BaseDBAsyncClient, meta: MetaInfo) -> None:
+        """Read database-supplied default columns back after an insert.
+
+        The ``Meta.fetch_db_defaults`` refresh for dialects without
+        ``INSERT ... RETURNING`` (MySQL): a follow-up ``SELECT`` by the new
+        primary key assigns the database-filled values onto the instance,
+        matching what a RETURNING clause hands back elsewhere.
+
+        Args:
+            executor: The executor the INSERT ran on (so an open transaction
+                sees its own row).
+            meta: The model metadata carrying the cached refresh statement.
+
+        Returns:
+            None
+        """
+        refresh_sql = meta.insert_refresh_sql
+        assert refresh_sql is not None  # noqa: S101 - callers gate on it
+        row = await executor.fetch_row(refresh_sql, [meta.pk_field.to_db(self.pk)])
+        for field, value in zip(meta.insert_refresh_fields, row):
+            setattr(self, field.model_field_name, field.to_python(value))
+
     def _mark_unfetched_db_defaults(self) -> None:
         """Record which database-default columns hold a never-fetched ``None``.
 
@@ -1196,6 +1224,10 @@ class Model(metaclass=ModelMeta):
                 for field, value in zip(meta.insert_returning_fields, row):
                     setattr(self, field.model_field_name, field.to_python(value))
                 self._in_db = True
+                if meta.insert_refresh_sql:
+                    # fetch_db_defaults without RETURNING (MySQL): read the
+                    # database-filled defaults back by the new pk.
+                    await self._refresh_inserted_defaults(executor, meta)
                 self._mark_unfetched_db_defaults()
                 return
 
@@ -1234,6 +1266,8 @@ class Model(metaclass=ModelMeta):
                 # The pk was supplied by the caller; nothing to read back.
                 await executor.execute(sql, params)
             self._in_db = True
+            if not dialect.supports_insert_returning and meta.insert_refresh_sql:
+                await self._refresh_inserted_defaults(executor, meta)
             self._mark_unfetched_db_defaults()
         elif update_fields is not None:
             # Partial update: write only the named fields (relation names map to

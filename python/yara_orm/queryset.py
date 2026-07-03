@@ -893,10 +893,9 @@ class QuerySet(Generic[ModelT]):
                 idx + 1,
             )
         if op in _REGEX_OPS:
-            regex_op = dialect.regex_ops.get(op)
-            if regex_op is None:
-                raise UnSupportedError(f"{dialect.name} does not support the __{op} lookup")
-            return f"{col} {regex_op} {dialect.placeholder(idx)}", [value], idx + 1
+            # Rendered by the dialect: an infix operator on PostgreSQL, a
+            # REGEXP_LIKE(...) call on MySQL; raises where unsupported (SQLite).
+            return dialect.regex_sql(op, col, dialect.placeholder(idx)), [value], idx + 1
         if op == "date":
             return (
                 f"{dialect.truncate_date_sql(col)} = {dialect.placeholder(idx)}",
