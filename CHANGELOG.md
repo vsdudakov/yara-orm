@@ -95,6 +95,63 @@ All notable changes to **yara-orm** are documented here. The format is based on
   `extensions_sql(models)` statements (e.g. `CREATE EXTENSION IF NOT
   EXISTS`) first, per write connection, before creating tables.
 
+### Performance
+
+- **`bulk_create` stamps `auto_now`/`auto_now_add` columns once per call**
+  (one `timezone.now()` shared by the whole batch, written via direct
+  `__dict__` assignment) and resolves each column's binder/attribute pair
+  once per statement instead of twice per column per row. Semantic note: all
+  rows inserted by one `bulk_create` call now share an *identical* timestamp
+  (previously each row got its own `now()`, microseconds apart); single
+  `save()` keeps its per-call timestamp. ~28% faster on a 5000-row batch.
+- **`Model.__setattr__` is no longer overridden on every model.** The
+  override existed only to un-mark never-fetched database-default columns on
+  explicit assignment; it is now installed by the metaclass only on model
+  classes that declare (or inherit) a `DatabaseDefault` column, and
+  `Model.__init__` writes field values into `__dict__` directly. Plain
+  models keep `object.__setattr__`, cutting `Model(...)` construction time
+  roughly in half; db-default semantics (explicit `None` persists) are
+  unchanged.
+- **`Model.get`/`get_or_none` fast path got faster**: the chainable
+  `QuerySetSingle` wrapper now builds its fallback queryset lazily (only
+  when the caller actually chains `.select_related()` etc. or the fast path
+  bails out), and the simple-equality SELECT (including its `IS NULL` shape
+  and `Meta.ordering` clause) is memoised per (dialect, lookup-name,
+  NULL-mask, limit) on the model's meta instead of being re-rendered per
+  call.
+- **`select_related` row hydration precomputes its per-relation plan**
+  (column slice, hydrator, parent/attribute) once per query instead of
+  re-reading the node dicts per row, with a dedicated single-relation fast
+  path; annotation columns and `only()`/`defer()` partial hydration behave
+  exactly as before.
+- **SQLite statements no longer hop to a blocking thread.** Every pooled and
+  in-transaction statement (`execute`, `fetch_*`, `execute_many`, savepoints,
+  COMMIT/ROLLBACK) now runs inline on the async runtime instead of paying a
+  `spawn_blocking` round trip per statement — measured at ~17% of per-query
+  time, +11% on autocommit inserts and +10–16% on N+1-style workloads.
+  `BEGIN IMMEDIATE` (which can queue on `busy_timeout` for up to 5s behind
+  concurrent write transactions) and `execute_script` (arbitrary migration
+  scripts) stay on the blocking pool so a parked statement cannot stall
+  unrelated queries. Parameters and SQL are now borrowed instead of cloned
+  per statement.
+- **SQLite result decoding plans each column once per result set.** The
+  declared-type substring scans (up to six per cell) are replaced by a
+  per-column decode tag computed once per statement, cell text is borrowed
+  instead of copied per typed decode attempt, and datetime TEXT parsing
+  dispatches on the value's shape (offset suffix, `T` vs space separator) so
+  well-formed values parse on the first try instead of walking a trial
+  chain. All previously accepted datetime layouts — canonical aware
+  (`YYYY-MM-DD HH:MM:SS.ffffff+00:00`), legacy RFC 3339 rows, and naive
+  space/`T` forms — still decode identically (covered by new Rust unit tests
+  plus a corpus differential check against the old decoder).
+- **Dict-row column names are created once per result set**: `fetch_all`'s
+  list-of-dicts conversion now interns each column name as a single shared
+  Python string instead of allocating a fresh key per cell per row, and the
+  Rust-side row representation shares one `Arc<str>` per column name across
+  rows. Positional `fetch_rows` is untouched.
+- **Release profile: fat LTO + a single codegen unit** (+7–12% on decode-heavy
+  fetch benchmarks; release builds take longer).
+
 ## [1.11.0] - 2026-07-02
 
 ### Added

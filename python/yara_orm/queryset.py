@@ -2015,36 +2015,88 @@ class QuerySet(Generic[ModelT]):
         engine = get_executor(self.model, using=self._using)
         sql, params, order, nodes, ncols = self._select_related_plan(dialect)
         base_sel = self._selected_fields() if (self._only is not None or self._defer) else None
-        annotation_names = list(self._annotations)
         ann_base = ncols + sum(nodes[path]["width"] for path in order)
-        rows = await engine.fetch_rows(sql, params)
-        instances = []
-        for row in rows:
-            obj = (
-                self.model._from_db_row_fields(row[:ncols], base_sel)
-                if base_sel is not None
-                else self.model._from_db_row(row[:ncols])
+        # Trailing annotation columns: (column index, attribute name) pairs.
+        ann_plan = [(ann_base + i, name) for i, name in enumerate(self._annotations)]
+        # Per-node hydration plan, resolved once instead of per row: the column
+        # slice, the hydrating classmethod and (for a partial only()/defer()
+        # projection) the field subset it decodes with.
+        plan: list[tuple[str, str | None, str, int, int, Any, list[Any] | None]] = []
+        for path in order:
+            node = nodes[path]
+            start = node["offset"]
+            partial = node["partial"]
+            target = node["target"]
+            plan.append(
+                (
+                    path,
+                    node["parent"],
+                    node["seg"],
+                    start,
+                    start + node["width"],
+                    target._from_db_row_fields if partial else target._from_db_row,
+                    node["fields"] if partial else None,
+                )
             )
-            built: dict[str | None, Model | None] = {None: obj}
-            obj.__dict__.setdefault("_prefetch", {})
-            for path in order:
-                node = nodes[path]
-                parent_inst = built[node["parent"]]
-                if parent_inst is None:
-                    built[path] = None
-                    continue
-                chunk = row[node["offset"] : node["offset"] + node["width"]]
+        rows = await engine.fetch_rows(sql, params)
+        model = self.model
+        from_row = model._from_db_row
+        from_row_fields = model._from_db_row_fields
+        instances = []
+        if len(plan) == 1 and plan[0][1] is None:
+            # Common case — a single direct relation: skip the per-row ``built``
+            # path map and assign the prefetch slot in one dict display.
+            _, _, seg, start, end, hydrate, sel = plan[0]
+            for row in rows:
+                obj = (
+                    from_row_fields(row[:ncols], base_sel)
+                    if base_sel is not None
+                    else from_row(row[:ncols])
+                )
+                chunk = row[start:end]
                 if not any(v is not None for v in chunk):
                     child = None
-                elif node["partial"]:
-                    child = node["target"]._from_db_row_fields(chunk, node["fields"])
+                elif sel is not None:
+                    child = hydrate(chunk, sel)
                 else:
-                    child = node["target"]._from_db_row(chunk)
-                parent_inst.__dict__.setdefault("_prefetch", {})[node["seg"]] = child
-                built[path] = child
-            for offset, name in enumerate(annotation_names):
-                setattr(obj, name, row[ann_base + offset])
-            instances.append(obj)
+                    child = hydrate(chunk)
+                obj.__dict__["_prefetch"] = {seg: child}
+                for col, name in ann_plan:
+                    setattr(obj, name, row[col])
+                instances.append(obj)
+        else:
+            for row in rows:
+                obj = (
+                    from_row_fields(row[:ncols], base_sel)
+                    if base_sel is not None
+                    else from_row(row[:ncols])
+                )
+                prefetch: dict[str, Model | None] = {}
+                obj.__dict__["_prefetch"] = prefetch
+                built: dict[str | None, Model | None] = {None: obj}
+                for path, parent, seg, start, end, hydrate, sel in plan:
+                    parent_inst = built[parent]
+                    if parent_inst is None:
+                        built[path] = None
+                        continue
+                    chunk = row[start:end]
+                    if not any(v is not None for v in chunk):
+                        child = None
+                    elif sel is not None:
+                        child = hydrate(chunk, sel)
+                    else:
+                        child = hydrate(chunk)
+                    if parent is None:
+                        prefetch[seg] = child
+                    else:
+                        pd = parent_inst.__dict__.get("_prefetch")
+                        if pd is None:
+                            pd = parent_inst.__dict__["_prefetch"] = {}
+                        pd[seg] = child
+                    built[path] = child
+                for col, name in ann_plan:
+                    setattr(obj, name, row[col])
+                instances.append(obj)
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
             from .prefetch import prefetch_instances
@@ -2887,14 +2939,18 @@ class QuerySetSingle(Generic[_SingleT]):
 
     def __init__(
         self,
-        queryset: QuerySet[Any],
+        queryset: QuerySet[Any] | Callable[[], QuerySet[Any]],
         resolver: Callable[[QuerySet[Any]], Awaitable[_SingleT]],
         fast: Callable[[], Awaitable[_SingleT]] | None = None,
     ) -> None:
         """Wrap the query set whose single row will be awaited.
 
         Args:
-            queryset: The query set already narrowed to the target row.
+            queryset: The query set already narrowed to the target row, or a
+                zero-arg factory building it. ``Model.get`` passes a factory:
+                the query set is only needed when the caller chains (or the
+                fast path bails out), so the common ``await Model.get(...)``
+                never pays for building it.
             resolver: Coroutine resolving the wrapped query set to a single
                 instance. ``Model.get`` passes one that raises on a missing
                 row; ``first()`` passes one that returns ``None`` instead.
@@ -2906,9 +2962,21 @@ class QuerySetSingle(Generic[_SingleT]):
         Returns:
             None
         """
-        self._queryset = queryset
+        self._queryset_source = queryset
         self._fast = fast
         self._resolver = resolver
+
+    @property
+    def _queryset(self) -> QuerySet[Any]:
+        """The wrapped query set, built on first use when given as a factory.
+
+        Returns:
+            The query set narrowed to the target row.
+        """
+        qs = self._queryset_source
+        if not isinstance(qs, QuerySet):
+            qs = self._queryset_source = qs()
+        return qs
 
     def _chain(self, queryset: QuerySet[Any]) -> QuerySetSingle[_SingleT]:
         """Wrap ``queryset`` keeping this result's resolver (drops the fast path).
