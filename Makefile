@@ -53,6 +53,12 @@ bench-mysql:
 	.venv312/bin/pip install -q -U asyncmy aiomysql pymysql cryptography
 	BENCH_BACKEND=mysql .venv312/bin/python benchmarks/bench.py
 
+# Same comparison on MariaDB (ORM_TEST_MARIADB, default :3307). Every competitor
+# reaches MariaDB through its MySQL driver; Piccolo has no MySQL backend (`-`).
+bench-mariadb:
+	.venv312/bin/pip install -q -U asyncmy aiomysql pymysql cryptography
+	BENCH_BACKEND=mariadb .venv312/bin/python benchmarks/bench.py
+
 # yara-orm-only feature micro-benchmarks (nested-transaction savepoints, eager
 # loading vs N+1, projection). Runs on SQLite by default (zero setup); pass
 # BENCH_BACKEND=postgres ORM_TEST_DB=... for Postgres.

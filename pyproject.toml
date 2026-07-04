@@ -6,7 +6,7 @@ build-backend = "maturin"
 # Distribution name on PyPI is "yara-orm"; the import package is `yara_orm`.
 name = "yara-orm"
 version = "1.13.1"
-description = "Fast async Python ORM with a Rust engine — Tortoise-style models, querysets, relations and migrations for PostgreSQL, MySQL and SQLite"
+description = "Fast async Python ORM with a Rust engine — Tortoise-style models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB and SQLite"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

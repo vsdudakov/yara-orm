@@ -1,12 +1,12 @@
 ---
 title: Yara ORM — Fast async Python ORM with a Rust engine
-description: Yara ORM is a fast, async Python ORM with a Rust engine. Tortoise-style models, querysets, relations and migrations for PostgreSQL, MySQL and SQLite — 2–9× faster.
+description: Yara ORM is a fast, async Python ORM with a Rust engine. Tortoise-style models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB and SQLite — 2–9× faster.
 ---
 
 # Yara ORM
 
 **A fast, async Python ORM with a Rust engine — [Tortoise](https://tortoise.github.io/)-style
-models, querysets, relations and migrations for PostgreSQL, MySQL and SQLite.**
+models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB and SQLite.**
 
 [![CI](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml/badge.svg)](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/yara-orm.svg)](https://pypi.org/project/yara-orm/)
@@ -18,7 +18,7 @@ Django/Tortoise-style API — models, querysets, relations, aggregation and migr
 with a hot path (connection pooling, parameter binding, row decoding) written in compiled
 **Rust** (PyO3 + tokio). It is a drop-in-feel **alternative to Tortoise ORM and async
 SQLAlchemy**: **2–9× faster** than popular pure-Python ORMs on common operations, with
-first-class **PostgreSQL**, **MySQL** and **SQLite** backends, full type hints, and **100% test
+first-class **PostgreSQL**, **MySQL**, **MariaDB** and **SQLite** backends, full type hints, and **100% test
 coverage**.
 
 ```python

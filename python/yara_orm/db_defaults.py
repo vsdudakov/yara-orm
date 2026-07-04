@@ -42,7 +42,7 @@ class Now(DatabaseDefault):
             MySQL, whose bare spelling would truncate a ``DATETIME(6)``
             column's default to whole seconds).
         """
-        if dialect.name == "mysql":
+        if dialect.name in ("mysql", "mariadb"):
             return "CURRENT_TIMESTAMP(6)"
         return "CURRENT_TIMESTAMP"
 
@@ -90,7 +90,7 @@ class RandomHex(DatabaseDefault):
                 f"md5(random()::text || clock_timestamp()::text || {i})" for i in range(chunks)
             )
             return f"substr({expr}, 1, {hex_len})"
-        if dialect.name == "mysql":
+        if dialect.name in ("mysql", "mariadb"):
             # ``size`` random bytes -> 2*size hex chars, same width as the
             # PostgreSQL and SQLite renderings.
             return f"lower(hex(random_bytes({self.size})))"

@@ -32,7 +32,7 @@ async def test_get_schema_sql(db):
     WHEN get_schema_sql() is called
     THEN it returns the CREATE TABLE / join-table DDL without executing it
     """
-    q = "`" if db == "mysql" else '"'
+    q = "`" if db in ("mysql", "mariadb") else '"'
     sql = YaraOrm.get_schema_sql()
     assert "CREATE TABLE" in sql
     assert f"{q}lc_thing{q}" in sql
@@ -47,7 +47,7 @@ async def test_get_schema_sql_subset(db):
     WHEN get_schema_sql(models=[...]) is called
     THEN only those tables appear
     """
-    q = "`" if db == "mysql" else '"'
+    q = "`" if db in ("mysql", "mariadb") else '"'
     sql = YaraOrm.get_schema_sql(models=[LcThing])
     assert f"{q}lc_thing{q}" in sql
     assert f"{q}lc_tag{q}" not in sql

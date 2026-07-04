@@ -155,7 +155,7 @@ async def test_set_router_and_transaction_fetch_all(db):
     """
     YaraOrm.set_router(None)
     await CvStar.create(name="x")
-    ph = "?" if db == "mysql" else "$1"  # raw SQL carries the driver's placeholder
+    ph = "?" if db in ("mysql", "mariadb") else "$1"  # raw SQL carries the driver's placeholder
     async with in_transaction():
         conn = connections.get("default")
         await conn.execute(f"INSERT INTO cov_star (name) VALUES ({ph})", ["y"])

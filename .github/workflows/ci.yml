@@ -62,10 +62,23 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: orm_test
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       ORM_TEST_DB: postgres://postgres:postgres@localhost:5432/orm_test
       ORM_TEST_DB2: postgres://postgres:postgres@localhost:5432/orm_test2
       ORM_TEST_MYSQL: mysql://root:root@localhost:3306/orm_test
+      ORM_TEST_MARIADB: mariadb://root:root@localhost:3307/orm_test
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v7

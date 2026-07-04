@@ -47,10 +47,13 @@ CATS = 20
 TH = (N // CATS) // 2
 
 
-#: Which database to benchmark: "postgres" (default), "mysql" or "sqlite".
+#: Which database to benchmark: "postgres" (default), "mysql", "mariadb" or "sqlite".
 BACKEND = os.environ.get("BENCH_BACKEND", "postgres")
 SQLITE_DIR = os.environ.get("BENCH_SQLITE_DIR", "/tmp")
 MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/orm_demo")
+#: MariaDB uses the same wire protocol/drivers as MySQL, so every competitor
+#: connects to it through its MySQL path; only the server URL differs.
+MARIADB_URL = os.environ.get("ORM_TEST_MARIADB", "mysql://root:root@localhost:3307/orm_demo")
 
 
 def pg_parts(url: str, default_port: int = 5432) -> dict:
@@ -64,22 +67,27 @@ def pg_parts(url: str, default_port: int = 5432) -> dict:
     }
 
 
+def mysql_family_url() -> str:
+    """The active MySQL-family server URL (MariaDB or MySQL)."""
+    return MARIADB_URL if BACKEND == "mariadb" else MYSQL_URL
+
+
 def mysql_parts() -> dict:
-    return pg_parts(MYSQL_URL, default_port=3306)
+    return pg_parts(mysql_family_url(), default_port=3306)
 
 
 def clear_sql(table: str) -> str:
     """Statement that empties a table (SQLite has no TRUNCATE)."""
     if BACKEND == "sqlite":
         return f"DELETE FROM {table}"
-    if BACKEND == "mysql":
+    if BACKEND in ("mysql", "mariadb"):
         # MySQL's TRUNCATE resets AUTO_INCREMENT by itself (no RESTART IDENTITY).
         return f"TRUNCATE TABLE {table}"
     return f"TRUNCATE {table} RESTART IDENTITY"
 
 
 def drop_sql(table: str) -> str:
-    if BACKEND in ("sqlite", "mysql"):  # MySQL accepts no CASCADE here
+    if BACKEND in ("sqlite", "mysql", "mariadb"):  # MySQL accepts no CASCADE here
         return f"DROP TABLE IF EXISTS {table}"
     return f"DROP TABLE IF EXISTS {table} CASCADE"
 
@@ -87,8 +95,8 @@ def drop_sql(table: str) -> str:
 def ours_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite://{SQLITE_DIR}/bench_ours.db"
-    if BACKEND == "mysql":
-        return MYSQL_URL
+    if BACKEND in ("mysql", "mariadb"):
+        return mysql_family_url()
     return URL
 
 
@@ -107,7 +115,7 @@ def _pg_userinfo(p: dict) -> str:
 def tortoise_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite://{SQLITE_DIR}/bench_tortoise.db"
-    if BACKEND == "mysql":
+    if BACKEND in ("mysql", "mariadb"):
         p = mysql_parts()
         return f"mysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
     p = pg_parts(URL)
@@ -117,7 +125,7 @@ def tortoise_url() -> str:
 def sqla_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite+aiosqlite:///{SQLITE_DIR}/bench_sqla.db"
-    if BACKEND == "mysql":
+    if BACKEND in ("mysql", "mariadb"):
         p = mysql_parts()
         return f"mysql+aiomysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
     p = pg_parts(URL)
@@ -324,7 +332,7 @@ def run_pony() -> dict:
         with contextlib.suppress(FileNotFoundError):
             os.remove(f"{SQLITE_DIR}/bench_pony.db")
         db.bind(provider="sqlite", filename=f"{SQLITE_DIR}/bench_pony.db", create_db=True)
-    elif BACKEND == "mysql":
+    elif BACKEND in ("mysql", "mariadb"):
         import pymysql
 
         parts = mysql_parts()
@@ -551,7 +559,7 @@ async def run_sqlalchemy() -> dict:
 def _django_db() -> dict:
     if BACKEND == "sqlite":
         return {"ENGINE": "django.db.backends.sqlite3", "NAME": f"{SQLITE_DIR}/bench_django.db"}
-    if BACKEND == "mysql":
+    if BACKEND in ("mysql", "mariadb"):
         import pymysql
 
         pymysql.install_as_MySQLdb()
@@ -694,7 +702,7 @@ def run_peewee() -> dict:
 
     if BACKEND == "sqlite":
         db = _pw.SqliteDatabase(f"{SQLITE_DIR}/bench_peewee.db")
-    elif BACKEND == "mysql":
+    elif BACKEND in ("mysql", "mariadb"):
         p = mysql_parts()
         db = _pw.MySQLDatabase(
             p["database"],
@@ -783,7 +791,7 @@ def run_peewee() -> dict:
 def sqlobject_uri() -> str:
     if BACKEND == "sqlite":
         return f"sqlite://{SQLITE_DIR}/bench_sqlobject.db?cache=false"
-    if BACKEND == "mysql":
+    if BACKEND in ("mysql", "mariadb"):
         p = mysql_parts()
         return f"mysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}?driver=pymysql&cache=false"
     p = pg_parts(URL)
@@ -882,7 +890,7 @@ def run_sqlobject() -> dict:
 def ormar_url() -> str:
     if BACKEND == "sqlite":
         return f"sqlite+aiosqlite:///{SQLITE_DIR}/bench_ormar.db"
-    if BACKEND == "mysql":
+    if BACKEND in ("mysql", "mariadb"):
         p = mysql_parts()
         return f"mysql+aiomysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
     p = pg_parts(URL)
@@ -1123,8 +1131,8 @@ def _median_runs(runner, is_async: bool) -> dict:
 def main():
     if BACKEND == "postgres":
         target = URL
-    elif BACKEND == "mysql":
-        target = MYSQL_URL
+    elif BACKEND in ("mysql", "mariadb"):
+        target = mysql_family_url()
     else:
         target = f"sqlite ({SQLITE_DIR})"
     print(

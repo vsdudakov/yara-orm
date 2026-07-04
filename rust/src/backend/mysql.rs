@@ -1,13 +1,17 @@
 //! MySQL backend built on mysql_async (pure-Rust driver with its own pool).
 //!
-//! # No `RETURNING`
+//! # MySQL vs MariaDB (`RETURNING`)
 //!
-//! MySQL has no `INSERT ... RETURNING`. The model layer compiles inserts
-//! without a RETURNING clause on this dialect and still calls `fetch_row` on
-//! them; to keep that contract, a statement that yields **no result set** but
-//! *did* generate an auto-increment id returns a single synthetic row
-//! `[last_insert_id]` (see [`run_fetch`]). Statements that generate no id
-//! (UPDATE/DELETE/explicit-pk INSERT) return no rows, exactly like PostgreSQL.
+//! This one backend serves both MySQL and MariaDB (same wire protocol/driver);
+//! the server is detected at connect (see [`dialect_from_version`]) and the
+//! reported [`Backend::dialect`] steers SQL generation. MySQL has no
+//! `INSERT ... RETURNING`, so on it the model layer compiles inserts without a
+//! RETURNING clause and still calls `fetch_row`; to keep that contract, a
+//! statement that yields **no result set** but *did* generate an auto-increment
+//! id returns a single synthetic row `[last_insert_id]` (see [`run_fetch`]).
+//! MariaDB 10.5+ *does* support `RETURNING`, so the model layer emits it there
+//! and [`run_fetch`] returns the real result set unchanged. Statements that
+//! generate no id (UPDATE/DELETE/explicit-pk INSERT) return no rows either way.
 //!
 //! # Timezones
 //!
@@ -41,8 +45,8 @@ const DEFAULT_MAX_SIZE: usize = 16;
 /// [`EngineError::Integrity`] so they reach Python as `IntegrityError`:
 /// 1062/1586 duplicate key, 1452 FK insert/update, 1451 FK delete (row still
 /// referenced), 1216/1217 legacy FK codes, 1048/1364 NOT NULL (explicit NULL /
-/// omitted column under strict mode), 3819 CHECK.
-const INTEGRITY_CODES: &[u16] = &[1062, 1586, 1452, 1451, 1216, 1217, 1048, 1364, 3819];
+/// omitted column under strict mode), 3819 CHECK (MySQL), 4025 CHECK (MariaDB).
+const INTEGRITY_CODES: &[u16] = &[1062, 1586, 1452, 1451, 1216, 1217, 1048, 1364, 3819, 4025];
 
 /// Map a mysql_async error, promoting constraint violations to `Integrity`.
 /// Deadlocks (1213) and lock-wait timeouts (1205) stay `Query`, which the
@@ -337,6 +341,30 @@ fn to_named(names: &[Arc<str>], rows: Vec<Vec<Value>>) -> Vec<Row> {
 
 pub struct MySqlBackend {
     pool: Pool,
+    /// Resolved SQL dialect for this server: `"mariadb"` for MariaDB 10.5+
+    /// (which supports `INSERT ... RETURNING`), `"mysql"` otherwise — detected
+    /// once from `SELECT VERSION()` at connect (see [`dialect_from_version`]).
+    dialect: &'static str,
+}
+
+/// Pick the dialect name for a live MySQL-family server from its `VERSION()`
+/// string. MariaDB gained `INSERT ... RETURNING` in 10.5, so a MariaDB server
+/// at 10.5 or newer gets the `"mariadb"` dialect (which emits RETURNING);
+/// MySQL and pre-10.5 MariaDB fall back to `"mysql"` (the last_insert_id path).
+fn dialect_from_version(version: &str) -> &'static str {
+    if !version.to_ascii_lowercase().contains("mariadb") {
+        return "mysql";
+    }
+    // The leading token is `MAJOR.MINOR.PATCH`, e.g. "10.5.9-MariaDB-1:..." or
+    // "11.4.2-MariaDB"; a missing/unparsable component reads as 0.
+    let mut nums = version.split('-').next().unwrap_or("").split('.');
+    let major: u32 = nums.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let minor: u32 = nums.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if major > 10 || (major == 10 && minor >= 5) {
+        "mariadb"
+    } else {
+        "mysql"
+    }
 }
 
 impl MySqlBackend {
@@ -405,9 +433,22 @@ impl MySqlBackend {
                     .map_err(|e| EngineError::Connection(redact(e.to_string(), url)))?,
             );
         }
+
+        // Detect MariaDB vs MySQL once, on an already-warmed connection, so the
+        // model layer can emit `RETURNING` against MariaDB 10.5+ (see
+        // [`dialect_from_version`]). `held` always holds at least one conn.
+        let version: Option<String> = held[0]
+            .query_first("SELECT VERSION()")
+            .await
+            .map_err(map_mysql)?;
+        let dialect = version
+            .as_deref()
+            .map(dialect_from_version)
+            .unwrap_or("mysql");
+
         drop(held); // return the warmed connections to the pool as idle
 
-        Ok(Self { pool })
+        Ok(Self { pool, dialect })
     }
 
     async fn conn(&self) -> Result<Conn, EngineError> {
@@ -494,7 +535,7 @@ impl Backend for MySqlBackend {
     }
 
     fn dialect(&self) -> &'static str {
-        "mysql"
+        self.dialect
     }
 
     async fn close(&self) {
@@ -869,5 +910,25 @@ mod tests {
     fn empty_params_bind_as_params_empty() {
         assert!(matches!(to_params(&[]), Params::Empty));
         assert!(matches!(to_params(&[Value::Int(1)]), Params::Positional(_)));
+    }
+
+    #[test]
+    fn dialect_detected_from_version_string() {
+        // MySQL of any version -> "mysql".
+        assert_eq!(dialect_from_version("8.4.0"), "mysql");
+        assert_eq!(dialect_from_version("5.7.44-log"), "mysql");
+        // MariaDB 10.5+ -> "mariadb" (has RETURNING).
+        assert_eq!(
+            dialect_from_version("10.5.9-MariaDB-1:10.5.9+maria~focal"),
+            "mariadb"
+        );
+        assert_eq!(dialect_from_version("11.4.2-MariaDB"), "mariadb");
+        assert_eq!(dialect_from_version("10.11.6-MariaDB-log"), "mariadb");
+        // Pre-10.5 MariaDB has no RETURNING -> "mysql" fallback.
+        assert_eq!(dialect_from_version("10.4.34-MariaDB"), "mysql");
+        assert_eq!(dialect_from_version("10.3.39-MariaDB-log"), "mysql");
+        // Case-insensitive vendor match; unparsable version reads as pre-10.5.
+        assert_eq!(dialect_from_version("10.6.0-mariadb"), "mariadb");
+        assert_eq!(dialect_from_version("garbage"), "mysql");
     }
 }

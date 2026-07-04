@@ -374,6 +374,11 @@ class FieldKindRegistration:
         try:
             return self.sql[dialect_name]
         except KeyError:
+            # MariaDB is MySQL-compatible for column types, so a kind registered
+            # only for "mysql" applies unchanged — fall back rather than force
+            # every registration to duplicate the entry under "mariadb".
+            if dialect_name == "mariadb" and "mysql" in self.sql:
+                return self.sql["mysql"]
             raise ConfigurationError(
                 f"field kind {self.kind!r} has no SQL type template for dialect "
                 f"{dialect_name!r} (registered dialects: {sorted(self.sql)})"
