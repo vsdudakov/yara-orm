@@ -2644,6 +2644,24 @@ def _float_from_db(value: Any) -> Any:
     return None if value is None else float(value)
 
 
+def _int_from_db(value: Any) -> Any:
+    """Coerce an integer column to a Python ``int``.
+
+    A row-decoded ``NUMBER`` already arrives as ``int``, but a ``RETURNING``
+    OUT bind is declared ``VARCHAR2`` and hands the pk back as text (e.g.
+    ``"1"``); integer fields are ``read_identity`` on every other backend, so
+    the model layer would otherwise assign that string verbatim. ``int(...)``
+    is a no-op on a value that is already an ``int``.
+
+    Args:
+        value: The raw column value (an ``int`` or numeric string, or None).
+
+    Returns:
+        The value as an ``int`` (None passes through).
+    """
+    return None if value is None else int(value)
+
+
 class OracleDialect(BaseDialect):
     """Dialect rendering SQL for Oracle Database (23ai and compatible).
 
@@ -2795,6 +2813,9 @@ class OracleDialect(BaseDialect):
             "json": _json_from_db,
             "time": _time_from_db,
             "float": _float_from_db,
+            "smallint": _int_from_db,
+            "int": _int_from_db,
+            "bigint": _int_from_db,
         }.get(kind)
         if extra is None:
             return base
