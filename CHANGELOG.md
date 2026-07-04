@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-07-04
+
 ### Performance
 
 - **PostgreSQL: TLS connector is built once per process, not per `init()`.**
