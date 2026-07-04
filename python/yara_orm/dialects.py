@@ -9,6 +9,7 @@ registering it -- the model and queryset layers never change.
 from __future__ import annotations
 
 import datetime as _dt
+import json as _json
 import re
 import uuid as _uuid
 from collections.abc import Callable, Sequence
@@ -163,6 +164,10 @@ class BaseDialect:
     #: (PostgreSQL/MySQL); on SQLite the whole database locks instead, so the
     #: clause is dropped.
     supports_for_update = False
+    #: Whether ``FOR UPDATE OF <table>`` (locking only specific tables of a
+    #: join) is accepted. MariaDB has no such syntax — it locks every table in
+    #: the statement — so its dialect drops the ``OF`` target.
+    supports_for_update_of = True
     #: Whether an UPDATE/DELETE that subqueries its *own* table must wrap that
     #: subquery in a derived table. MySQL rejects the direct form ("You can't
     #: specify target table ... for update in FROM clause", error 1093).
@@ -2356,10 +2361,96 @@ class MySQLDialect(BaseDialect):
         raise UnSupportedError("mysql cannot RENAME a constraint; drop and re-add it")
 
 
+class MariaDbDialect(MySQLDialect):
+    """MariaDB dialect: MySQL wire/SQL compatible, but with ``RETURNING``.
+
+    MariaDB shares MySQL's protocol, driver and SQL, so this reuses the whole
+    :class:`MySQLDialect` behaviour and changes only one thing: MariaDB 10.5+
+    supports ``INSERT ... RETURNING``, so the model layer emits it (instead of
+    the MySQL last_insert_id follow-up) and reads generated primary keys and
+    ``Meta.fetch_db_defaults`` columns straight back from the insert.
+
+    The engine selects this dialect automatically: the MySQL backend probes
+    ``SELECT VERSION()`` at connect and reports ``"mariadb"`` for a MariaDB
+    server at 10.5 or newer (older MariaDB, which lacks ``RETURNING``, stays on
+    the ``"mysql"`` dialect). Both ``mariadb://`` and ``mysql://`` URLs work.
+    """
+
+    name = "mariadb"
+    supports_insert_returning = True
+    #: MariaDB has no ``FOR UPDATE OF <table>``; it locks the whole statement.
+    supports_for_update_of = False
+
+    def regex_sql(self, op: str, col: str, placeholder: str) -> str:
+        """Render a regex lookup via MariaDB's PCRE ``REGEXP`` operator.
+
+        MariaDB has no ``REGEXP_LIKE`` function (MySQL 8 only); its ``REGEXP``
+        follows the operand collation for case (usually case-insensitive), so an
+        inline PCRE flag pins the case semantics regardless of collation:
+        ``(?-i)`` (case-sensitive) for ``regex``/``posix_regex``, ``(?i)`` for
+        the ``i``-variants.
+
+        Args:
+            op: The lookup name.
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A ``col REGEXP CONCAT('(?flag)', ?)`` expression.
+        """
+        flag = "(?i)" if op in ("iregex", "iposix_regex") else "(?-i)"
+        return f"{col} REGEXP CONCAT('{flag}', {placeholder})"
+
+    def read_decoder(self, field: Field) -> Callable[[Any], Any] | None:
+        """Decode MariaDB values, parsing ``JSON`` columns from text.
+
+        MariaDB implements ``JSON`` as an alias for ``LONGTEXT`` (no native JSON
+        type flag on the wire, unlike MySQL 8), so the engine returns the raw
+        JSON text; parse it here so a ``JSONField`` hydrates to the same Python
+        object it does on every other backend. The field's own ``to_python``
+        still runs, so any ``decoder`` hook applies to the parsed value. All
+        other kinds (uuid/datetime/identity) defer to :class:`MySQLDialect`.
+
+        Args:
+            field: The field whose column is being decoded.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        if field.field_kind == "json":
+            to_python = field.to_python
+            return lambda value, _tp=to_python: _tp(
+                _json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+            )
+        return super().read_decoder(field)
+
+    def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
+        """Render the MariaDB upsert clause for ``bulk_create``.
+
+        MariaDB never adopted MySQL 8.0.19's ``... AS new`` row-alias syntax;
+        it keeps the classic ``VALUES(col)`` function, so the upsert reads
+        ``ON DUPLICATE KEY UPDATE col = VALUES(col)``. Without update columns,
+        conflict skipping is spelled on the INSERT verb (``INSERT IGNORE``), so
+        the clause is empty.
+
+        Args:
+            conflict_columns: Ignored — MySQL/MariaDB have no conflict target.
+            update_columns: The columns to overwrite on a duplicate key.
+
+        Returns:
+            The upsert clause (leading space included), or ``""``.
+        """
+        if not update_columns:
+            return ""
+        sets = ", ".join(f"{self.quote(c)} = VALUES({self.quote(c)})" for c in update_columns)
+        return f" ON DUPLICATE KEY UPDATE {sets}"
+
+
 _DIALECTS: dict[str, type[BaseDialect]] = {
     "postgres": PostgresDialect,
     "sqlite": SqliteDialect,
     "mysql": MySQLDialect,
+    "mariadb": MariaDbDialect,
 }
 
 

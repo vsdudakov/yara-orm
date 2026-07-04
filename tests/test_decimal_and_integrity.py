@@ -78,14 +78,14 @@ async def test_decimal_column_type(db):
     TEXT-affinity VARCHAR (never a lossy floating type)
     """
     engine = get_engine()
-    if db in ("postgres", "mysql"):
+    if db in ("postgres", "mysql", "mariadb"):
         rows = await engine.fetch_rows(
             "SELECT data_type, numeric_precision, numeric_scale "
             "FROM information_schema.columns "
             "WHERE table_name = 'dec_acct' AND column_name = 'balance'"
         )
         data_type, precision, scale = rows[0]
-        assert data_type.lower() == ("decimal" if db == "mysql" else "numeric")
+        assert data_type.lower() == ("decimal" if db in ("mysql", "mariadb") else "numeric")
         assert (int(precision), int(scale)) == (30, 10)
     else:
         rows = await engine.fetch_rows("SELECT sql FROM sqlite_master WHERE name = 'dec_acct'")

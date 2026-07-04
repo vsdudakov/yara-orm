@@ -67,7 +67,7 @@ async def test_composite_index_created(db):
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'mc_slot'"
         )
         defs = " ".join(r[0] for r in rows)
-    elif db == "mysql":
+    elif db in ("mysql", "mariadb"):
         rows = await engine.fetch_rows(
             "SELECT index_name, column_name FROM information_schema.statistics "
             "WHERE table_name = 'mc_slot'"

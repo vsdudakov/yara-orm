@@ -1438,7 +1438,7 @@ class QuerySet(Generic[ModelT]):
         if not (self._for_update and dialect.supports_for_update):
             return ""
         parts = ["FOR UPDATE"]
-        if self._for_update_of:
+        if self._for_update_of and dialect.supports_for_update_of:
             parts.append("OF " + ", ".join(dialect.quote(n) for n in self._for_update_of))
         if self._for_update_nowait:
             parts.append("NOWAIT")
@@ -2010,9 +2010,11 @@ class QuerySet(Generic[ModelT]):
             ]
             group = " GROUP BY " + ", ".join(group_refs)
         lock = self._lock_sql(dialect)
-        if lock and joins and not self._for_update_of:
+        if lock and joins and not self._for_update_of and dialect.supports_for_update_of:
             # PostgreSQL rejects FOR UPDATE on the nullable side of a LEFT
             # JOIN, so with joined relations lock only the base table's rows.
+            # MariaDB has no FOR UPDATE OF (and doesn't need it — plain
+            # FOR UPDATE over a join locks the matched rows), so it is skipped.
             lock = lock.replace("FOR UPDATE", f"FOR UPDATE OF {table}", 1)
         sql = (
             f"SELECT {', '.join(select)} FROM {table}{''.join(joins)}{extra_joins}{where}"
@@ -2253,9 +2255,11 @@ class QuerySet(Generic[ModelT]):
         table = dialect.quote(meta.table)
         distinct = "DISTINCT " if self._distinct else ""
         lock = self._lock_sql(dialect)
-        if lock and joins and not self._for_update_of:
+        if lock and joins and not self._for_update_of and dialect.supports_for_update_of:
             # PostgreSQL rejects FOR UPDATE on the nullable side of a LEFT
             # JOIN, so with joined relations lock only the base table's rows.
+            # MariaDB has no FOR UPDATE OF (and doesn't need it — plain
+            # FOR UPDATE over a join locks the matched rows), so it is skipped.
             lock = lock.replace("FOR UPDATE", f"FOR UPDATE OF {table}", 1)
         sql = (
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"

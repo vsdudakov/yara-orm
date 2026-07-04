@@ -10,7 +10,7 @@ avoid collisions with the rest of the suite.
 import pytest
 
 from yara_orm import IsolationLevel, Model, fields, in_transaction
-from yara_orm.connection import _active_tx, connections
+from yara_orm.connection import _active_tx, connections, get_dialect
 from yara_orm.exceptions import TransactionManagementError
 from yara_orm.transactions import atomic
 
@@ -173,12 +173,17 @@ async def test_select_for_update_sql_per_backend(db):
     none (no-op)
     """
     base = MtTxAcct.filter(balance__gt=0)
-    if db in ("postgres", "mysql"):
+    if db in ("postgres", "mysql", "mariadb"):
         assert base.select_for_update().sql().rstrip().endswith("FOR UPDATE")
         assert "NOWAIT" in base.select_for_update(nowait=True).sql()
         assert "SKIP LOCKED" in base.select_for_update(skip_locked=True).sql()
         of_sql = base.select_for_update(of=("mt_tx_acct",)).sql()
-        assert "FOR UPDATE OF" in of_sql
+        if get_dialect(MtTxAcct).supports_for_update_of:
+            assert "FOR UPDATE OF" in of_sql
+        else:
+            # MariaDB has no FOR UPDATE OF; the OF target is dropped and it
+            # locks every table in the statement instead.
+            assert of_sql.rstrip().endswith("FOR UPDATE")
         # nowait wins over skip_locked when both are set.
         both = base.select_for_update(nowait=True, skip_locked=True).sql()
         assert "NOWAIT" in both and "SKIP LOCKED" not in both

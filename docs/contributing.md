@@ -38,7 +38,7 @@ make bench      # cross-ORM benchmark (see benchmarks/)
 !!! warning "Both must be green before a PR"
     Pull requests are expected to pass **`make lint`** (ruff + ty clean) and **`make cov`**
     (100% statement *and* branch coverage). CI runs the same checks on Python 3.12–3.14
-    against PostgreSQL, MySQL and SQLite.
+    against PostgreSQL, MySQL, MariaDB and SQLite.
 
 ## Project layout
 

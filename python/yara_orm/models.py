@@ -1222,7 +1222,8 @@ class Model(metaclass=ModelMeta):
                 ]
                 row = await executor.fetch_row(meta.insert_sql, params)
                 for field, value in zip(meta.insert_returning_fields, row):
-                    setattr(self, field.model_field_name, field.to_python(value))
+                    decode = meta._read_decoders.get(field.model_field_name)
+                    setattr(self, field.model_field_name, decode(value) if decode else value)
                 self._in_db = True
                 if meta.insert_refresh_sql:
                     # fetch_db_defaults without RETURNING (MySQL): read the
@@ -1256,7 +1257,8 @@ class Model(metaclass=ModelMeta):
                 )
                 row = await executor.fetch_row(f"{sql} RETURNING {returning}", params)
                 for field, value in zip(meta.insert_returning_fields, row):
-                    setattr(self, field.model_field_name, field.to_python(value))
+                    decode = meta._read_decoders.get(field.model_field_name)
+                    setattr(self, field.model_field_name, decode(value) if decode else value)
             elif pk_unset:
                 # No RETURNING (MySQL): the backend returns the auto-increment
                 # id as a synthetic single-value row.

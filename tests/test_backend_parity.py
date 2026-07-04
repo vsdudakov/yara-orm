@@ -173,7 +173,7 @@ async def test_full_field_round_trip(db):
     assert got.ratio == 2.5
     assert got.price == Decimal("12345.678")
     expected_utc = aware.astimezone(dt.timezone.utc)
-    if db == "mysql":
+    if db in ("mysql", "mariadb"):
         # DATETIME is naive: the aware value is stored as its UTC instant.
         assert got.when == expected_utc.replace(tzinfo=None)
     else:
@@ -411,7 +411,7 @@ async def test_search_lookup_per_backend(db):
         with pytest.raises(UnSupportedError):
             await MyEverything.filter(body__search="foxes").count()
         return
-    if db == "mysql":
+    if db in ("mysql", "mariadb"):
         # MATCH ... AGAINST needs a FULLTEXT index; models can declare it as
         # Index(fields=["body"], using="fulltext") — added here via ALTER so
         # the shared model stays creatable on PostgreSQL (no fulltext method).

@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: How Yara ORM works — a Python model layer over a compiled Rust engine (PyO3 + tokio) with pluggable PostgreSQL, MySQL and SQLite backends.
+description: How Yara ORM works — a Python model layer over a compiled Rust engine (PyO3 + tokio) with pluggable PostgreSQL, MySQL, MariaDB and SQLite backends.
 ---
 
 # Architecture
@@ -62,7 +62,7 @@ Backends plug in at exactly two seams, and the model layer never changes:
 2. **Python** — add a [`BaseDialect`](guides/migrations.md) subclass in
    `python/yara_orm/dialects.py` and register it with `register_dialect(name, DialectClass)`.
 
-See [Backends](backends/index.md) for how PostgreSQL, MySQL and SQLite use these seams —
+See [Backends](backends/index.md) for how PostgreSQL, MySQL, MariaDB and SQLite use these seams —
 the MySQL backend is the most recent worked example of both.
 
 ## Distribution

@@ -14,12 +14,16 @@ from yara_orm.connection import get_engine
 # Per-backend connection URLs, overridable via the environment.
 PG_URL = os.environ.get("ORM_TEST_DB", "postgres://localhost/orm_demo")
 MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/orm_demo")
+# MariaDB shares the MySQL driver/wire protocol but is a distinct backend (it
+# adds RETURNING and diverges on JSON/regex/upsert/FOR UPDATE OF), so it runs as
+# its own parametrisation against a separate server.
+MARIADB_URL = os.environ.get("ORM_TEST_MARIADB", "mariadb://root:root@localhost:3307/orm_demo")
 
 # Backends every ``db``-parametrised test runs against. Override to scope a run
 # (e.g. ``ORM_TEST_BACKENDS=sqlite``); extend by adding a branch in
-# ``_setup_backend`` when a new backend lands. The mysql backend skips itself
-# when no server is reachable at MYSQL_URL (see ``mysql_reachable``).
-TEST_BACKENDS = os.environ.get("ORM_TEST_BACKENDS", "sqlite,postgres,mysql").split(",")
+# ``_setup_backend`` when a new backend lands. Each networked backend skips
+# itself when no server is reachable at its URL (see ``*_reachable``).
+TEST_BACKENDS = os.environ.get("ORM_TEST_BACKENDS", "sqlite,postgres,mysql,mariadb").split(",")
 
 
 def _tcp_reachable(url: str, default_port: int) -> bool:
@@ -70,6 +74,16 @@ def mysql_reachable() -> bool:
         True when a TCP connection to the MYSQL_URL host/port succeeds.
     """
     return _tcp_reachable(MYSQL_URL, 3306)
+
+
+@functools.cache
+def mariadb_reachable() -> bool:
+    """Probe the configured MariaDB host/port once per test session.
+
+    Returns:
+        True when a TCP connection to the MARIADB_URL host/port succeeds.
+    """
+    return _tcp_reachable(MARIADB_URL, 3306)
 
 
 @pytest_asyncio.fixture
@@ -221,6 +235,17 @@ async def _setup_backend(backend: str, models: list):
             pytest.skip(f"MySQL server not reachable at {MYSQL_URL}")
         await YaraOrm.init(MYSQL_URL)
         await _drop_tables_mysql(tables)
+        await YaraOrm.generate_schemas(models=models)
+        try:
+            yield backend
+        finally:
+            await _drop_tables_mysql(tables)
+            await YaraOrm.close()
+    elif backend == "mariadb":
+        if not mariadb_reachable():
+            pytest.skip(f"MariaDB server not reachable at {MARIADB_URL}")
+        await YaraOrm.init(MARIADB_URL)
+        await _drop_tables_mysql(tables)  # MariaDB shares MySQL's DDL/teardown
         await YaraOrm.generate_schemas(models=models)
         try:
             yield backend

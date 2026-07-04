@@ -54,7 +54,7 @@ async def test_aware_offset_roundtrip(db):
     """
     value = dt.datetime(2021, 6, 15, 12, 30, 45, 123456, tzinfo=PLUS5)
     out = await _roundtrip(value)
-    if db == "mysql":
+    if db in ("mysql", "mariadb"):
         assert out.tzinfo is None
         assert out == value.astimezone(UTC).replace(tzinfo=None)
     else:
@@ -72,7 +72,7 @@ async def test_various_offsets_same_instant(db, tz):
     """
     value = dt.datetime(2022, 1, 1, 0, 0, 0, tzinfo=tz)
     out = await _roundtrip(value)
-    if db == "mysql":
+    if db in ("mysql", "mariadb"):
         # DATETIME is naive: every offset stores as the same UTC instant.
         assert out == value.astimezone(UTC).replace(tzinfo=None)
     else:

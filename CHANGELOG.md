@@ -6,6 +6,34 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **MariaDB support — first-class backend.**
+  `await YaraOrm.init("mariadb://user:pass@host:3306/db")` (or a plain
+  `mysql://` URL pointing at a MariaDB server) now runs end to end against
+  MariaDB 10.5+. The MySQL backend detects the server via `SELECT VERSION()` at
+  connect and switches to a dedicated `MariaDbDialect` that uses MariaDB's
+  `INSERT ... RETURNING` (primary-key and database-default backfill straight
+  from the insert), its classic `ON DUPLICATE KEY UPDATE col = VALUES(col)`
+  upsert (MariaDB has no MySQL 8 `AS new` row alias), PCRE `REGEXP` lookups
+  (no `REGEXP_LIKE`), JSON decoding from `LONGTEXT`, and MariaDB's CHECK-
+  constraint error code. `FOR UPDATE OF <table>` (unsupported by MariaDB) is
+  dropped to a plain `FOR UPDATE`. MariaDB is part of the test matrix and CI
+  alongside PostgreSQL, MySQL and SQLite.
+- **Cross-ORM benchmark expanded to nine ORMs.** `benchmarks/bench.py` now
+  compares yara-orm against Django, Peewee, SQLObject, Ormar and Piccolo in
+  addition to Tortoise, SQLAlchemy and Pony, across PostgreSQL, MySQL, MariaDB
+  and SQLite (`BENCH_BACKEND=mariadb`).
+
+### Fixed
+
+- **`INSERT ... RETURNING` backfill decodes through the dialect read decoder.**
+  Values read back from a RETURNING insert now pass through the same decoder as
+  a SELECT, so a database-generated UUID primary key stored in a `CHAR(36)`/text
+  column hydrates as `uuid.UUID` rather than a raw string. Surfaced by MariaDB's
+  RETURNING support; applies to any backend whose RETURNING returns a
+  non-native column type.
+
 ## [1.13.1] - 2026-07-04
 
 ### Performance
