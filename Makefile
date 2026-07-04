@@ -31,22 +31,23 @@ cov: build
 example: build
 	ORM_TEST_DB=$(DB) $(PY) examples/basic.py
 
-# 3-way benchmark vs Tortoise + Pony. Pony needs Python <= 3.12, so this target
+# Cross-ORM benchmark vs eight other ORMs (Tortoise, SQLAlchemy, Pony, Django,
+# Peewee, SQLObject, Ormar, Piccolo). Pony needs Python <= 3.12, so this target
 # uses a separate 3.12 venv (.venv312). Run `make bench-setup` once first.
 bench-setup:
 	python3.12 -m venv .venv312
-	.venv312/bin/pip install -U pip maturin tortoise-orm "sqlalchemy[asyncio]" asyncpg aiosqlite pony psycopg2-binary
+	.venv312/bin/pip install -U pip maturin tortoise-orm "sqlalchemy[asyncio]" asyncpg aiosqlite pony psycopg2-binary django peewee sqlobject ormar piccolo
 	VIRTUAL_ENV=$(PWD)/.venv312 .venv312/bin/maturin develop --release
 
 bench:
 	ORM_TEST_DB=$(DB) .venv312/bin/python benchmarks/bench.py
 
-# Same 4-way comparison on SQLite (each ORM gets its own file in /tmp).
+# Same comparison on SQLite (each ORM gets its own file in /tmp).
 bench-sqlite:
 	.venv312/bin/pip install -q -U aiosqlite
 	BENCH_BACKEND=sqlite .venv312/bin/python benchmarks/bench.py
 
-# Same 4-way comparison on MySQL (ORM_TEST_MYSQL, default the local yara-mysql
+# Same comparison on MySQL (ORM_TEST_MYSQL, default the local yara-mysql
 # container). Missing competitor drivers are reported as `-`.
 bench-mysql:
 	.venv312/bin/pip install -q -U asyncmy aiomysql pymysql cryptography

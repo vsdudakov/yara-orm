@@ -1,6 +1,6 @@
 """Feature micro-benchmarks for `yara-orm` only (no cross-ORM comparison).
 
-These cover what the 4-way ``bench.py`` suite intentionally skips because it is
+These cover what the cross-ORM ``bench.py`` suite intentionally skips because it is
 not comparable across ORMs and feature sets:
 
 * **transactions** — autocommit vs one transaction vs a nested savepoint per

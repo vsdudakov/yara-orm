@@ -32,7 +32,7 @@ make build      # compile the Rust engine into the venv (maturin develop --relea
 make lint       # ruff check + ruff format --check + ty
 make test       # pytest against $DB (default postgres://localhost/orm_demo)
 make cov        # tests with the 100% coverage gate
-make bench      # 4-way benchmark (see benchmarks/)
+make bench      # cross-ORM benchmark (see benchmarks/)
 ```
 
 !!! warning "Both must be green before a PR"
@@ -47,7 +47,7 @@ make bench      # 4-way benchmark (see benchmarks/)
 | `python/yara_orm/` | The Python ORM layer (models, fields, queryset, dialects, migrations). |
 | `rust/src/` | The Rust engine (Engine, Backend trait, Pg/MySQL/SQLite backends, Value). |
 | `tests/` | End-to-end tests (mocks kept to a minimum). |
-| `benchmarks/` | The 4-way benchmark script and methodology. |
+| `benchmarks/` | The cross-ORM benchmark script and methodology. |
 | `docs/` | This documentation site (MkDocs Material). |
 
 ## Tests & coverage

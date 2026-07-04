@@ -51,7 +51,7 @@ print(await User.filter(name__icontains="ad").count())
 - :truck: **Migrations** — operation-based, auto-generated and backend-portable
   (`makemigrations` / `upgrade` / `downgrade`).
 - :test_tube: **Quality** — fully typed, linted (ruff + ty) and **100% test coverage**.
-- :rocket: **Fast** — **2–9× faster** than Tortoise ORM, async SQLAlchemy and Pony on
+- :rocket: **Fast** — fastest or tied against **eight other Python ORMs** (Tortoise, SQLAlchemy, Pony, Django, Peewee, SQLObject, Ormar, Piccolo) on
   common operations. See [Performance](performance.md).
 
 ## Installation

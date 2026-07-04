@@ -1,10 +1,13 @@
-"""Benchmark: this library (`yara-orm`) vs Tortoise ORM vs Pony ORM.
+"""Benchmark: this library (`yara-orm`) vs eight other Python ORMs.
 
+Competitors: Tortoise, SQLAlchemy, Pony, Django, Peewee, SQLObject, Ormar, Piccolo.
 Identical workloads run against the same database, each ORM in its own table.
 Times are wall-clock for the warm path (drivers/prepared-statement caches are
 hit once before measuring). This is throughput-oriented and not a micro-
-benchmark: sync (Pony) vs async (Tortoise, yara-orm) and differing feature sets mean
-results are indicative, not absolute. Methodology is printed with the results.
+benchmark: sync (Pony, Django, Peewee, SQLObject) vs async (Tortoise, SQLAlchemy,
+Ormar, Piccolo, yara-orm) and differing feature sets mean results are indicative,
+not absolute. Any ORM that isn't installed (or can't serve the chosen backend) is
+skipped and shown as "-". Methodology is printed with the results.
 
 Usage:
     ORM_TEST_DB=postgres://user@localhost/orm_demo python benchmarks/bench.py
@@ -539,6 +542,557 @@ async def run_sqlalchemy() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Django ORM (synchronous)
+# ---------------------------------------------------------------------------
+# Django needs its settings configured (and ``django.setup()`` run) *before* any
+# model class is defined, so both happen at import time. The model declares an
+# explicit ``app_label`` so it can live in this standalone script with no app in
+# ``INSTALLED_APPS`` — the documented pattern for using the ORM outside a project.
+def _django_db() -> dict:
+    if BACKEND == "sqlite":
+        return {"ENGINE": "django.db.backends.sqlite3", "NAME": f"{SQLITE_DIR}/bench_django.db"}
+    if BACKEND == "mysql":
+        import pymysql
+
+        pymysql.install_as_MySQLdb()
+        p = mysql_parts()
+        return {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": p["database"],
+            "USER": p["user"],
+            "PASSWORD": p["password"] or "",
+            "HOST": p["host"],
+            "PORT": str(p["port"]),
+        }
+    p = pg_parts(URL)
+    return {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": p["database"],
+        "USER": p["user"],
+        "PASSWORD": p["password"] or "",
+        "HOST": p["host"],
+        "PORT": str(p["port"]),
+    }
+
+
+try:
+    import django
+    from django.conf import settings as _dj_settings
+
+    if not _dj_settings.configured:
+        _dj_settings.configure(INSTALLED_APPS=[], USE_TZ=True, DATABASES={"default": _django_db()})
+        django.setup()
+
+    from django.db import connection as _dj_connection
+    from django.db import models as _dj_models
+    from django.db.models import Count as DjCount
+    from django.db.models import Sum as DjSum
+
+    class BDjango(_dj_models.Model):
+        name = _dj_models.CharField(max_length=50)
+        value = _dj_models.IntegerField()
+        cat = _dj_models.IntegerField()
+        created = _dj_models.DateTimeField(auto_now_add=True)
+
+        class Meta:
+            app_label = "bench"
+            db_table = "bench_django"
+
+except ImportError:  # pragma: no cover
+    BDjango = None
+
+
+def run_django() -> dict:
+    if BDjango is None:
+        raise RuntimeError("django is not installed")
+
+    with _dj_connection.cursor() as cur:
+        cur.execute(drop_sql("bench_django"))
+    with _dj_connection.schema_editor() as se:
+        se.create_model(BDjango)
+
+    res: dict = {}
+
+    objs = [BDjango(name=f"n{i}", value=i, cat=i % CATS) for i in range(N)]
+    with _Stopwatch() as sw:
+        BDjango.objects.bulk_create(objs)
+    res["bulk_insert"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        agg = list(
+            BDjango.objects.values("cat")
+            .annotate(n=DjCount("id"), s=DjSum("value"))
+            .filter(n__gt=TH)
+            .order_by("cat")
+        )
+    res["group_by"] = sw.elapsed
+    assert len(agg) == CATS
+
+    with _Stopwatch() as sw:
+        rows = list(BDjango.objects.all())
+    res["fetch_all"] = sw.elapsed
+    assert len(rows) == N
+
+    with _Stopwatch() as sw:
+        total = BDjango.objects.count()
+    res["count"] = sw.elapsed
+    assert total == N
+
+    with _Stopwatch() as sw:
+        rows = list(BDjango.objects.filter(value__gte=HALF))
+    res["filter"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        for pk in PK_SEQUENCE:
+            BDjango.objects.get(id=pk)
+    res["get_by_pk"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        BDjango.objects.filter(value__lt=HALF).update(value=0)
+    res["update"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        BDjango.objects.filter(value__gte=HALF).delete()
+    res["delete"] = sw.elapsed
+
+    with _dj_connection.cursor() as cur:
+        cur.execute(clear_sql("bench_django"))
+    with _Stopwatch() as sw:
+        for i in range(S):
+            BDjango.objects.create(name=f"s{i}", value=i, cat=i % CATS)
+    res["single_insert"] = sw.elapsed
+
+    _dj_connection.close()
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Peewee (synchronous)
+# ---------------------------------------------------------------------------
+try:
+    import peewee as _pw
+
+    _pw_db = _pw.DatabaseProxy()  # bound to a concrete database inside the runner
+
+    class BPeewee(_pw.Model):
+        name = _pw.CharField(max_length=50)
+        value = _pw.IntegerField()
+        cat = _pw.IntegerField()
+        created = _pw.DateTimeField(null=True)
+
+        class Meta:
+            database = _pw_db
+            table_name = "bench_peewee"
+
+except ImportError:  # pragma: no cover
+    BPeewee = None
+
+
+def run_peewee() -> dict:
+    if BPeewee is None:
+        raise RuntimeError("peewee is not installed")
+
+    if BACKEND == "sqlite":
+        db = _pw.SqliteDatabase(f"{SQLITE_DIR}/bench_peewee.db")
+    elif BACKEND == "mysql":
+        p = mysql_parts()
+        db = _pw.MySQLDatabase(
+            p["database"],
+            user=p["user"],
+            password=p["password"] or "",
+            host=p["host"],
+            port=p["port"],
+        )
+    else:
+        p = pg_parts(URL)
+        db = _pw.PostgresqlDatabase(
+            p["database"], user=p["user"], password=p["password"], host=p["host"], port=p["port"]
+        )
+    _pw_db.initialize(db)
+    db.connect(reuse_if_open=True)
+    db.execute_sql(drop_sql("bench_peewee"))
+    db.create_tables([BPeewee])
+
+    res: dict = {}
+
+    # SQLite caps bound parameters per statement; batch so multi-row INSERTs fit.
+    batch = 200 if BACKEND == "sqlite" else 900
+    objs = [BPeewee(name=f"n{i}", value=i, cat=i % CATS, created=NOW_NAIVE) for i in range(N)]
+    with _Stopwatch() as sw:
+        with db.atomic():
+            BPeewee.bulk_create(objs, batch_size=batch)
+    res["bulk_insert"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        q = (
+            BPeewee.select(
+                BPeewee.cat,
+                _pw.fn.COUNT(BPeewee.id).alias("n"),
+                _pw.fn.SUM(BPeewee.value).alias("s"),
+            )
+            .group_by(BPeewee.cat)
+            .having(_pw.fn.COUNT(BPeewee.id) > TH)
+            .order_by(BPeewee.cat)
+        )
+        agg = list(q.dicts())
+    res["group_by"] = sw.elapsed
+    assert len(agg) == CATS
+
+    with _Stopwatch() as sw:
+        rows = list(BPeewee.select())
+    res["fetch_all"] = sw.elapsed
+    assert len(rows) == N
+
+    with _Stopwatch() as sw:
+        total = BPeewee.select().count()
+    res["count"] = sw.elapsed
+    assert total == N
+
+    with _Stopwatch() as sw:
+        rows = list(BPeewee.select().where(BPeewee.value >= HALF))
+    res["filter"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        for pk in PK_SEQUENCE:
+            BPeewee.get_by_id(pk)
+    res["get_by_pk"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        BPeewee.update(value=0).where(BPeewee.value < HALF).execute()
+    res["update"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        BPeewee.delete().where(BPeewee.value >= HALF).execute()
+    res["delete"] = sw.elapsed
+
+    db.execute_sql(clear_sql("bench_peewee"))
+    with _Stopwatch() as sw:
+        for i in range(S):
+            BPeewee.create(name=f"s{i}", value=i, cat=i % CATS, created=NOW_NAIVE)
+    res["single_insert"] = sw.elapsed
+
+    db.close()
+    return res
+
+
+# ---------------------------------------------------------------------------
+# SQLObject (synchronous)
+# ---------------------------------------------------------------------------
+# SQLObject keeps an in-process identity map; ``?cache=false`` disables it so
+# every ``.get()`` hits the database, matching how the other ORMs are measured.
+def sqlobject_uri() -> str:
+    if BACKEND == "sqlite":
+        return f"sqlite://{SQLITE_DIR}/bench_sqlobject.db?cache=false"
+    if BACKEND == "mysql":
+        p = mysql_parts()
+        return f"mysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}?driver=pymysql&cache=false"
+    p = pg_parts(URL)
+    return f"postgres://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}?cache=false"
+
+
+try:
+    from sqlobject import DateTimeCol, IntCol, SQLObject, StringCol, connectionForURI
+    from sqlobject import sqlhub as _sqlhub
+
+    class BSQLObject(SQLObject):
+        class sqlmeta:
+            table = "bench_sqlobject"
+
+        name = StringCol(length=50)
+        value = IntCol()
+        cat = IntCol()
+        created = DateTimeCol(default=None)
+
+except ImportError:  # pragma: no cover
+    BSQLObject = None
+
+
+def run_sqlobject() -> dict:
+    if BSQLObject is None:
+        raise RuntimeError("sqlobject is not installed")
+
+    conn = connectionForURI(sqlobject_uri())
+    _sqlhub.processConnection = conn
+    BSQLObject.dropTable(ifExists=True)
+    BSQLObject.createTable(ifNotExists=True)
+
+    res: dict = {}
+
+    # SQLObject has no bulk INSERT; the idiomatic path creates one row at a time.
+    # A single transaction around the loop mirrors the other ORMs' one commit.
+    trans = conn.transaction()
+    with _Stopwatch() as sw:
+        for i in range(N):
+            BSQLObject(name=f"n{i}", value=i, cat=i % CATS, created=NOW_NAIVE, connection=trans)
+        trans.commit(close=True)
+    res["bulk_insert"] = sw.elapsed
+
+    try:
+        with _Stopwatch() as sw:
+            agg = conn.queryAll(
+                "SELECT cat, COUNT(id), SUM(value) FROM bench_sqlobject "
+                f"GROUP BY cat HAVING COUNT(id) > {TH} ORDER BY cat"
+            )
+        res["group_by"] = sw.elapsed
+        assert len(agg) == CATS
+    except Exception:  # noqa: BLE001 - SQLObject has no ORM-level GROUP BY/HAVING
+        pass
+
+    with _Stopwatch() as sw:
+        rows = list(BSQLObject.select())
+    res["fetch_all"] = sw.elapsed
+    assert len(rows) == N
+
+    with _Stopwatch() as sw:
+        total = BSQLObject.select().count()
+    res["count"] = sw.elapsed
+    assert total == N
+
+    with _Stopwatch() as sw:
+        rows = list(BSQLObject.select(BSQLObject.q.value >= HALF))
+    res["filter"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        for pk in PK_SEQUENCE:
+            BSQLObject.get(pk)
+    res["get_by_pk"] = sw.elapsed
+
+    # No ORM-level bulk UPDATE; issue the set-based statement directly.
+    with _Stopwatch() as sw:
+        conn.query(f"UPDATE bench_sqlobject SET value = 0 WHERE value < {HALF}")
+    res["update"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        BSQLObject.deleteMany(BSQLObject.q.value >= HALF)
+    res["delete"] = sw.elapsed
+
+    conn.query(clear_sql("bench_sqlobject"))
+    with _Stopwatch() as sw:
+        for i in range(S):
+            BSQLObject(name=f"s{i}", value=i, cat=i % CATS, created=NOW_NAIVE)
+    res["single_insert"] = sw.elapsed
+
+    conn.close()
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Ormar (async, SQLAlchemy core + asyncpg/aiomysql/aiosqlite)
+# ---------------------------------------------------------------------------
+def ormar_url() -> str:
+    if BACKEND == "sqlite":
+        return f"sqlite+aiosqlite:///{SQLITE_DIR}/bench_ormar.db"
+    if BACKEND == "mysql":
+        p = mysql_parts()
+        return f"mysql+aiomysql://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
+    p = pg_parts(URL)
+    return f"postgresql+asyncpg://{_pg_userinfo(p)}@{p['host']}:{p['port']}/{p['database']}"
+
+
+try:
+    import ormar
+    import sqlalchemy as _ormar_sa
+    from ormar.databases.connection import DatabaseConnection
+
+    _ormar_meta = _ormar_sa.MetaData()
+    _ormar_db = DatabaseConnection(ormar_url())
+    _ormar_config = ormar.OrmarConfig(metadata=_ormar_meta, database=_ormar_db)
+
+    class BOrmar(ormar.Model):
+        ormar_config = _ormar_config.copy(tablename="bench_ormar")
+
+        id: int = ormar.Integer(primary_key=True)
+        name: str = ormar.String(max_length=50)
+        value: int = ormar.Integer()
+        cat: int = ormar.Integer()
+        created: datetime = ormar.DateTime(timezone=True, nullable=True)
+
+except ImportError:  # pragma: no cover
+    BOrmar = None
+
+
+async def run_ormar() -> dict:
+    if BOrmar is None:
+        raise RuntimeError("ormar is not installed")
+
+    await _ormar_db.connect()
+    async with _ormar_db.engine.begin() as conn:
+        await conn.run_sync(_ormar_meta.drop_all)
+        await conn.run_sync(_ormar_meta.create_all)
+
+    res: dict = {}
+
+    objs = [BOrmar(name=f"n{i}", value=i, cat=i % CATS, created=NOW) for i in range(N)]
+    with _Stopwatch() as sw:
+        await BOrmar.objects.bulk_create(objs)
+    res["bulk_insert"] = sw.elapsed
+
+    # Ormar exposes no annotate/GROUP BY; group_by is left unset (reported "-").
+
+    with _Stopwatch() as sw:
+        rows = await BOrmar.objects.all()
+    res["fetch_all"] = sw.elapsed
+    assert len(rows) == N
+
+    with _Stopwatch() as sw:
+        total = await BOrmar.objects.count()
+    res["count"] = sw.elapsed
+    assert total == N
+
+    with _Stopwatch() as sw:
+        rows = await BOrmar.objects.filter(value__gte=HALF).all()
+    res["filter"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        for pk in PK_SEQUENCE:
+            await BOrmar.objects.get(id=pk)
+    res["get_by_pk"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        await BOrmar.objects.filter(value__lt=HALF).update(value=0)
+    res["update"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        await BOrmar.objects.filter(value__gte=HALF).delete()
+    res["delete"] = sw.elapsed
+
+    async with _ormar_db.engine.begin() as conn:
+        await conn.exec_driver_sql(clear_sql("bench_ormar"))
+    with _Stopwatch() as sw:
+        for i in range(S):
+            await BOrmar.objects.create(name=f"s{i}", value=i, cat=i % CATS, created=NOW)
+    res["single_insert"] = sw.elapsed
+
+    await _ormar_db.disconnect()
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Piccolo (async; no MySQL backend)
+# ---------------------------------------------------------------------------
+try:
+    from piccolo.columns import Integer as PInteger
+    from piccolo.columns import Timestamptz as PTimestamptz
+    from piccolo.columns import Varchar as PVarchar
+    from piccolo.query.functions.aggregate import Count as PCount
+    from piccolo.query.functions.aggregate import Sum as PSum
+    from piccolo.table import Table as PTable
+
+    def _piccolo_engine():
+        if BACKEND == "sqlite":
+            from piccolo.engine.sqlite import SQLiteEngine
+
+            return SQLiteEngine(path=f"{SQLITE_DIR}/bench_piccolo.sqlite")
+        if BACKEND == "postgres":
+            from piccolo.engine.postgres import PostgresEngine
+
+            p = pg_parts(URL)
+            cfg = {
+                "user": p["user"],
+                "host": p["host"],
+                "port": p["port"],
+                "database": p["database"],
+            }
+            if p["password"]:
+                cfg["password"] = p["password"]
+            return PostgresEngine(config=cfg)
+        return None  # Piccolo has no MySQL backend
+
+    _piccolo_db = _piccolo_engine()
+
+    if _piccolo_db is not None:
+
+        class BPiccolo(PTable, tablename="bench_piccolo", db=_piccolo_db):
+            name = PVarchar(length=50)
+            value = PInteger()
+            cat = PInteger()
+            created = PTimestamptz(null=True)
+
+    else:
+        BPiccolo = None
+
+except ImportError:  # pragma: no cover
+    BPiccolo = None
+
+
+async def run_piccolo() -> dict:
+    if BPiccolo is None:
+        raise RuntimeError("piccolo is not installed or has no backend for this database")
+
+    # Piccolo opens a fresh connection per query unless its pool is started; the
+    # other async ORMs all pool/reuse connections, so start one for a fair fight
+    # (SQLite is file-based and has no real pool, so only PostgreSQL pools here).
+    pooled = BACKEND == "postgres"
+    if pooled:
+        await _piccolo_db.start_connection_pool()
+    try:
+        return await _run_piccolo_ops()
+    finally:
+        if pooled:
+            await _piccolo_db.close_connection_pool()
+
+
+async def _run_piccolo_ops() -> dict:
+    await BPiccolo.alter().drop_table(if_exists=True).run()
+    await BPiccolo.create_table(if_not_exists=True).run()
+
+    res: dict = {}
+
+    objs = [BPiccolo(name=f"n{i}", value=i, cat=i % CATS, created=NOW) for i in range(N)]
+    with _Stopwatch() as sw:
+        await BPiccolo.insert(*objs).run()
+    res["bulk_insert"] = sw.elapsed
+
+    # Piccolo supports GROUP BY + aggregates but no HAVING clause here; the even
+    # row spread means every group passes anyway, so CATS groups still come back.
+    with _Stopwatch() as sw:
+        agg = await (
+            BPiccolo.select(
+                BPiccolo.cat, PCount().as_alias("n"), PSum(BPiccolo.value).as_alias("s")
+            )
+            .group_by(BPiccolo.cat)
+            .order_by(BPiccolo.cat)
+        )
+    res["group_by"] = sw.elapsed
+    assert len(agg) == CATS
+
+    with _Stopwatch() as sw:
+        rows = await BPiccolo.select()
+    res["fetch_all"] = sw.elapsed
+    assert len(rows) == N
+
+    with _Stopwatch() as sw:
+        total = await BPiccolo.count()
+    res["count"] = sw.elapsed
+    assert total == N
+
+    with _Stopwatch() as sw:
+        rows = await BPiccolo.select().where(BPiccolo.value >= HALF)
+    res["filter"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        for pk in PK_SEQUENCE:
+            await BPiccolo.objects().where(BPiccolo.id == pk).first().run()
+    res["get_by_pk"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        await BPiccolo.update({BPiccolo.value: 0}).where(BPiccolo.value < HALF).run()
+    res["update"] = sw.elapsed
+
+    with _Stopwatch() as sw:
+        await BPiccolo.delete().where(BPiccolo.value >= HALF).run()
+    res["delete"] = sw.elapsed
+
+    await BPiccolo.delete(force=True).run()
+    with _Stopwatch() as sw:
+        for i in range(S):
+            await BPiccolo(name=f"s{i}", value=i, cat=i % CATS, created=NOW).save().run()
+    res["single_insert"] = sw.elapsed
+
+    return res
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 OPS = [
@@ -577,30 +1131,32 @@ def main():
         f"BACKEND={BACKEND}  target={target}  N={N}  S={S}  GETS={GETS}  REPEAT={REPEAT} (median)\n"
     )
 
+    # (name, runner, is_async). "ours" runs first and unguarded; a failure there
+    # means the benchmark itself is broken and should surface loudly.
+    runners = [
+        ("tortoise", run_tortoise, True),
+        ("sqlalchemy", run_sqlalchemy, True),
+        ("pony", run_pony, False),
+        ("django", run_django, False),
+        ("peewee", run_peewee, False),
+        ("sqlobject", run_sqlobject, False),
+        ("ormar", run_ormar, True),
+        ("piccolo", run_piccolo, True),
+    ]
+
     results = {}
     print("running: yara-orm (ours) ...")
     results["ours"] = _median_runs(run_ours, True)
-    print("running: tortoise ...")
-    try:
-        results["tortoise"] = _median_runs(run_tortoise, True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  tortoise failed: {exc!r}")
-        results["tortoise"] = {}
-    print("running: sqlalchemy ...")
-    try:
-        results["sqlalchemy"] = _median_runs(run_sqlalchemy, True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  sqlalchemy failed: {exc!r}")
-        results["sqlalchemy"] = {}
-    print("running: pony ...")
-    try:
-        results["pony"] = _median_runs(run_pony, False)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  pony failed: {exc!r}")
-        results["pony"] = {}
+    for name, runner, is_async in runners:
+        print(f"running: {name} ...")
+        try:
+            results[name] = _median_runs(runner, is_async)
+        except Exception as exc:  # noqa: BLE001 - a missing/unsupported ORM shouldn't abort the suite
+            print(f"  {name} failed: {exc!r}")
+            results[name] = {}
 
-    cols = ["ours", "tortoise", "sqlalchemy", "pony"]
-    competitors = ["tortoise", "sqlalchemy", "pony"]
+    cols = ["ours", *(r[0] for r in runners)]
+    competitors = [r[0] for r in runners]
 
     print("\n=== Time per operation (ms, lower is better) ===")
     header = f"{'operation':<16}" + "".join(f"{c:>13}" for c in cols)
@@ -634,10 +1190,15 @@ def main():
     print(
         "\nNotes: each ORM uses its own table; same workload; median of "
         f"{REPEAT} runs (warm)."
-        "\n  - Tortoise & SQLAlchemy are async over asyncpg; Pony is sync over psycopg2."
-        "\n  - SQLAlchemy get_by_pk uses a fresh session per lookup (no identity-map reuse)."
+        "\n  - Async (asyncpg/aiomysql/aiosqlite): yara-orm, Tortoise, SQLAlchemy, Ormar, Piccolo."
+        "\n  - Sync: Pony, Django, Peewee, SQLObject."
+        "\n  - SQLAlchemy get_by_pk uses a fresh session per lookup (no identity-map reuse);"
+        "\n    SQLObject runs with cache=false so every .get() hits the database."
         "\n  - Pony opens a transaction per get and has no SQL-level bulk UPDATE,"
         "\n    so its update path mutates objects in a loop."
+        "\n  - Ormar has no GROUP BY/annotate API and Piccolo no HAVING clause, so their"
+        "\n    group_by cells are '-' / unfiltered respectively; Piccolo has no MySQL backend."
+        "\n  - SQLObject has no bulk INSERT (one row per statement, wrapped in one transaction)."
     )
 
 
