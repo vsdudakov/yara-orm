@@ -5,14 +5,24 @@ PostgreSQL alters in place; SQLite rebuilds or rejects, so each renderer is
 exercised on both dialects to lock in the capability-flag behaviour.
 """
 
+import datetime as _dt
+
 import pytest
 
-from yara_orm.dialects import BaseDialect, PostgresDialect, SqliteDialect
+from yara_orm.dialects import (
+    BaseDialect,
+    OracleDialect,
+    PostgresDialect,
+    SqliteDialect,
+    _json_from_db,
+    _time_from_db,
+)
 from yara_orm.exceptions import UnSupportedError
 
 PG = PostgresDialect()
 LITE = SqliteDialect()
 BASE = BaseDialect()
+ORA = OracleDialect()
 
 
 @pytest.mark.parametrize(
@@ -221,3 +231,168 @@ def test_alter_column_fk_drop_without_readd():
     tspec = {"columns": {"n": without_fk}, "pk": None, "fks": {}, "indexes": []}
     out = PG.render_alter_column("t", "n", with_fk, without_fk, tspec)
     assert out == ['ALTER TABLE "t" DROP CONSTRAINT IF EXISTS "t_n_fkey"']
+
+
+# ---------------------------------------------------------------------------
+# Oracle dialect — DDL renderers and decode helpers.
+#
+# These are pure string builders (no database), mirroring the PostgreSQL/SQLite
+# cases above so the Oracle-specific ``MODIFY``/``ALTER INDEX``/``JSON_VALUE``
+# spellings are exercised without needing an Oracle server.
+# ---------------------------------------------------------------------------
+
+
+def test_oracle_alter_column_add_type_default_unique_fk():
+    """
+    GIVEN a column that changes type and gains a default, a unique constraint
+    and a foreign key
+    WHEN rendered on Oracle
+    THEN a MODIFY plus ADD CONSTRAINT statements are produced
+    """
+    old = dict(INT)
+    new = {
+        **INT,
+        "kind": "bigint",
+        "default": {"kind": "sql", "sql": "7"},
+        "unique": True,
+        "fk": {"table": "u", "pk": "id", "on_delete": "CASCADE"},
+    }
+    tspec = {"columns": {"n": new}, "pk": None, "fks": {}, "indexes": []}
+    out = ORA.render_alter_column("t", "n", old, new, tspec)
+    joined = "\n".join(out)
+    assert 'MODIFY ("n"' in joined  # type change
+    assert "DEFAULT 7" in joined  # default set
+    assert 'ADD CONSTRAINT "t_n_key" UNIQUE ("n")' in joined  # unique add
+    assert 'ADD CONSTRAINT "t_n_fkey"' in joined  # fk add
+
+
+def test_oracle_alter_column_null_drop_default_unique_fk():
+    """
+    GIVEN a column that only flips nullability and drops its default, unique
+    constraint and foreign key
+    WHEN rendered on Oracle
+    THEN MODIFY NULL / DEFAULT NULL and DROP CONSTRAINT statements are produced
+    """
+    old = {
+        **INT,
+        "kind": "bigint",
+        "default": {"kind": "sql", "sql": "7"},
+        "unique": True,
+        "fk": {"table": "u", "pk": "id", "on_delete": "CASCADE"},
+    }
+    new = {**INT, "kind": "bigint", "null": True}
+    tspec = {"columns": {"n": new}, "pk": None, "fks": {}, "indexes": []}
+    out = ORA.render_alter_column("t", "n", old, new, tspec)
+    joined = "\n".join(out)
+    assert 'MODIFY ("n" NULL)' in joined  # nullability only (no type change)
+    assert 'DEFAULT NULL' in joined  # default drop
+    assert 'DROP CONSTRAINT "t_n_key"' in joined  # unique drop
+    assert 'DROP CONSTRAINT "t_n_fkey"' in joined  # fk drop
+
+
+def test_oracle_alter_column_default_only_leaves_others_untouched():
+    """
+    GIVEN a column change that only adds a default (type, nullability, unique and
+    fk unchanged)
+    WHEN rendered on Oracle
+    THEN a single MODIFY DEFAULT statement is produced (no MODIFY type, no
+    constraint DDL) — exercising the "unchanged" branch of each other clause
+    """
+    old = dict(INT)
+    new = {**INT, "default": {"kind": "sql", "sql": "5"}}
+    tspec = {"columns": {"n": new}, "pk": None, "fks": {}, "indexes": []}
+    assert ORA.render_alter_column("t", "n", old, new, tspec) == [
+        'ALTER TABLE "t" MODIFY ("n" DEFAULT 5)'
+    ]
+
+
+def test_oracle_alter_column_unique_only_leaves_default_untouched():
+    """
+    GIVEN a column change that only adds a unique constraint
+    WHEN rendered on Oracle
+    THEN a single ADD CONSTRAINT UNIQUE is produced — exercising the "default
+    unchanged" branch
+    """
+    old = dict(INT)
+    new = {**INT, "unique": True}
+    tspec = {"columns": {"n": new}, "pk": None, "fks": {}, "indexes": []}
+    assert ORA.render_alter_column("t", "n", old, new, tspec) == [
+        'ALTER TABLE "t" ADD CONSTRAINT "t_n_key" UNIQUE ("n")'
+    ]
+
+
+def test_oracle_index_renderers():
+    """
+    GIVEN single- and multi-column index create/drop/rename
+    WHEN rendered on Oracle
+    THEN Oracle CREATE INDEX / DROP INDEX / ALTER INDEX statements are produced
+    """
+    assert ORA.render_create_index("t", "c", safe=False, unique=True) == [
+        'CREATE UNIQUE INDEX "idx_t_c" ON "t" ("c")'
+    ]
+    assert ORA.render_drop_index("t", "c") == ['DROP INDEX IF EXISTS "idx_t_c"']
+    assert ORA.render_create_composite_index("t", "ix", ["a", "b"], safe=False) == [
+        'CREATE INDEX "ix" ON "t" ("a", "b")'
+    ]
+    assert ORA.render_drop_composite_index("ix") == ['DROP INDEX IF EXISTS "ix"']
+    assert ORA.render_rename_index("t", "c", "ix_old", "ix_new") == [
+        'ALTER INDEX "ix_old" RENAME TO "ix_new"'
+    ]
+
+
+def test_oracle_constraint_renderers():
+    """
+    GIVEN a constraint drop and rename
+    WHEN rendered on Oracle
+    THEN ALTER TABLE DROP/RENAME CONSTRAINT statements are produced
+    """
+    assert ORA.render_drop_constraint("t", "uq") == [
+        'ALTER TABLE "t" DROP CONSTRAINT "uq"'
+    ]
+    assert ORA.render_rename_constraint("t", "uq", "uq2") == [
+        'ALTER TABLE "t" RENAME CONSTRAINT "uq" TO "uq2"'
+    ]
+
+
+def test_oracle_date_part_and_json_extract():
+    """
+    GIVEN a TO_CHAR-backed date part, an unsupported part, and a JSON path
+    WHEN rendered on Oracle
+    THEN TO_NUMBER(TO_CHAR(...)) / JSON_VALUE(...) are produced and unsupported
+    parts raise
+    """
+    assert ORA.date_part_sql("quarter", '"c"') == "TO_NUMBER(TO_CHAR(\"c\", 'Q'))"
+    with pytest.raises(UnSupportedError):
+        ORA.date_part_sql("century", '"c"')
+    assert ORA.json_extract_sql('"c"', ["a", "b"]) == "JSON_VALUE(\"c\", '$.\"a\".\"b\"')"
+    assert ORA.json_extract_sql('"c"', []) == '"c"'  # no keys -> bare column
+
+
+def test_oracle_decode_helpers_parse_text():
+    """
+    GIVEN JSON and time columns Oracle hands back as text
+    WHEN decoded
+    THEN the string is parsed into the Python value
+    """
+    assert _json_from_db('{"a": 1}') == {"a": 1}
+    assert _time_from_db("12:30:00") == _dt.time(12, 30, 0)
+    # Already-decoded values pass through unchanged.
+    assert _json_from_db({"a": 1}) == {"a": 1}
+    assert _time_from_db(_dt.time(1, 2, 3)) == _dt.time(1, 2, 3)
+
+
+def test_uuid_field_to_python_none_and_text():
+    """
+    GIVEN a UUID field decoding a NULL and a text uuid (Oracle stores uuids as
+    VARCHAR2 and hands them back as strings)
+    WHEN to_python runs
+    THEN None passes through and text is reconstructed into a UUID
+    """
+    import uuid as _uuid
+
+    from yara_orm.fields import UUIDField
+
+    field = UUIDField()
+    assert field.to_python(None) is None
+    u = _uuid.uuid4()
+    assert field.to_python(str(u)) == u
