@@ -59,6 +59,11 @@ bench-mariadb:
 	.venv312/bin/pip install -q -U asyncmy aiomysql pymysql cryptography
 	BENCH_BACKEND=mariadb .venv312/bin/python benchmarks/bench.py
 
+# Oracle (ORM_TEST_ORACLE, default the local gvenzl/oracle-free container). No
+# competitor ships an Oracle backend, so this measures yara-orm alone.
+bench-oracle:
+	BENCH_BACKEND=oracle .venv312/bin/python benchmarks/bench.py
+
 # yara-orm-only feature micro-benchmarks (nested-transaction savepoints, eager
 # loading vs N+1, projection). Runs on SQLite by default (zero setup); pass
 # BENCH_BACKEND=postgres ORM_TEST_DB=... for Postgres.

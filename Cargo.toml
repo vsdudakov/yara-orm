@@ -43,9 +43,13 @@ mysql_async = { version = "0.37", default-features = false, features = [
 ] }
 # Pure-Rust Oracle driver (native TNS protocol; no OCI / ODPI-C / Instant
 # Client, so manylinux wheels stay self-contained — the same invariant that
-# picked mysql_async over the C drivers). TLS rides the same rustls/ring stack;
-# `deadpool-oracle` supplies the async connection pool.
-oracle-rs = "0.1.7"
+# picked mysql_async over the C drivers). TLS rides the same rustls/ring stack.
+# Pinned to a fork of oracle-rs 0.1.7 that negotiates END_OF_RESPONSE at connect
+# and fetches a whole result set in one execute — without those fixes the driver
+# desyncs on multi-packet responses and caps every query at 100 rows. The
+# END_OF_RESPONSE fix is proposed upstream (stiang/oracle-rs#14); the fetch cap
+# waits on the upstream fetch_more() fix (stiang/oracle-rs#9).
+oracle-rs = { git = "https://github.com/vsdudakov/oracle-rs", rev = "139aa08604b86f69e60d0cf5af18030faf7db5b4" }
 deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
 
 [profile.release]

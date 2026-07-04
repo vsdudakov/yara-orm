@@ -54,6 +54,9 @@ MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/o
 #: MariaDB uses the same wire protocol/drivers as MySQL, so every competitor
 #: connects to it through its MySQL path; only the server URL differs.
 MARIADB_URL = os.environ.get("ORM_TEST_MARIADB", "mysql://root:root@localhost:3307/orm_demo")
+#: Oracle only benchmarks yara-orm itself — none of the eight competitors ship an
+#: Oracle backend, so ``BENCH_BACKEND=oracle`` runs the "ours" column alone.
+ORACLE_URL = os.environ.get("ORM_TEST_ORACLE", "oracle://orm:orm@localhost:1521/FREEPDB1")
 
 
 def pg_parts(url: str, default_port: int = 5432) -> dict:
@@ -83,12 +86,19 @@ def clear_sql(table: str) -> str:
     if BACKEND in ("mysql", "mariadb"):
         # MySQL's TRUNCATE resets AUTO_INCREMENT by itself (no RESTART IDENTITY).
         return f"TRUNCATE TABLE {table}"
+    if BACKEND == "oracle":
+        # Oracle folds unquoted names to upper-case; the ORM creates the table
+        # quoted lower-case, so the name must be quoted to match. TRUNCATE takes
+        # no RESTART IDENTITY (the IDENTITY sequence simply carries on).
+        return f'TRUNCATE TABLE "{table}"'
     return f"TRUNCATE {table} RESTART IDENTITY"
 
 
 def drop_sql(table: str) -> str:
     if BACKEND in ("sqlite", "mysql", "mariadb"):  # MySQL accepts no CASCADE here
         return f"DROP TABLE IF EXISTS {table}"
+    if BACKEND == "oracle":  # quoted name; CASCADE CONSTRAINTS severs FKs
+        return f'DROP TABLE IF EXISTS "{table}" CASCADE CONSTRAINTS'
     return f"DROP TABLE IF EXISTS {table} CASCADE"
 
 
@@ -97,6 +107,8 @@ def ours_url() -> str:
         return f"sqlite://{SQLITE_DIR}/bench_ours.db"
     if BACKEND in ("mysql", "mariadb"):
         return mysql_family_url()
+    if BACKEND == "oracle":
+        return ORACLE_URL
     return URL
 
 
@@ -1133,6 +1145,8 @@ def main():
         target = URL
     elif BACKEND in ("mysql", "mariadb"):
         target = mysql_family_url()
+    elif BACKEND == "oracle":
+        target = ORACLE_URL
     else:
         target = f"sqlite ({SQLITE_DIR})"
     print(
@@ -1140,7 +1154,9 @@ def main():
     )
 
     # (name, runner, is_async). "ours" runs first and unguarded; a failure there
-    # means the benchmark itself is broken and should surface loudly.
+    # means the benchmark itself is broken and should surface loudly. None of the
+    # eight competitors ships an Oracle backend, so the Oracle run measures
+    # yara-orm alone (its own numbers across operations, no comparison column).
     runners = [
         ("tortoise", run_tortoise, True),
         ("sqlalchemy", run_sqlalchemy, True),
@@ -1151,6 +1167,8 @@ def main():
         ("ormar", run_ormar, True),
         ("piccolo", run_piccolo, True),
     ]
+    if BACKEND == "oracle":
+        runners = []
 
     results = {}
     print("running: yara-orm (ours) ...")

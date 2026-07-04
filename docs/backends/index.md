@@ -126,6 +126,31 @@ await YaraOrm.init("mysql://user:password@host:3306/dbname")
 
 ## Oracle
 
+!!! warning "Experimental — why"
+
+    The Oracle backend is **experimental**, not because the ORM layer is
+    incomplete — the same model code, URL and query API work as on every other
+    backend, and the full cross-backend suite passes — but because it rides on
+    the young pure-Rust `oracle-rs` **0.1.x** driver, whose gaps leak into a few
+    operations:
+
+    - **Large values can't be bound.** A string/bytes parameter above ~1&nbsp;KB
+      drops the connection, so long `TextField` / `JSONField` / `BinaryField` /
+      `CharField` values cannot be inserted.
+    - **No `IntegrityError`.** A constraint violation closes the connection
+      without surfacing the `ORA-` code, so duplicate/NOT-NULL breaches can't be
+      raised as `IntegrityError`.
+    - **A few features are unimplemented** at the driver level: `__search`
+      (Oracle Text) and JSON `__contains`.
+    - **Reduced throughput on some paths.** `bulk_create` falls back to one
+      statement per row (no multi-row `VALUES`), and pooled connections are
+      retired periodically to dodge a driver protocol-desync.
+
+    The affected tests are skipped and each limitation is listed under
+    [Driver limitations](#driver-limitations-oracle-rs-01x) below. The backend
+    graduates out of "experimental" as the driver matures; until then, treat
+    production use with care.
+
 The Oracle backend is built on the pure-Rust **oracle-rs** driver (a native
 implementation of Oracle's TNS protocol — no OCI, ODPI-C or Instant Client) with
 a **deadpool** connection pool. It targets **Oracle Database 23ai** (tested
