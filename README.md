@@ -220,59 +220,72 @@ idempotent analogs (`CreateModelIfNotExists`, `AddFieldIfNotExists`, …) and de
 
 ## Performance
 
-Median of 5 runs, Python 3.12, 5000 rows — Yara ORM is fastest (or tied) on
-every operation measured on PostgreSQL **and MySQL**, and wins everything
-throughput-shaped on SQLite. Cells show Yara ORM's time and each competitor's
-slowdown factor (>1 means Yara ORM is faster). Full methodology and tables in
-[`benchmarks/`](benchmarks/).
+Median of 5 runs, Python 3.12, 5000 rows, against **eight other Python ORMs**
+(Tortoise, SQLAlchemy, Pony, Django, Peewee, SQLObject, Ormar, Piccolo) — Yara
+ORM is fastest or tied on every operation across PostgreSQL, MySQL and SQLite,
+losing only to leaner in-process sync ORMs on single-row point reads. Times in
+ms, lower is better. Full methodology, speedup tables and per-op notes in
+[`benchmarks/`](benchmarks/) and the [performance docs](https://vsdudakov.github.io/yara-orm/performance/).
 
 ### PostgreSQL 18
 
-![Yara ORM vs Tortoise, SQLAlchemy and Pony on PostgreSQL — latency per operation, log scale, lower is better](docs/assets/benchmark-postgres.png)
+![Yara ORM vs eight Python ORMs on PostgreSQL — latency per operation, log scale, lower is better](docs/assets/benchmark-postgres.png)
 
-| operation     | yara-orm | vs Tortoise | vs SQLAlchemy | vs Pony |
-|---------------|---------:|------------:|--------------:|--------:|
-| bulk_insert   | 14.7 ms  | 1.6×        | 4.6×          | 14.9×   |
-| single_insert | 34.2 ms  | 2.3×        | 4.4×          |  1.8×   |
-| fetch_all     |  3.5 ms  | 4.8×        | 6.1×          |  9.8×   |
-| count         |  0.3 ms  | 1.9×        | 3.2×          |  1.5×   |
-| group_by      |  0.7 ms  | 1.6×        | 1.9×          |  3.1×   |
-| filter        |  2.2 ms  | 3.9×        | 3.5×          |  8.1×   |
-| get_by_pk     | 65.0 ms  | 3.0×        | 4.4×          |  1.3×   |
-| update        |  3.2 ms  | 1.1×        | 1.2×          | 37.3×   |
-| delete        |  0.7 ms  | 1.2×        | 1.6×          | 135.6×  |
+| operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
+|---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
+| bulk_insert   | 15.5 | 26.4 | 100.5 | 411.6 | 56.6 | 83.9 | 1045.8 | 260.7 | 119.9 |
+| single_insert | 35.5 | 79.5 | 299.3 | 109.6 | 67.2 | 75.5 | 171.0 | 273.8 | 186.2 |
+| fetch_all     | 3.7 | 17.5 | 36.0 | 41.5 | 12.4 | 14.4 | 70.3 | 65.8 | 5.9 |
+| count         | 0.3 | 0.6 | 1.9 | 0.7 | 0.9 | 0.8 | 0.8 | 3.7 | 1.0 |
+| group_by      | 0.8 | 1.2 | 3.2 | 3.7 | 2.4 | 1.5 | 1.3 | - | 2.2 |
+| filter        | 2.3 | 9.4 | 12.0 | 20.5 | 6.8 | 9.9 | 14.2 | 51.1 | 2.8 |
+| get_by_pk     | 64.0 | 198.1 | 589.1 | 136.5 | 189.2 | 175.8 | 54.7 | 512.5 | 347.8 |
+| update        | 3.7 | 3.7 | 7.8 | 204.1 | 9.1 | 7.9 | 8.4 | 9.1 | 8.0 |
+| delete        | 0.9 | 0.9 | 1.9 | 148.3 | 1.8 | 1.4 | 1.6 | 2.2 | 1.6 |
 
 ### MySQL 8.4
 
-Same workload against MySQL (Tortoise over asyncmy, SQLAlchemy over aiomysql,
-Pony over pymysql):
+Same workload against MySQL (Tortoise over asyncmy, SQLAlchemy/Ormar over
+aiomysql, the sync ORMs over pymysql; Piccolo has no MySQL backend):
 
-![Yara ORM vs Tortoise, SQLAlchemy and Pony on MySQL — latency per operation, log scale, lower is better](docs/assets/benchmark-mysql.png)
+![Yara ORM vs seven Python ORMs on MySQL — latency per operation, log scale, lower is better](docs/assets/benchmark-mysql.png)
 
-| operation     | yara-orm  | vs Tortoise | vs SQLAlchemy | vs Pony |
-|---------------|----------:|------------:|--------------:|--------:|
-| bulk_insert   |  46.0 ms  | 1.0×        | 17.4×         |  9.4×   |
-| single_insert | 693.7 ms  | 1.1×        | 1.3×          |  1.1×   |
-| fetch_all     |   5.6 ms  | 6.0×        | 6.9×          |  8.4×   |
-| count         |   0.7 ms  | 1.4×        | 1.7×          |  1.1×   |
-| group_by      |   1.2 ms  | 1.2×        | 1.7×          |  2.0×   |
-| filter        |   3.4 ms  | 5.3×        | 4.8×          |  7.3×   |
-| get_by_pk     | 110.9 ms  | 2.1×        | 4.9×          |  2.8×   |
-| update        |   7.2 ms  | 1.1×        | 1.5×          | 32.5×   |
-| delete        |   4.9 ms  | 1.0×        | 1.1×          | 42.9×   |
+| operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar |
+|---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|
+| bulk_insert   | 53.8 | 51.5 | 640.5 | 402.5 | 93.3 | 85.6 | 1058.7 | 193.7 |
+| single_insert | 715.8 | 795.4 | 1214.8 | 883.9 | 834.8 | 840.3 | 879.0 | 1091.1 |
+| fetch_all     | 11.5 | 33.8 | 45.5 | 49.2 | 30.0 | 28.0 | 43.8 | 74.7 |
+| count         | 0.8 | 0.8 | 1.2 | 0.8 | 0.9 | 0.8 | 0.7 | 3.9 |
+| group_by      | 1.4 | 1.4 | 2.1 | 2.5 | 1.4 | 1.1 | 1.1 | - |
+| filter        | 3.6 | 17.7 | 16.1 | 25.0 | 15.8 | 15.0 | 17.0 | 30.6 |
+| get_by_pk     | 106.6 | 212.9 | 479.6 | 275.5 | 209.6 | 194.9 | 59.8 | 855.5 |
+| update        | 7.0 | 9.8 | 10.1 | 221.9 | 7.0 | 7.4 | 7.0 | 9.1 |
+| delete        | 5.0 | 5.6 | 5.5 | 192.0 | 6.1 | 5.7 | 5.3 | 6.0 |
 
-(`single_insert` is dominated by InnoDB's per-commit fsync — every ORM pays
-it; `get_by_pk` and `single_insert` include the Docker-network round trip.)
+(`single_insert` ~0.7–1.2 s is dominated by InnoDB's per-commit fsync — every ORM
+pays it; `get_by_pk` and `single_insert` include the Docker-network round trip.)
 
 ### SQLite
 
-![Yara ORM vs Tortoise, SQLAlchemy and Pony on SQLite — latency per operation, log scale, lower is better](docs/assets/benchmark-sqlite.png)
+![Yara ORM vs eight Python ORMs on SQLite — latency per operation, log scale, lower is better](docs/assets/benchmark-sqlite.png)
 
-Yara ORM wins everything throughput-shaped (fetch_all 6–16×, filter 4–14×,
-bulk_insert 1.8–80×) and trails only the two latency-bound point ops, where
-the per-statement asyncio bridge costs tens of µs against in-process sync
-drivers — the opt-in `sqlite://...?sync_fast_path=1` URL flag removes that
-bridge entirely (point queries ~7× faster).
+| operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
+|---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
+| bulk_insert   | 8.0 | 15.5 | 660.8 | 56.1 | 66.9 | 34.0 | 234.8 | 158.9 | 75.9 |
+| single_insert | 36.1 | 44.1 | 397.7 | 155.1 | 162.8 | 144.0 | 139.4 | 339.0 | 264.7 |
+| fetch_all     | 3.5 | 43.3 | 32.0 | 56.4 | 16.9 | 13.4 | 46.5 | 53.1 | 9.2 |
+| count         | 0.1 | 0.4 | 0.8 | 0.2 | 0.2 | 0.2 | 0.1 | 1.6 | 0.4 |
+| group_by      | 0.6 | 0.8 | 1.5 | 1.6 | 0.9 | 0.7 | 0.5 | - | 1.0 |
+| filter        | 2.0 | 21.6 | 8.2 | 29.7 | 8.9 | 7.1 | 17.9 | 19.1 | 5.0 |
+| get_by_pk     | 57.2 | 103.8 | 373.8 | 35.5 | 90.9 | 92.3 | 13.9 | 506.9 | 365.9 |
+| update        | 0.6 | 0.8 | 2.0 | 50.0 | 1.5 | 1.2 | 1.0 | 1.7 | 1.5 |
+| delete        | 0.5 | 0.5 | 1.4 | 39.7 | 1.0 | 0.8 | 0.7 | 1.1 | 1.2 |
+
+Yara ORM wins everything throughput-shaped (fetch_all 2.6–16×, filter 2.5–15×,
+bulk_insert 1.9–83×) and trails only the latency-bound point reads, where the
+per-statement asyncio bridge costs tens of µs against in-process sync ORMs
+(SQLObject and Pony on `get_by_pk`) — the opt-in `sqlite://...?sync_fast_path=1`
+URL flag removes that bridge entirely (point queries ~7× faster).
 
 Speed comes from the Rust hot path, **positional row decoding** (no per-row dict
 or column-name allocation), **compiled-SQL + prepared-statement caching**, and
@@ -318,9 +331,9 @@ make build      # compile the Rust engine into the venv (maturin develop)
 make lint       # ruff check + ruff format --check + ty
 make test       # pytest against $DB (default postgres://localhost/orm_demo)
 make cov        # tests with the 100% coverage gate
-make bench      # 4-way benchmark (needs `make bench-setup` once; Python ≤ 3.12 for Pony)
-make bench-mysql   # same 4-way comparison on MySQL
-make bench-sqlite  # same 4-way comparison on SQLite
+make bench      # cross-ORM benchmark (needs `make bench-setup` once; Python ≤ 3.12 for Pony)
+make bench-mysql   # same comparison on MySQL
+make bench-sqlite  # same comparison on SQLite
 ```
 
 Requires a Rust toolchain (`rustup`), a local PostgreSQL for the Postgres tests
