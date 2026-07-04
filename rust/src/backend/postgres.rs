@@ -1,6 +1,6 @@
 //! PostgreSQL backend built on tokio-postgres + deadpool connection pooling.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
@@ -17,9 +17,33 @@ use crate::value::{decode_pg_row, decode_pg_row_values, Row, Value};
 /// Default pool size when the URL does not specify `max_size`.
 const DEFAULT_MAX_SIZE: usize = 16;
 
+/// The process-wide TLS connector, built once on first use.
+///
+/// Constructing it parses the entire OS trust store
+/// (`rustls_native_certs::load_native_certs`), which reads and decodes ~100–150
+/// system CA certificates — tens of milliseconds. It holds only an
+/// `Arc<ClientConfig>`, so it is cached here and cloned (a refcount bump) for
+/// every connection instead of being rebuilt per `connect()` — otherwise each
+/// `YaraOrm.init()` re-parsed the whole trust store (measured ~95ms of the
+/// ~100ms per-init cost, since tokio-postgres defaults to `sslmode=prefer` and
+/// so takes the TLS path even for a plaintext localhost URL).
+static TLS_CONNECTOR: OnceLock<MakeRustlsConnect> = OnceLock::new();
+
+/// Return the shared rustls TLS connector, building it once (see
+/// [`TLS_CONNECTOR`]) and cloning it thereafter.
+fn make_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
+    if let Some(connector) = TLS_CONNECTOR.get() {
+        return Ok(connector.clone());
+    }
+    // Build outside the lock; on a first-connect race the loser's connector is
+    // simply dropped and every caller clones the single cached one.
+    let connector = build_tls_connector()?;
+    Ok(TLS_CONNECTOR.get_or_init(|| connector).clone())
+}
+
 /// Build a rustls TLS connector: server certs are verified against the OS trust
 /// store, using the pure-Rust `ring` crypto provider (no system OpenSSL).
-fn make_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
+fn build_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert); // ignore individual malformed OS certs
