@@ -44,15 +44,18 @@ mysql_async = { version = "0.37", default-features = false, features = [
 # Pure-Rust Oracle driver (native TNS protocol; no OCI / ODPI-C / Instant
 # Client, so manylinux wheels stay self-contained — the same invariant that
 # picked mysql_async over the C drivers). TLS rides the same rustls/ring stack.
-# Pinned to a fork of oracle-rs 0.1.7 with fixes yara-orm depends on:
+# Pinned to a fork of oracle-rs 0.1.7 with fixes yara-orm depends on, each
+# proposed upstream:
 #   - negotiate END_OF_RESPONSE at connect + read multi-packet query responses,
 #     so the connection stays in sync and a whole result set comes back in one
-#     execute (stock caps every query at the 100-row prefetch) — proposed
-#     upstream in stiang/oracle-rs#14;
+#     execute (stock caps every query at the 100-row prefetch) — #14;
 #   - terminate long-form bind data with a zero-length chunk, so string/bytes
-#     binds above 252 bytes no longer drop the connection — stiang/oracle-rs#15.
+#     binds above 252 bytes no longer drop the connection — #15;
+#   - frame marker packets with a 4-byte length in large-SDU mode, so the RESET
+#     after a server break is well-formed and constraint violations surface as
+#     ORA errors (IntegrityError) instead of a dropped connection — #16.
 # The pure-Rust / self-contained-wheel invariant is preserved (no OCI/ODPI-C).
-oracle-rs = { git = "https://github.com/vsdudakov/oracle-rs", rev = "2e4b25b3c162ce263fdfd5a70dea9c2a7eff63d6" }
+oracle-rs = { git = "https://github.com/vsdudakov/oracle-rs", rev = "f4b980a670f031997b12e320a676127614e67bb4" }
 deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
 
 [profile.release]

@@ -319,9 +319,11 @@ async def db(request):
 
 # ---------------------------------------------------------------------------
 # Oracle backend: skip the cross-backend tests the young oracle-rs 0.1.x driver
-# cannot support (large-value binds >~1KB, lost constraint-violation errors,
-# SET TRANSACTION ISOLATION drops, and a handful of unimplemented features /
-# inherent Oracle raw-SQL differences). See docs/backends for the full list.
+# cannot support (values above the max VARCHAR2/RAW size that need CLOB/LONG
+# binding, SET TRANSACTION ISOLATION drops, unimplemented __search/JSON
+# __contains, and a handful of inherent Oracle raw-SQL differences). The pinned
+# driver fork fixes the fetch cap, large-value binds and constraint-violation
+# reporting. See docs/backends for the full list.
 # ---------------------------------------------------------------------------
 _ORACLE_LIMITATIONS = {
     "test_annotator_comment_reaches_all_query_paths",
@@ -344,16 +346,12 @@ _ORACLE_LIMITATIONS = {
     "test_decimal_column_type",
     "test_decimal_precision",
     "test_defer_with_annotate_keeps_column_deferred",
-    "test_duplicate_unique_value_raises_integrity_error",
     "test_execute_many_applies_nothing_on_failure",
     "test_execute_query_rows_support_positional_access",
     "test_execute_script_honours_explicit_transaction_control",
     "test_execute_script_paths_carry_the_comment",
     "test_execute_script_statements_run_in_autocommit",
     "test_fetch_db_defaults_refreshes_the_instance",
-    "test_foreign_key_is_enforced",
-    "test_foreign_key_violation_raises_integrity_error",
-    "test_get_schema_sql",
     "test_isolation_repeatable_read_per_backend",
     "test_isolation_serializable_both_backends",
     "test_json_contains_postgres",
@@ -381,9 +379,6 @@ _ORACLE_LIMITATIONS = {
     "test_sql_and_explain",
     "test_sqlite_omits_using_and_include_but_keeps_unique",
     "test_unique_composite_index_enforces_uniqueness",
-    "test_unique_together_enforced",
-    "test_unique_together_on_relation",
-    "test_unique_violation_raises_integrity_error",
     "test_using_and_include_render_in_schema_sql",
     "test_window_annotation_with_select_related_and_only",
 }
@@ -392,9 +387,9 @@ _ORACLE_LIMITATIONS = {
 def pytest_collection_modifyitems(config, items):
     """Skip the tests a known oracle-rs 0.1.x driver limitation blocks."""
     reason = (
-        "known oracle-rs 0.1.x limitation (see docs/backends): large-value bind, "
-        "constraint-violation connection close, isolation-level drop, or an "
-        "unimplemented feature / inherent Oracle raw-SQL difference"
+        "known oracle-rs 0.1.x limitation (see docs/backends): over-max-size "
+        "CLOB/LONG bind, isolation-level drop, unimplemented __search/__contains, "
+        "or an inherent Oracle raw-SQL difference"
     )
     skip = pytest.mark.skip(reason=reason)
     for item in items:

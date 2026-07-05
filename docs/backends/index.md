@@ -134,19 +134,17 @@ await YaraOrm.init("mysql://user:password@host:3306/dbname")
     the young pure-Rust `oracle-rs` **0.1.x** driver, whose gaps leak into a few
     operations:
 
-    - **Very large values can't be bound.** Strings and bytes now bind at any
-      size up to the server's max `VARCHAR2`/`RAW` (32&nbsp;767 with extended
-      strings, otherwise 4000) — the fork fixes the long-form framing that used
-      to drop the connection above ~252 bytes. Values beyond that limit still
-      need `CLOB`/`LONG` binding, which is not yet implemented.
-    - **No `IntegrityError`.** A constraint violation closes the connection
-      without surfacing the `ORA-` code, so duplicate/NOT-NULL breaches can't be
-      raised as `IntegrityError`.
-    - **A few features are unimplemented** at the driver level: `__search`
+    - **Very large values can't be bound.** Strings and bytes bind at any size up
+      to the server's max `VARCHAR2`/`RAW` (32&nbsp;767 with extended strings,
+      otherwise 4000). Values beyond that still need `CLOB`/`LONG` binding, which
+      is not yet implemented.
+    - **Custom transaction isolation levels are unavailable.** `SET TRANSACTION
+      ISOLATION LEVEL` drops the connection, so per-transaction isolation
+      overrides can't be used (the default isolation still applies).
+    - **A few lookups are unimplemented** at the driver/dialect level: `__search`
       (Oracle Text) and JSON `__contains`.
     - **Reduced throughput on some paths.** `bulk_create` falls back to one
-      statement per row (no multi-row `VALUES`), and pooled connections are
-      retired periodically to dodge a driver protocol-desync.
+      statement per row (no multi-row `VALUES`).
 
     The affected tests are skipped and each limitation is listed under
     [Driver limitations](#driver-limitations-oracle-rs-01x) below. The backend
@@ -195,14 +193,18 @@ and their tests are skipped:
   Values beyond that limit still need `CLOB`/`LONG` binding, which is not yet
   implemented, so very large `TextField` / `JSONField` / `BinaryField` values
   cannot be inserted.
-- **`IntegrityError` on constraint violations.** A unique / foreign-key /
-  not-null violation makes the driver close the connection without surfacing the
-  `ORA-` code, so the violation cannot be reported as an `IntegrityError`.
+- **Custom transaction isolation levels.** `SET TRANSACTION ISOLATION LEVEL`
+  drops the connection, so a per-transaction isolation override cannot be
+  applied (the session default still governs).
 - **`__search`** (Oracle Text) and JSON **`__contains`** are not implemented.
 - `bulk_create` inserts one row per statement (Oracle has no multi-row
-  `VALUES`), and connections are retired after a fixed number of reuses to work
-  around a driver protocol-desync at a few hundred statements — so very large
-  bulk loads carry extra reconnect overhead.
+  `VALUES`), and connections are retired after a fixed number of reuses as a
+  safety margin — so very large bulk loads carry extra reconnect overhead.
+
+Constraint violations (unique / foreign-key / not-null) now raise
+`IntegrityError` with the `ORA-` code, and query results of any size are
+returned, thanks to the [pinned driver fork](#oracle) (proposed upstream in
+`stiang/oracle-rs#14`/`#15`/`#16`).
 
 The backend passes the shared cross-backend test suite apart from the cases
 above. It will graduate as the driver matures.
