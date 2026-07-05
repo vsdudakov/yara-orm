@@ -32,10 +32,12 @@ async def test_get_schema_sql(db):
     WHEN get_schema_sql() is called
     THEN it returns the CREATE TABLE / join-table DDL without executing it
     """
-    q = "`" if db in ("mysql", "mariadb") else '"'
+    lo, hi = (
+        ("[", "]") if db == "mssql" else (("`", "`") if db in ("mysql", "mariadb") else ('"', '"'))
+    )
     sql = YaraOrm.get_schema_sql()
     assert "CREATE TABLE" in sql
-    assert f"{q}lc_thing{q}" in sql
+    assert f"{lo}lc_thing{hi}" in sql
     assert "lc_thing_tag" in sql  # m2m join table included
     assert sql.rstrip().endswith(";")
 
@@ -47,10 +49,12 @@ async def test_get_schema_sql_subset(db):
     WHEN get_schema_sql(models=[...]) is called
     THEN only those tables appear
     """
-    q = "`" if db in ("mysql", "mariadb") else '"'
+    lo, hi = (
+        ("[", "]") if db == "mssql" else (("`", "`") if db in ("mysql", "mariadb") else ('"', '"'))
+    )
     sql = YaraOrm.get_schema_sql(models=[LcThing])
-    assert f"{q}lc_thing{q}" in sql
-    assert f"{q}lc_tag{q}" not in sql
+    assert f"{lo}lc_thing{hi}" in sql
+    assert f"{lo}lc_tag{hi}" not in sql
 
 
 def test_run_async_runs_and_closes():

@@ -341,8 +341,8 @@ async def test_contains_object_subset(db):
     WHEN filtered with ``__contains`` for an object subset
     THEN rows whose object contains the given key/value pairs match
     """
-    if db == "sqlite":
-        pytest.skip("SQLite has no JSON containment operator (@>)")
+    if db in ("sqlite", "mssql"):
+        pytest.skip("SQLite/SQL Server have no JSON containment operator (@>)")
     await JdDoc.create(data={"a": 1, "b": 2, "c": 3})
     await JdDoc.create(data={"a": 1, "b": 9})
 
@@ -358,8 +358,8 @@ async def test_contains_array_element(db):
     WHEN filtered with ``__contains`` for an element subset
     THEN rows whose array contains all listed elements match
     """
-    if db == "sqlite":
-        pytest.skip("SQLite has no JSON containment operator (@>)")
+    if db in ("sqlite", "mssql"):
+        pytest.skip("SQLite/SQL Server have no JSON containment operator (@>)")
     await JdDoc.create(data=["x", "y", "z"])
     await JdDoc.create(data=["x"])
 
@@ -375,8 +375,8 @@ async def test_contains_array_of_objects(db):
     WHEN filtered with ``__contains`` for a matching object element
     THEN rows containing that object (as a subset) match
     """
-    if db == "sqlite":
-        pytest.skip("SQLite has no JSON containment operator (@>)")
+    if db in ("sqlite", "mssql"):
+        pytest.skip("SQLite/SQL Server have no JSON containment operator (@>)")
     await JdDoc.create(data=[{"id": 1, "t": "a"}, {"id": 2, "t": "b"}])
     await JdDoc.create(data=[{"id": 3, "t": "c"}])
 

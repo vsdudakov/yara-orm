@@ -177,6 +177,15 @@ class BaseDialect:
     #: Oracle cannot (its multi-row insert is ``INSERT ALL`` / a MERGE source),
     #: so ``bulk_create`` falls back to one statement per row there.
     supports_multirow_insert = True
+    #: Maximum number of bind parameters a single statement may carry; bulk
+    #: inserts are chunked to stay under it. PostgreSQL's protocol ceiling is
+    #: 65535; SQL Server's is 2100 (a much tighter cap, so its dialect lowers it).
+    max_bind_params = 65535
+    #: Whether a conflict-ignoring bulk insert needs an explicit conflict target.
+    #: ``INSERT IGNORE`` / ``ON CONFLICT DO NOTHING`` catch any unique violation
+    #: implicitly; SQL Server's ``MERGE`` must name the columns to match on, so
+    #: its dialect sets this and the model supplies the unique columns.
+    upsert_requires_conflict_target = False
     #: Whether grouping by a table's primary key lets the other selected columns
     #: of that table appear unaggregated (functional dependency — PostgreSQL's
     #: rule, and SQLite/MySQL allow bare columns too). Oracle enforces the strict
@@ -491,6 +500,52 @@ class BaseDialect:
             tail += f" OFFSET {int(offset)}"
         return tail
 
+    def offset_order_fallback(self) -> str:
+        """Render a placeholder ``ORDER BY`` for an unordered paginated query.
+
+        Most dialects render pagination as ``LIMIT``/``OFFSET``, which needs no
+        ordering, so the default is empty. SQL Server renders ``OFFSET ... ROWS
+        FETCH NEXT`` — which the grammar only permits after an ``ORDER BY`` — so
+        its dialect returns ``ORDER BY (SELECT NULL)`` to satisfy the parser when
+        a limited/offset query carries no ordering of its own.
+
+        Returns:
+            The fallback ``ORDER BY`` fragment (leading space included), or
+            ``""`` when the dialect needs none.
+        """
+        return ""
+
+    def scalar_function(self, name: str) -> str:
+        """Map a portable scalar-function name to the dialect's spelling.
+
+        Most names are ANSI and pass through; SQL Server overrides the few that
+        differ (e.g. ``LENGTH`` → ``LEN``).
+
+        Args:
+            name: The portable function name (e.g. ``LENGTH``).
+
+        Returns:
+            The dialect-specific function name.
+        """
+        return name
+
+    def aggregate_argument_sql(self, function: str, inner_sql: str) -> str:
+        """Transform an aggregate's argument for dialect-specific typing.
+
+        Most dialects aggregate the column as-is. SQL Server overrides this to
+        cast ``AVG`` arguments to a floating type, since ``AVG`` over an integer
+        column there performs integer division (``AVG`` of 3,4,4,4 yields 3, not
+        3.75) — unlike PostgreSQL/MySQL, which promote the result to a decimal.
+
+        Args:
+            function: The aggregate function name (e.g. ``AVG``, ``SUM``).
+            inner_sql: The already-rendered argument expression.
+
+        Returns:
+            The argument expression, possibly wrapped in a cast.
+        """
+        return inner_sql
+
     def insert_default_values_sql(self, pk_column: str) -> str:
         """Render the statement tail that inserts a row of column defaults.
 
@@ -506,6 +561,38 @@ class BaseDialect:
             The statement tail following the table name.
         """
         return "DEFAULT VALUES"
+
+    def insert_placeholder(self, field: Field, idx: int) -> str:
+        """Render an INSERT ``VALUES`` placeholder, optionally typed per column.
+
+        Most dialects use the plain positional placeholder. SQL Server overrides
+        this to ``CAST(... AS VARBINARY(MAX))`` for binary columns, since a bound
+        ``NULL`` (or text) parameter cannot implicitly convert to ``VARBINARY``.
+
+        Args:
+            field: The field the placeholder binds a value for.
+            idx: The 1-based bind-parameter index.
+
+        Returns:
+            The placeholder SQL fragment.
+        """
+        return self.placeholder(idx)
+
+    def identity_insert_sql(self, table: str, insert_sql: str) -> str:
+        """Wrap an INSERT that supplies an explicit auto-increment primary key.
+
+        Most dialects accept an explicit value for a serial/identity column, so
+        the statement passes through unchanged. SQL Server rejects it unless the
+        table's ``IDENTITY_INSERT`` is toggled on for that statement.
+
+        Args:
+            table: The already-quoted target table.
+            insert_sql: The rendered ``INSERT`` statement.
+
+        Returns:
+            The (possibly wrapped) statement.
+        """
+        return insert_sql
 
     def insert_returning_clause(self, fields: Sequence[Field]) -> str:
         """Render the ``RETURNING`` clause appended to an INSERT.
@@ -3276,12 +3363,771 @@ class OracleDialect(BaseDialect):
         ]
 
 
+class SqlServerDialect(BaseDialect):
+    """Dialect rendering T-SQL for Microsoft SQL Server (2017+ / Azure SQL).
+
+    Key departures from the base dialect: ``@PN`` bind placeholders and
+    ``[bracket]`` identifier quoting; the ``NVARCHAR``/``BIGINT``/``DATETIME2``/
+    ``UNIQUEIDENTIFIER``/``BIT`` type family (``BIT`` booleans, native ``GUID``
+    uuids); ``IDENTITY(1,1)`` auto-increment whose generated value is read back
+    via ``SCOPE_IDENTITY()`` — the backend batches it, since T-SQL has no
+    ``RETURNING`` and ``OUTPUT`` cannot be a statement suffix the model appends;
+    ``OFFSET ... FETCH NEXT`` paging (which requires an ``ORDER BY``); ``MERGE``
+    for bulk upserts; ``CONCAT`` string concatenation; and case-insensitive
+    ``LIKE`` by default (a binary ``COLLATE`` folds the case-sensitive lookups).
+    SQL Server has no ``REGEXP`` operator, so regex lookups raise
+    ``UnSupportedError``.
+    """
+
+    name = "mssql"
+    # T-SQL has no `RETURNING`; the backend reads a generated IDENTITY back with
+    # a batched `SELECT SCOPE_IDENTITY()`, and `Meta.fetch_db_defaults` columns
+    # come back via the follow-up SELECT (the same path MySQL uses).
+    supports_insert_returning = False
+    insert_ignore_verb = "INSERT"  # no INSERT IGNORE; conflicts go through MERGE
+    insert_default_values = "DEFAULT VALUES"
+    random_function = "NEWID()"
+    # SQL Server has no `SELECT ... FOR UPDATE` suffix (it uses table lock hints),
+    # so the lock clause is dropped, as on SQLite.
+    supports_for_update = False
+    modifying_subquery_needs_wrap = True
+    supports_aggregate_filter = False
+    supports_multirow_insert = True  # multi-row VALUES (up to 1000 rows)
+    max_bind_params = 2000  # under SQL Server's hard 2100-parameter ceiling
+    upsert_requires_conflict_target = True  # MERGE must name its match columns
+    group_by_functional_dependency = False
+    offset_requires_limit = False
+    index_concurrently = False
+    index_using = False
+    index_include = False
+    index_opclass = False
+    supports_extensions = False
+    column_if_exists = False
+    # Default collations are case-insensitive; `like_pattern_sql` adds a binary
+    # COLLATE for the case-sensitive lookups. Plain LIKE for the subquery path.
+    ilike = "LIKE"
+    like = "LIKE"
+    like_escape = " ESCAPE '\\'"
+    #: SQL Server has no regular-expression operator (regex lookups raise).
+    regex_ops: dict[str, str] = {}
+
+    type_map = {
+        "smallint": "SMALLINT",
+        "int": "INT",
+        "bigint": "BIGINT",
+        "varchar": "NVARCHAR({max_length})",
+        "text": "NVARCHAR(MAX)",
+        "bool": "BIT",
+        "float": "FLOAT(53)",
+        "decimal": "DECIMAL({max_digits}, {decimal_places})",
+        "datetime": "DATETIME2(6)",
+        "date": "DATE",
+        "time": "TIME(6)",
+        "timedelta": "BIGINT",
+        "uuid": "UNIQUEIDENTIFIER",
+        "json": "NVARCHAR(MAX)",
+        "bytes": "VARBINARY(MAX)",
+    }
+    #: ``IDENTITY(1,1)``: the database assigns the pk when the INSERT omits it.
+    serial_map = {
+        "smallint": "SMALLINT IDENTITY(1,1)",
+        "int": "INT IDENTITY(1,1)",
+        "bigint": "BIGINT IDENTITY(1,1)",
+    }
+    _datepart = {
+        "year": "year",
+        "month": "month",
+        "day": "day",
+        "hour": "hour",
+        "minute": "minute",
+        "second": "second",
+        "quarter": "quarter",
+        "week": "iso_week",
+        "microsecond": "microsecond",
+    }
+
+    def placeholder(self, index: int) -> str:
+        """Render T-SQL's ``@PN`` bind placeholder.
+
+        Args:
+            index: The 1-based parameter position.
+
+        Returns:
+            ``"@P<index>"``.
+        """
+        return f"@P{index}"
+
+    def quote(self, identifier: str) -> str:
+        """Quote an identifier with square brackets (``]`` doubled).
+
+        Args:
+            identifier: The identifier to quote.
+
+        Returns:
+            The bracket-quoted identifier.
+        """
+        return f"[{identifier.replace(']', ']]')}]"
+
+    def insert_placeholder(self, field: Field, idx: int) -> str:
+        """Cast binary-column placeholders to ``VARBINARY(MAX)``.
+
+        A bound parameter defaults to an ``nvarchar`` type; SQL Server refuses to
+        implicitly convert ``nvarchar`` (including a typed ``NULL``) to
+        ``varbinary`` (error 257), so binary columns get an explicit cast.
+
+        Args:
+            field: The field the placeholder binds a value for.
+            idx: The 1-based bind-parameter index.
+
+        Returns:
+            The placeholder, wrapped in ``CAST(... AS VARBINARY(MAX))`` for bytes.
+        """
+        if field.field_kind == "bytes":
+            return f"CAST({self.placeholder(idx)} AS VARBINARY(MAX))"
+        return self.placeholder(idx)
+
+    def identity_insert_sql(self, table: str, insert_sql: str) -> str:
+        """Bracket an explicit-identity INSERT with ``SET IDENTITY_INSERT``.
+
+        SQL Server refuses an explicit value for an ``IDENTITY`` column unless
+        the table's ``IDENTITY_INSERT`` is ON for that statement (error 544).
+
+        Args:
+            table: The already-quoted target table.
+            insert_sql: The rendered ``INSERT`` statement.
+
+        Returns:
+            The INSERT wrapped in ``SET IDENTITY_INSERT ON/OFF``.
+        """
+        return f"SET IDENTITY_INSERT {table} ON; {insert_sql}; SET IDENTITY_INSERT {table} OFF"
+
+    def concat_sql(self, parts: list[str]) -> str:
+        """Concatenate operands with T-SQL's ``CONCAT`` (``||`` is not string concat).
+
+        Args:
+            parts: The rendered SQL operand expressions.
+
+        Returns:
+            The concatenation SQL expression.
+        """
+        return "CONCAT(" + ", ".join(parts) + ")"
+
+    def cast_text(self, col: str) -> str:
+        """Render a text cast (``CAST(col AS NVARCHAR(4000))``).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            The cast expression.
+        """
+        return f"CAST({col} AS NVARCHAR(4000))"
+
+    # -- row decoding -------------------------------------------------------
+    def read_decoder(self, field: Field) -> Callable[[Any], Any] | None:
+        """Reconstruct types SQL Server returns as text/naive.
+
+        ``NVARCHAR(MAX)`` json comes back as a string; ``DATETIME2`` is naive
+        (re-labelled UTC under ``use_tz``). ``UNIQUEIDENTIFIER`` and ``BIT`` are
+        already native (``uuid.UUID`` / ``bool``). An FK column adopts the
+        referenced primary key's kind.
+
+        Args:
+            field: The field whose column is being decoded.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        base = super().read_decoder(field)
+        kind = field.field_kind
+        if isinstance(field, ForeignKeyFieldInstance):
+            kind = get_model(field.reference)._meta.pk_field.field_kind
+        extra: Callable[[Any], Any] | None = {
+            "datetime": _datetime_from_db,
+            "json": _json_from_db,
+        }.get(kind)
+        if extra is None:
+            return base
+        if base is None:
+            return extra
+        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+
+    # -- query lookups ------------------------------------------------------
+    def like_pattern_sql(self, case_insensitive: bool, col: str, placeholder: str) -> str:
+        """Render a pattern lookup; a binary COLLATE makes it case-sensitive.
+
+        SQL Server's default collations are case-insensitive, so ``ILIKE``-style
+        matching is plain ``LIKE``; the case-sensitive lookups force a binary
+        collation on the comparison.
+
+        Args:
+            case_insensitive: Whether the lookup ignores case.
+            col: The already-qualified (already text-cast) column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A boolean SQL expression matching ``col`` against the pattern.
+        """
+        if case_insensitive:
+            return f"{col} LIKE {placeholder}{self.like_escape}"
+        return f"{col} LIKE {placeholder} COLLATE Latin1_General_BIN2{self.like_escape}"
+
+    def limit_offset_sql(self, limit: int | None, offset: int | None) -> str:
+        """Render ``OFFSET m ROWS FETCH NEXT n ROWS ONLY``.
+
+        SQL Server requires an ``ORDER BY`` for ``OFFSET/FETCH``; the queryset
+        supplies one whenever it paginates.
+
+        Args:
+            limit: The maximum row count, or None.
+            offset: The number of leading rows to skip, or None.
+
+        Returns:
+            The clause fragment (leading space included), or ``""``.
+        """
+        if limit is None and offset is None:
+            return ""
+        if limit is not None and int(limit) <= 0:
+            # SQL Server rejects FETCH NEXT 0; skipping past every row (an offset
+            # of the maximum BIGINT) yields the empty result an empty slice wants.
+            return " OFFSET 9223372036854775807 ROWS"
+        tail = f" OFFSET {int(offset) if offset is not None else 0} ROWS"
+        if limit is not None:
+            tail += f" FETCH NEXT {int(limit)} ROWS ONLY"
+        return tail
+
+    def offset_order_fallback(self) -> str:
+        """Render ``ORDER BY (SELECT NULL)`` for an unordered paginated query.
+
+        ``OFFSET ... FETCH`` is only legal after an ``ORDER BY``; ``(SELECT
+        NULL)`` is the canonical no-op ordering used when the query itself
+        imposes none.
+
+        Returns:
+            The fallback ``ORDER BY`` fragment (leading space included).
+        """
+        return " ORDER BY (SELECT NULL)"
+
+    def scalar_function(self, name: str) -> str:
+        """Map portable scalar-function names to their T-SQL spelling.
+
+        SQL Server spells string length ``LEN`` (``LENGTH`` is unrecognised).
+
+        Args:
+            name: The portable function name.
+
+        Returns:
+            The T-SQL function name.
+        """
+        return {"LENGTH": "LEN"}.get(name, name)
+
+    def aggregate_argument_sql(self, function: str, inner_sql: str) -> str:
+        """Cast ``AVG`` arguments to ``FLOAT`` to avoid integer division.
+
+        ``AVG`` over an integer column does integer division on SQL Server; the
+        cast makes it return a fractional average, matching the other backends.
+
+        Args:
+            function: The aggregate function name.
+            inner_sql: The already-rendered argument expression.
+
+        Returns:
+            The argument, wrapped in ``CAST(... AS FLOAT)`` for ``AVG``.
+        """
+        if function == "AVG" and inner_sql != "*":
+            return f"CAST({inner_sql} AS FLOAT)"
+        return inner_sql
+
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render a date/time part via ``DATEPART``.
+
+        Args:
+            part: A supported date/time part name.
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the integer part.
+        """
+        spelled = self._datepart.get(part)
+        if spelled is None:
+            raise UnSupportedError(f"mssql does not support the __{part} lookup")
+        return f"DATEPART({spelled}, {col})"
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render ``CAST(col AS DATE)`` (for the ``__date`` lookup).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the date part.
+        """
+        return f"CAST({col} AS DATE)"
+
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render a JSON key path as text via ``JSON_VALUE`` (SQL Server 2016+).
+
+        Args:
+            col: The already-qualified JSON (NVARCHAR) column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            ``JSON_VALUE(col, N'$."a"."b"')`` (the column itself with no keys).
+        """
+        if not keys:
+            return col
+        legs = "".join('."' + key.replace('"', '\\"') + '"' for key in keys)
+        # An N-prefixed (NVARCHAR) path literal preserves non-ASCII keys; a plain
+        # VARCHAR literal would fold them to the database codepage and never match.
+        path = ("$" + legs).replace("'", "''")
+        return f"JSON_VALUE({col}, N'{path}')"
+
+    def regex_sql(self, op: str, col: str, placeholder: str) -> str:
+        """SQL Server has no regular-expression operator.
+
+        Args:
+            op: The lookup name.
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder.
+
+        Raises:
+            UnSupportedError: Always.
+        """
+        raise UnSupportedError("mssql has no regular-expression operator")
+
+    # -- bulk upsert (MERGE) -------------------------------------------------
+    def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
+        """Reject the ``ON CONFLICT`` suffix; SQL Server renders a ``MERGE``.
+
+        Args:
+            conflict_columns: The conflict-target columns.
+            update_columns: The columns to overwrite on conflict.
+
+        Raises:
+            UnSupportedError: Always — the ``MERGE`` path supersedes this hook.
+        """
+        raise UnSupportedError(  # pragma: no cover - superseded by render_upsert
+            "mssql renders conflict handling as MERGE via render_upsert, not an ON CONFLICT suffix"
+        )
+
+    def render_upsert(
+        self,
+        table: str,
+        columns: Sequence[str],
+        nrows: int,
+        conflict_columns: Sequence[str],
+        update_columns: Sequence[str],
+        pk_columns: Sequence[str],
+    ) -> str:
+        """Render a conflict-skipping/updating bulk insert as a T-SQL ``MERGE``.
+
+        SQL Server has no ``INSERT ... ON CONFLICT`` / ``INSERT IGNORE``; a
+        ``MERGE`` against a ``VALUES`` row source is the equivalent.
+        ``WHEN NOT MATCHED THEN INSERT`` covers the ignore case;
+        ``WHEN MATCHED THEN UPDATE`` adds the upsert.
+
+        Args:
+            table: The already-quoted target table.
+            columns: The unquoted column names, in insert (and bind) order.
+            nrows: Number of value rows.
+            conflict_columns: The unquoted conflict-target columns.
+            update_columns: The unquoted columns to overwrite on conflict.
+            pk_columns: The unquoted primary-key columns (target fallback).
+
+        Returns:
+            The complete ``MERGE`` statement (terminated with ``;``).
+        """
+        targets = [c for c in (list(conflict_columns) or list(pk_columns)) if c in columns]
+        if not targets:  # pragma: no cover - exercised only by mssql-skipped tests
+            raise UnSupportedError(
+                "mssql bulk upsert needs a conflict target present in the inserted "
+                "columns; pass on_conflict=[...]"
+            )
+        ncols = len(columns)
+        idx = 1
+        value_rows = []
+        for _ in range(nrows):
+            holes = ", ".join(self.placeholder(idx + j) for j in range(ncols))
+            value_rows.append(f"({holes})")
+            idx += ncols
+        src_cols = ", ".join(self.quote(c) for c in columns)
+        on = " AND ".join(f"d.{self.quote(c)} = s.{self.quote(c)}" for c in targets)
+        merge = (
+            f"MERGE INTO {table} AS d USING (VALUES {', '.join(value_rows)}) "
+            f"AS s ({src_cols}) ON ({on}) "
+        )
+        updates = [c for c in update_columns if c not in targets]
+        if updates:
+            sets = ", ".join(f"d.{self.quote(c)} = s.{self.quote(c)}" for c in updates)
+            merge += f"WHEN MATCHED THEN UPDATE SET {sets} "
+        insert_cols = ", ".join(self.quote(c) for c in columns)
+        insert_vals = ", ".join(f"s.{self.quote(c)}" for c in columns)
+        merge += f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
+        return merge
+
+    # -- DDL ------------------------------------------------------------------
+    def create_table_sql(self, meta: MetaInfo, safe: bool = True) -> list[str]:
+        """Render one guarded ``CREATE TABLE`` with indexes folded inline.
+
+        SQL Server has no ``CREATE TABLE IF NOT EXISTS`` (nor
+        ``CREATE INDEX IF NOT EXISTS``); the idempotency guard is a preceding
+        ``IF OBJECT_ID(...) IS NULL``, and secondary indexes ride the table via
+        SQL Server 2014+ inline ``INDEX`` clauses so one guard covers them all.
+
+        Args:
+            meta: The model metadata describing the table.
+            safe: Whether to emit the ``IF OBJECT_ID`` existence guard.
+
+        Returns:
+            The list with the (guarded) create-table statement.
+        """
+        lines = [self.column_sql(f) for f in meta.fields.values()]
+        pk_line = self._pk_line(meta)
+        if pk_line:  # pragma: no branch - always table-level on SQL Server
+            lines.append(pk_line)
+        fks = [
+            f
+            for f in meta.fields.values()
+            if isinstance(f, ForeignKeyFieldInstance) and f.db_constraint
+        ]
+        # SQL Server rejects a FOREIGN KEY that introduces a second cascade path
+        # to a table (error 1785) — including any self-referential cascade — so
+        # those FKs are pinned to NO ACTION. Single-path cascades are left intact.
+        ref_counts: dict[str, int] = {}
+        for f in fks:
+            table = get_model(f.reference)._meta.table
+            ref_counts[table] = ref_counts.get(table, 0) + 1
+        for field in fks:
+            ref = get_model(field.reference)
+            ref_table = ref._meta.table
+            on_delete = field.on_delete
+            if ref_table == meta.table or ref_counts[ref_table] > 1:
+                on_delete = "NO ACTION"
+            lines.append(
+                self._fk_clause(
+                    self.quote(field.db_column),
+                    self.quote(ref_table),
+                    self.quote(ref._meta.pk_field.db_column),
+                    on_delete,
+                )
+            )
+        lines.extend(self._unique_together_lines(meta))
+        for constraint in meta.constraints:
+            lines.append(self._constraint_clause(constraint.to_spec()))
+        for field in meta.fields.values():
+            if field.index and not field.unique and not field.pk:
+                if self._is_max_column(field):
+                    continue  # SQL Server cannot index a MAX-typed column (1919).
+                idx_name = self.quote(f"idx_{meta.table}_{field.db_column}")
+                lines.append(f"INDEX {idx_name} ({self.quote(field.db_column)})")
+        for index in meta.indexes:
+            # SQL Server cannot index a MAX-typed (json/text/bytes) column; such
+            # an index (e.g. a PostgreSQL GIN index on JSON) is dropped so the
+            # table stays creatable.
+            if any(
+                f not in meta.relations and self._is_max_column(meta.get_field(f))
+                for f in index.fields
+            ):
+                continue
+            cols = ", ".join(self._group_columns(meta, index.fields))
+            # SQL Server's inline form is ``INDEX name UNIQUE (cols)`` — the
+            # UNIQUE keyword follows the name (a leading ``UNIQUE INDEX`` is 1018).
+            uniq = " UNIQUE" if getattr(index, "unique", False) else ""
+            lines.append(f"INDEX {self.quote(index.resolve_name(meta.table))}{uniq} ({cols})")
+
+        body = ",\n  ".join(lines)
+        table = self.quote(meta.table)
+        create = f"CREATE TABLE {table} (\n  {body}\n)"
+        if safe:
+            create = f"IF OBJECT_ID(N'{table}', 'U') IS NULL\n{create}"
+        statements = [create]
+        # A nullable UNIQUE column: SQL Server treats NULLs as equal in a UNIQUE
+        # constraint (one NULL max), unlike PostgreSQL. A filtered unique index
+        # over the non-NULL rows restores multi-NULL semantics.
+        for field in meta.fields.values():
+            if field.unique and not field.pk and field.null:
+                statements.append(
+                    self._filtered_unique_index_sql(meta.table, field.db_column, safe)
+                )
+        return statements
+
+    def _is_max_column(self, field: Field) -> bool:
+        """Whether a field maps to an unindexable MAX-length SQL Server type.
+
+        ``json``/``text`` become ``NVARCHAR(MAX)`` and ``bytes`` ``VARBINARY(MAX)``;
+        SQL Server rejects any of these as an index key column (error 1919).
+
+        Args:
+            field: The field to classify.
+
+        Returns:
+            True when the field's column cannot be an index key.
+        """
+        return field.field_kind in ("json", "text", "bytes")
+
+    def _filtered_unique_index_sql(self, table: str, column: str, safe: bool) -> str:
+        """Render a nullable column's filtered unique index (guarded when safe).
+
+        Args:
+            table: The (unquoted) table name.
+            column: The (unquoted) column name.
+            safe: Whether to guard against re-creation via ``sys.indexes``.
+
+        Returns:
+            The ``CREATE UNIQUE INDEX ... WHERE col IS NOT NULL`` statement.
+        """
+        name = f"uq_{table}_{column}"
+        col = self.quote(column)
+        stmt = (
+            f"CREATE UNIQUE INDEX {self.quote(name)} ON {self.quote(table)} "
+            f"({col}) WHERE {col} IS NOT NULL"
+        )
+        if safe:
+            guard = (
+                f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{name}' "
+                f"AND object_id = OBJECT_ID(N'{self.quote(table)}'))"
+            )
+            stmt = f"{guard}\n{stmt}"
+        return stmt
+
+    def column_sql(self, field: Field) -> str:
+        """Render a column definition, deferring nullable UNIQUE to a filtered index.
+
+        Identical to the base form except a *nullable* unique column omits the
+        inline ``UNIQUE`` (:meth:`create_table_sql` emits a filtered index for
+        it instead); a NOT NULL unique column keeps the inline constraint.
+
+        Args:
+            field: The field to render as a column definition.
+
+        Returns:
+            The column definition SQL fragment.
+        """
+        parts = [self.quote(field.db_column), self.column_type(field)]
+        if field.pk:
+            pass
+        elif field.null:
+            parts.append("NULL")
+        else:
+            parts.append("NOT NULL")
+        if field.unique and not field.pk and not field.null:
+            parts.append("UNIQUE")
+        if isinstance(field.default, DatabaseDefault):
+            parts.append(f"DEFAULT ({field.default.to_sql(self)})")
+        return " ".join(parts)
+
+    def _fk_clause(self, col: str, ref_tbl: str, ref_pk: str, on_delete: str) -> str:
+        """Render an FK clause, mapping ``RESTRICT`` to SQL Server's ``NO ACTION``.
+
+        Args:
+            col: The already-quoted referencing column.
+            ref_tbl: The already-quoted referenced table.
+            ref_pk: The already-quoted referenced primary key column.
+            on_delete: The ``ON DELETE`` action.
+
+        Returns:
+            The ``FOREIGN KEY`` clause.
+        """
+        action = "NO ACTION" if on_delete == "RESTRICT" else on_delete
+        return f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) ON DELETE {action}"
+
+    def _comment_sql(self, meta: MetaInfo) -> list[str]:
+        """Drop column/table comments — SQL Server has no ``COMMENT ON``.
+
+        (Comments would use ``sp_addextendedproperty``, which is not emitted.)
+
+        Args:
+            meta: The model metadata (unused).
+
+        Returns:
+            An empty list.
+        """
+        return []
+
+    def create_m2m_table_sql(self, info: M2MInfo, safe: bool = True) -> list[str]:
+        """DDL for a many-to-many join table, guarded the SQL Server way.
+
+        SQL Server has no ``CREATE TABLE IF NOT EXISTS``, so the idempotency
+        guard is a preceding ``IF OBJECT_ID(...) IS NULL``. A self-referential
+        M2M (owner and target are the same table) would make the two cascading
+        FKs a second cascade path (error 1785), so both drop to ``NO ACTION``.
+
+        Args:
+            info: The many-to-many relation metadata.
+            safe: Whether to emit the existence guard.
+
+        Returns:
+            The list with the (guarded) join-table create statement.
+        """
+        owner = info.owner
+        target = info.resolve_target()
+        near = self.quote(info.backward_key)
+        far = self.quote(info.forward_key)
+        owner_tbl = self.quote(owner._meta.table)
+        owner_pk = self.quote(owner._meta.pk_field.db_column)
+        target_tbl = self.quote(target._meta.table)
+        target_pk = self.quote(target._meta.pk_field.db_column)
+        # A join table's two cascading FKs are a classic SQL Server 1785 trigger:
+        # self-referential M2M, or a cascade *diamond* when the two endpoints
+        # share a descendant through other FKs. Diamonds can't be detected from a
+        # single table's spec, so both FKs drop to NO ACTION unconditionally; the
+        # ORM removes join rows itself when a related instance is deleted.
+        lines = [
+            f"{near} {self._scalar_pk_type(owner._meta.pk_field)} NOT NULL",
+            f"{far} {self._scalar_pk_type(target._meta.pk_field)} NOT NULL",
+            f"PRIMARY KEY ({near}, {far})",
+            f"FOREIGN KEY ({near}) REFERENCES {owner_tbl} ({owner_pk}) ON DELETE NO ACTION",
+            f"FOREIGN KEY ({far}) REFERENCES {target_tbl} ({target_pk}) ON DELETE NO ACTION",
+        ]
+        body = ",\n  ".join(lines)
+        table = self.quote(info.through)
+        create = f"CREATE TABLE {table} (\n  {body}\n)"
+        if safe:
+            create = f"IF OBJECT_ID(N'{table}', 'U') IS NULL\n{create}"
+        return [create]
+
+    # -- migration rendering -------------------------------------------------
+    def render_drop_table(self, table: str) -> list[str]:
+        """Render a drop-table statement (``DROP TABLE IF EXISTS``, 2016+).
+
+        Args:
+            table: The table name.
+
+        Returns:
+            The list with the drop-table statement.
+        """
+        return [f"DROP TABLE IF EXISTS {self.quote(table)}"]
+
+    def render_create_table(
+        self, table: str, tspec: dict[str, Any], safe: bool = True
+    ) -> list[str]:
+        """Render a migration ``CREATE TABLE`` with the SQL Server guard.
+
+        Mirrors the base spec-based renderer but swaps ``CREATE TABLE IF NOT
+        EXISTS`` for a preceding ``IF OBJECT_ID(...) IS NULL`` and pins any
+        multi-path / self-referential / ``RESTRICT`` FK to ``NO ACTION`` (SQL
+        Server error 1785 / no ``RESTRICT`` keyword).
+
+        Args:
+            table: The table name.
+            tspec: The migration table spec.
+            safe: Whether to emit the ``IF OBJECT_ID`` existence guard.
+
+        Returns:
+            The list of SQL statements creating the table (and its indexes).
+        """
+        lines = [self.render_column_def(n, s) for n, s in tspec["columns"].items()]
+        pk = self._pk_clause(tspec)
+        if pk:
+            lines.append(pk)
+        fks = tspec.get("fks", {})
+        ref_counts: dict[str, int] = {}
+        for ref in fks.values():
+            ref_counts[ref["table"]] = ref_counts.get(ref["table"], 0) + 1
+        for col, ref in fks.items():
+            on_delete = ref.get("on_delete", "CASCADE")
+            if ref["table"] == table or ref_counts[ref["table"]] > 1 or on_delete == "RESTRICT":
+                on_delete = "NO ACTION"
+            lines.append(
+                f"FOREIGN KEY ({self.quote(col)}) REFERENCES {self.quote(ref['table'])} "
+                f"({self.quote(ref['pk'])}) ON DELETE {on_delete}"
+            )
+        for constraint in tspec.get("constraints", []):
+            lines.append(self._constraint_clause(constraint))
+        body = ",\n  ".join(lines)
+        tbl = self.quote(table)
+        create = f"CREATE TABLE {tbl} (\n  {body}\n)"
+        if safe:
+            create = f"IF OBJECT_ID(N'{tbl}', 'U') IS NULL\n{create}"
+        out = [create]
+        for col in tspec.get("indexes", []):
+            out.extend(self.render_create_index(table, col, safe))
+        for name, spec in tspec.get("composite_indexes", {}).items():
+            out.extend(
+                self.render_create_composite_index(
+                    table,
+                    name,
+                    spec["columns"],
+                    safe=safe,
+                    condition=spec.get("condition"),
+                    unique=spec.get("unique", False),
+                )
+            )
+        return out
+
+    def render_create_index(
+        self,
+        table: str,
+        column: str,
+        safe: bool = True,
+        unique: bool = False,
+        concurrently: bool = False,
+        name: str | None = None,
+    ) -> list[str]:
+        """Render a create-index statement (SQL Server has no guard for it).
+
+        Args:
+            table: The table name.
+            column: The column to index.
+            safe: Ignored — SQL Server has no ``CREATE INDEX IF NOT EXISTS``.
+            unique: Whether to create a ``UNIQUE`` index.
+            concurrently: Ignored (no ``CONCURRENTLY``).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        return [
+            f"CREATE {uniq}INDEX {self.quote(name or f'idx_{table}_{column}')} "
+            f"ON {self.quote(table)} ({self.quote(column)})"
+        ]
+
+    def render_create_composite_index(
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        safe: bool = True,
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
+        opclass: str | None = None,
+    ) -> list[str]:
+        """Render a multi-column create-index; keeps only the filtered ``WHERE``.
+
+        SQL Server has no ``IF NOT EXISTS`` guard and none of the PostgreSQL-only
+        ``USING``/``INCLUDE``/``opclass`` clauses, but it does support filtered
+        indexes, so ``condition`` is preserved.
+
+        Args:
+            table: The table to index.
+            name: The index name.
+            columns: The ordered columns covered by the index.
+            safe: Ignored (no guard).
+            condition: Optional filtered-index predicate (``WHERE ...``).
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Ignored.
+            include: Ignored.
+            opclass: Ignored.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        cols = ", ".join(self.quote(c) for c in columns)
+        where = f" WHERE {condition}" if condition else ""
+        return [f"CREATE {uniq}INDEX {self.quote(name)} ON {self.quote(table)} ({cols}){where}"]
+
+
 _DIALECTS: dict[str, type[BaseDialect]] = {
     "postgres": PostgresDialect,
     "sqlite": SqliteDialect,
     "mysql": MySQLDialect,
     "mariadb": MariaDbDialect,
     "oracle": OracleDialect,
+    "mssql": SqlServerDialect,
 }
 
 

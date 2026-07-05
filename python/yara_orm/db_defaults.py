@@ -44,6 +44,10 @@ class Now(DatabaseDefault):
         """
         if dialect.name in ("mysql", "mariadb"):
             return "CURRENT_TIMESTAMP(6)"
+        if dialect.name == "mssql":
+            # SYSDATETIME() keeps the DATETIME2 sub-second precision that the
+            # lower-resolution CURRENT_TIMESTAMP (a DATETIME) would drop.
+            return "SYSDATETIME()"
         return "CURRENT_TIMESTAMP"
 
 
@@ -94,6 +98,10 @@ class RandomHex(DatabaseDefault):
             # ``size`` random bytes -> 2*size hex chars, same width as the
             # PostgreSQL and SQLite renderings.
             return f"lower(hex(random_bytes({self.size})))"
+        if dialect.name == "mssql":
+            # CRYPT_GEN_RANDOM(n) yields n random bytes; CONVERT(..., 2) hex-
+            # encodes them to the same 2*size width as the other backends.
+            return f"LOWER(CONVERT(VARCHAR({self.size * 2}), CRYPT_GEN_RANDOM({self.size}), 2))"
         if dialect.name == "oracle":
             # ``SYS_GUID()`` yields 16 random bytes -> 32 hex chars; concatenate
             # enough to cover ``size`` bytes, then trim to the same 2*size width.

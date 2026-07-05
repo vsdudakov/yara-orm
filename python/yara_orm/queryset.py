@@ -854,10 +854,11 @@ class QuerySet(Generic[ModelT]):
                 membership = "NOT IN" if op == "not_in" else "IN"
                 return f"{col} {membership} {vsql}", vparams, idx
             sql_op = _OPERATORS[op][0]
-            if sql_op == "ILIKE":
-                sql_op = dialect.ilike
-            elif sql_op == "LIKE":
-                sql_op = dialect.like
+            if sql_op in ("LIKE", "ILIKE"):
+                # Route through the dialect's pattern renderer so an expression
+                # value gets the same LIKE spelling as a bound one (e.g. SQL
+                # Server's binary COLLATE for case-sensitive matching).
+                return dialect.like_pattern_sql(sql_op == "ILIKE", col, vsql), vparams, idx
             return f"{col} {sql_op} {vsql}", vparams, idx
 
         # When ``col`` is a bare expression (e.g. a HAVING aggregate) there is no
@@ -1268,6 +1269,24 @@ class QuerySet(Generic[ModelT]):
         where = (" WHERE " + " AND ".join(parts)) if parts else ""
         return where, params, idx
 
+    def _offset_order_fallback(self, dialect: BaseDialect) -> str:
+        """Supply a placeholder ``ORDER BY`` when a paginated query has none.
+
+        SQL Server's ``OFFSET/FETCH`` pagination is only valid after an ``ORDER
+        BY``; when this query slices (``_limit``/``_offset``) but imposes no
+        ordering of its own, borrow the dialect's fallback ordering. All other
+        dialects (and unsliced queries) return an empty clause.
+
+        Args:
+            dialect: The active SQL dialect.
+
+        Returns:
+            The fallback ``ORDER BY`` fragment, or ``""``.
+        """
+        if self._limit is not None or self._offset is not None:
+            return dialect.offset_order_fallback()
+        return ""
+
     def _order_sql(self, dialect: BaseDialect) -> str:
         """Build the ``ORDER BY`` clause for the configured ordering.
 
@@ -1281,7 +1300,7 @@ class QuerySet(Generic[ModelT]):
         """
         order = self._order or self.model._meta.ordering
         if not order:
-            return ""
+            return self._offset_order_fallback(dialect)
         meta = self.model._meta
         table = dialect.quote(meta.table)
         parts = []
@@ -1322,7 +1341,7 @@ class QuerySet(Generic[ModelT]):
         """
         order = self._order or self.model._meta.ordering
         if not order:
-            return ""
+            return self._offset_order_fallback(dialect)
         meta = self.model._meta
         table = dialect.quote(meta.table)
         parts = []
@@ -1561,6 +1580,7 @@ class QuerySet(Generic[ModelT]):
             inner_sql, idx = inner.as_sql(self, dialect, joins, params, idx)
         else:
             inner_sql = resolve(inner)
+        inner_sql = dialect.aggregate_argument_sql(agg.function, inner_sql)
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
         if case_form and case_sql:
             counted = "1" if inner_sql == "*" else inner_sql
@@ -2179,14 +2199,23 @@ class QuerySet(Generic[ModelT]):
         where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
         params = select_params + wparams + hparams
-        # PostgreSQL/SQLite/MySQL let the pk group make the other base columns
-        # functionally dependent; Oracle requires every selected column grouped.
-        group_refs = (
-            [f"{table}.{q(meta.pk_field.db_column)}"]
-            if dialect.group_by_functional_dependency
-            else base_cols
-        )
-        group = " GROUP BY " + ", ".join(group_refs)
+        # A GROUP BY is only needed when an aggregate (or HAVING) collapses rows;
+        # a purely scalar annotation (e.g. F("x") * 2) does not. Grouping by the
+        # unique pk would be a harmless no-op on functional-dependency backends,
+        # but SQL Server groups by every selected column and then rejects a scalar
+        # annotation that references a deferred (ungrouped) column (error 8120).
+        if self._has_aggregate_annotations() or self._having:
+            # PostgreSQL/SQLite/MySQL let the pk group make the other base columns
+            # functionally dependent; Oracle/SQL Server require every selected
+            # column grouped.
+            group_refs = (
+                [f"{table}.{q(meta.pk_field.db_column)}"]
+                if dialect.group_by_functional_dependency
+                else base_cols
+            )
+            group = " GROUP BY " + ", ".join(group_refs)
+        else:
+            group = ""
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"
             f"{''.join(joins.values())}{where}{group}{having}"
@@ -2763,13 +2792,15 @@ class QuerySet(Generic[ModelT]):
         if self._needs_wrapped_terminal():
             inner, params = self._wrapped_terminal_inner()
             sub = dialect.quote("sub")
+            order = dialect.offset_order_fallback()
             tail = dialect.limit_offset_sql(1, None)
-            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) {sub}{tail}", params)
+            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) {sub}{order}{tail}", params)
             return bool(rows)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
+        order = dialect.offset_order_fallback()
         tail = dialect.limit_offset_sql(1, None)
-        rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where}{tail}", params)
+        rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where}{order}{tail}", params)
         return bool(rows)
 
     def _pk_having_subselect(self, dialect: BaseDialect, start: int = 1) -> tuple[str, list[Any]]:

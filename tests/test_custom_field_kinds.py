@@ -38,7 +38,12 @@ class VectorField(fields.Field):
 register_field_kind(
     "vector",
     field_cls=VectorField,
-    sql={"postgres": "vector({dim})", "sqlite": "TEXT", "mysql": "LONGTEXT"},
+    sql={
+        "postgres": "vector({dim})",
+        "sqlite": "TEXT",
+        "mysql": "LONGTEXT",
+        "mssql": "NVARCHAR(MAX)",
+    },
 )
 
 
@@ -60,6 +65,7 @@ register_field_kind(
         "sqlite": "REAL",
         "mysql": "DOUBLE",
         "oracle": "FLOAT",
+        "mssql": "FLOAT",
     },
 )
 

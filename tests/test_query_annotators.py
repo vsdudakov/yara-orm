@@ -226,6 +226,12 @@ async def test_generate_schemas_runs_extension_statements_first(db, seen_sql, mo
 
     def fake_extensions_sql(self, models):
         received.append(list(models))
+        if db == "mssql":
+            # SQL Server has no CREATE TABLE IF NOT EXISTS.
+            return [
+                "IF OBJECT_ID(N'qa_ext_marker', 'U') IS NULL "
+                "CREATE TABLE qa_ext_marker (id INTEGER)"
+            ]
         return ["CREATE TABLE IF NOT EXISTS qa_ext_marker (id INTEGER)"]
 
     monkeypatch.setattr(type(dialect), "extensions_sql", fake_extensions_sql, raising=False)
