@@ -1579,6 +1579,7 @@ class QuerySet(Generic[ModelT]):
             inner_sql, idx = inner.as_sql(self, dialect, joins, params, idx)
         else:
             inner_sql = resolve(inner)
+        inner_sql = dialect.aggregate_argument_sql(agg.function, inner_sql)
         distinct = "DISTINCT " if getattr(agg, "distinct", False) else ""
         if case_form and case_sql:
             counted = "1" if inner_sql == "*" else inner_sql

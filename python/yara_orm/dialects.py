@@ -177,6 +177,10 @@ class BaseDialect:
     #: Oracle cannot (its multi-row insert is ``INSERT ALL`` / a MERGE source),
     #: so ``bulk_create`` falls back to one statement per row there.
     supports_multirow_insert = True
+    #: Maximum number of bind parameters a single statement may carry; bulk
+    #: inserts are chunked to stay under it. PostgreSQL's protocol ceiling is
+    #: 65535; SQL Server's is 2100 (a much tighter cap, so its dialect lowers it).
+    max_bind_params = 65535
     #: Whether grouping by a table's primary key lets the other selected columns
     #: of that table appear unaggregated (functional dependency — PostgreSQL's
     #: rule, and SQLite/MySQL allow bare columns too). Oracle enforces the strict
@@ -506,6 +510,23 @@ class BaseDialect:
         """
         return ""
 
+    def aggregate_argument_sql(self, function: str, inner_sql: str) -> str:
+        """Transform an aggregate's argument for dialect-specific typing.
+
+        Most dialects aggregate the column as-is. SQL Server overrides this to
+        cast ``AVG`` arguments to a floating type, since ``AVG`` over an integer
+        column there performs integer division (``AVG`` of 3,4,4,4 yields 3, not
+        3.75) — unlike PostgreSQL/MySQL, which promote the result to a decimal.
+
+        Args:
+            function: The aggregate function name (e.g. ``AVG``, ``SUM``).
+            inner_sql: The already-rendered argument expression.
+
+        Returns:
+            The argument expression, possibly wrapped in a cast.
+        """
+        return inner_sql
+
     def insert_default_values_sql(self, pk_column: str) -> str:
         """Render the statement tail that inserts a row of column defaults.
 
@@ -521,6 +542,22 @@ class BaseDialect:
             The statement tail following the table name.
         """
         return "DEFAULT VALUES"
+
+    def identity_insert_sql(self, table: str, insert_sql: str) -> str:
+        """Wrap an INSERT that supplies an explicit auto-increment primary key.
+
+        Most dialects accept an explicit value for a serial/identity column, so
+        the statement passes through unchanged. SQL Server rejects it unless the
+        table's ``IDENTITY_INSERT`` is toggled on for that statement.
+
+        Args:
+            table: The already-quoted target table.
+            insert_sql: The rendered ``INSERT`` statement.
+
+        Returns:
+            The (possibly wrapped) statement.
+        """
+        return insert_sql
 
     def insert_returning_clause(self, fields: Sequence[Field]) -> str:
         """Render the ``RETURNING`` clause appended to an INSERT.
@@ -3321,6 +3358,7 @@ class SqlServerDialect(BaseDialect):
     modifying_subquery_needs_wrap = True
     supports_aggregate_filter = False
     supports_multirow_insert = True  # multi-row VALUES (up to 1000 rows)
+    max_bind_params = 2100  # SQL Server's hard per-statement parameter ceiling
     group_by_functional_dependency = False
     offset_requires_limit = False
     index_concurrently = False
@@ -3393,6 +3431,21 @@ class SqlServerDialect(BaseDialect):
             The bracket-quoted identifier.
         """
         return f"[{identifier.replace(']', ']]')}]"
+
+    def identity_insert_sql(self, table: str, insert_sql: str) -> str:
+        """Bracket an explicit-identity INSERT with ``SET IDENTITY_INSERT``.
+
+        SQL Server refuses an explicit value for an ``IDENTITY`` column unless
+        the table's ``IDENTITY_INSERT`` is ON for that statement (error 544).
+
+        Args:
+            table: The already-quoted target table.
+            insert_sql: The rendered ``INSERT`` statement.
+
+        Returns:
+            The INSERT wrapped in ``SET IDENTITY_INSERT ON/OFF``.
+        """
+        return f"SET IDENTITY_INSERT {table} ON; {insert_sql}; SET IDENTITY_INSERT {table} OFF"
 
     def concat_sql(self, parts: list[str]) -> str:
         """Concatenate operands with T-SQL's ``CONCAT`` (``||`` is not string concat).
@@ -3480,6 +3533,10 @@ class SqlServerDialect(BaseDialect):
         """
         if limit is None and offset is None:
             return ""
+        if limit is not None and int(limit) <= 0:
+            # SQL Server rejects FETCH NEXT 0; skipping past every row (an offset
+            # of the maximum BIGINT) yields the empty result an empty slice wants.
+            return " OFFSET 9223372036854775807 ROWS"
         tail = f" OFFSET {int(offset) if offset is not None else 0} ROWS"
         if limit is not None:
             tail += f" FETCH NEXT {int(limit)} ROWS ONLY"
@@ -3496,6 +3553,23 @@ class SqlServerDialect(BaseDialect):
             The fallback ``ORDER BY`` fragment (leading space included).
         """
         return " ORDER BY (SELECT NULL)"
+
+    def aggregate_argument_sql(self, function: str, inner_sql: str) -> str:
+        """Cast ``AVG`` arguments to ``FLOAT`` to avoid integer division.
+
+        ``AVG`` over an integer column does integer division on SQL Server; the
+        cast makes it return a fractional average, matching the other backends.
+
+        Args:
+            function: The aggregate function name.
+            inner_sql: The already-rendered argument expression.
+
+        Returns:
+            The argument, wrapped in ``CAST(... AS FLOAT)`` for ``AVG``.
+        """
+        if function == "AVG" and inner_sql != "*":
+            return f"CAST({inner_sql} AS FLOAT)"
+        return inner_sql
 
     def date_part_sql(self, part: str, col: str) -> str:
         """Render a date/time part via ``DATEPART``.
@@ -3676,15 +3750,77 @@ class SqlServerDialect(BaseDialect):
                 lines.append(f"INDEX {idx_name} ({self.quote(field.db_column)})")
         for index in meta.indexes:
             cols = ", ".join(self._group_columns(meta, index.fields))
-            prefix = "UNIQUE " if getattr(index, "unique", False) else ""
-            lines.append(f"{prefix}INDEX {self.quote(index.resolve_name(meta.table))} ({cols})")
+            # SQL Server's inline form is ``INDEX name UNIQUE (cols)`` — the
+            # UNIQUE keyword follows the name (a leading ``UNIQUE INDEX`` is 1018).
+            uniq = " UNIQUE" if getattr(index, "unique", False) else ""
+            lines.append(f"INDEX {self.quote(index.resolve_name(meta.table))}{uniq} ({cols})")
 
         body = ",\n  ".join(lines)
         table = self.quote(meta.table)
         create = f"CREATE TABLE {table} (\n  {body}\n)"
         if safe:
             create = f"IF OBJECT_ID(N'{table}', 'U') IS NULL\n{create}"
-        return [create]
+        statements = [create]
+        # A nullable UNIQUE column: SQL Server treats NULLs as equal in a UNIQUE
+        # constraint (one NULL max), unlike PostgreSQL. A filtered unique index
+        # over the non-NULL rows restores multi-NULL semantics.
+        for field in meta.fields.values():
+            if field.unique and not field.pk and field.null:
+                statements.append(
+                    self._filtered_unique_index_sql(meta.table, field.db_column, safe)
+                )
+        return statements
+
+    def _filtered_unique_index_sql(self, table: str, column: str, safe: bool) -> str:
+        """Render a nullable column's filtered unique index (guarded when safe).
+
+        Args:
+            table: The (unquoted) table name.
+            column: The (unquoted) column name.
+            safe: Whether to guard against re-creation via ``sys.indexes``.
+
+        Returns:
+            The ``CREATE UNIQUE INDEX ... WHERE col IS NOT NULL`` statement.
+        """
+        name = f"uq_{table}_{column}"
+        col = self.quote(column)
+        stmt = (
+            f"CREATE UNIQUE INDEX {self.quote(name)} ON {self.quote(table)} "
+            f"({col}) WHERE {col} IS NOT NULL"
+        )
+        if safe:
+            guard = (
+                f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{name}' "
+                f"AND object_id = OBJECT_ID(N'{self.quote(table)}'))"
+            )
+            stmt = f"{guard}\n{stmt}"
+        return stmt
+
+    def column_sql(self, field: Field) -> str:
+        """Render a column definition, deferring nullable UNIQUE to a filtered index.
+
+        Identical to the base form except a *nullable* unique column omits the
+        inline ``UNIQUE`` (:meth:`create_table_sql` emits a filtered index for
+        it instead); a NOT NULL unique column keeps the inline constraint.
+
+        Args:
+            field: The field to render as a column definition.
+
+        Returns:
+            The column definition SQL fragment.
+        """
+        parts = [self.quote(field.db_column), self.column_type(field)]
+        if field.pk:
+            pass
+        elif field.null:
+            parts.append("NULL")
+        else:
+            parts.append("NOT NULL")
+        if field.unique and not field.pk and not field.null:
+            parts.append("UNIQUE")
+        if isinstance(field.default, DatabaseDefault):
+            parts.append(f"DEFAULT ({field.default.to_sql(self)})")
+        return " ".join(parts)
 
     def _fk_clause(self, col: str, ref_tbl: str, ref_pk: str, on_delete: str) -> str:
         """Render an FK clause, mapping ``RESTRICT`` to SQL Server's ``NO ACTION``.
@@ -3714,6 +3850,48 @@ class SqlServerDialect(BaseDialect):
         """
         return []
 
+    def create_m2m_table_sql(self, info: M2MInfo, safe: bool = True) -> list[str]:
+        """DDL for a many-to-many join table, guarded the SQL Server way.
+
+        SQL Server has no ``CREATE TABLE IF NOT EXISTS``, so the idempotency
+        guard is a preceding ``IF OBJECT_ID(...) IS NULL``. A self-referential
+        M2M (owner and target are the same table) would make the two cascading
+        FKs a second cascade path (error 1785), so both drop to ``NO ACTION``.
+
+        Args:
+            info: The many-to-many relation metadata.
+            safe: Whether to emit the existence guard.
+
+        Returns:
+            The list with the (guarded) join-table create statement.
+        """
+        owner = info.owner
+        target = info.resolve_target()
+        near = self.quote(info.backward_key)
+        far = self.quote(info.forward_key)
+        owner_tbl = self.quote(owner._meta.table)
+        owner_pk = self.quote(owner._meta.pk_field.db_column)
+        target_tbl = self.quote(target._meta.table)
+        target_pk = self.quote(target._meta.pk_field.db_column)
+        # A join table's two cascading FKs are a classic SQL Server 1785 trigger:
+        # self-referential M2M, or a cascade *diamond* when the two endpoints
+        # share a descendant through other FKs. Diamonds can't be detected from a
+        # single table's spec, so both FKs drop to NO ACTION unconditionally; the
+        # ORM removes join rows itself when a related instance is deleted.
+        lines = [
+            f"{near} {self._scalar_pk_type(owner._meta.pk_field)} NOT NULL",
+            f"{far} {self._scalar_pk_type(target._meta.pk_field)} NOT NULL",
+            f"PRIMARY KEY ({near}, {far})",
+            f"FOREIGN KEY ({near}) REFERENCES {owner_tbl} ({owner_pk}) ON DELETE NO ACTION",
+            f"FOREIGN KEY ({far}) REFERENCES {target_tbl} ({target_pk}) ON DELETE NO ACTION",
+        ]
+        body = ",\n  ".join(lines)
+        table = self.quote(info.through)
+        create = f"CREATE TABLE {table} (\n  {body}\n)"
+        if safe:
+            create = f"IF OBJECT_ID(N'{table}', 'U') IS NULL\n{create}"
+        return [create]
+
     # -- migration rendering -------------------------------------------------
     def render_drop_table(self, table: str) -> list[str]:
         """Render a drop-table statement (``DROP TABLE IF EXISTS``, 2016+).
@@ -3725,6 +3903,128 @@ class SqlServerDialect(BaseDialect):
             The list with the drop-table statement.
         """
         return [f"DROP TABLE IF EXISTS {self.quote(table)}"]
+
+    def render_create_table(
+        self, table: str, tspec: dict[str, Any], safe: bool = True
+    ) -> list[str]:
+        """Render a migration ``CREATE TABLE`` with the SQL Server guard.
+
+        Mirrors the base spec-based renderer but swaps ``CREATE TABLE IF NOT
+        EXISTS`` for a preceding ``IF OBJECT_ID(...) IS NULL`` and pins any
+        multi-path / self-referential / ``RESTRICT`` FK to ``NO ACTION`` (SQL
+        Server error 1785 / no ``RESTRICT`` keyword).
+
+        Args:
+            table: The table name.
+            tspec: The migration table spec.
+            safe: Whether to emit the ``IF OBJECT_ID`` existence guard.
+
+        Returns:
+            The list of SQL statements creating the table (and its indexes).
+        """
+        lines = [self.render_column_def(n, s) for n, s in tspec["columns"].items()]
+        pk = self._pk_clause(tspec)
+        if pk:
+            lines.append(pk)
+        fks = tspec.get("fks", {})
+        ref_counts: dict[str, int] = {}
+        for ref in fks.values():
+            ref_counts[ref["table"]] = ref_counts.get(ref["table"], 0) + 1
+        for col, ref in fks.items():
+            on_delete = ref.get("on_delete", "CASCADE")
+            if ref["table"] == table or ref_counts[ref["table"]] > 1 or on_delete == "RESTRICT":
+                on_delete = "NO ACTION"
+            lines.append(
+                f"FOREIGN KEY ({self.quote(col)}) REFERENCES {self.quote(ref['table'])} "
+                f"({self.quote(ref['pk'])}) ON DELETE {on_delete}"
+            )
+        for constraint in tspec.get("constraints", []):
+            lines.append(self._constraint_clause(constraint))
+        body = ",\n  ".join(lines)
+        tbl = self.quote(table)
+        create = f"CREATE TABLE {tbl} (\n  {body}\n)"
+        if safe:
+            create = f"IF OBJECT_ID(N'{tbl}', 'U') IS NULL\n{create}"
+        out = [create]
+        for col in tspec.get("indexes", []):
+            out.extend(self.render_create_index(table, col, safe))
+        for name, spec in tspec.get("composite_indexes", {}).items():
+            out.extend(
+                self.render_create_composite_index(
+                    table,
+                    name,
+                    spec["columns"],
+                    safe=safe,
+                    condition=spec.get("condition"),
+                    unique=spec.get("unique", False),
+                )
+            )
+        return out
+
+    def render_create_index(
+        self,
+        table: str,
+        column: str,
+        safe: bool = True,
+        unique: bool = False,
+        concurrently: bool = False,
+        name: str | None = None,
+    ) -> list[str]:
+        """Render a create-index statement (SQL Server has no guard for it).
+
+        Args:
+            table: The table name.
+            column: The column to index.
+            safe: Ignored — SQL Server has no ``CREATE INDEX IF NOT EXISTS``.
+            unique: Whether to create a ``UNIQUE`` index.
+            concurrently: Ignored (no ``CONCURRENTLY``).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        return [
+            f"CREATE {uniq}INDEX {self.quote(name or f'idx_{table}_{column}')} "
+            f"ON {self.quote(table)} ({self.quote(column)})"
+        ]
+
+    def render_create_composite_index(
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        safe: bool = True,
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
+        opclass: str | None = None,
+    ) -> list[str]:
+        """Render a multi-column create-index; keeps only the filtered ``WHERE``.
+
+        SQL Server has no ``IF NOT EXISTS`` guard and none of the PostgreSQL-only
+        ``USING``/``INCLUDE``/``opclass`` clauses, but it does support filtered
+        indexes, so ``condition`` is preserved.
+
+        Args:
+            table: The table to index.
+            name: The index name.
+            columns: The ordered columns covered by the index.
+            safe: Ignored (no guard).
+            condition: Optional filtered-index predicate (``WHERE ...``).
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Ignored.
+            include: Ignored.
+            opclass: Ignored.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        uniq = "UNIQUE " if unique else ""
+        cols = ", ".join(self.quote(c) for c in columns)
+        where = f" WHERE {condition}" if condition else ""
+        return [f"CREATE {uniq}INDEX {self.quote(name)} ON {self.quote(table)} ({cols}){where}"]
 
 
 _DIALECTS: dict[str, type[BaseDialect]] = {
