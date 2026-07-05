@@ -57,6 +57,18 @@ mysql_async = { version = "0.37", default-features = false, features = [
 # The pure-Rust / self-contained-wheel invariant is preserved (no OCI/ODPI-C).
 oracle-rs = { git = "https://github.com/vsdudakov/oracle-rs", rev = "f4b980a670f031997b12e320a676127614e67bb4" }
 deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
+# Pure-Rust Microsoft SQL Server driver (TDS protocol — no ODBC / native
+# client, so wheels stay self-contained). rustls TLS (never native-tls, matching
+# the PostgreSQL/MySQL stack); pooled through the same `deadpool` manager.
+tiberius = { version = "0.12", default-features = false, features = [
+    "rustls",
+    "tds73",
+    "chrono",
+    "rust_decimal",
+] }
+# tiberius runs over any AsyncRead+AsyncWrite; this bridges a tokio TcpStream.
+tokio-util = { version = "0.7", features = ["compat"] }
+url = "2"
 
 [profile.release]
 opt-level = 3

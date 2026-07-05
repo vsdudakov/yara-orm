@@ -3276,12 +3276,344 @@ class OracleDialect(BaseDialect):
         ]
 
 
+class SqlServerDialect(BaseDialect):
+    """Dialect rendering T-SQL for Microsoft SQL Server (2017+ / Azure SQL).
+
+    Key departures from the base dialect: ``@PN`` bind placeholders and
+    ``[bracket]`` identifier quoting; the ``NVARCHAR``/``BIGINT``/``DATETIME2``/
+    ``UNIQUEIDENTIFIER``/``BIT`` type family (``BIT`` booleans, native ``GUID``
+    uuids); ``IDENTITY(1,1)`` auto-increment whose generated value is read back
+    via ``SCOPE_IDENTITY()`` — the backend batches it, since T-SQL has no
+    ``RETURNING`` and ``OUTPUT`` cannot be a statement suffix the model appends;
+    ``OFFSET ... FETCH NEXT`` paging (which requires an ``ORDER BY``); ``MERGE``
+    for bulk upserts; ``CONCAT`` string concatenation; and case-insensitive
+    ``LIKE`` by default (a binary ``COLLATE`` folds the case-sensitive lookups).
+    SQL Server has no ``REGEXP`` operator, so regex lookups raise
+    ``UnSupportedError``.
+    """
+
+    name = "mssql"
+    # T-SQL has no `RETURNING`; the backend reads a generated IDENTITY back with
+    # a batched `SELECT SCOPE_IDENTITY()`, and `Meta.fetch_db_defaults` columns
+    # come back via the follow-up SELECT (the same path MySQL uses).
+    supports_insert_returning = False
+    insert_ignore_verb = "INSERT"  # no INSERT IGNORE; conflicts go through MERGE
+    insert_default_values = "DEFAULT VALUES"
+    random_function = "NEWID()"
+    # SQL Server has no `SELECT ... FOR UPDATE` suffix (it uses table lock hints),
+    # so the lock clause is dropped, as on SQLite.
+    supports_for_update = False
+    modifying_subquery_needs_wrap = True
+    supports_aggregate_filter = False
+    supports_multirow_insert = True  # multi-row VALUES (up to 1000 rows)
+    group_by_functional_dependency = False
+    offset_requires_limit = False
+    index_concurrently = False
+    index_using = False
+    index_include = False
+    index_opclass = False
+    supports_extensions = False
+    column_if_exists = False
+    # Default collations are case-insensitive; `like_pattern_sql` adds a binary
+    # COLLATE for the case-sensitive lookups. Plain LIKE for the subquery path.
+    ilike = "LIKE"
+    like = "LIKE"
+    like_escape = " ESCAPE '\\'"
+    #: SQL Server has no regular-expression operator (regex lookups raise).
+    regex_ops: dict[str, str] = {}
+
+    type_map = {
+        "smallint": "SMALLINT",
+        "int": "INT",
+        "bigint": "BIGINT",
+        "varchar": "NVARCHAR({max_length})",
+        "text": "NVARCHAR(MAX)",
+        "bool": "BIT",
+        "float": "FLOAT(53)",
+        "decimal": "DECIMAL({max_digits}, {decimal_places})",
+        "datetime": "DATETIME2(6)",
+        "date": "DATE",
+        "time": "TIME(6)",
+        "timedelta": "BIGINT",
+        "uuid": "UNIQUEIDENTIFIER",
+        "json": "NVARCHAR(MAX)",
+        "bytes": "VARBINARY(MAX)",
+    }
+    #: ``IDENTITY(1,1)``: the database assigns the pk when the INSERT omits it.
+    serial_map = {
+        "smallint": "SMALLINT IDENTITY(1,1)",
+        "int": "INT IDENTITY(1,1)",
+        "bigint": "BIGINT IDENTITY(1,1)",
+    }
+    _datepart = {
+        "year": "year",
+        "month": "month",
+        "day": "day",
+        "hour": "hour",
+        "minute": "minute",
+        "second": "second",
+        "quarter": "quarter",
+        "week": "iso_week",
+        "microsecond": "microsecond",
+    }
+
+    def placeholder(self, index: int) -> str:
+        """Render T-SQL's ``@PN`` bind placeholder.
+
+        Args:
+            index: The 1-based parameter position.
+
+        Returns:
+            ``"@P<index>"``.
+        """
+        return f"@P{index}"
+
+    def quote(self, identifier: str) -> str:
+        """Quote an identifier with square brackets (``]`` doubled).
+
+        Args:
+            identifier: The identifier to quote.
+
+        Returns:
+            The bracket-quoted identifier.
+        """
+        return f"[{identifier.replace(']', ']]')}]"
+
+    def concat_sql(self, parts: list[str]) -> str:
+        """Concatenate operands with T-SQL's ``CONCAT`` (``||`` is not string concat).
+
+        Args:
+            parts: The rendered SQL operand expressions.
+
+        Returns:
+            The concatenation SQL expression.
+        """
+        return "CONCAT(" + ", ".join(parts) + ")"
+
+    def cast_text(self, col: str) -> str:
+        """Render a text cast (``CAST(col AS NVARCHAR(4000))``).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            The cast expression.
+        """
+        return f"CAST({col} AS NVARCHAR(4000))"
+
+    # -- row decoding -------------------------------------------------------
+    def read_decoder(self, field: Field) -> Callable[[Any], Any] | None:
+        """Reconstruct types SQL Server returns as text/naive.
+
+        ``NVARCHAR(MAX)`` json comes back as a string; ``DATETIME2`` is naive
+        (re-labelled UTC under ``use_tz``). ``UNIQUEIDENTIFIER`` and ``BIT`` are
+        already native (``uuid.UUID`` / ``bool``). An FK column adopts the
+        referenced primary key's kind.
+
+        Args:
+            field: The field whose column is being decoded.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        base = super().read_decoder(field)
+        kind = field.field_kind
+        if isinstance(field, ForeignKeyFieldInstance):
+            kind = get_model(field.reference)._meta.pk_field.field_kind
+        extra: Callable[[Any], Any] | None = {
+            "datetime": _datetime_from_db,
+            "json": _json_from_db,
+        }.get(kind)
+        if extra is None:
+            return base
+        if base is None:
+            return extra
+        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+
+    # -- query lookups ------------------------------------------------------
+    def like_pattern_sql(self, case_insensitive: bool, col: str, placeholder: str) -> str:
+        """Render a pattern lookup; a binary COLLATE makes it case-sensitive.
+
+        SQL Server's default collations are case-insensitive, so ``ILIKE``-style
+        matching is plain ``LIKE``; the case-sensitive lookups force a binary
+        collation on the comparison.
+
+        Args:
+            case_insensitive: Whether the lookup ignores case.
+            col: The already-qualified (already text-cast) column reference.
+            placeholder: The bound-parameter placeholder for the pattern.
+
+        Returns:
+            A boolean SQL expression matching ``col`` against the pattern.
+        """
+        if case_insensitive:
+            return f"{col} LIKE {placeholder}{self.like_escape}"
+        return f"{col} LIKE {placeholder} COLLATE Latin1_General_BIN2{self.like_escape}"
+
+    def limit_offset_sql(self, limit: int | None, offset: int | None) -> str:
+        """Render ``OFFSET m ROWS FETCH NEXT n ROWS ONLY``.
+
+        SQL Server requires an ``ORDER BY`` for ``OFFSET/FETCH``; the queryset
+        supplies one whenever it paginates.
+
+        Args:
+            limit: The maximum row count, or None.
+            offset: The number of leading rows to skip, or None.
+
+        Returns:
+            The clause fragment (leading space included), or ``""``.
+        """
+        if limit is None and offset is None:
+            return ""
+        tail = f" OFFSET {int(offset) if offset is not None else 0} ROWS"
+        if limit is not None:
+            tail += f" FETCH NEXT {int(limit)} ROWS ONLY"
+        return tail
+
+    def date_part_sql(self, part: str, col: str) -> str:
+        """Render a date/time part via ``DATEPART``.
+
+        Args:
+            part: A supported date/time part name.
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the integer part.
+        """
+        spelled = self._datepart.get(part)
+        if spelled is None:
+            raise UnSupportedError(f"mssql does not support the __{part} lookup")
+        return f"DATEPART({spelled}, {col})"
+
+    def truncate_date_sql(self, col: str) -> str:
+        """Render ``CAST(col AS DATE)`` (for the ``__date`` lookup).
+
+        Args:
+            col: The already-qualified column reference.
+
+        Returns:
+            A SQL expression yielding the date part.
+        """
+        return f"CAST({col} AS DATE)"
+
+    def json_extract_sql(self, col: str, keys: list[str]) -> str:
+        """Render a JSON key path as text via ``JSON_VALUE`` (SQL Server 2016+).
+
+        Args:
+            col: The already-qualified JSON (NVARCHAR) column reference.
+            keys: The object keys to traverse (outermost first).
+
+        Returns:
+            ``JSON_VALUE(col, '$."a"."b"')`` (the column itself with no keys).
+        """
+        if not keys:
+            return col
+        legs = "".join('."' + key.replace('"', '\\"') + '"' for key in keys)
+        return f"JSON_VALUE({col}, {self._literal('$' + legs)})"
+
+    def regex_sql(self, op: str, col: str, placeholder: str) -> str:
+        """SQL Server has no regular-expression operator.
+
+        Args:
+            op: The lookup name.
+            col: The already-qualified column reference.
+            placeholder: The bound-parameter placeholder.
+
+        Raises:
+            UnSupportedError: Always.
+        """
+        raise UnSupportedError("mssql has no regular-expression operator")
+
+    # -- bulk upsert (MERGE) -------------------------------------------------
+    def on_conflict_sql(self, conflict_columns: list[str], update_columns: list[str]) -> str:
+        """Reject the ``ON CONFLICT`` suffix; SQL Server renders a ``MERGE``.
+
+        Args:
+            conflict_columns: The conflict-target columns.
+            update_columns: The columns to overwrite on conflict.
+
+        Raises:
+            UnSupportedError: Always — the ``MERGE`` path supersedes this hook.
+        """
+        raise UnSupportedError(  # pragma: no cover - superseded by render_upsert
+            "mssql renders conflict handling as MERGE via render_upsert, not an ON CONFLICT suffix"
+        )
+
+    def render_upsert(
+        self,
+        table: str,
+        columns: Sequence[str],
+        nrows: int,
+        conflict_columns: Sequence[str],
+        update_columns: Sequence[str],
+        pk_columns: Sequence[str],
+    ) -> str:
+        """Render a conflict-skipping/updating bulk insert as a T-SQL ``MERGE``.
+
+        SQL Server has no ``INSERT ... ON CONFLICT`` / ``INSERT IGNORE``; a
+        ``MERGE`` against a ``VALUES`` row source is the equivalent.
+        ``WHEN NOT MATCHED THEN INSERT`` covers the ignore case;
+        ``WHEN MATCHED THEN UPDATE`` adds the upsert.
+
+        Args:
+            table: The already-quoted target table.
+            columns: The unquoted column names, in insert (and bind) order.
+            nrows: Number of value rows.
+            conflict_columns: The unquoted conflict-target columns.
+            update_columns: The unquoted columns to overwrite on conflict.
+            pk_columns: The unquoted primary-key columns (target fallback).
+
+        Returns:
+            The complete ``MERGE`` statement (terminated with ``;``).
+        """
+        targets = [c for c in (list(conflict_columns) or list(pk_columns)) if c in columns]
+        if not targets:  # pragma: no cover - exercised only by mssql-skipped tests
+            raise UnSupportedError(
+                "mssql bulk upsert needs a conflict target present in the inserted "
+                "columns; pass on_conflict=[...]"
+            )
+        ncols = len(columns)
+        idx = 1
+        value_rows = []
+        for _ in range(nrows):
+            holes = ", ".join(self.placeholder(idx + j) for j in range(ncols))
+            value_rows.append(f"({holes})")
+            idx += ncols
+        src_cols = ", ".join(self.quote(c) for c in columns)
+        on = " AND ".join(f"d.{self.quote(c)} = s.{self.quote(c)}" for c in targets)
+        merge = (
+            f"MERGE INTO {table} AS d USING (VALUES {', '.join(value_rows)}) "
+            f"AS s ({src_cols}) ON ({on}) "
+        )
+        updates = [c for c in update_columns if c not in targets]
+        if updates:
+            sets = ", ".join(f"d.{self.quote(c)} = s.{self.quote(c)}" for c in updates)
+            merge += f"WHEN MATCHED THEN UPDATE SET {sets} "
+        insert_cols = ", ".join(self.quote(c) for c in columns)
+        insert_vals = ", ".join(f"s.{self.quote(c)}" for c in columns)
+        merge += f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
+        return merge
+
+    # -- migration rendering -------------------------------------------------
+    def render_drop_table(self, table: str) -> list[str]:
+        """Render a drop-table statement (``DROP TABLE IF EXISTS``, 2016+).
+
+        Args:
+            table: The table name.
+
+        Returns:
+            The list with the drop-table statement.
+        """
+        return [f"DROP TABLE IF EXISTS {self.quote(table)}"]
+
+
 _DIALECTS: dict[str, type[BaseDialect]] = {
     "postgres": PostgresDialect,
     "sqlite": SqliteDialect,
     "mysql": MySQLDialect,
     "mariadb": MariaDbDialect,
     "oracle": OracleDialect,
+    "mssql": SqlServerDialect,
 }
 
 

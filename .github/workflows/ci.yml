@@ -88,12 +88,27 @@ jobs:
           --health-timeout 10s
           --health-retries 30
           --health-start-period 60s
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: yaraOrm_Pass1
+          MSSQL_PID: Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P yaraOrm_Pass1 -C -Q 'SELECT 1' -b"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 30s
     env:
       ORM_TEST_DB: postgres://postgres:postgres@localhost:5432/orm_test
       ORM_TEST_DB2: postgres://postgres:postgres@localhost:5432/orm_test2
       ORM_TEST_MYSQL: mysql://root:root@localhost:3306/orm_test
       ORM_TEST_MARIADB: mariadb://root:root@localhost:3307/orm_test
       ORM_TEST_ORACLE: oracle://orm:orm@localhost:1521/FREEPDB1
+      ORM_TEST_MSSQL: mssql://sa:yaraOrm_Pass1@localhost:1433/master
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v7

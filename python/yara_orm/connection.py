@@ -99,6 +99,9 @@ _POSTGRES_URL_SCHEMES = frozenset({"postgres", "postgresql", "psycopg", "psycopg
 #: engine's driver also speaks the MariaDB protocol).
 _MYSQL_URL_SCHEMES = frozenset({"mysql", "mariadb", "aiomysql", "asyncmy", "pymysql"})
 
+#: URL schemes treated as Microsoft SQL Server (normalised to ``mssql``).
+_MSSQL_URL_SCHEMES = frozenset({"mssql", "sqlserver"})
+
 
 def register_query_hook(hook: Callable[[str, list[Any] | None], object]) -> None:
     """Register a callable invoked as ``hook(sql, params)`` before each query.
@@ -896,6 +899,8 @@ class YaraOrm:
             return f"postgres://{rest}"
         if base in _MYSQL_URL_SCHEMES:
             return f"mysql://{rest}"
+        if base in _MSSQL_URL_SCHEMES:
+            return f"mssql://{rest}"
         return db_url
 
     @staticmethod

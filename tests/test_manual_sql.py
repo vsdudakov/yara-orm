@@ -24,7 +24,7 @@ async def test_raw_execute_and_fetch(db):
     """
     conn = connections.get("default")
     # raw SQL carries the driver's placeholder
-    ph = {"mysql": "?", "mariadb": "?", "oracle": ":1"}.get(db, "$1")
+    ph = {"mysql": "?", "mariadb": "?", "oracle": ":1", "mssql": "@P1"}.get(db, "$1")
     await conn.execute(f"INSERT INTO m_thing (name) VALUES ({ph})", ["x"])
     affected = await conn.execute(f"INSERT INTO m_thing (name) VALUES ({ph})", ["y"])
     assert affected == 1
@@ -42,7 +42,7 @@ async def test_model_raw_returns_instances(db):
     await Thing.create(name="alpha")
     await Thing.create(name="beta")
 
-    ph = "?" if db in ("mysql", "mariadb") else "$1"
+    ph = {"mysql": "?", "mariadb": "?", "mssql": "@P1"}.get(db, "$1")
     objs = await Thing.raw(f"SELECT * FROM m_thing WHERE name = {ph}", ["alpha"])
     assert len(objs) == 1
     assert isinstance(objs[0], Thing)
