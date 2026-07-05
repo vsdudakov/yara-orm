@@ -854,10 +854,11 @@ class QuerySet(Generic[ModelT]):
                 membership = "NOT IN" if op == "not_in" else "IN"
                 return f"{col} {membership} {vsql}", vparams, idx
             sql_op = _OPERATORS[op][0]
-            if sql_op == "ILIKE":
-                sql_op = dialect.ilike
-            elif sql_op == "LIKE":
-                sql_op = dialect.like
+            if sql_op in ("LIKE", "ILIKE"):
+                # Route through the dialect's pattern renderer so an expression
+                # value gets the same LIKE spelling as a bound one (e.g. SQL
+                # Server's binary COLLATE for case-sensitive matching).
+                return dialect.like_pattern_sql(sql_op == "ILIKE", col, vsql), vparams, idx
             return f"{col} {sql_op} {vsql}", vparams, idx
 
         # When ``col`` is a bare expression (e.g. a HAVING aggregate) there is no

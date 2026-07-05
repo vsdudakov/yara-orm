@@ -3672,12 +3672,15 @@ class SqlServerDialect(BaseDialect):
             keys: The object keys to traverse (outermost first).
 
         Returns:
-            ``JSON_VALUE(col, '$."a"."b"')`` (the column itself with no keys).
+            ``JSON_VALUE(col, N'$."a"."b"')`` (the column itself with no keys).
         """
         if not keys:
             return col
         legs = "".join('."' + key.replace('"', '\\"') + '"' for key in keys)
-        return f"JSON_VALUE({col}, {self._literal('$' + legs)})"
+        # An N-prefixed (NVARCHAR) path literal preserves non-ASCII keys; a plain
+        # VARCHAR literal would fold them to the database codepage and never match.
+        path = ("$" + legs).replace("'", "''")
+        return f"JSON_VALUE({col}, N'{path}')"
 
     def regex_sql(self, op: str, col: str, placeholder: str) -> str:
         """SQL Server has no regular-expression operator.
@@ -3813,9 +3816,19 @@ class SqlServerDialect(BaseDialect):
             lines.append(self._constraint_clause(constraint.to_spec()))
         for field in meta.fields.values():
             if field.index and not field.unique and not field.pk:
+                if self._is_max_column(field):
+                    continue  # SQL Server cannot index a MAX-typed column (1919).
                 idx_name = self.quote(f"idx_{meta.table}_{field.db_column}")
                 lines.append(f"INDEX {idx_name} ({self.quote(field.db_column)})")
         for index in meta.indexes:
+            # SQL Server cannot index a MAX-typed (json/text/bytes) column; such
+            # an index (e.g. a PostgreSQL GIN index on JSON) is dropped so the
+            # table stays creatable.
+            if any(
+                f not in meta.relations and self._is_max_column(meta.get_field(f))
+                for f in index.fields
+            ):
+                continue
             cols = ", ".join(self._group_columns(meta, index.fields))
             # SQL Server's inline form is ``INDEX name UNIQUE (cols)`` — the
             # UNIQUE keyword follows the name (a leading ``UNIQUE INDEX`` is 1018).
@@ -3837,6 +3850,20 @@ class SqlServerDialect(BaseDialect):
                     self._filtered_unique_index_sql(meta.table, field.db_column, safe)
                 )
         return statements
+
+    def _is_max_column(self, field: Field) -> bool:
+        """Whether a field maps to an unindexable MAX-length SQL Server type.
+
+        ``json``/``text`` become ``NVARCHAR(MAX)`` and ``bytes`` ``VARBINARY(MAX)``;
+        SQL Server rejects any of these as an index key column (error 1919).
+
+        Args:
+            field: The field to classify.
+
+        Returns:
+            True when the field's column cannot be an index key.
+        """
+        return field.field_kind in ("json", "text", "bytes")
 
     def _filtered_unique_index_sql(self, table: str, column: str, safe: bool) -> str:
         """Render a nullable column's filtered unique index (guarded when safe).
