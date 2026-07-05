@@ -10,6 +10,7 @@ use crate::error::EngineError;
 use crate::value::{Row, Value};
 
 pub mod mysql;
+pub mod oracle;
 pub mod pool;
 pub mod postgres;
 pub mod sqlite;
@@ -141,6 +142,17 @@ pub async fn connect(url: &str) -> Result<Box<dyn Backend>, EngineError> {
             ));
         }
         let backend = mysql::MySqlBackend::connect(url).await?;
+        Ok(Box::new(backend))
+    } else if url.starts_with("oracle://") {
+        // `sync_fast_path` is sqlite-only (see the postgres branch above).
+        if url_query_has_param(url, "sync_fast_path") {
+            return Err(EngineError::Config(
+                "sync_fast_path is a SQLite-only URL parameter; remove it from the \
+                 oracle URL"
+                    .to_string(),
+            ));
+        }
+        let backend = oracle::OracleBackend::connect(url).await?;
         Ok(Box::new(backend))
     } else {
         Err(EngineError::UnsupportedUrl(url.to_string()))

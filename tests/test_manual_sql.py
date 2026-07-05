@@ -23,7 +23,8 @@ async def test_raw_execute_and_fetch(db):
     THEN execute() reports affected rows and fetch_all() returns dict rows
     """
     conn = connections.get("default")
-    ph = "?" if db in ("mysql", "mariadb") else "$1"  # raw SQL carries the driver's placeholder
+    # raw SQL carries the driver's placeholder
+    ph = {"mysql": "?", "mariadb": "?", "oracle": ":1"}.get(db, "$1")
     await conn.execute(f"INSERT INTO m_thing (name) VALUES ({ph})", ["x"])
     affected = await conn.execute(f"INSERT INTO m_thing (name) VALUES ({ph})", ["y"])
     assert affected == 1
