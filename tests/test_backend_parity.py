@@ -390,7 +390,8 @@ async def test_regex_lookups_per_backend(db):
     THEN PostgreSQL (~ / ~*) and MySQL (REGEXP_LIKE with 'c'/'i' flags) honour
          the case semantics, and SQLite raises UnSupportedError
     """
-    if db == "sqlite":
+    if db in ("sqlite", "mssql"):
+        # SQL Server has no regular-expression operator.
         with pytest.raises(UnSupportedError):
             await MyAuthor.filter(name__regex="^al").count()
         return
@@ -408,9 +409,9 @@ async def test_search_lookup_per_backend(db):
     THEN PostgreSQL matches via to_tsvector, MySQL via MATCH ... AGAINST over a
          FULLTEXT index, and SQLite raises UnSupportedError
     """
-    if db in ("sqlite", "oracle"):
+    if db in ("sqlite", "oracle", "mssql"):
         # SQLite has no full-text lookup; Oracle Text (CONTAINS) needs a context
-        # index and is not implemented here.
+        # index; SQL Server full-text needs a catalog — none is implemented here.
         with pytest.raises(UnSupportedError):
             await MyEverything.filter(body__search="foxes").count()
         return

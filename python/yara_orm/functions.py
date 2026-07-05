@@ -134,7 +134,8 @@ class _Unary(Function):
         Returns:
             A ``(sql, next_index)`` tuple.
         """
-        fn = dialect.scalar_function(self.function)
+        mapper = getattr(dialect, "scalar_function", None)
+        fn = mapper(self.function) if mapper else self.function
         if isinstance(self.field, (Expression, Function)):
             inner, idx = _render_operand(
                 self.field, resolve, dialect, params, idx, str_is_column=True
