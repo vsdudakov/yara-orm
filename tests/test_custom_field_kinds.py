@@ -55,7 +55,12 @@ class MoneyField(fields.Field):
 register_field_kind(
     "money",
     field_cls=MoneyField,
-    sql={"postgres": "DOUBLE PRECISION", "sqlite": "REAL", "mysql": "DOUBLE"},
+    sql={
+        "postgres": "DOUBLE PRECISION",
+        "sqlite": "REAL",
+        "mysql": "DOUBLE",
+        "oracle": "FLOAT",
+    },
 )
 
 

@@ -1196,6 +1196,25 @@ class UUIDField(Field[VT]):
             return None
         return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
 
+    def to_python(self, value: Any) -> _uuid.UUID | None:
+        """Reconstruct a ``UUID`` from a database value.
+
+        The value is already a ``UUID`` on backends whose driver decodes the
+        type natively (PostgreSQL), but arrives as text where it is stored in a
+        character column and read back as a string (Oracle's ``RETURNING`` OUT
+        binds, which the model layer coerces through ``to_python`` rather than
+        the row decoder).
+
+        Args:
+            value: The value returned by the database engine.
+
+        Returns:
+            A ``UUID`` instance, or ``None``.
+        """
+        if value is None:
+            return None
+        return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
+
 
 class JSONField(Field[VT]):
     """A JSON column.

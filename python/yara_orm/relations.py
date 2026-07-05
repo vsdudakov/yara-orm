@@ -792,22 +792,19 @@ class M2MManager(_ChainableManager[MODEL]):
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=True)
         parts = self._sql(dialect)
-        ph = dialect.placeholder
         near = self.instance.pk
         fars = [obj.pk if hasattr(obj, "pk") else obj for obj in objects]
-        # One multi-row INSERT instead of N round-trips.
-        values = ", ".join(f"({ph(2 * i + 1)}, {ph(2 * i + 2)})" for i in range(len(fars)))
         params: list[Any] = []
         for far in fars:
             params.append(near)
             params.append(far)
-        # "Skip already-linked pairs" is dialect-specific: an ON CONFLICT DO
-        # NOTHING clause on PostgreSQL/SQLite, the INSERT IGNORE verb on MySQL.
-        sql = (
-            f"{dialect.insert_ignore_verb} INTO {parts['through']} "
-            f"({parts['near']}, {parts['far']}) "
-            f"VALUES {values}{dialect.on_conflict_sql([], [])}"
-        )
+        # "Skip already-linked pairs" is dialect-specific: the dialect renders
+        # the whole insert — an ON CONFLICT DO NOTHING clause on
+        # PostgreSQL/SQLite, the INSERT IGNORE verb on MySQL, a MERGE on Oracle
+        # (which has neither). The join table's composite primary key is the
+        # conflict target.
+        key_cols = [self.near_key, self.far_key]
+        sql = dialect.render_upsert(parts["through"], key_cols, len(fars), key_cols, [], key_cols)
         await engine.execute(sql, params)
 
     async def remove(self, *objects: Model | Any) -> None:

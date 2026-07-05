@@ -325,7 +325,7 @@ class MetaInfo:
                 f for f in self.db_default_fields if f is not self.pk_field
             ]
         if dialect.supports_insert_returning:
-            ret = " RETURNING " + ", ".join(q(f.db_column) for f in self.insert_returning_fields)
+            ret = dialect.insert_returning_clause(self.insert_returning_fields)
             self.insert_refresh_fields: list[Field] = []
             self.insert_refresh_sql: str | None = None
         else:
@@ -348,7 +348,8 @@ class MetaInfo:
             holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(self.insert_fields)))
             self.insert_sql = f"INSERT INTO {q(self.table)} ({cols}) VALUES ({holes}){ret}"
         else:
-            self.insert_sql = f"INSERT INTO {q(self.table)} {dialect.insert_default_values}{ret}"
+            default_values = dialect.insert_default_values_sql(self.pk_field.db_column)
+            self.insert_sql = f"INSERT INTO {q(self.table)} {default_values}{ret}"
 
         # Single-instance UPDATE (all non-pk columns) and DELETE, both keyed by
         # the primary key. These are static per (model, dialect) — exactly like
@@ -1252,10 +1253,8 @@ class Model(metaclass=ModelMeta):
 
             sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
             if dialect.supports_insert_returning:
-                returning = ", ".join(
-                    dialect.quote(f.db_column) for f in meta.insert_returning_fields
-                )
-                row = await executor.fetch_row(f"{sql} RETURNING {returning}", params)
+                returning = dialect.insert_returning_clause(meta.insert_returning_fields)
+                row = await executor.fetch_row(f"{sql}{returning}", params)
                 for field, value in zip(meta.insert_returning_fields, row):
                     decode = meta._read_decoders.get(field.model_field_name)
                     setattr(self, field.model_field_name, decode(value) if decode else value)
@@ -1702,7 +1701,8 @@ class Model(metaclass=ModelMeta):
                     for name, desc in meta.ordering
                 ]
                 order = f" ORDER BY {', '.join(parts)}"
-            sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)}{order} LIMIT {limit}"
+            tail = dialect.limit_offset_sql(limit, None)
+            sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)}{order}{tail}"
             cached = meta._simple_lookup_cache[cache_key] = (sql, converters)
         sql, converters = cached
         params = [
@@ -2080,15 +2080,14 @@ class Model(metaclass=ModelMeta):
         meta = cls._meta
         pk_field = meta.pk_field
         table = dialect.quote(meta.table)
-        returning = dialect.quote(pk_field.db_column)
 
         def column_of(name: str) -> str:
             """Resolve a field/relation name to its database column."""
             return meta.resolve_writable_field(name).db_column
 
         upsert = ignore_conflicts or update_fields is not None
-        conflict_sql = ""
-        insert_verb = "INSERT"
+        update_cols: list[str] = []
+        conflict_cols: list[str] = []
         if upsert:
             update_cols = [column_of(n) for n in (update_fields or ())]
             if on_conflict is not None:
@@ -2097,11 +2096,6 @@ class Model(metaclass=ModelMeta):
                 conflict_cols = [pk_field.db_column]
             else:
                 conflict_cols = []
-            conflict_sql = dialect.on_conflict_sql(conflict_cols, update_cols)
-            if not update_cols:
-                # Some dialects (MySQL) spell "skip duplicates" on the INSERT
-                # verb (INSERT IGNORE) instead of an ON CONFLICT clause.
-                insert_verb = dialect.insert_ignore_verb
 
         base_fields = [
             f
@@ -2149,6 +2143,12 @@ class Model(metaclass=ModelMeta):
                 continue
             # Keep batches under PostgreSQL's 65535 bind-parameter ceiling.
             size = min(batch_size, max(1, 65535 // ncols))
+            # Oracle has no multi-row ``VALUES (...), (...)`` INSERT: a plain
+            # bulk insert falls back to one single-row statement per object
+            # (its RETURNING pk backfill needs a single-row DML anyway). The
+            # upsert path renders a MERGE, which is inherently multi-row.
+            if not upsert and not dialect.supports_multirow_insert:
+                size = 1
             columns = ", ".join(dialect.quote(f.db_column) for f in insert_fields)
 
             def values_clause(nrows: int, ncols: int = ncols) -> str:
@@ -2169,29 +2169,39 @@ class Model(metaclass=ModelMeta):
                     idx += ncols
                 return ", ".join(rows)
 
-            def build_sql(nrows: int, columns: str = columns) -> str:
+            column_names = [f.db_column for f in insert_fields]
+
+            def build_sql(
+                nrows: int, columns: str = columns, column_names: list = column_names
+            ) -> str:
                 """Build the multi-row INSERT statement for ``nrows`` rows.
 
                 Args:
                     nrows: Number of rows the statement should insert.
                     columns: The rendered column list for this group.
+                    column_names: The unquoted column names (for the dialect's
+                        upsert renderer).
 
                 Returns:
                     The complete INSERT SQL string (with conflict/RETURNING).
                 """
-                # RETURNING is omitted under ON CONFLICT (skipped rows would not
-                # be returned, so the row order could not be matched to objects)
-                # and on dialects without it (MySQL reports the batch's first
-                # auto-increment id instead; see the backfill below).
+                if upsert:
+                    # Conflict handling has no RETURNING (skipped rows could not
+                    # be matched back to objects); the dialect renders the whole
+                    # statement (ON CONFLICT suffix, or a MERGE on Oracle).
+                    return dialect.render_upsert(
+                        table, column_names, nrows, conflict_cols, update_cols, [pk_field.db_column]
+                    )
+                # RETURNING is omitted on dialects without it (MySQL reports the
+                # batch's first auto-increment id instead; see the backfill
+                # below); the dialect renders its own clause (Oracle uses
+                # ``RETURNING ... INTO`` OUT binds).
                 ret = (
-                    f" RETURNING {returning}"
-                    if not upsert and dialect.supports_insert_returning
+                    dialect.insert_returning_clause([pk_field])
+                    if dialect.supports_insert_returning
                     else ""
                 )
-                return (
-                    f"{insert_verb} INTO {table} ({columns}) "
-                    f"VALUES {values_clause(nrows)}{conflict_sql}{ret}"
-                )
+                return f"INSERT INTO {table} ({columns}) VALUES {values_clause(nrows)}{ret}"
 
             # Pre-build the statement shared by every full-size batch, and
             # resolve the per-column binder/attribute pairs once per group
