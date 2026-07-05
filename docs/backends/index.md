@@ -134,9 +134,11 @@ await YaraOrm.init("mysql://user:password@host:3306/dbname")
     the young pure-Rust `oracle-rs` **0.1.x** driver, whose gaps leak into a few
     operations:
 
-    - **Large values can't be bound.** A string/bytes parameter above ~1&nbsp;KB
-      drops the connection, so long `TextField` / `JSONField` / `BinaryField` /
-      `CharField` values cannot be inserted.
+    - **Very large values can't be bound.** Strings and bytes now bind at any
+      size up to the server's max `VARCHAR2`/`RAW` (32&nbsp;767 with extended
+      strings, otherwise 4000) — the fork fixes the long-form framing that used
+      to drop the connection above ~252 bytes. Values beyond that limit still
+      need `CLOB`/`LONG` binding, which is not yet implemented.
     - **No `IntegrityError`.** A constraint violation closes the connection
       without surfacing the `ORA-` code, so duplicate/NOT-NULL breaches can't be
       raised as `IntegrityError`.
@@ -186,10 +188,13 @@ await YaraOrm.init("oracle://user:password@host:1521/FREEPDB1")
 The driver is young; the following are **not supported** on the Oracle backend
 and their tests are skipped:
 
-- **Bind values larger than ~1&nbsp;KB.** The driver cannot send a string or
-  byte parameter above roughly 1000 bytes (it drops the connection), so large
-  `TextField` / `JSONField` / `BinaryField` / long `CharField` values cannot be
-  inserted. Smaller values work.
+- **Bind values above the max `VARCHAR2`/`RAW` size.** String and byte binds now
+  work at any size up to the server limit (32&nbsp;767 with extended strings,
+  otherwise 4000); the fork fixed the long-form chunk framing that used to drop
+  the connection above ~252 bytes (proposed upstream, `stiang/oracle-rs#15`).
+  Values beyond that limit still need `CLOB`/`LONG` binding, which is not yet
+  implemented, so very large `TextField` / `JSONField` / `BinaryField` values
+  cannot be inserted.
 - **`IntegrityError` on constraint violations.** A unique / foreign-key /
   not-null violation makes the driver close the connection without surfacing the
   `ORA-` code, so the violation cannot be reported as an `IntegrityError`.
