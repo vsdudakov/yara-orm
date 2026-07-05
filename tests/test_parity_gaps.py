@@ -248,13 +248,14 @@ async def test_bulk_create_upsert_without_conflict_target(db):
     """
     GIVEN a model with an auto pk and no unique columns (no legal conflict target)
     WHEN bulk_create upserts with update_fields
-    THEN SQL Server raises (its MERGE needs a real target) while the other
-         backends default to the pk and insert cleanly (the auto pk never fires)
+    THEN the MERGE-based backends (SQL Server, Oracle) raise (they need a real
+         target) while the others default to the pk and insert cleanly (the auto
+         pk never fires)
     """
     from yara_orm.exceptions import UnSupportedError
 
     rows = [PgBare(hits=1), PgBare(hits=2)]
-    if db == "mssql":
+    if db in ("mssql", "oracle"):
         with pytest.raises(UnSupportedError):
             await PgBare.bulk_create(rows, update_fields=["hits"])
     else:
