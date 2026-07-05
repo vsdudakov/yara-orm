@@ -3594,6 +3594,84 @@ class SqlServerDialect(BaseDialect):
         merge += f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
         return merge
 
+    # -- DDL ------------------------------------------------------------------
+    def create_table_sql(self, meta: MetaInfo, safe: bool = True) -> list[str]:
+        """Render one guarded ``CREATE TABLE`` with indexes folded inline.
+
+        SQL Server has no ``CREATE TABLE IF NOT EXISTS`` (nor
+        ``CREATE INDEX IF NOT EXISTS``); the idempotency guard is a preceding
+        ``IF OBJECT_ID(...) IS NULL``, and secondary indexes ride the table via
+        SQL Server 2014+ inline ``INDEX`` clauses so one guard covers them all.
+
+        Args:
+            meta: The model metadata describing the table.
+            safe: Whether to emit the ``IF OBJECT_ID`` existence guard.
+
+        Returns:
+            The list with the (guarded) create-table statement.
+        """
+        lines = [self.column_sql(f) for f in meta.fields.values()]
+        pk_line = self._pk_line(meta)
+        if pk_line:
+            lines.append(pk_line)
+        for field in meta.fields.values():
+            if isinstance(field, ForeignKeyFieldInstance) and field.db_constraint:
+                ref = get_model(field.reference)
+                lines.append(
+                    self._fk_clause(
+                        self.quote(field.db_column),
+                        self.quote(ref._meta.table),
+                        self.quote(ref._meta.pk_field.db_column),
+                        field.on_delete,
+                    )
+                )
+        lines.extend(self._unique_together_lines(meta))
+        for constraint in meta.constraints:
+            lines.append(self._constraint_clause(constraint.to_spec()))
+        for field in meta.fields.values():
+            if field.index and not field.unique and not field.pk:
+                idx_name = self.quote(f"idx_{meta.table}_{field.db_column}")
+                lines.append(f"INDEX {idx_name} ({self.quote(field.db_column)})")
+        for index in meta.indexes:
+            cols = ", ".join(self._group_columns(meta, index.fields))
+            prefix = "UNIQUE " if getattr(index, "unique", False) else ""
+            lines.append(f"{prefix}INDEX {self.quote(index.resolve_name(meta.table))} ({cols})")
+
+        body = ",\n  ".join(lines)
+        table = self.quote(meta.table)
+        create = f"CREATE TABLE {table} (\n  {body}\n)"
+        if safe:
+            create = f"IF OBJECT_ID(N'{table}', 'U') IS NULL\n{create}"
+        return [create]
+
+    def _fk_clause(self, col: str, ref_tbl: str, ref_pk: str, on_delete: str) -> str:
+        """Render an FK clause, mapping ``RESTRICT`` to SQL Server's ``NO ACTION``.
+
+        Args:
+            col: The already-quoted referencing column.
+            ref_tbl: The already-quoted referenced table.
+            ref_pk: The already-quoted referenced primary key column.
+            on_delete: The ``ON DELETE`` action.
+
+        Returns:
+            The ``FOREIGN KEY`` clause.
+        """
+        action = "NO ACTION" if on_delete == "RESTRICT" else on_delete
+        return f"FOREIGN KEY ({col}) REFERENCES {ref_tbl} ({ref_pk}) ON DELETE {action}"
+
+    def _comment_sql(self, meta: MetaInfo) -> list[str]:
+        """Drop column/table comments — SQL Server has no ``COMMENT ON``.
+
+        (Comments would use ``sp_addextendedproperty``, which is not emitted.)
+
+        Args:
+            meta: The model metadata (unused).
+
+        Returns:
+            An empty list.
+        """
+        return []
+
     # -- migration rendering -------------------------------------------------
     def render_drop_table(self, table: str) -> list[str]:
         """Render a drop-table statement (``DROP TABLE IF EXISTS``, 2016+).
