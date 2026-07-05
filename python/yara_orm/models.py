@@ -345,7 +345,9 @@ class MetaInfo:
                 self.insert_refresh_sql = None
         if self.insert_fields:
             cols = ", ".join(q(f.db_column) for f in self.insert_fields)
-            holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(self.insert_fields)))
+            holes = ", ".join(
+                dialect.insert_placeholder(f, i + 1) for i, f in enumerate(self.insert_fields)
+            )
             self.insert_sql = f"INSERT INTO {q(self.table)} ({cols}) VALUES ({holes}){ret}"
         else:
             default_values = dialect.insert_default_values_sql(self.pk_field.db_column)
@@ -1247,7 +1249,7 @@ class Model(metaclass=ModelMeta):
                 ):
                     continue
                 columns.append(dialect.quote(field.db_column))
-                placeholders.append(dialect.placeholder(idx))
+                placeholders.append(dialect.insert_placeholder(field, idx))
                 params.append(field.to_db(value))
                 idx += 1
 
@@ -1264,7 +1266,11 @@ class Model(metaclass=ModelMeta):
                 row = await executor.fetch_row(sql, params)
                 setattr(self, pk_attr, pk_field.to_python(row[0]))
             else:
-                # The pk was supplied by the caller; nothing to read back.
+                # The pk was supplied by the caller; nothing to read back. An
+                # explicit value for an auto-increment pk needs the dialect's
+                # identity-insert wrapper (a no-op except on SQL Server).
+                if pk_field.auto_increment:
+                    sql = dialect.identity_insert_sql(table, sql)
                 await executor.execute(sql, params)
             self._in_db = True
             if not dialect.supports_insert_returning and meta.insert_refresh_sql:
@@ -1701,6 +1707,10 @@ class Model(metaclass=ModelMeta):
                     for name, desc in meta.ordering
                 ]
                 order = f" ORDER BY {', '.join(parts)}"
+            if not order and limit is not None:
+                # SQL Server's OFFSET/FETCH needs a preceding ORDER BY; borrow the
+                # dialect's placeholder ordering when the lookup imposes none.
+                order = dialect.offset_order_fallback()
             tail = dialect.limit_offset_sql(limit, None)
             sql = f"{meta.select_prefix} WHERE {' AND '.join(clauses)}{order}{tail}"
             cached = meta._simple_lookup_cache[cache_key] = (sql, converters)
@@ -2096,6 +2106,20 @@ class Model(metaclass=ModelMeta):
                 conflict_cols = [pk_field.db_column]
             else:
                 conflict_cols = []
+            if dialect.upsert_requires_conflict_target and on_conflict is None:
+                # SQL Server's MERGE must name real match columns present in the
+                # inserted set; INSERT IGNORE / ON CONFLICT DO NOTHING catch any
+                # unique violation implicitly, and default to the (uninserted)
+                # auto pk. Substitute the model's unique columns as the target.
+                auto_pk = pk_field.db_column if pk_field.auto_increment else None
+                if not conflict_cols or conflict_cols == [auto_pk]:
+                    unique_cols = [
+                        f.db_column
+                        for f in meta.fields.values()
+                        if f.unique and not (f is pk_field and f.auto_increment)
+                    ]
+                    if unique_cols:
+                        conflict_cols = unique_cols
 
         base_fields = [
             f
@@ -2141,8 +2165,9 @@ class Model(metaclass=ModelMeta):
                 for obj in group:
                     await obj.save()
                 continue
-            # Keep batches under PostgreSQL's 65535 bind-parameter ceiling.
-            size = min(batch_size, max(1, 65535 // ncols))
+            # Keep batches under the dialect's bind-parameter ceiling
+            # (65535 on PostgreSQL, 2100 on SQL Server).
+            size = min(batch_size, max(1, dialect.max_bind_params // ncols))
             # Oracle has no multi-row ``VALUES (...), (...)`` INSERT: a plain
             # bulk insert falls back to one single-row statement per object
             # (its RETURNING pk backfill needs a single-row DML anyway). The

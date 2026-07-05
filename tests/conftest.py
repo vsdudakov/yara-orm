@@ -19,14 +19,15 @@ MYSQL_URL = os.environ.get("ORM_TEST_MYSQL", "mysql://root:root@localhost:3306/o
 # its own parametrisation against a separate server.
 MARIADB_URL = os.environ.get("ORM_TEST_MARIADB", "mariadb://root:root@localhost:3307/orm_demo")
 ORACLE_URL = os.environ.get("ORM_TEST_ORACLE", "oracle://orm:orm@localhost:1521/FREEPDB1")
+MSSQL_URL = os.environ.get("ORM_TEST_MSSQL", "mssql://sa:yaraOrm_Pass1@localhost:1433/master")
 
 # Backends every ``db``-parametrised test runs against. Override to scope a run
 # (e.g. ``ORM_TEST_BACKENDS=sqlite``); extend by adding a branch in
 # ``_setup_backend`` when a new backend lands. Each networked backend skips
 # itself when no server is reachable at its URL (see the ``*_reachable`` probes).
-TEST_BACKENDS = os.environ.get("ORM_TEST_BACKENDS", "sqlite,postgres,mysql,mariadb,oracle").split(
-    ","
-)
+TEST_BACKENDS = os.environ.get(
+    "ORM_TEST_BACKENDS", "sqlite,postgres,mysql,mariadb,oracle,mssql"
+).split(",")
 
 
 def _tcp_reachable(url: str, default_port: int) -> bool:
@@ -97,6 +98,16 @@ def oracle_reachable() -> bool:
         True when a TCP connection to the ORACLE_URL host/port succeeds.
     """
     return _tcp_reachable(ORACLE_URL, 1521)
+
+
+@functools.cache
+def mssql_reachable() -> bool:
+    """Probe the configured SQL Server host/port once per test session.
+
+    Returns:
+        True when a TCP connection to the MSSQL_URL host/port succeeds.
+    """
+    return _tcp_reachable(MSSQL_URL, 1433)
 
 
 @pytest_asyncio.fixture
@@ -195,6 +206,33 @@ async def _drop_tables_oracle(tables: list[str]) -> None:
         await engine.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE CONSTRAINTS')
 
 
+async def _drop_tables_mssql(tables: list[str]) -> None:
+    """Drop the given tables on SQL Server, severing referencing FKs first.
+
+    SQL Server has no ``DROP ... CASCADE``; drop every table's inbound foreign
+    keys (via ``sys.foreign_keys``) before dropping the tables, so order does
+    not matter.
+
+    Args:
+        tables: Table names to drop.
+
+    Returns:
+        None
+    """
+    engine = get_engine()
+    for table in tables:
+        # Drop any FK constraints that reference this table, then the table.
+        await engine.execute(
+            "DECLARE @sql NVARCHAR(MAX) = N'';"
+            "SELECT @sql = @sql + N'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id))"
+            " + N'.' + QUOTENAME(OBJECT_NAME(parent_object_id)) + N' DROP CONSTRAINT '"
+            " + QUOTENAME(name) + N';' FROM sys.foreign_keys"
+            f" WHERE referenced_object_id = OBJECT_ID(N'[{table}]');"
+            "EXEC sp_executesql @sql;"
+        )
+        await engine.execute(f"DROP TABLE IF EXISTS [{table}]")
+
+
 async def _drop_tables_mysql(tables: list[str]) -> None:
     """Drop the given tables on MySQL, which has no ``DROP ... CASCADE``.
 
@@ -289,6 +327,17 @@ async def _setup_backend(backend: str, models: list):
             yield backend
         finally:
             await _drop_tables_oracle(tables)
+            await YaraOrm.close()
+    elif backend == "mssql":
+        if not mssql_reachable():
+            pytest.skip(f"SQL Server not reachable at {MSSQL_URL}")
+        await YaraOrm.init(MSSQL_URL)
+        await _drop_tables_mssql(tables)
+        await YaraOrm.generate_schemas(models=models)
+        try:
+            yield backend
+        finally:
+            await _drop_tables_mssql(tables)
             await YaraOrm.close()
     else:  # pragma: no cover - guards a misconfigured ORM_TEST_BACKENDS
         raise ValueError(f"unknown test backend: {backend!r}")

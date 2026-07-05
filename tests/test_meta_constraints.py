@@ -73,6 +73,14 @@ async def test_composite_index_created(db):
             "WHERE table_name = 'mc_slot'"
         )
         defs = " ".join(f"{r[0]} {r[1]}" for r in rows)
+    elif db == "mssql":
+        rows = await engine.fetch_rows(
+            "SELECT c.name FROM sys.indexes i "
+            "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+            "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+            "WHERE i.object_id = OBJECT_ID('mc_slot')"
+        )
+        defs = " ".join(r[0] for r in rows)
     else:
         rows = await engine.fetch_rows(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'mc_slot'"

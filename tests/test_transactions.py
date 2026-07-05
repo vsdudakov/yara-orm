@@ -198,7 +198,7 @@ async def test_isolation_repeatable_read_per_backend(db):
     (serializable-only)
     THEN PostgreSQL and MySQL apply it and SQLite raises UnSupportedError
     """
-    if db in ("postgres", "mysql", "mariadb"):
+    if db in ("postgres", "mysql", "mariadb", "mssql"):
         async with in_transaction(isolation=IsolationLevel.REPEATABLE_READ):
             await TxAccount.create(name="R", balance=1)
         assert await TxAccount.all().count() == 1

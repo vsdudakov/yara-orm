@@ -57,6 +57,9 @@ MARIADB_URL = os.environ.get("ORM_TEST_MARIADB", "mysql://root:root@localhost:33
 #: Oracle only benchmarks yara-orm itself — none of the eight competitors ship an
 #: Oracle backend, so ``BENCH_BACKEND=oracle`` runs the "ours" column alone.
 ORACLE_URL = os.environ.get("ORM_TEST_ORACLE", "oracle://orm:orm@localhost:1521/FREEPDB1")
+#: SQL Server, like Oracle, benchmarks yara-orm alone — the competitor ORMs need
+#: an ODBC driver stack to reach it, so ``BENCH_BACKEND=mssql`` runs "ours" only.
+MSSQL_URL = os.environ.get("ORM_TEST_MSSQL", "mssql://sa:yaraOrm_Pass1@localhost:1433/master")
 
 
 def pg_parts(url: str, default_port: int = 5432) -> dict:
@@ -91,11 +94,16 @@ def clear_sql(table: str) -> str:
         # quoted lower-case, so the name must be quoted to match. TRUNCATE takes
         # no RESTART IDENTITY (the IDENTITY sequence simply carries on).
         return f'TRUNCATE TABLE "{table}"'
+    if BACKEND == "mssql":
+        # SQL Server's TRUNCATE reseeds the IDENTITY column by itself (there is
+        # no RESTART IDENTITY clause).
+        return f"TRUNCATE TABLE {table}"
     return f"TRUNCATE {table} RESTART IDENTITY"
 
 
 def drop_sql(table: str) -> str:
-    if BACKEND in ("sqlite", "mysql", "mariadb"):  # MySQL accepts no CASCADE here
+    # SQL Server (2016+) also honours DROP TABLE IF EXISTS and takes no CASCADE.
+    if BACKEND in ("sqlite", "mysql", "mariadb", "mssql"):  # MySQL accepts no CASCADE here
         return f"DROP TABLE IF EXISTS {table}"
     if BACKEND == "oracle":  # quoted name; CASCADE CONSTRAINTS severs FKs
         return f'DROP TABLE IF EXISTS "{table}" CASCADE CONSTRAINTS'
@@ -109,6 +117,8 @@ def ours_url() -> str:
         return mysql_family_url()
     if BACKEND == "oracle":
         return ORACLE_URL
+    if BACKEND == "mssql":
+        return MSSQL_URL
     return URL
 
 
@@ -1147,6 +1157,8 @@ def main():
         target = mysql_family_url()
     elif BACKEND == "oracle":
         target = ORACLE_URL
+    elif BACKEND == "mssql":
+        target = MSSQL_URL
     else:
         target = f"sqlite ({SQLITE_DIR})"
     print(
@@ -1167,7 +1179,7 @@ def main():
         ("ormar", run_ormar, True),
         ("piccolo", run_piccolo, True),
     ]
-    if BACKEND == "oracle":
+    if BACKEND in ("oracle", "mssql"):
         runners = []
 
     results = {}

@@ -197,7 +197,8 @@ async def test_json_contains_postgres(db):
     THEN it uses structural containment (@>) on PostgreSQL, and raises on SQLite
     """
     await GRec.create(data={"tags": ["a", "b"], "role": "admin"})
-    if db == "sqlite":
+    if db in ("sqlite", "mssql"):
+        # SQLite and SQL Server have no JSON structural-containment operator.
         with pytest.raises(UnSupportedError):
             await GRec.filter(data__contains={"role": "admin"}).count()
         return

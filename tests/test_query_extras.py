@@ -338,6 +338,10 @@ async def test_sql_and_explain(db):
     await _seed()
     text = QxBook.filter(rating__gte=3).sql()
     assert text.startswith("SELECT") and "qx_book" in text
+    if db == "mssql":
+        # SQL Server has no inline EXPLAIN — its SET SHOWPLAN modes are batch-only
+        # session settings that do not fit the ``<prefix><query>`` model.
+        return
     assert isinstance(await QxBook.filter(rating__gte=3).explain(), str)
 
 
