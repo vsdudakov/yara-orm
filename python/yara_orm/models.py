@@ -345,7 +345,9 @@ class MetaInfo:
                 self.insert_refresh_sql = None
         if self.insert_fields:
             cols = ", ".join(q(f.db_column) for f in self.insert_fields)
-            holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(self.insert_fields)))
+            holes = ", ".join(
+                dialect.insert_placeholder(f, i + 1) for i, f in enumerate(self.insert_fields)
+            )
             self.insert_sql = f"INSERT INTO {q(self.table)} ({cols}) VALUES ({holes}){ret}"
         else:
             default_values = dialect.insert_default_values_sql(self.pk_field.db_column)
@@ -1247,7 +1249,7 @@ class Model(metaclass=ModelMeta):
                 ):
                     continue
                 columns.append(dialect.quote(field.db_column))
-                placeholders.append(dialect.placeholder(idx))
+                placeholders.append(dialect.insert_placeholder(field, idx))
                 params.append(field.to_db(value))
                 idx += 1
 

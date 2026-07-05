@@ -510,6 +510,20 @@ class BaseDialect:
         """
         return ""
 
+    def scalar_function(self, name: str) -> str:
+        """Map a portable scalar-function name to the dialect's spelling.
+
+        Most names are ANSI and pass through; SQL Server overrides the few that
+        differ (e.g. ``LENGTH`` → ``LEN``).
+
+        Args:
+            name: The portable function name (e.g. ``LENGTH``).
+
+        Returns:
+            The dialect-specific function name.
+        """
+        return name
+
     def aggregate_argument_sql(self, function: str, inner_sql: str) -> str:
         """Transform an aggregate's argument for dialect-specific typing.
 
@@ -542,6 +556,22 @@ class BaseDialect:
             The statement tail following the table name.
         """
         return "DEFAULT VALUES"
+
+    def insert_placeholder(self, field: Field, idx: int) -> str:
+        """Render an INSERT ``VALUES`` placeholder, optionally typed per column.
+
+        Most dialects use the plain positional placeholder. SQL Server overrides
+        this to ``CAST(... AS VARBINARY(MAX))`` for binary columns, since a bound
+        ``NULL`` (or text) parameter cannot implicitly convert to ``VARBINARY``.
+
+        Args:
+            field: The field the placeholder binds a value for.
+            idx: The 1-based bind-parameter index.
+
+        Returns:
+            The placeholder SQL fragment.
+        """
+        return self.placeholder(idx)
 
     def identity_insert_sql(self, table: str, insert_sql: str) -> str:
         """Wrap an INSERT that supplies an explicit auto-increment primary key.
@@ -3432,6 +3462,24 @@ class SqlServerDialect(BaseDialect):
         """
         return f"[{identifier.replace(']', ']]')}]"
 
+    def insert_placeholder(self, field: Field, idx: int) -> str:
+        """Cast binary-column placeholders to ``VARBINARY(MAX)``.
+
+        A bound parameter defaults to an ``nvarchar`` type; SQL Server refuses to
+        implicitly convert ``nvarchar`` (including a typed ``NULL``) to
+        ``varbinary`` (error 257), so binary columns get an explicit cast.
+
+        Args:
+            field: The field the placeholder binds a value for.
+            idx: The 1-based bind-parameter index.
+
+        Returns:
+            The placeholder, wrapped in ``CAST(... AS VARBINARY(MAX))`` for bytes.
+        """
+        if field.field_kind == "bytes":
+            return f"CAST({self.placeholder(idx)} AS VARBINARY(MAX))"
+        return self.placeholder(idx)
+
     def identity_insert_sql(self, table: str, insert_sql: str) -> str:
         """Bracket an explicit-identity INSERT with ``SET IDENTITY_INSERT``.
 
@@ -3553,6 +3601,19 @@ class SqlServerDialect(BaseDialect):
             The fallback ``ORDER BY`` fragment (leading space included).
         """
         return " ORDER BY (SELECT NULL)"
+
+    def scalar_function(self, name: str) -> str:
+        """Map portable scalar-function names to their T-SQL spelling.
+
+        SQL Server spells string length ``LEN`` (``LENGTH`` is unrecognised).
+
+        Args:
+            name: The portable function name.
+
+        Returns:
+            The T-SQL function name.
+        """
+        return {"LENGTH": "LEN"}.get(name, name)
 
     def aggregate_argument_sql(self, function: str, inner_sql: str) -> str:
         """Cast ``AVG`` arguments to ``FLOAT`` to avoid integer division.

@@ -134,12 +134,13 @@ class _Unary(Function):
         Returns:
             A ``(sql, next_index)`` tuple.
         """
+        fn = dialect.scalar_function(self.function)
         if isinstance(self.field, (Expression, Function)):
             inner, idx = _render_operand(
                 self.field, resolve, dialect, params, idx, str_is_column=True
             )
-            return f"{self.function}({inner})", idx
-        return self.render(resolve), idx
+            return f"{fn}({inner})", idx
+        return f"{fn}({resolve(self.field)})", idx
 
 
 class Lower(_Unary):

@@ -173,8 +173,9 @@ async def test_full_field_round_trip(db):
     assert got.ratio == 2.5
     assert got.price == Decimal("12345.678")
     expected_utc = aware.astimezone(dt.timezone.utc)
-    if db in ("mysql", "mariadb", "oracle"):
-        # DATETIME/TIMESTAMP is naive: the aware value is stored as its UTC instant.
+    if db in ("mysql", "mariadb", "oracle", "mssql"):
+        # DATETIME/TIMESTAMP/DATETIME2 is naive: the aware value is stored as its
+        # UTC instant.
         assert got.when == expected_utc.replace(tzinfo=None)
     else:
         assert got.when == expected_utc
