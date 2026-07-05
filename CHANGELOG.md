@@ -24,7 +24,7 @@ All notable changes to **yara-orm** are documented here. The format is based on
   compares yara-orm against Django, Peewee, SQLObject, Ormar and Piccolo in
   addition to Tortoise, SQLAlchemy and Pony, across PostgreSQL, MySQL, MariaDB
   and SQLite (`BENCH_BACKEND=mariadb`).
-- **Oracle backend (experimental).**
+- **Oracle backend (beta).**
   `await YaraOrm.init("oracle://user:pass@host:1521/FREEPDB1")` connects to
   Oracle Database 23ai. Built on the **pure-Rust `oracle-rs`** driver (a native
   TNS implementation — no OCI / ODPI-C / Instant Client, so manylinux wheels
@@ -36,15 +36,20 @@ All notable changes to **yara-orm** are documented here. The format is based on
   `VARCHAR2(36)` uuids). Slicing uses `OFFSET ... FETCH NEXT`, case-insensitive
   lookups fold with `UPPER()`, regex uses `REGEXP_LIKE`, upserts and m2m links
   render `MERGE`, and `GROUP BY` lists every selected column (Oracle's strict
-  rule). The shared cross-backend suite runs on Oracle via `ORM_TEST_ORACLE`.
+  rule). Constraint violations raise `IntegrityError` with the `ORA-` code, and
+  result sets of any size are returned. The shared cross-backend suite runs on
+  Oracle via `ORM_TEST_ORACLE`.
 
-  Known limitations of the young `oracle-rs 0.1.x` driver (documented, their
-  tests skipped): bind values above ~1&nbsp;KB are rejected (large
-  text/JSON/binary values cannot be inserted); a constraint violation closes the
-  connection without surfacing the `ORA-` code, so `IntegrityError` cannot be
-  raised; `__search` and JSON `__contains` are unimplemented; `bulk_create`
-  inserts one row per statement and connections are retired periodically to
-  dodge a driver protocol-desync. See `docs/backends` for the full list.
+  yara-orm pins a fork of `oracle-rs` 0.1.7 that fixes three wire-protocol bugs
+  (each proposed upstream): negotiate `END_OF_RESPONSE` + read multi-packet
+  responses (`stiang/oracle-rs#14`), terminate long-form bind data with a
+  zero-length chunk (`#15`), and frame marker packets with a 4-byte length in
+  large-SDU mode (`#16`). It is **beta** for the remaining gaps (documented,
+  their tests skipped): values above the server's max `VARCHAR2`/`RAW` size need
+  `CLOB`/`LONG` binding (not yet implemented); custom per-transaction isolation
+  levels are unavailable; `__search` and JSON `__contains` are unimplemented;
+  and `bulk_create` inserts one row per statement. See `docs/backends` for the
+  full list.
 
 ### Changed
 
