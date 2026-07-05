@@ -143,6 +143,20 @@ fn cd_to_value(cd: ColumnData<'static>) -> Result<Value, EngineError> {
 /// Column names + positional rows of one query.
 type Fetched = (Vec<Arc<str>>, Vec<Vec<Value>>);
 
+/// Whether a statement is an `INSERT`, seen past any leading whitespace and
+/// `/* ... */` block comment (the query annotators prepend such a comment, which
+/// would otherwise hide the `INSERT` keyword from a naive prefix check).
+fn stmt_is_insert(sql: &str) -> bool {
+    let mut s = sql.trim_start();
+    while let Some(rest) = s.strip_prefix("/*") {
+        match rest.find("*/") {
+            Some(end) => s = rest[end + 2..].trim_start(),
+            None => return false,
+        }
+    }
+    s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("insert"))
+}
+
 async fn run_fetch(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<Fetched, EngineError> {
     let wrappers: Vec<Param> = params.iter().map(Param).collect();
     let refs: Vec<&dyn ToSql> = wrappers.iter().map(|p| p as &dyn ToSql).collect();
@@ -156,10 +170,7 @@ async fn run_fetch(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<
     // statement) yields the first of the range. Cast to BIGINT so it decodes as
     // an integer (uuid/explicit-pk inserts never reach this path — they carry
     // their own pk and go through `execute`).
-    let is_insert = sql
-        .trim_start()
-        .get(..6)
-        .is_some_and(|s| s.eq_ignore_ascii_case("insert"));
+    let is_insert = stmt_is_insert(sql);
     let batched;
     let query = if is_insert {
         batched = format!("{sql}; SELECT CAST(SCOPE_IDENTITY() - @@ROWCOUNT + 1 AS BIGINT) AS id");

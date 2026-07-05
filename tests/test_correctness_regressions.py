@@ -241,7 +241,16 @@ async def test_random_hex_width(db):
     await eng.execute("DROP TABLE IF EXISTS a4_token")
     await YaraOrm.generate_schemas(models=[A4Token])
     try:
-        await eng.execute("INSERT INTO a4_token (id) VALUES (1)")
+        if db == "mssql":
+            # SQL Server rejects an explicit value for an IDENTITY column unless
+            # IDENTITY_INSERT is toggled on for the statement.
+            await eng.execute(
+                "SET IDENTITY_INSERT a4_token ON; "
+                "INSERT INTO a4_token (id) VALUES (1); "
+                "SET IDENTITY_INSERT a4_token OFF"
+            )
+        else:
+            await eng.execute("INSERT INTO a4_token (id) VALUES (1)")
         rows = await eng.fetch_rows("SELECT token FROM a4_token WHERE id = 1")
         assert len(rows[0][0]) == 16
     finally:

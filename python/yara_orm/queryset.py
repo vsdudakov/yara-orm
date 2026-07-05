@@ -2198,14 +2198,23 @@ class QuerySet(Generic[ModelT]):
         where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
         params = select_params + wparams + hparams
-        # PostgreSQL/SQLite/MySQL let the pk group make the other base columns
-        # functionally dependent; Oracle requires every selected column grouped.
-        group_refs = (
-            [f"{table}.{q(meta.pk_field.db_column)}"]
-            if dialect.group_by_functional_dependency
-            else base_cols
-        )
-        group = " GROUP BY " + ", ".join(group_refs)
+        # A GROUP BY is only needed when an aggregate (or HAVING) collapses rows;
+        # a purely scalar annotation (e.g. F("x") * 2) does not. Grouping by the
+        # unique pk would be a harmless no-op on functional-dependency backends,
+        # but SQL Server groups by every selected column and then rejects a scalar
+        # annotation that references a deferred (ungrouped) column (error 8120).
+        if self._has_aggregate_annotations() or self._having:
+            # PostgreSQL/SQLite/MySQL let the pk group make the other base columns
+            # functionally dependent; Oracle/SQL Server require every selected
+            # column grouped.
+            group_refs = (
+                [f"{table}.{q(meta.pk_field.db_column)}"]
+                if dialect.group_by_functional_dependency
+                else base_cols
+            )
+            group = " GROUP BY " + ", ".join(group_refs)
+        else:
+            group = ""
         sql = (
             f"SELECT {', '.join(select)} FROM {table}"
             f"{''.join(joins.values())}{where}{group}{having}"
