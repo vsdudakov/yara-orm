@@ -341,7 +341,6 @@ _ORACLE_LIMITATIONS = {
     "test_contains_array_element",
     "test_contains_array_of_objects",
     "test_contains_object_subset",
-    "test_custom_kind_crud_via_generated_schema",
     "test_decimal_column_type",
     "test_decimal_precision",
     "test_defer_with_annotate_keeps_column_deferred",
