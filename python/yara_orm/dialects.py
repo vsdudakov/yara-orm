@@ -3783,7 +3783,7 @@ class SqlServerDialect(BaseDialect):
         """
         lines = [self.column_sql(f) for f in meta.fields.values()]
         pk_line = self._pk_line(meta)
-        if pk_line:
+        if pk_line:  # pragma: no branch - always table-level on SQL Server
             lines.append(pk_line)
         fks = [
             f

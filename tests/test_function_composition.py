@@ -46,6 +46,15 @@ def test_custom_function_render_params_defaults_to_render():
     assert idx == 1
 
 
+def test_unary_render_emits_name_column():
+    """
+    GIVEN a unary function over a column name
+    WHEN render() is called directly (the resolve-only entry point)
+    THEN it emits NAME("col")
+    """
+    assert Lower("name").render(_resolve) == 'LOWER("name")'
+
+
 def test_unary_string_operand_uses_render():
     """
     GIVEN a unary function over a column name

@@ -43,7 +43,28 @@ class PgStat(Model):
         table = "pg_stat"
 
 
-MODELS = [PgAuthor, PgTag, PgBook, PgStat]
+class PgCoded(Model):
+    # A non-auto-increment primary key: bulk_create sends it, so it is itself a
+    # valid conflict target (unlike an auto pk) and needs no unique-column
+    # substitution on SQL Server's MERGE.
+    code = fields.CharField(max_length=20, pk=True)
+    hits = fields.IntField(default=0)
+
+    class Meta:
+        table = "pg_coded"
+
+
+class PgBare(Model):
+    # An auto pk and no unique columns: SQL Server's MERGE has no legal conflict
+    # target (the auto pk is never inserted), so an upsert must raise.
+    id = fields.IntField(pk=True)
+    hits = fields.IntField(default=0)
+
+    class Meta:
+        table = "pg_bare"
+
+
+MODELS = [PgAuthor, PgTag, PgBook, PgStat, PgCoded, PgBare]
 
 
 async def _seed():
@@ -203,6 +224,42 @@ async def test_bulk_create_update_fields_defaults_conflict_to_pk(db):
     # default-target branch and must run cleanly.
     await PgStat.bulk_create([PgStat(key="solo", hits=1)], update_fields=["hits"])
     assert await PgStat.filter(key="solo").count() == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_upsert_manual_pk_is_its_own_conflict_target(db):
+    """
+    GIVEN a model with a non-auto-increment primary key
+    WHEN bulk_create upserts with update_fields and no explicit on_conflict
+    THEN the pk itself is the conflict target (no unique-column substitution)
+         and the existing row is updated in place
+    """
+    await PgCoded.create(code="x", hits=1)
+    await PgCoded.bulk_create(
+        [PgCoded(code="x", hits=9), PgCoded(code="y", hits=2)],
+        update_fields=["hits"],
+    )
+    rows = {r.code: r.hits for r in await PgCoded.all()}
+    assert rows == {"x": 9, "y": 2}
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_upsert_without_conflict_target(db):
+    """
+    GIVEN a model with an auto pk and no unique columns (no legal conflict target)
+    WHEN bulk_create upserts with update_fields
+    THEN SQL Server raises (its MERGE needs a real target) while the other
+         backends default to the pk and insert cleanly (the auto pk never fires)
+    """
+    from yara_orm.exceptions import UnSupportedError
+
+    rows = [PgBare(hits=1), PgBare(hits=2)]
+    if db == "mssql":
+        with pytest.raises(UnSupportedError):
+            await PgBare.bulk_create(rows, update_fields=["hits"])
+    else:
+        await PgBare.bulk_create(rows, update_fields=["hits"])
+        assert await PgBare.all().count() == 2
 
 
 @pytest.mark.asyncio
