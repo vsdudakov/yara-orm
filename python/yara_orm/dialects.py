@@ -491,6 +491,21 @@ class BaseDialect:
             tail += f" OFFSET {int(offset)}"
         return tail
 
+    def offset_order_fallback(self) -> str:
+        """Render a placeholder ``ORDER BY`` for an unordered paginated query.
+
+        Most dialects render pagination as ``LIMIT``/``OFFSET``, which needs no
+        ordering, so the default is empty. SQL Server renders ``OFFSET ... ROWS
+        FETCH NEXT`` — which the grammar only permits after an ``ORDER BY`` — so
+        its dialect returns ``ORDER BY (SELECT NULL)`` to satisfy the parser when
+        a limited/offset query carries no ordering of its own.
+
+        Returns:
+            The fallback ``ORDER BY`` fragment (leading space included), or
+            ``""`` when the dialect needs none.
+        """
+        return ""
+
     def insert_default_values_sql(self, pk_column: str) -> str:
         """Render the statement tail that inserts a row of column defaults.
 
@@ -3469,6 +3484,18 @@ class SqlServerDialect(BaseDialect):
         if limit is not None:
             tail += f" FETCH NEXT {int(limit)} ROWS ONLY"
         return tail
+
+    def offset_order_fallback(self) -> str:
+        """Render ``ORDER BY (SELECT NULL)`` for an unordered paginated query.
+
+        ``OFFSET ... FETCH`` is only legal after an ``ORDER BY``; ``(SELECT
+        NULL)`` is the canonical no-op ordering used when the query itself
+        imposes none.
+
+        Returns:
+            The fallback ``ORDER BY`` fragment (leading space included).
+        """
+        return " ORDER BY (SELECT NULL)"
 
     def date_part_sql(self, part: str, col: str) -> str:
         """Render a date/time part via ``DATEPART``.

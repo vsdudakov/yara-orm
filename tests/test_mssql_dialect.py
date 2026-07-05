@@ -73,6 +73,17 @@ def test_limit_offset_uses_offset_fetch():
     assert d.limit_offset_sql(10, 5) == " OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY"
 
 
+def test_offset_order_fallback():
+    """
+    GIVEN OFFSET/FETCH pagination (only legal after ORDER BY)
+    WHEN a paginated query imposes no ordering of its own
+    THEN the dialect supplies a placeholder ORDER BY (SELECT NULL)
+    """
+    assert SqlServerDialect().offset_order_fallback() == " ORDER BY (SELECT NULL)"
+    # The portable default needs no such placeholder.
+    assert BaseDialect().offset_order_fallback() == ""
+
+
 def test_like_pattern_case_sensitivity():
     """
     GIVEN case-sensitive vs case-insensitive pattern lookups

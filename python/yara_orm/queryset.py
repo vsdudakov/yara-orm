@@ -1268,6 +1268,24 @@ class QuerySet(Generic[ModelT]):
         where = (" WHERE " + " AND ".join(parts)) if parts else ""
         return where, params, idx
 
+    def _offset_order_fallback(self, dialect: BaseDialect) -> str:
+        """Supply a placeholder ``ORDER BY`` when a paginated query has none.
+
+        SQL Server's ``OFFSET/FETCH`` pagination is only valid after an ``ORDER
+        BY``; when this query slices (``_limit``/``_offset``) but imposes no
+        ordering of its own, borrow the dialect's fallback ordering. All other
+        dialects (and unsliced queries) return an empty clause.
+
+        Args:
+            dialect: The active SQL dialect.
+
+        Returns:
+            The fallback ``ORDER BY`` fragment, or ``""``.
+        """
+        if self._limit is not None or self._offset is not None:
+            return dialect.offset_order_fallback()
+        return ""
+
     def _order_sql(self, dialect: BaseDialect) -> str:
         """Build the ``ORDER BY`` clause for the configured ordering.
 
@@ -1281,7 +1299,7 @@ class QuerySet(Generic[ModelT]):
         """
         order = self._order or self.model._meta.ordering
         if not order:
-            return ""
+            return self._offset_order_fallback(dialect)
         meta = self.model._meta
         table = dialect.quote(meta.table)
         parts = []
@@ -1322,7 +1340,7 @@ class QuerySet(Generic[ModelT]):
         """
         order = self._order or self.model._meta.ordering
         if not order:
-            return ""
+            return self._offset_order_fallback(dialect)
         meta = self.model._meta
         table = dialect.quote(meta.table)
         parts = []
@@ -2763,13 +2781,15 @@ class QuerySet(Generic[ModelT]):
         if self._needs_wrapped_terminal():
             inner, params = self._wrapped_terminal_inner()
             sub = dialect.quote("sub")
+            order = dialect.offset_order_fallback()
             tail = dialect.limit_offset_sql(1, None)
-            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) {sub}{tail}", params)
+            rows = await engine.fetch_rows(f"SELECT 1 FROM ({inner}) {sub}{order}{tail}", params)
             return bool(rows)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(self.model._meta.table)
+        order = dialect.offset_order_fallback()
         tail = dialect.limit_offset_sql(1, None)
-        rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where}{tail}", params)
+        rows = await engine.fetch_rows(f"SELECT 1 FROM {table}{where}{order}{tail}", params)
         return bool(rows)
 
     def _pk_having_subselect(self, dialect: BaseDialect, start: int = 1) -> tuple[str, list[Any]]:
