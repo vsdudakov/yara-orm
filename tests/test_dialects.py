@@ -285,7 +285,7 @@ def test_oracle_alter_column_null_drop_default_unique_fk():
     out = ORA.render_alter_column("t", "n", old, new, tspec)
     joined = "\n".join(out)
     assert 'MODIFY ("n" NULL)' in joined  # nullability only (no type change)
-    assert 'DEFAULT NULL' in joined  # default drop
+    assert "DEFAULT NULL" in joined  # default drop
     assert 'DROP CONSTRAINT "t_n_key"' in joined  # unique drop
     assert 'DROP CONSTRAINT "t_n_fkey"' in joined  # fk drop
 
@@ -346,9 +346,7 @@ def test_oracle_constraint_renderers():
     WHEN rendered on Oracle
     THEN ALTER TABLE DROP/RENAME CONSTRAINT statements are produced
     """
-    assert ORA.render_drop_constraint("t", "uq") == [
-        'ALTER TABLE "t" DROP CONSTRAINT "uq"'
-    ]
+    assert ORA.render_drop_constraint("t", "uq") == ['ALTER TABLE "t" DROP CONSTRAINT "uq"']
     assert ORA.render_rename_constraint("t", "uq", "uq2") == [
         'ALTER TABLE "t" RENAME CONSTRAINT "uq" TO "uq2"'
     ]
@@ -364,7 +362,7 @@ def test_oracle_date_part_and_json_extract():
     assert ORA.date_part_sql("quarter", '"c"') == "TO_NUMBER(TO_CHAR(\"c\", 'Q'))"
     with pytest.raises(UnSupportedError):
         ORA.date_part_sql("century", '"c"')
-    assert ORA.json_extract_sql('"c"', ["a", "b"]) == "JSON_VALUE(\"c\", '$.\"a\".\"b\"')"
+    assert ORA.json_extract_sql('"c"', ["a", "b"]) == 'JSON_VALUE("c", \'$."a"."b"\')'
     assert ORA.json_extract_sql('"c"', []) == '"c"'  # no keys -> bare column
 
 
