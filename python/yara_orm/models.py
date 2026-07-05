@@ -2106,6 +2106,20 @@ class Model(metaclass=ModelMeta):
                 conflict_cols = [pk_field.db_column]
             else:
                 conflict_cols = []
+            if dialect.upsert_requires_conflict_target and on_conflict is None:
+                # SQL Server's MERGE must name real match columns present in the
+                # inserted set; INSERT IGNORE / ON CONFLICT DO NOTHING catch any
+                # unique violation implicitly, and default to the (uninserted)
+                # auto pk. Substitute the model's unique columns as the target.
+                auto_pk = pk_field.db_column if pk_field.auto_increment else None
+                if not conflict_cols or conflict_cols == [auto_pk]:
+                    unique_cols = [
+                        f.db_column
+                        for f in meta.fields.values()
+                        if f.unique and not (f is pk_field and f.auto_increment)
+                    ]
+                    if unique_cols:
+                        conflict_cols = unique_cols
 
         base_fields = [
             f

@@ -181,6 +181,11 @@ class BaseDialect:
     #: inserts are chunked to stay under it. PostgreSQL's protocol ceiling is
     #: 65535; SQL Server's is 2100 (a much tighter cap, so its dialect lowers it).
     max_bind_params = 65535
+    #: Whether a conflict-ignoring bulk insert needs an explicit conflict target.
+    #: ``INSERT IGNORE`` / ``ON CONFLICT DO NOTHING`` catch any unique violation
+    #: implicitly; SQL Server's ``MERGE`` must name the columns to match on, so
+    #: its dialect sets this and the model supplies the unique columns.
+    upsert_requires_conflict_target = False
     #: Whether grouping by a table's primary key lets the other selected columns
     #: of that table appear unaggregated (functional dependency — PostgreSQL's
     #: rule, and SQLite/MySQL allow bare columns too). Oracle enforces the strict
@@ -3388,7 +3393,8 @@ class SqlServerDialect(BaseDialect):
     modifying_subquery_needs_wrap = True
     supports_aggregate_filter = False
     supports_multirow_insert = True  # multi-row VALUES (up to 1000 rows)
-    max_bind_params = 2100  # SQL Server's hard per-statement parameter ceiling
+    max_bind_params = 2000  # under SQL Server's hard 2100-parameter ceiling
+    upsert_requires_conflict_target = True  # MERGE must name its match columns
     group_by_functional_dependency = False
     offset_requires_limit = False
     index_concurrently = False

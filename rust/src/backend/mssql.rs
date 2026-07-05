@@ -148,9 +148,12 @@ async fn run_fetch(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<
     let refs: Vec<&dyn ToSql> = wrappers.iter().map(|p| p as &dyn ToSql).collect();
     // The model layer calls the fetch path on an auto-increment INSERT to read
     // the new pk back (T-SQL has no `RETURNING`, and `OUTPUT` cannot be a suffix
-    // the model appends). Batch a `SELECT SCOPE_IDENTITY()` so the identity is
-    // read on the same connection immediately after the insert — the first
-    // result set the batch yields is that id, cast to BIGINT so it decodes as
+    // the model appends). Batch a `SELECT` so the identity is read on the same
+    // connection immediately after the insert. `SCOPE_IDENTITY()` is the *last*
+    // id, but the model's bulk backfill expects the *first* (MySQL's
+    // `LAST_INSERT_ID` semantics), so subtract `@@ROWCOUNT - 1`: a single-row
+    // insert yields the id itself, and a multi-row insert (contiguous within one
+    // statement) yields the first of the range. Cast to BIGINT so it decodes as
     // an integer (uuid/explicit-pk inserts never reach this path — they carry
     // their own pk and go through `execute`).
     let is_insert = sql
@@ -159,7 +162,7 @@ async fn run_fetch(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<
         .is_some_and(|s| s.eq_ignore_ascii_case("insert"));
     let batched;
     let query = if is_insert {
-        batched = format!("{sql}; SELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS id");
+        batched = format!("{sql}; SELECT CAST(SCOPE_IDENTITY() - @@ROWCOUNT + 1 AS BIGINT) AS id");
         batched.as_str()
     } else {
         sql
