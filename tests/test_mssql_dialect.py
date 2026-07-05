@@ -6,9 +6,38 @@ even when the DB-backed suite runs without a SQL Server instance.
 
 import pytest
 
+from yara_orm import Model, fields
 from yara_orm.db_defaults import Now, RandomHex
 from yara_orm.dialects import BaseDialect, SqlServerDialect, get_dialect
 from yara_orm.exceptions import UnSupportedError
+
+
+class MsDlUser(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "ms_dl_user"
+
+
+class MsDlBook(Model):
+    id = fields.IntField(pk=True)
+    # A single-path cascade — legal on SQL Server, so CASCADE is preserved.
+    author = fields.ForeignKeyField("MsDlUser", related_name="books")
+
+    class Meta:
+        table = "ms_dl_book"
+
+
+class MsDlTicket(Model):
+    id = fields.IntField(pk=True)
+    # Two FKs to the same table (a second cascade path) plus a self-reference:
+    # SQL Server rejects both with error 1785, so each must fall back to NO ACTION.
+    created_by = fields.ForeignKeyField("MsDlUser", related_name="created")
+    updated_by = fields.ForeignKeyField("MsDlUser", related_name="updated", null=True)
+    parent = fields.ForeignKeyField("MsDlTicket", related_name="children", null=True)
+
+    class Meta:
+        table = "ms_dl_ticket"
 
 
 def test_mssql_is_registered():
@@ -152,6 +181,39 @@ def test_database_defaults_use_tsql_spelling():
     d = SqlServerDialect()
     assert Now().to_sql(d) == "SYSDATETIME()"
     assert RandomHex(8).to_sql(d) == "LOWER(CONVERT(VARCHAR(16), CRYPT_GEN_RANDOM(8), 2))"
+
+
+def test_create_table_guards_with_object_id_and_drops_comments():
+    """
+    GIVEN a table create on SQL Server (no CREATE TABLE IF NOT EXISTS / COMMENT ON)
+    WHEN create_table_sql renders it
+    THEN safe=True prefixes an IF OBJECT_ID guard and no COMMENT ON is emitted
+    """
+    d = SqlServerDialect()
+    guarded = d.create_table_sql(MsDlBook._meta, safe=True)[0]
+    assert guarded.startswith("IF OBJECT_ID(N'[ms_dl_book]', 'U') IS NULL\nCREATE TABLE")
+    unguarded = d.create_table_sql(MsDlBook._meta, safe=False)[0]
+    assert unguarded.startswith("CREATE TABLE [ms_dl_book]")
+    assert "COMMENT ON" not in guarded
+    assert d._comment_sql(MsDlBook._meta) == []
+
+
+def test_create_table_downgrades_only_illegal_cascades():
+    """
+    GIVEN multi-path and self-referential FKs (SQL Server error 1785)
+    WHEN create_table_sql renders the table
+    THEN those FKs fall back to NO ACTION while a single-path cascade is kept
+    """
+    d = SqlServerDialect()
+    ticket = d.create_table_sql(MsDlTicket._meta, safe=False)[0]
+    # Two FKs share ms_dl_user (a second cascade path) -> both NO ACTION.
+    assert ticket.count("REFERENCES [ms_dl_user] ([id]) ON DELETE NO ACTION") == 2
+    # The self-referential FK -> NO ACTION.
+    assert "REFERENCES [ms_dl_ticket] ([id]) ON DELETE NO ACTION" in ticket
+    assert "CASCADE" not in ticket
+    # A lone single-path cascade stays CASCADE (legal on SQL Server).
+    book = d.create_table_sql(MsDlBook._meta, safe=False)[0]
+    assert "REFERENCES [ms_dl_user] ([id]) ON DELETE CASCADE" in book
 
 
 def test_render_drop_table():

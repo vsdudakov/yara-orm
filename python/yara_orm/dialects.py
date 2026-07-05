@@ -3641,17 +3641,32 @@ class SqlServerDialect(BaseDialect):
         pk_line = self._pk_line(meta)
         if pk_line:
             lines.append(pk_line)
-        for field in meta.fields.values():
-            if isinstance(field, ForeignKeyFieldInstance) and field.db_constraint:
-                ref = get_model(field.reference)
-                lines.append(
-                    self._fk_clause(
-                        self.quote(field.db_column),
-                        self.quote(ref._meta.table),
-                        self.quote(ref._meta.pk_field.db_column),
-                        field.on_delete,
-                    )
+        fks = [
+            f
+            for f in meta.fields.values()
+            if isinstance(f, ForeignKeyFieldInstance) and f.db_constraint
+        ]
+        # SQL Server rejects a FOREIGN KEY that introduces a second cascade path
+        # to a table (error 1785) — including any self-referential cascade — so
+        # those FKs are pinned to NO ACTION. Single-path cascades are left intact.
+        ref_counts: dict[str, int] = {}
+        for f in fks:
+            table = get_model(f.reference)._meta.table
+            ref_counts[table] = ref_counts.get(table, 0) + 1
+        for field in fks:
+            ref = get_model(field.reference)
+            ref_table = ref._meta.table
+            on_delete = field.on_delete
+            if ref_table == meta.table or ref_counts[ref_table] > 1:
+                on_delete = "NO ACTION"
+            lines.append(
+                self._fk_clause(
+                    self.quote(field.db_column),
+                    self.quote(ref_table),
+                    self.quote(ref._meta.pk_field.db_column),
+                    on_delete,
                 )
+            )
         lines.extend(self._unique_together_lines(meta))
         for constraint in meta.constraints:
             lines.append(self._constraint_clause(constraint.to_spec()))
