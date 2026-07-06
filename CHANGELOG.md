@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-07-06
+
 ### Fixed
 
 - **`values()` / `values_list()` now decode column values to their field's
