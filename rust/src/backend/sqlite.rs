@@ -17,7 +17,7 @@ use deadpool_sqlite::{Config, Hook, HookError, Object, Pool, Runtime};
 use rusqlite::Connection;
 
 use crate::backend::pool::extract_pool_params;
-use crate::backend::{Backend, TxConn};
+use crate::backend::{Backend, TxConn, TxState};
 use crate::error::EngineError;
 use crate::value::{decode_sqlite, sqlite_decode_plan, Row, SqliteDecode, Value};
 
@@ -479,16 +479,6 @@ impl Backend for SqliteBackend {
 
 // --- transaction -----------------------------------------------------------
 
-/// Lifecycle of a pinned-connection transaction, driving the drop guard.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TxState {
-    /// A transaction is (or may be) open on the connection.
-    Active,
-    /// COMMIT/ROLLBACK completed cleanly; the connection is safe to recycle.
-    Finished,
-    /// A control statement failed; the connection state is unknown.
-    Broken,
-}
 
 /// A pinned-connection SQLite transaction.
 ///

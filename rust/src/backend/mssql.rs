@@ -36,7 +36,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::backend::pool::extract_pool_params;
 use crate::backend::postgres::redact;
-use crate::backend::{Backend, TxConn};
+use crate::backend::{Backend, PinnedTx, TxConn, TxState};
 use crate::error::EngineError;
 use crate::value::{value_to_json, Row, Value};
 
@@ -416,27 +416,17 @@ impl Backend for MssqlBackend {
 // Transaction
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-enum TxState {
-    Active,
-    Finished,
-    Broken,
-}
+/// A pinned-connection SQL Server transaction. The lifecycle/drop guard is the
+/// shared [`PinnedTx`]; only the driver calls and the drop-time recovery
+/// ([`mssql_tx_on_drop`]) are SQL-Server-specific.
+type MssqlTx = PinnedTx<Object<MssqlManager>>;
 
-struct MssqlTx {
-    conn: tokio::sync::Mutex<Option<Object<MssqlManager>>>,
-    state: std::sync::Mutex<TxState>,
-}
-
-impl MssqlTx {
+impl PinnedTx<Object<MssqlManager>> {
     async fn begin(
         conn: Object<MssqlManager>,
         isolation: Option<&str>,
     ) -> Result<Self, EngineError> {
-        let tx = MssqlTx {
-            conn: tokio::sync::Mutex::new(Some(conn)),
-            state: std::sync::Mutex::new(TxState::Active),
-        };
+        let tx = PinnedTx::new(conn, mssql_tx_on_drop);
         {
             let mut guard = tx.conn.lock().await;
             let conn = guard.as_mut().expect("MssqlTx conn present until drop");
@@ -453,10 +443,6 @@ impl MssqlTx {
         Ok(tx)
     }
 
-    fn set_state(&self, state: TxState) {
-        *self.state.lock().expect("tx state lock never poisoned") = state;
-    }
-
     async fn control(self: Box<Self>, sql: &str) -> Result<(), EngineError> {
         let mut guard = self.conn.lock().await;
         let conn = guard.as_mut().expect("MssqlTx conn present until drop");
@@ -471,22 +457,19 @@ impl MssqlTx {
     }
 }
 
-impl Drop for MssqlTx {
-    fn drop(&mut self) {
-        let Some(conn) = self.conn.get_mut().take() else {
-            return;
-        };
-        let state = *self.state.lock().expect("tx state lock never poisoned");
-        match state {
-            TxState::Finished => drop(conn),
-            TxState::Broken => drop(conn),
-            // Dropped mid-transaction: roll back on the background runtime.
-            TxState::Active => {
-                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-                    let mut conn = conn;
-                    let _ = conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK").await;
-                });
-            }
+/// Drop-time recovery for a SQL Server transaction (see [`PinnedTx`]). The
+/// pool's `recycle` already rolls back any open transaction on check-in, so a
+/// broken control statement can simply return the connection; only a
+/// mid-transaction drop rolls back eagerly on the background runtime.
+fn mssql_tx_on_drop(conn: Object<MssqlManager>, state: TxState) {
+    match state {
+        TxState::Finished | TxState::Broken => drop(conn),
+        // Dropped mid-transaction: roll back on the background runtime.
+        TxState::Active => {
+            pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+                let mut conn = conn;
+                let _ = conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK").await;
+            });
         }
     }
 }
