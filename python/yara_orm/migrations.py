@@ -3088,7 +3088,13 @@ class MigrationManager:
                         await op.run_forward()
                     await _apply_op_sql(engine, op.forward_sql(dialect, state), migration.atomic)
                     op.apply_state(state)
-                await engine.execute(insert_sql, [self.app, name, datetime.now(timezone.utc)])
+                # The tracking table's ``applied_at`` is a plain (tz-naive)
+                # datetime column, and the ORM stores naive UTC there; binding an
+                # aware value would shift or be rejected on backends that map
+                # ``datetime`` to TIMESTAMP WITHOUT TIME ZONE. Strip the tzinfo so
+                # the stored value matches the column (and ``history()`` reads).
+                applied_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                await engine.execute(insert_sql, [self.app, name, applied_at])
             done.append(name)
             if target and name == target:
                 break

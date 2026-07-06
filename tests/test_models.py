@@ -72,6 +72,23 @@ class MBWidget(MBAbstractOwned):
         table = "mb_widget"
 
 
+class MBTimestampMixin(Model):
+    # Abstract base declaring NO primary key (a plain mixin of shared columns).
+    created_at = fields.DatetimeField(null=True)
+
+    class Meta:
+        abstract = True
+
+
+class MBUuidDoc(MBTimestampMixin):
+    # Concrete subclass whose own pk is named something other than ``id``.
+    ref = fields.UUIDField(pk=True, default=uuid.uuid4)
+    title = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "mb_uuid_doc"
+
+
 class MBLoose(Model):
     id = fields.IntField(pk=True)
     name = fields.CharField(max_length=20)
@@ -156,6 +173,7 @@ MODELS = [
     CovParent,
     CovOverride,
     MBStoreChild,
+    MBUuidDoc,
 ]
 
 
@@ -664,3 +682,31 @@ async def test_refresh_from_db_partial_fields(db):
     assert user.alias == "stale"
     await user.refresh_from_db()
     assert user.alias == "a2"
+
+
+def test_abstract_base_without_pk_does_not_hijack_subclass_pk():
+    """
+    GIVEN an abstract base that declares no primary key
+    WHEN a concrete subclass declares its own pk under a non-'id' name
+    THEN the subclass pk is that field, with no spurious auto-injected 'id'
+
+    Regression: pk auto-injection ran before ``abstract`` was read, so the base
+    got an ``id`` serial the subclass inherited; ``next(f for f if f.pk)`` then
+    returned that inherited ``id`` and demoted the real pk to a plain column.
+    """
+    assert MBUuidDoc._meta.pk_field.model_field_name == "ref"
+    assert MBUuidDoc._meta.pk_field.pk is True
+    assert "id" not in MBUuidDoc._meta.fields
+
+
+@pytest.mark.asyncio
+async def test_abstract_pk_subclass_round_trips(db):
+    """
+    GIVEN a concrete subclass of a pk-less abstract base
+    WHEN a row is created and fetched back
+    THEN its non-'id' primary key persists and round-trips
+    """
+    doc = await MBUuidDoc.create(title="hello")
+    fetched = await MBUuidDoc.get(ref=doc.ref)
+    assert fetched.ref == doc.ref
+    assert fetched.title == "hello"

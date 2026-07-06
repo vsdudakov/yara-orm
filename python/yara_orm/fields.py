@@ -187,6 +187,10 @@ class Field(Generic[VT]):
         self.model_field_name: str = ""
         #: Whether the database assigns this column's value (serial pk).
         self.auto_increment = False
+        #: Set by the metaclass on the ``id`` pk it synthesises when a model
+        #: declares none, so a subclass that later declares its own pk can tell
+        #: the injected default apart from a user-declared field and drop it.
+        self._auto_pk = False
         #: Extra parameters consumed by the dialect type templates.
         self.type_params: dict[str, int] = {}
 

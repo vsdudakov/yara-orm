@@ -32,26 +32,11 @@ if TYPE_CHECKING:
 ModelT = TypeVar("ModelT", bound="Model")
 
 
-def _like_escape(value: Any) -> str:
-    r"""Escape LIKE/ILIKE metacharacters in a user-supplied value.
-
-    Pattern lookups (``contains``/``startswith``/``iexact``/...) wrap the raw
-    value in wildcards, so any ``%``/``_`` inside it must match literally —
-    otherwise user input silently acts as a wildcard. Paired with an
-    ``ESCAPE '\\'`` clause on the rendered comparison.
-
-    Args:
-        value: The raw lookup value.
-
-    Returns:
-        The value with ``\\``, ``%`` and ``_`` backslash-escaped.
-    """
-    return str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-# op -> (sql operator, pattern builder or None). A pattern builder turns the
-# value into a LIKE/ILIKE pattern (bound as plain text, wildcards escaped);
-# None binds via to_db.
+# op -> (sql operator, pattern builder or None). A pattern builder wraps an
+# already-escaped value in the lookup's wildcards; the LIKE metacharacter
+# escaping is applied by ``dialect.escape_like_value`` at compile time (it is
+# dialect-specific — SQL Server escapes ``[`` too), then bound as plain text.
+# ``None`` binds via to_db.
 _OPERATORS = {
     "exact": ("=", None),
     "not": ("!=", None),
@@ -59,14 +44,14 @@ _OPERATORS = {
     "gte": (">=", None),
     "lt": ("<", None),
     "lte": ("<=", None),
-    "contains": ("LIKE", lambda v: f"%{_like_escape(v)}%"),
-    "icontains": ("ILIKE", lambda v: f"%{_like_escape(v)}%"),
-    "startswith": ("LIKE", lambda v: f"{_like_escape(v)}%"),
-    "istartswith": ("ILIKE", lambda v: f"{_like_escape(v)}%"),
-    "endswith": ("LIKE", lambda v: f"%{_like_escape(v)}"),
-    "iendswith": ("ILIKE", lambda v: f"%{_like_escape(v)}"),
+    "contains": ("LIKE", lambda v: f"%{v}%"),
+    "icontains": ("ILIKE", lambda v: f"%{v}%"),
+    "startswith": ("LIKE", lambda v: f"{v}%"),
+    "istartswith": ("ILIKE", lambda v: f"{v}%"),
+    "endswith": ("LIKE", lambda v: f"%{v}"),
+    "iendswith": ("ILIKE", lambda v: f"%{v}"),
     # Case-insensitive exact match: ILIKE with no wildcards in the bound value.
-    "iexact": ("ILIKE", _like_escape),
+    "iexact": ("ILIKE", lambda v: v),
 }
 
 # Date/time part lookups, e.g. ``created_at__year=2024`` (rendered per dialect).
@@ -850,9 +835,13 @@ class QuerySet(Generic[ModelT]):
             # A Subquery / RawSQL / Case used as the comparison value.
             vparams: list[Any] = []
             vsql, idx = value.as_sql(self, dialect, {}, vparams, idx)
-            if op in ("in", "not_in"):
-                membership = "NOT IN" if op == "not_in" else "IN"
-                return f"{col} {membership} {vsql}", vparams, idx
+            if op == "not_in":
+                # Keep NULL rows, matching the literal-list path (and Tortoise):
+                # ``NULL NOT IN (...)`` is UNKNOWN, so a bare ``NOT IN`` would
+                # silently drop a nullable column's NULL rows from the result.
+                return f"({col} NOT IN {vsql} OR {col} IS NULL)", vparams, idx
+            if op == "in":
+                return f"{col} IN {vsql}", vparams, idx
             sql_op = _OPERATORS[op][0]
             if sql_op in ("LIKE", "ILIKE"):
                 # Route through the dialect's pattern renderer so an expression
@@ -932,14 +921,15 @@ class QuerySet(Generic[ModelT]):
             # not exist: uuid ~~* text'.
             if field is not None and field.field_kind not in _TEXT_KINDS:
                 col = dialect.cast_text(col)
-            # The pattern builder backslash-escapes %/_ in the value; the
-            # dialect renders the operator + ESCAPE clause (MySQL spells the
+            # The dialect escapes the LIKE metacharacters in the value (``[``
+            # too on SQL Server) before the builder wraps it in wildcards; the
+            # dialect then renders the operator + ESCAPE clause (MySQL spells the
             # literal differently; Oracle folds both operands with UPPER for
             # the case-insensitive lookups, having no ILIKE operator).
             case_insensitive = _OPERATORS[op][0] == "ILIKE"
             return (
                 dialect.like_pattern_sql(case_insensitive, col, placeholder),
-                [pattern(value)],
+                [pattern(dialect.escape_like_value(value))],
                 idx,
             )
         clause = f"{col} {sql_op} {placeholder}"
@@ -2744,6 +2734,13 @@ class QuerySet(Generic[ModelT]):
         A HAVING clause, an explicit grouping or a limit/offset slice all change
         which result rows exist, so counting the base table's rows would be
         wrong; the full select is wrapped as a subquery instead.
+
+        (``DISTINCT`` is deliberately not listed: ``count()``/``exists()`` always
+        run on a full-row queryset whose projection includes the pk — ``only()``
+        force-adds it — so ``SELECT DISTINCT`` never removes a row, and
+        reverse-relation filters compile to EXISTS rather than row-multiplying
+        joins. A projected distinct count goes through ``values()`` instead,
+        which has its own terminal handling.)
 
         Returns:
             ``True`` when the wrapped form is required.

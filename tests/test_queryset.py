@@ -12,6 +12,7 @@ from yara_orm import (
     FieldError,
     Model,
     Q,
+    Subquery,
     Sum,
     Value,
     When,
@@ -373,6 +374,25 @@ async def test_distinct(db):
     await QsWidget.bulk_create([QsWidget(name=f"d{i}", qty=i % 2) for i in range(6)])
     qtys = await QsWidget.all().distinct().values_list("qty", flat=True)
     assert sorted(qtys) == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_not_in_subquery_keeps_null_rows(db):
+    """
+    GIVEN a nullable column with some NULL rows
+    WHEN filtering with __not_in against a Subquery
+    THEN NULL rows are kept, matching the literal-list __not_in semantics
+
+    Regression: the subquery path emitted a bare ``NOT IN`` (``NULL NOT IN
+    (...)`` is UNKNOWN), silently dropping the NULL rows.
+    """
+    a = await McAuthor.create(name="A")
+    await McBook.create(title="x", rating=1, note="keep-out", author=a)
+    await McBook.create(title="y", rating=2, note="stay", author=a)
+    await McBook.create(title="z", rating=3, note=None, author=a)
+    sub = Subquery(McBook.filter(title="x").only("note"))
+    notes = {b.note for b in await McBook.filter(note__not_in=sub)}
+    assert notes == {"stay", None}
 
 
 @pytest.mark.asyncio
