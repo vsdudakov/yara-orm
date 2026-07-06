@@ -33,7 +33,7 @@ use mysql_async::{
 
 use crate::backend::pool::extract_pool_params;
 use crate::backend::postgres::redact;
-use crate::backend::{Backend, TxConn};
+use crate::backend::{Backend, PinnedTx, TxConn, TxState};
 use crate::error::EngineError;
 use crate::value::{value_to_json, Row, Value};
 
@@ -561,43 +561,17 @@ impl Backend for MySqlBackend {
 // Transactions
 // ---------------------------------------------------------------------------
 
-/// Lifecycle of a pinned-connection transaction, driving the drop guard.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TxState {
-    /// A transaction is (or may be) open on the connection.
-    Active,
-    /// COMMIT/ROLLBACK completed cleanly; the connection is safe to recycle.
-    Finished,
-    /// A control statement failed; the connection state is unknown.
-    Broken,
-}
+/// A pinned-connection MySQL transaction. The lifecycle/drop guard is the
+/// shared [`PinnedTx`]; only the driver calls and the drop-time recovery
+/// ([`mysql_tx_on_drop`]) are MySQL-specific.
+type MySqlTx = PinnedTx<Conn>;
 
-/// A pinned-connection MySQL transaction, mirroring the PgTx guard.
-///
-/// The pool's per-check-in COM_RESET_CONNECTION (which would roll back an
-/// open transaction) is disabled for round-trip economy — see `connect` — so
-/// this guard is the *only* safety net: dropped in any state other than a
-/// clean COMMIT/ROLLBACK it rolls back explicitly on the background runtime,
-/// and disconnects the connection outright when even that fails, exactly like
-/// the PostgreSQL twin.
-///
-/// The connection lives in a tokio `Mutex` because mysql_async statements need
-/// `&mut Conn` while `TxConn` methods take `&self`; the engine layer already
-/// serialises calls per transaction, so the lock is effectively uncontended.
-struct MySqlTx {
-    conn: tokio::sync::Mutex<Option<Conn>>,
-    state: std::sync::Mutex<TxState>,
-}
-
-impl MySqlTx {
+impl PinnedTx<Conn> {
     /// Acquire-and-BEGIN with the drop guard armed *before* BEGIN is sent, so
     /// a cancellation mid-BEGIN can never recycle a possibly-in-transaction
     /// connection unguarded.
     async fn begin(conn: Conn, isolation: Option<&str>) -> Result<Self, EngineError> {
-        let tx = MySqlTx {
-            conn: tokio::sync::Mutex::new(Some(conn)),
-            state: std::sync::Mutex::new(TxState::Active),
-        };
+        let tx = PinnedTx::new(conn, mysql_tx_on_drop);
         {
             let mut guard = tx.conn.lock().await;
             let conn = guard.as_mut().expect("MySqlTx conn is present until drop");
@@ -611,10 +585,6 @@ impl MySqlTx {
             conn.query_drop("BEGIN").await.map_err(map_mysql)?;
         }
         Ok(tx)
-    }
-
-    fn set_state(&self, state: TxState) {
-        *self.state.lock().expect("tx state lock never poisoned") = state;
     }
 
     async fn control(self: Box<Self>, sql: &str) -> Result<(), EngineError> {
@@ -631,37 +601,33 @@ impl MySqlTx {
     }
 }
 
-impl Drop for MySqlTx {
-    fn drop(&mut self) {
-        // Drop gives exclusive access, so `get_mut` reaches the Conn without
-        // locking.
-        let Some(conn) = self.conn.get_mut().take() else {
-            return;
-        };
-        let state = *self.state.lock().expect("tx state lock never poisoned");
-        match state {
-            // Clean end: dropping the Conn returns it to the pool (which also
-            // resets the session by default).
-            TxState::Finished => drop(conn),
-            // A COMMIT/ROLLBACK failed outright: session state unknown — close
-            // the connection instead of recycling it.
-            TxState::Broken => {
-                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+/// Drop-time recovery for a MySQL transaction (see [`PinnedTx`]). The pool's
+/// per-check-in COM_RESET_CONNECTION (which would roll back an open
+/// transaction) is disabled for round-trip economy — see `connect` — so this is
+/// the *only* safety net.
+fn mysql_tx_on_drop(conn: Conn, state: TxState) {
+    match state {
+        // Clean end: dropping the Conn returns it to the pool (which also
+        // resets the session by default).
+        TxState::Finished => drop(conn),
+        // A COMMIT/ROLLBACK failed outright: session state unknown — close the
+        // connection instead of recycling it.
+        TxState::Broken => {
+            pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+                let _ = conn.disconnect().await;
+            });
+        }
+        // Dropped mid-transaction (cancellation windows around BEGIN / COMMIT /
+        // ROLLBACK, or an abandoned transaction object): roll back on the
+        // background runtime; only if that fails is the connection closed
+        // rather than returned.
+        TxState::Active => {
+            pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+                let mut conn = conn;
+                if conn.query_drop("ROLLBACK").await.is_err() {
                     let _ = conn.disconnect().await;
-                });
-            }
-            // Dropped mid-transaction (cancellation windows around BEGIN /
-            // COMMIT / ROLLBACK, or an abandoned transaction object): roll
-            // back on the background runtime; only if that fails is the
-            // connection closed rather than returned.
-            TxState::Active => {
-                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-                    let mut conn = conn;
-                    if conn.query_drop("ROLLBACK").await.is_err() {
-                        let _ = conn.disconnect().await;
-                    }
-                });
-            }
+                }
+            });
         }
     }
 }

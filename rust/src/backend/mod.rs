@@ -97,6 +97,69 @@ pub trait TxConn: Send + Sync {
     async fn rollback_to(&self, name: &str) -> Result<(), EngineError>;
 }
 
+/// Lifecycle of a pinned-connection transaction, driving the drop guard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TxState {
+    /// A transaction is (or may be) open on the connection.
+    Active,
+    /// COMMIT/ROLLBACK completed cleanly; the connection is safe to recycle.
+    Finished,
+    /// A control statement failed; the connection state is unknown.
+    Broken,
+}
+
+/// A pinned-connection transaction guard shared by the network backends whose
+/// driver hands out an owned connection (`MySQL`, `SQL Server`).
+///
+/// The connection lives in a tokio `Mutex` because the driver statements need
+/// `&mut Conn` while [`TxConn`] methods take `&self`; the engine layer already
+/// serialises calls per transaction, so the lock is effectively uncontended.
+/// A separate `state` records the lifecycle for the drop guard.
+///
+/// On drop — in any state other than a clean COMMIT/ROLLBACK — the still-open
+/// transaction must be cleaned up so the pool never recycles a mid-transaction
+/// connection. Because a `Drop` cannot be async, the guard hands the owned
+/// connection and the final [`TxState`] to a backend-supplied `on_drop`
+/// function, which performs the driver-specific best-effort rollback /
+/// disconnect on the background runtime. `on_drop` is a plain `fn` pointer: the
+/// per-backend recovery captures nothing but the global runtime and static SQL,
+/// so no closure environment is needed.
+pub struct PinnedTx<C: Send + 'static> {
+    pub(crate) conn: tokio::sync::Mutex<Option<C>>,
+    state: std::sync::Mutex<TxState>,
+    on_drop: fn(C, TxState),
+}
+
+impl<C: Send + 'static> PinnedTx<C> {
+    /// Wrap an owned connection whose transaction has just begun, arming the
+    /// drop guard with the backend's `on_drop` recovery.
+    pub(crate) fn new(conn: C, on_drop: fn(C, TxState)) -> Self {
+        Self {
+            conn: tokio::sync::Mutex::new(Some(conn)),
+            state: std::sync::Mutex::new(TxState::Active),
+            on_drop,
+        }
+    }
+
+    /// Record the lifecycle transition the drop guard reads.
+    pub(crate) fn set_state(&self, state: TxState) {
+        *self.state.lock().expect("tx state lock never poisoned") = state;
+    }
+}
+
+impl<C: Send + 'static> Drop for PinnedTx<C> {
+    fn drop(&mut self) {
+        // Drop gives exclusive access, so `get_mut` reaches the connection
+        // without locking. A `None` means it was already taken (never happens
+        // in practice; the guard owns the connection for its whole life).
+        let Some(conn) = self.conn.get_mut().take() else {
+            return;
+        };
+        let state = *self.state.lock().expect("tx state lock never poisoned");
+        (self.on_drop)(conn, state);
+    }
+}
+
 /// Whether the URL's query string carries a parameter named `key`.
 ///
 /// Matches on the key only (everything before the first `=` of each

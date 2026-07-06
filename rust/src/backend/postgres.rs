@@ -10,7 +10,7 @@ use tokio_postgres::{NoTls, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::backend::pool::extract_pool_params;
-use crate::backend::{Backend, TxConn};
+use crate::backend::{Backend, TxConn, TxState};
 use crate::error::EngineError;
 use crate::value::{decode_pg_row, decode_pg_row_values, decode_pg_rows, Row, Value};
 
@@ -302,17 +302,6 @@ impl Backend for PgBackend {
         let tx = PgTx::begin(self.get().await?, isolation, self.cache_statements).await?;
         Ok(Box::new(tx))
     }
-}
-
-/// Lifecycle of a pinned-connection transaction, driving the drop guard.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TxState {
-    /// A transaction is (or may be) open on the connection.
-    Active,
-    /// COMMIT/ROLLBACK completed cleanly; the connection is safe to recycle.
-    Finished,
-    /// A control statement failed; the connection state is unknown.
-    Broken,
 }
 
 /// A pinned-connection PostgreSQL transaction.

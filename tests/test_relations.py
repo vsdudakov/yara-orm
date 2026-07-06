@@ -502,3 +502,23 @@ async def test_bulk_update_relation_field_by_id(db):
     e2.tournament_id = b.id
     assert await Event.bulk_update([e1, e2], ["tournament"]) == 2
     assert {e.tournament_id for e in await Event.all()} == {b.id}
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_relation_deferred_column_raises(db):
+    """
+    GIVEN events fetched with only() that excluded the FK backing column
+    WHEN bulk_update writes that relation field
+    THEN a FieldError is raised, not a silent UPDATE that wipes the FK to NULL
+
+    Regression: the FK source column has no class descriptor, so reading it with
+    a getattr default swallowed the AttributeError and bound NULL.
+    """
+    a = await Tournament.create(name="A")
+    await Event.create(name="e1", tournament=a)
+    # only() excludes tournament_id, so it is never loaded on these instances.
+    events = await Event.all().only("id", "name")
+    with pytest.raises(FieldError):
+        await Event.bulk_update(events, ["tournament"])
+    # The FK is untouched — nothing was written.
+    assert {e.tournament_id for e in await Event.all()} == {a.id}
