@@ -73,7 +73,9 @@ asyncio_mode = "auto"
 line-length = 100
 target-version = "py39"
 src = ["python"]
-extend-exclude = ["migrations"]
+# Skip generated migration files (NNNN_name.py from `makemigrations`), not the
+# library's own migrations package.
+extend-exclude = ["[0-9]*_*.py"]
 
 [tool.ruff.lint]
 # D = pydocstyle: every public symbol in the library carries a Google-style
