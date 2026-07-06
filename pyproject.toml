@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.14.1,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -50,16 +50,16 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0", "pytest-asyncio>=0.23", "factory-boy>=3.3"]
-factory = ["factory-boy>=3.3"]
+test = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0", "factory-boy>=3.3.3"]
+factory = ["factory-boy>=3.3.3"]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "pytest-cov>=5.0",
-    "ruff>=0.6",
-    "ty>=0.0.1a1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.20",
+    "ty>=0.0.56",
 ]
-docs = ["mkdocs-material[imaging]>=9.5"]
+docs = ["mkdocs-material[imaging]>=9.7.6"]
 
 [tool.maturin]
 python-source = "python"
