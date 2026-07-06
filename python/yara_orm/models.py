@@ -1217,6 +1217,38 @@ class Model(metaclass=ModelMeta):
             for validator in field.validators:
                 validator(value)
 
+    def _bind_values(self, fields: Iterable[Field]) -> list[Any]:
+        """Bind this instance's values for ``fields`` in order via ``to_db``.
+
+        The insert/update binding step shared by the save paths: read each
+        field's attribute (missing → ``None``) and coerce it through the field's
+        ``to_db``.
+
+        Args:
+            fields: The fields to bind, in placeholder order.
+
+        Returns:
+            The bound parameter values.
+        """
+        return [f.to_db(getattr(self, f.model_field_name, None)) for f in fields]
+
+    def _apply_returning(self, row: Sequence[Any], meta: MetaInfo) -> None:
+        """Write an INSERT's RETURNING row back onto this instance.
+
+        The database-assigned columns (serial pk, ``RETURNING`` defaults) are
+        decoded through the model's read decoders and assigned.
+
+        Args:
+            row: The RETURNING row, in ``meta.insert_returning_fields`` order.
+            meta: The model metadata.
+
+        Returns:
+            None
+        """
+        for field, value in zip(meta.insert_returning_fields, row):
+            decode = meta._read_decoders.get(field.model_field_name)
+            setattr(self, field.model_field_name, decode(value) if decode else value)
+
     async def _perform_save(
         self,
         executor: BaseDBAsyncClient,
@@ -1224,6 +1256,10 @@ class Model(metaclass=ModelMeta):
         using_db: str | BaseDBAsyncClient | None = None,
     ) -> None:
         """Run the INSERT or UPDATE statement that persists this instance.
+
+        Applies auto-now timestamps, then dispatches to :meth:`_insert` for a
+        new row, :meth:`_update_partial` when ``update_fields`` names a subset,
+        or :meth:`_update_full` for a full update of an existing row.
 
         Args:
             executor: The write-capable database executor to run SQL against.
@@ -1242,109 +1278,159 @@ class Model(metaclass=ModelMeta):
         dialect = get_dialect(type(self), using=using_db)
         meta = self._meta
         meta.compile(dialect)
+        if not self._in_db:
+            await self._insert(executor, dialect, meta)
+        elif update_fields is not None:
+            await self._update_partial(executor, dialect, meta, update_fields)
+        elif meta.update_sql is not None:
+            await self._update_full(executor, dialect, meta)
+
+    async def _insert(
+        self, executor: BaseDBAsyncClient, dialect: BaseDialect, meta: MetaInfo
+    ) -> None:
+        """Insert this not-yet-persisted instance and read back generated values.
+
+        Uses the cached single INSERT when the pk is an unset auto-increment and
+        no database-default column carries an explicit value; otherwise builds
+        the statement from the columns actually set. Generated columns come back
+        via ``RETURNING`` (or a synthetic id row / a follow-up refresh on
+        backends without RETURNING).
+
+        Args:
+            executor: The write-capable executor.
+            dialect: The dialect the statement renders for.
+            meta: The model metadata.
+
+        Returns:
+            None
+        """
         pk_field = meta.pk_field
         table = dialect.quote(meta.table)
-
-        if not self._in_db:
-            pk_attr = pk_field.model_field_name
-            pk_unset = pk_field.auto_increment and getattr(self, pk_attr, None) is None
-            # An explicit value on a database-default column must reach the
-            # INSERT (the cached statement omits those columns), so the fast
-            # path only applies while every such column is unset.
-            if pk_unset and all(
-                getattr(self, f.model_field_name, None) is None for f in meta.db_default_fields
-            ):
-                # Fast path: reuse the cached INSERT statement, bind params only.
-                params = [
-                    f.to_db(getattr(self, f.model_field_name, None)) for f in meta.insert_fields
-                ]
-                row = await executor.fetch_row(meta.insert_sql, params)
-                for field, value in zip(meta.insert_returning_fields, row):
-                    decode = meta._read_decoders.get(field.model_field_name)
-                    setattr(self, field.model_field_name, decode(value) if decode else value)
-                self._in_db = True
-                if meta.insert_refresh_sql:
-                    # fetch_db_defaults without RETURNING (MySQL): read the
-                    # database-filled defaults back by the new pk.
-                    await self._refresh_inserted_defaults(executor, meta)
-                self._mark_unfetched_db_defaults()
-                return
-
-            columns = []
-            placeholders = []
-            params = []
-            idx = 1
-            for name, field in meta.fields.items():
-                value = getattr(self, name, None)
-                # Omit an unset database-default column so the DB supplies it,
-                # and an unset auto-increment pk so the DB assigns it.
-                if value is None and (
-                    isinstance(field.default, DatabaseDefault)
-                    or (field is pk_field and field.auto_increment)
-                ):
-                    continue
-                columns.append(dialect.quote(field.db_column))
-                placeholders.append(dialect.insert_placeholder(field, idx))
-                params.append(field.to_db(value))
-                idx += 1
-
-            sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-            if dialect.supports_insert_returning:
-                returning = dialect.insert_returning_clause(meta.insert_returning_fields)
-                row = await executor.fetch_row(f"{sql}{returning}", params)
-                for field, value in zip(meta.insert_returning_fields, row):
-                    decode = meta._read_decoders.get(field.model_field_name)
-                    setattr(self, field.model_field_name, decode(value) if decode else value)
-            elif pk_unset:
-                # No RETURNING (MySQL): the backend returns the auto-increment
-                # id as a synthetic single-value row.
-                row = await executor.fetch_row(sql, params)
-                setattr(self, pk_attr, pk_field.to_python(row[0]))
-            else:
-                # The pk was supplied by the caller; nothing to read back. An
-                # explicit value for an auto-increment pk needs the dialect's
-                # identity-insert wrapper (a no-op except on SQL Server).
-                if pk_field.auto_increment:
-                    sql = dialect.identity_insert_sql(table, sql)
-                await executor.execute(sql, params)
+        pk_attr = pk_field.model_field_name
+        pk_unset = pk_field.auto_increment and getattr(self, pk_attr, None) is None
+        # An explicit value on a database-default column must reach the INSERT
+        # (the cached statement omits those columns), so the fast path only
+        # applies while every such column is unset.
+        if pk_unset and all(
+            getattr(self, f.model_field_name, None) is None for f in meta.db_default_fields
+        ):
+            # Fast path: reuse the cached INSERT statement, bind params only.
+            row = await executor.fetch_row(meta.insert_sql, self._bind_values(meta.insert_fields))
+            self._apply_returning(row, meta)
             self._in_db = True
-            if not dialect.supports_insert_returning and meta.insert_refresh_sql:
+            if meta.insert_refresh_sql:
+                # fetch_db_defaults without RETURNING (MySQL): read the
+                # database-filled defaults back by the new pk.
                 await self._refresh_inserted_defaults(executor, meta)
             self._mark_unfetched_db_defaults()
-        elif update_fields is not None:
-            # Partial update: write only the named fields (relation names map to
-            # their FK column). The pk is the WHERE key, never an assignment.
-            resolved: list[Field] = []
-            seen: set[str] = set()
-            for name in update_fields:
-                field = meta.resolve_writable_field(name)  # raises if unknown
-                if field is pk_field or field.db_column in seen:
-                    continue
-                seen.add(field.db_column)
-                resolved.append(field)
-            if not resolved:
-                # Empty update_fields (or only the pk): nothing to persist.
-                return
-            params = [f.to_db(getattr(self, f.model_field_name, None)) for f in resolved]
-            params.append(pk_field.to_db(self.pk))
-            await executor.execute(meta.partial_update_sql(dialect, resolved), params)
-        elif meta.update_sql is not None:
-            # Reuse the cached UPDATE statement; only the bound values change.
-            fields = meta.update_field_list
-            sql = meta.update_sql
-            unfetched = self.__dict__.get("_unfetched_db_defaults")
-            if unfetched:
-                # Never overwrite a database-default column with a ``None`` the
-                # instance holds only because the DB-supplied value was never
-                # fetched (e.g. after ``create()`` without fetch_db_defaults).
-                # An explicitly assigned ``None`` clears the mark and is written.
-                fields = [f for f in fields if f.model_field_name not in unfetched]
-                if not fields:
-                    return
-                sql = meta.partial_update_sql(dialect, fields)
-            params = [f.to_db(getattr(self, f.model_field_name, None)) for f in fields]
-            params.append(pk_field.to_db(self.pk))
+            return
+
+        columns = []
+        placeholders = []
+        params = []
+        idx = 1
+        for name, field in meta.fields.items():
+            value = getattr(self, name, None)
+            # Omit an unset database-default column so the DB supplies it, and an
+            # unset auto-increment pk so the DB assigns it.
+            if value is None and (
+                isinstance(field.default, DatabaseDefault)
+                or (field is pk_field and field.auto_increment)
+            ):
+                continue
+            columns.append(dialect.quote(field.db_column))
+            placeholders.append(dialect.insert_placeholder(field, idx))
+            params.append(field.to_db(value))
+            idx += 1
+
+        sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+        if dialect.supports_insert_returning:
+            returning = dialect.insert_returning_clause(meta.insert_returning_fields)
+            row = await executor.fetch_row(f"{sql}{returning}", params)
+            self._apply_returning(row, meta)
+        elif pk_unset:
+            # No RETURNING (MySQL): the backend returns the auto-increment id as
+            # a synthetic single-value row.
+            row = await executor.fetch_row(sql, params)
+            setattr(self, pk_attr, pk_field.to_python(row[0]))
+        else:
+            # The pk was supplied by the caller; nothing to read back. An
+            # explicit value for an auto-increment pk needs the dialect's
+            # identity-insert wrapper (a no-op except on SQL Server).
+            if pk_field.auto_increment:
+                sql = dialect.identity_insert_sql(table, sql)
             await executor.execute(sql, params)
+        self._in_db = True
+        if not dialect.supports_insert_returning and meta.insert_refresh_sql:
+            await self._refresh_inserted_defaults(executor, meta)
+        self._mark_unfetched_db_defaults()
+
+    async def _update_partial(
+        self,
+        executor: BaseDBAsyncClient,
+        dialect: BaseDialect,
+        meta: MetaInfo,
+        update_fields: list[str],
+    ) -> None:
+        """Write only ``update_fields`` on an existing row.
+
+        Relation names map to their FK column; the pk is the WHERE key, never an
+        assignment. Empty (or pk-only) ``update_fields`` persists nothing.
+
+        Args:
+            executor: The write-capable executor.
+            dialect: The dialect the statement renders for.
+            meta: The model metadata.
+            update_fields: The field/relation names to write.
+
+        Returns:
+            None
+        """
+        pk_field = meta.pk_field
+        resolved: list[Field] = []
+        seen: set[str] = set()
+        for name in update_fields:
+            field = meta.resolve_writable_field(name)  # raises if unknown
+            if field is pk_field or field.db_column in seen:
+                continue
+            seen.add(field.db_column)
+            resolved.append(field)
+        if not resolved:
+            return
+        params = self._bind_values(resolved)
+        params.append(pk_field.to_db(self.pk))
+        await executor.execute(meta.partial_update_sql(dialect, resolved), params)
+
+    async def _update_full(
+        self, executor: BaseDBAsyncClient, dialect: BaseDialect, meta: MetaInfo
+    ) -> None:
+        """Write every updatable column of an existing row via the cached UPDATE.
+
+        A never-fetched database-default column is excluded so its DB-supplied
+        value is not overwritten with the ``None`` the instance holds only as a
+        placeholder (an explicit assignment clears that mark and is written).
+
+        Args:
+            executor: The write-capable executor.
+            dialect: The dialect the statement renders for.
+            meta: The model metadata (``update_sql`` guaranteed set by the caller).
+
+        Returns:
+            None
+        """
+        pk_field = meta.pk_field
+        fields = meta.update_field_list
+        sql = meta.update_sql
+        assert sql is not None  # noqa: S101 - dispatched only when update_sql is set
+        unfetched = self.__dict__.get("_unfetched_db_defaults")
+        if unfetched:
+            fields = [f for f in fields if f.model_field_name not in unfetched]
+            if not fields:
+                return
+            sql = meta.partial_update_sql(dialect, fields)
+        params = self._bind_values(fields)
+        params.append(pk_field.to_db(self.pk))
+        await executor.execute(sql, params)
 
     async def delete(self, using_db: str | BaseDBAsyncClient | None = None) -> None:
         """Delete this instance's row, emitting pre/post-delete signals.
