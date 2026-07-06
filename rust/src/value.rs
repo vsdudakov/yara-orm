@@ -311,8 +311,17 @@ fn json_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Bound<'py
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 i.into_pyobject(py)?.into_any()
+            } else if let Some(u) = n.as_u64() {
+                // A JSON integer above i64::MAX (e.g. a uint64 id) is exact as
+                // u64; the old code skipped straight to as_f64 and lost precision.
+                u.into_pyobject(py)?.into_any()
             } else {
-                n.as_f64().unwrap_or(0.0).into_pyobject(py)?.into_any()
+                // Every remaining JSON number is an f64: serde_json stores each
+                // number as i64/u64/f64 and `arbitrary_precision` is not enabled.
+                n.as_f64()
+                    .expect("serde_json number is i64, u64 or f64")
+                    .into_pyobject(py)?
+                    .into_any()
             }
         }
         serde_json::Value::String(s) => s.into_pyobject(py)?.into_any(),
@@ -428,7 +437,14 @@ impl ToSql for Value {
                 Type::FLOAT4 => (*v as f32).to_sql(ty, out),
                 Type::NUMERIC => match rust_decimal::Decimal::from_f64_retain(*v) {
                     Some(d) => d.to_sql(ty, out),
-                    None => v.to_sql(ty, out),
+                    // NaN/±Inf (and floats beyond Decimal's range) have no
+                    // NUMERIC encoding. The old fallback called `f64::to_sql`,
+                    // which only accepts FLOAT8 and would write 8 float bytes
+                    // into a numeric field — silent corruption. Reject cleanly.
+                    None => Err(format!(
+                        "cannot encode non-finite / out-of-range float {v} as NUMERIC"
+                    )
+                    .into()),
                 },
                 _ => v.to_sql(ty, out),
             },
@@ -528,6 +544,31 @@ pub fn decode_pg_row(row: &tokio_postgres::Row) -> Result<Row, EngineError> {
             Arc::from(col.name()),
             decode_pg_cell(row, idx, col.type_())?,
         ));
+    }
+    Ok(out)
+}
+
+/// Decode a whole result set, interning the column names once.
+///
+/// All rows of one result set carry the same columns, so the names and types
+/// are built a single time and each row clones the shared `Arc<str>` name (a
+/// refcount bump, not a fresh allocation) — the invariant the [`Row`] doc
+/// describes. Decoding row-by-row via [`decode_pg_row`] would instead allocate
+/// every name N times over an N-row set.
+pub fn decode_pg_rows(rows: &[tokio_postgres::Row]) -> Result<Vec<Row>, EngineError> {
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let cols = first.columns();
+    let names: Vec<Arc<str>> = cols.iter().map(|c| Arc::from(c.name())).collect();
+    let types: Vec<Type> = cols.iter().map(|c| c.type_().clone()).collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut r = Row::with_capacity(names.len());
+        for idx in 0..names.len() {
+            r.push((names[idx].clone(), decode_pg_cell(row, idx, &types[idx])?));
+        }
+        out.push(r);
     }
     Ok(out)
 }

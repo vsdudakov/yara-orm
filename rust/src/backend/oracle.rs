@@ -343,29 +343,29 @@ async fn decode_cell(
                     .unwrap_or(Value::Null)
             }
             OraValue::Timestamp(ref ts) => decode_timestamp(ts),
-            _ => decode_by_shape(v),
+            _ => decode_by_shape(v)?,
         },
         OracleType::Timestamp | OracleType::TimestampTz | OracleType::TimestampLtz => match v {
             OraValue::Timestamp(ref ts) => decode_timestamp(ts),
             OraValue::Date(od) => decode_timestamp(&OracleTimestamp::from(od)),
-            _ => decode_by_shape(v),
+            _ => decode_by_shape(v)?,
         },
         OracleType::Clob | OracleType::Blob | OracleType::Bfile | OracleType::LongRaw => match v {
             OraValue::Lob(lob) => decode_lob(conn, col, lob).await?,
-            _ => decode_by_shape(v),
+            _ => decode_by_shape(v)?,
         },
         OracleType::Boolean => match v {
             OraValue::Boolean(b) => Value::Bool(b),
             _ => decode_number(col, &v),
         },
-        _ => decode_by_shape(v),
+        _ => decode_by_shape(v)?,
     })
 }
 
 /// Fallback decode by the driver value's own shape, for types not pinned by the
 /// column-type dispatch above.
-fn decode_by_shape(v: OraValue) -> Value {
-    match v {
+fn decode_by_shape(v: OraValue) -> Result<Value, EngineError> {
+    Ok(match v {
         OraValue::Null => Value::Null,
         OraValue::String(s) => Value::Text(s),
         OraValue::Bytes(b) => Value::Bytes(b),
@@ -374,8 +374,15 @@ fn decode_by_shape(v: OraValue) -> Value {
         OraValue::Boolean(b) => Value::Bool(b),
         OraValue::Json(j) => Value::Json(j),
         OraValue::Timestamp(ref ts) => decode_timestamp(ts),
-        other => Value::Text(format!("{other:?}")),
-    }
+        // A shape the dispatch above did not anticipate (e.g. INTERVAL). Surface
+        // it as a decode error instead of silently storing the Rust `Debug`
+        // string, which would be indistinguishable from real column data.
+        other => {
+            return Err(EngineError::Query(format!(
+                "unsupported Oracle value shape in result: {other:?}"
+            )))
+        }
+    })
 }
 
 /// Decode a RETURNING OUT-bind value. These are declared `VARCHAR2`, so Oracle

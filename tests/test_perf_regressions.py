@@ -17,6 +17,7 @@
 import pytest
 
 from yara_orm import Model, SqlDefault, fields
+from yara_orm.fields import Field
 from yara_orm.models import _setattr_unmark_db_default
 
 
@@ -134,6 +135,17 @@ def test_plain_model_uses_object_setattr():
     assert "__setattr__" not in vars(PrPlain)
     assert PrPlain.__setattr__ is object.__setattr__
     assert Model.__setattr__ is object.__setattr__
+
+
+def test_base_field_to_python_value_is_identity():
+    """
+    GIVEN the base ``Field.to_python_value`` — the sentinel the construction
+      plan compares against to skip per-value coercion for plain fields
+    WHEN it is called directly
+    THEN it returns its argument unchanged (the identity default)
+    """
+    sentinel = object()
+    assert Field.to_python_value(fields.CharField(max_length=1), sentinel) is sentinel
 
 
 def test_db_default_model_gets_unmarking_setattr():

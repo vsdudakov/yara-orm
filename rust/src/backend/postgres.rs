@@ -12,7 +12,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::backend::pool::extract_pool_params;
 use crate::backend::{Backend, TxConn};
 use crate::error::EngineError;
-use crate::value::{decode_pg_row, decode_pg_row_values, Row, Value};
+use crate::value::{decode_pg_row, decode_pg_row_values, decode_pg_rows, Row, Value};
 
 /// Default pool size when the URL does not specify `max_size`.
 const DEFAULT_MAX_SIZE: usize = 16;
@@ -208,7 +208,7 @@ impl Backend for PgBackend {
         let stmt = prepare_for(&client, sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = client.query(&stmt, &bound).await?;
-        rows.iter().map(decode_pg_row).collect()
+        decode_pg_rows(&rows)
     }
 
     async fn fetch_all_values(
@@ -415,7 +415,7 @@ impl TxConn for PgTx {
         let stmt = prepare_for(self.client(), sql, params, self.cache_statements).await?;
         let bound = as_sql_params(params);
         let rows = self.client().query(&stmt, &bound).await?;
-        rows.iter().map(decode_pg_row).collect()
+        decode_pg_rows(&rows)
     }
 
     async fn fetch_all_values(

@@ -481,3 +481,24 @@ async def test_prefetch_unknown_relation_raises(db):
     await CvAuthor.create(name="A")
     with pytest.raises(ValueError):
         await CvAuthor.all().prefetch_related("nope")
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_relation_field_by_id(db):
+    """
+    GIVEN events whose FK was set by id only (no model instance assigned)
+    WHEN bulk_update writes the relation field
+    THEN the FK column value is read from ``<name>_id`` and updated correctly
+
+    Regression: reading the relation accessor returned an unresolved
+    ``ForwardRelation`` awaitable, which was then bound verbatim.
+    """
+    a = await Tournament.create(name="A")
+    b = await Tournament.create(name="B")
+    e1 = await Event.create(name="e1", tournament=a)
+    e2 = await Event.create(name="e2", tournament=a)
+    # Set only the backing column, so the relation accessor is unresolved.
+    e1.tournament_id = b.id
+    e2.tournament_id = b.id
+    assert await Event.bulk_update([e1, e2], ["tournament"]) == 2
+    assert {e.tournament_id for e in await Event.all()} == {b.id}

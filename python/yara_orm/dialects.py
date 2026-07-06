@@ -476,6 +476,24 @@ class BaseDialect:
         op = self.ilike if case_insensitive else self.like
         return f"{col} {op} {placeholder}{self.like_escape}"
 
+    def escape_like_value(self, value: Any) -> str:
+        r"""Escape LIKE/ILIKE metacharacters in a user-supplied value.
+
+        Pattern lookups (``contains``/``startswith``/``iexact``/...) wrap the
+        raw value in wildcards, so any metacharacter inside it must match
+        literally — otherwise user input silently acts as a wildcard. The
+        default escapes ``\``, ``%`` and ``_`` with the ``\`` that
+        :attr:`like_escape` names in the rendered ``ESCAPE`` clause; dialects
+        with extra metacharacters (SQL Server's ``[``) override this.
+
+        Args:
+            value: The raw lookup value.
+
+        Returns:
+            The stringified value with LIKE metacharacters backslash-escaped.
+        """
+        return str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     def limit_offset_sql(self, limit: int | None, offset: int | None) -> str:
         """Render the trailing row-limit / row-offset clause.
 
@@ -3431,6 +3449,23 @@ class SqlServerDialect(BaseDialect):
     like_escape = " ESCAPE '\\'"
     #: SQL Server has no regular-expression operator (regex lookups raise).
     regex_ops: dict[str, str] = {}
+
+    def escape_like_value(self, value: Any) -> str:
+        r"""Escape LIKE metacharacters, including SQL Server's ``[``.
+
+        Unlike every other backend, T-SQL's ``LIKE`` treats ``[`` as the start
+        of a character-class range (``[abc]``, ``[a-z]``), so a user value such
+        as ``"a[bc]"`` in ``__contains`` would silently broaden the match. With
+        the ``ESCAPE '\'`` clause this dialect renders, ``\[`` matches a literal
+        bracket. ``]`` on its own is already literal and needs no escaping.
+
+        Args:
+            value: The raw lookup value.
+
+        Returns:
+            The stringified value with ``\``, ``%``, ``_`` and ``[`` escaped.
+        """
+        return super().escape_like_value(value).replace("[", "\\[")
 
     type_map = {
         "smallint": "SMALLINT",

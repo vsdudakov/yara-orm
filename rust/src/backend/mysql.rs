@@ -255,7 +255,13 @@ pub(crate) fn decode_my(plan: MyDecode, v: MyValue) -> Value {
                 Err(_) => Value::Text(String::from_utf8_lossy(&bytes).into_owned()),
             },
             MyDecode::Blob => Value::Bytes(bytes),
-            _ => Value::Text(String::from_utf8_lossy(&bytes).into_owned()),
+            // Move the buffer into the String when it is already valid UTF-8
+            // (the common case) instead of copying it; only mis-encoded bytes
+            // pay the lossy re-allocation.
+            _ => match String::from_utf8(bytes) {
+                Ok(s) => Value::Text(s),
+                Err(e) => Value::Text(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            },
         },
     }
 }
@@ -302,11 +308,14 @@ async fn run_fetch(conn: &mut Conn, sql: &str, params: &[Value]) -> Result<Fetch
             Ok((names, rows))
         }
         None => {
+            // Only this statement's own OK packet is trustworthy for the
+            // synthetic pk row. MySQL does NOT reset LAST_INSERT_ID() on
+            // UPDATE/DELETE, so `conn.last_insert_id()` would hand back a stale
+            // id from an earlier INSERT on the same pooled connection — a
+            // fetched DELETE/UPDATE would then fabricate a bogus `[stale_id]`
+            // row. `result.last_insert_id()` is 0/None for non-INSERTs.
             let id = result.last_insert_id();
             result.drop_result().await.map_err(map_mysql)?;
-            // The result-set handle may not carry the id; the connection's OK
-            // packet always does.
-            let id = id.or_else(|| conn.last_insert_id());
             match id {
                 Some(id) if id != 0 => Ok((
                     vec![Arc::from("last_insert_id")],
