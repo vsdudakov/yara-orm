@@ -55,7 +55,7 @@ mysql_async = { version = "0.37", default-features = false, features = [
 #     after a server break is well-formed and constraint violations surface as
 #     ORA errors (IntegrityError) instead of a dropped connection — #16.
 # The pure-Rust / self-contained-wheel invariant is preserved (no OCI/ODPI-C).
-oracle-rs = { git = "https://github.com/vsdudakov/oracle-rs", rev = "f4b980a670f031997b12e320a676127614e67bb4" }
+oracle-rs = { git = "https://github.com/vsdudakov/oracle-rs", rev = "03f497523b2dde8b102ce8563981c168f1bd366a" }
 deadpool = { version = "0.13", features = ["managed", "rt_tokio_1"] }
 # Pure-Rust Microsoft SQL Server driver (TDS protocol — no ODBC / native
 # client, so wheels stay self-contained). rustls TLS (never native-tls, matching
