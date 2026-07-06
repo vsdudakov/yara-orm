@@ -214,6 +214,21 @@ def test_split_sql_statements_quotes_comments_and_no_trailing_semicolon():
     assert stmts[-1] == "SELECT 2 $ 3"  # no trailing ';' -> tail kept
 
 
+def test_split_sql_statements_handles_nested_block_comments():
+    """
+    GIVEN a PostgreSQL script whose block comment nests another block comment
+        containing a semicolon
+    WHEN it is split into statements
+    THEN the inner ``*/`` does not end the comment early, so the whole comment
+         is one unit and only the real statement terminator splits
+    """
+    script = "/* a /* b */ c; */ SELECT 1; SELECT 2;"
+    stmts = _split_sql_statements(script)
+    assert len(stmts) == 2
+    assert stmts[0].endswith("SELECT 1") and stmts[0].startswith("/* a")
+    assert stmts[1] == "SELECT 2"
+
+
 def test_connection_url_from_credentials_dict():
     """
     GIVEN a structured connection spec (credentials dict)

@@ -247,6 +247,21 @@ def test_timefield_to_db_coercions():
     assert field.to_db(99) == 99  # unknown type passes through
 
 
+def test_floatfield_to_db_coerces_numeric_strings():
+    """
+    GIVEN a FloatField filtered/populated with a numeric string
+    WHEN to_db is called
+    THEN the string is coerced to float (so PostgreSQL does not reject
+         'double precision = text'), while non-strings pass through unchanged
+    """
+    field = fields.FloatField()
+    assert field.to_db("1.5") == 1.5
+    assert isinstance(field.to_db("2"), float)
+    assert field.to_db(3.0) == 3.0  # already a float
+    assert field.to_db(None) is None
+    assert field.to_db(F("other")) is not None  # F expression passes through
+
+
 def test_subquery_rejects_grouped_values_list():
     """
     GIVEN a grouped/annotated values_list projection

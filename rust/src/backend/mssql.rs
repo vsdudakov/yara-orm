@@ -30,7 +30,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use deadpool::managed::{Manager, Metrics, Object, Pool, RecycleResult};
 use rust_decimal::Decimal;
-use tiberius::{AuthMethod, ColumnData, Config, FromSql, IntoSql, ToSql};
+use percent_encoding::percent_decode_str;
+use tiberius::{AuthMethod, ColumnData, Config, EncryptionLevel, FromSql, IntoSql, ToSql};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -223,17 +224,35 @@ fn config_from_url(url: &str) -> Result<Config, EngineError> {
     if !database.is_empty() {
         config.database(database);
     }
-    let user = if u.username().is_empty() { "sa" } else { u.username() };
-    let pass = u.password().unwrap_or("");
-    config.authentication(AuthMethod::sql_server(user, pass));
+    // `url` returns userinfo still percent-encoded (a password containing `@`,
+    // `:`, `%`, etc. must be encoded for the authority to parse), so decode it
+    // back to the real credential before handing it to the driver.
+    let user = if u.username().is_empty() {
+        "sa".to_string()
+    } else {
+        percent_decode_str(u.username()).decode_utf8_lossy().into_owned()
+    };
+    let pass = u
+        .password()
+        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned())
+        .unwrap_or_default();
+    config.authentication(AuthMethod::sql_server(&user, &pass));
     // TLS is negotiated; the server's certificate is trusted by default (a
     // dev/self-signed cert is the common case). `?encrypt=strict` opts into
-    // full certificate validation; `?trust_cert=false` also enforces it.
+    // full certificate validation (encryption required, cert verified against
+    // the trust store); `?trust_cert=false` also enforces validation.
     let params: std::collections::HashMap<_, _> = u.query_pairs().collect();
-    let trust = params
-        .get("trust_cert")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    let strict = params.get("encrypt").map(|v| v == "strict").unwrap_or(false);
+    if strict {
+        config.encryption(EncryptionLevel::Required);
+    }
+    // Strict mode always validates the certificate, so it overrides the
+    // trust-by-default; otherwise `trust_cert` (default on) controls it.
+    let trust = !strict
+        && params
+            .get("trust_cert")
+            .map(|v| v != "false")
+            .unwrap_or(true);
     if trust {
         config.trust_cert();
     }

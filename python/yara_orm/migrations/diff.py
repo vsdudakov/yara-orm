@@ -137,10 +137,10 @@ def _alterable(old: dict[str, Any], new: dict[str, Any]) -> bool:
         new: The column spec after the change.
 
     Returns:
-        ``True`` if the column's type, nullability, uniqueness, database
-        default or foreign-key target/action changed.
+        ``True`` if the column's type, nullability, uniqueness, primary-key
+        status, database default or foreign-key target/action changed.
     """
-    keys = ("kind", "type_params", "null", "unique", "default", "fk")
+    keys = ("kind", "type_params", "null", "unique", "pk", "default", "fk")
     return any(old.get(k) != new.get(k) for k in keys)
 
 

@@ -167,6 +167,25 @@ async def test_prefetch_to_attr_m2m(db):
     assert [t.label for t in books[0].my_tags] == ["py"]
 
 
+@pytest.mark.asyncio
+async def test_prefetch_m2m_honours_custom_queryset_filter(db):
+    """
+    GIVEN a book with two tags
+    WHEN prefetching the m2m with a *filtered* Prefetch queryset
+    THEN only the tags matching the filter load, not every related row
+    """
+    ada = await PgAuthor.create(name="Ada")
+    book = await PgBook.create(title="B1", author=ada)
+    py = await PgTag.create(label="py")
+    rust = await PgTag.create(label="rust")
+    await book.tags.add(py)
+    await book.tags.add(rust)
+    books = await PgBook.filter(title="B1").prefetch_related(
+        Prefetch("tags", PgTag.filter(label="py"), to_attr="only_py")
+    )
+    assert [t.label for t in books[0].only_py] == ["py"]
+
+
 # -- bulk_create upsert -------------------------------------------------------
 
 
@@ -224,6 +243,22 @@ async def test_bulk_create_update_fields_defaults_conflict_to_pk(db):
     # default-target branch and must run cleanly.
     await PgStat.bulk_create([PgStat(key="solo", hits=1)], update_fields=["hits"])
     assert await PgStat.filter(key="solo").count() == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_update_fields_empty_conflict_target_falls_back_to_pk(db):
+    """
+    GIVEN update_fields with an explicit *empty* on_conflict list
+    WHEN bulk_create runs
+    THEN the conflict target still falls back to the primary key rather than
+         rendering an invalid targetless ``DO UPDATE``
+    """
+    if db in ("mssql", "oracle"):
+        pytest.skip("MERGE backends need a real match column; covered elsewhere")
+    # Empty list (not just an omitted arg) must also default the target to the
+    # pk; the auto pk never fires, so the statement just inserts cleanly.
+    await PgStat.bulk_create([PgStat(key="empty", hits=1)], update_fields=["hits"], on_conflict=[])
+    assert await PgStat.filter(key="empty").count() == 1
 
 
 @pytest.mark.asyncio
