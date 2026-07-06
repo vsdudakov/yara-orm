@@ -2474,7 +2474,20 @@ class Model(metaclass=ModelMeta):
             for field, read_attr in targets:
                 whens = []
                 for obj in batch:
-                    value = getattr(obj, read_attr, None)
+                    # Read the backing column straight from ``__dict__`` and
+                    # raise if it is absent. A missing column means the instance
+                    # was narrowed with only()/defer() and never loaded it; an
+                    # FK source column has no class-level descriptor, so a
+                    # ``getattr`` default would silently bind NULL here and wipe
+                    # the foreign key instead of erroring like a deferred regular
+                    # column does.
+                    if read_attr not in obj.__dict__:
+                        raise FieldError(
+                            f"cannot bulk_update {field.model_field_name!r}: the "
+                            f"column {read_attr!r} is not loaded on an instance "
+                            f"(deferred via only()/defer()); re-fetch it first"
+                        )
+                    value = obj.__dict__[read_attr]
                     whens.append(
                         f"WHEN {dialect.placeholder(idx)} THEN {dialect.placeholder(idx + 1)}"
                     )
