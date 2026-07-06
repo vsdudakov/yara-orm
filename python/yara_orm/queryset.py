@@ -1588,11 +1588,8 @@ class QuerySet(Generic[ModelT]):
     def _resolve_column(self, field: str, dialect: BaseDialect, joins: dict[str, str]) -> str:
         """Resolve a field name to its qualified column, adding joins as needed.
 
-        Supports multi-level forward-relation paths (``author__country__name``):
-        each non-final segment that names a forward relation is chain-joined, and
-        the final segment is the target column (or, if it too is a relation, its
-        primary key). A single reverse-FK/M2M hop (``rel__col``) is still handled
-        via the aggregate join helper.
+        A thin wrapper over :meth:`_resolve_column_field` for callers that only
+        need the column reference (not the terminal field).
 
         Args:
             field: A local column, ``pk``, a relation name, or a (possibly
@@ -1604,14 +1601,46 @@ class QuerySet(Generic[ModelT]):
         Returns:
             The qualified ``"table"."column"`` reference.
         """
+        return self._resolve_column_field(field, dialect, joins)[0]
+
+    def _resolve_column_field(
+        self, field: str, dialect: BaseDialect, joins: dict[str, str]
+    ) -> tuple[str, Field]:
+        """Resolve a path to its qualified column *and* the field it selects.
+
+        The single traversal shared by column selection and the
+        ``values()``/``values_list()`` decode path: the caller uses the column
+        reference to build SQL and the terminal :class:`Field` to pick that
+        column's dialect read decoder (so a projected value has the same Python
+        type as the attribute on a hydrated instance). Every selectable path has
+        a terminal field — a relation or trailing ``pk`` resolves to the
+        referenced table's primary-key field.
+
+        Supports multi-level forward-relation paths (``author__country__name``):
+        each non-final segment that names a forward relation is chain-joined, and
+        the final segment is the target column (or, if it too is a relation, its
+        primary key). A single reverse-FK/M2M hop (``rel__col``) is handled via
+        the aggregate join helper.
+
+        Args:
+            field: A local column, ``pk``, a relation name, or a (possibly
+                multi-level) ``rel__...__col`` path.
+            dialect: The SQL dialect providing identifier quoting.
+            joins: Mapping of join key to join SQL, mutated in place when the
+                field spans a relation.
+
+        Returns:
+            A ``(qualified_column, terminal_field)`` tuple.
+        """
         q = dialect.quote
         meta = self.model._meta
         table = q(meta.table)
         if "__" not in field:
             if field in meta.fields or field == "pk":
-                return f"{table}.{q(meta.get_field(field).db_column)}"
+                f = meta.get_field(field)
+                return f"{table}.{q(f.db_column)}", f
             tmeta, alias = self._add_relation_join(field, dialect, joins)
-            return f"{alias}.{q(tmeta.pk_field.db_column)}"
+            return f"{alias}.{q(tmeta.pk_field.db_column)}", tmeta.pk_field
 
         segments = field.split("__")
         cur_meta = meta
@@ -1629,13 +1658,15 @@ class QuerySet(Generic[ModelT]):
                 tmeta, joins[chain] = self._forward_join(cur_table, cur_meta, info, dialect, alias)
                 cur_meta, cur_table = tmeta, alias
                 if last:
-                    return f"{cur_table}.{q(cur_meta.pk_field.db_column)}"
+                    return f"{cur_table}.{q(cur_meta.pk_field.db_column)}", cur_meta.pk_field
             elif last:
-                return f"{cur_table}.{q(cur_meta.get_field(seg).db_column)}"
+                f = cur_meta.get_field(seg)
+                return f"{cur_table}.{q(f.db_column)}", f
             elif cur_meta is meta and len(segments) == 2:
                 # A single reverse-FK / M2M hop, e.g. ``tags__name``.
                 tmeta, alias = self._add_relation_join(seg, dialect, joins)
-                return f"{alias}.{q(tmeta.get_field(segments[1]).db_column)}"
+                f = tmeta.get_field(segments[1])
+                return f"{alias}.{q(f.db_column)}", f
             else:
                 raise FieldError(f"Cannot traverse relation path {field!r}")
         raise FieldError(f"Cannot traverse relation path {field!r}")  # pragma: no cover
@@ -2267,24 +2298,76 @@ class QuerySet(Generic[ModelT]):
         for obj in await self._fetch():
             yield obj
 
+    @staticmethod
+    def _column_decoders(
+        fields: list[Field | None], dialect: BaseDialect
+    ) -> list[tuple[int, Callable[[Any], Any]]]:
+        """Pick the read decoder for each projected column that needs one.
+
+        Shared by the plain (:meth:`_fetch_columns`) and grouped
+        (:meth:`_values_grouped`) ``values()`` paths so a projected column has
+        the same Python type as the attribute on a hydrated instance.
+
+        Args:
+            fields: The terminal field per output column, in select order;
+                ``None`` for columns that are not a single field (an aggregate
+                annotation) and so stay as the driver returned them.
+            dialect: The dialect providing the per-field read decoder.
+
+        Returns:
+            ``(column_index, decoder)`` pairs for the columns that need decoding.
+        """
+        return [
+            (i, decoder)
+            for i, f in enumerate(fields)
+            if f is not None and (decoder := dialect.read_decoder(f)) is not None
+        ]
+
+    @staticmethod
+    def _decode_rows(
+        rows: list[list[Any]], decoders: list[tuple[int, Callable[[Any], Any]]]
+    ) -> list[list[Any]]:
+        """Decode the selected columns of ``rows`` in place (skipping NULLs).
+
+        Args:
+            rows: The raw driver rows (mutated in place).
+            decoders: ``(column_index, decoder)`` pairs from
+                :meth:`_column_decoders`.
+
+        Returns:
+            The same ``rows`` list, decoded.
+        """
+        for row in rows:
+            for i, decoder in decoders:
+                if row[i] is not None:
+                    row[i] = decoder(row[i])
+        return rows
+
     async def _fetch_columns(self, field_paths: tuple[str, ...]) -> list[Any]:
-        """Fetch raw rows for the given column paths without building models.
+        """Fetch rows for the given column paths without building models.
 
         Each path may traverse a relation (``"author__name"``); the needed
-        ``LEFT JOIN`` is added automatically via :meth:`_resolve_column`.
+        ``LEFT JOIN`` is added automatically via :meth:`_resolve_column_field`.
+        Each column is decoded with its field's dialect read decoder, so a
+        ``values()``/``values_list()`` value has the same Python type as the
+        attribute on a hydrated instance (e.g. a SQLite ``DecimalField`` comes
+        back as ``Decimal``, not the raw ``str`` the driver returns).
 
         Args:
             field_paths: The field names/paths whose columns to select.
 
         Returns:
-            The raw database rows for the selected columns.
+            The decoded database rows for the selected columns.
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         meta = self.model._meta
         meta.compile(dialect)
         joins: dict[str, str] = {}
-        cols = ", ".join(self._resolve_column(p, dialect, joins) for p in field_paths)
+        # One traversal per path yields both the column reference (for SQL) and
+        # the terminal field (for the read decoder).
+        resolved = [self._resolve_column_field(p, dialect, joins) for p in field_paths]
+        cols = ", ".join(col for col, _ in resolved)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(meta.table)
         distinct = "DISTINCT " if self._distinct else ""
@@ -2299,11 +2382,13 @@ class QuerySet(Generic[ModelT]):
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
             f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{lock}"
         )
-        return await engine.fetch_rows(sql, params)
+        rows = await engine.fetch_rows(sql, params)
+        decoders = self._column_decoders([field for _, field in resolved], dialect)
+        return self._decode_rows(rows, decoders)
 
     def _grouped_select_sql(
         self, dialect: BaseDialect, fields: tuple[str, ...] = ()
-    ) -> tuple[str, list[Any], list[str]]:
+    ) -> tuple[str, list[Any], list[str], list[Field | None]]:
         """Build the grouped/annotated SELECT, its params and column names.
 
         Shared by :meth:`_values_grouped` and :meth:`get_parameterized_sql`. An
@@ -2315,8 +2400,9 @@ class QuerySet(Generic[ModelT]):
             fields: Requested field/annotation names, or empty for all.
 
         Returns:
-            A ``(sql, params, names)`` tuple; ``names`` are the output column
-            names in select order.
+            A ``(sql, params, names, col_fields)`` tuple; ``names`` are the
+            output column names in select order and ``col_fields`` the terminal
+            field of each (``None`` for aggregate annotations).
 
         Raises:
             UnSupportedError: With ``select_for_update()`` set; ``FOR UPDATE``
@@ -2333,6 +2419,9 @@ class QuerySet(Generic[ModelT]):
         table = q(meta.table)
         joins: dict[str, str] = {}
         select, names, group_cols = [], [], []
+        # Terminal field per output column (``None`` for an aggregate), so the
+        # caller can decode field columns like a hydrated instance's attributes.
+        col_fields: list[Field | None] = []
         requested = list(fields) if fields else None
 
         if requested is None and not self._group_by:
@@ -2345,26 +2434,30 @@ class QuerySet(Generic[ModelT]):
                 col = f"{table}.{q(f.db_column)}"
                 select.append(col)
                 names.append(f.model_field_name)
+                col_fields.append(f)
                 if not dialect.group_by_functional_dependency:
                     group_cols.append(col)
             if dialect.group_by_functional_dependency:
                 group_cols.append(f"{table}.{q(meta.pk_field.db_column)}")
         else:
-            # ``_resolve_column`` handles both own columns and forward-relation
-            # paths (``bearworks_disposition__user_defined``), adding the needed
-            # LEFT JOIN, so group_by()/values() can reference related columns.
+            # ``_resolve_column_field`` handles both own columns and forward-
+            # relation paths (``bearworks_disposition__user_defined``), adding
+            # the needed LEFT JOIN, so group_by()/values() can reference related
+            # columns — and yields the terminal field for decoding.
             for f in self._group_by:
-                col = self._resolve_column(f, dialect, joins)
+                col, field = self._resolve_column_field(f, dialect, joins)
                 select.append(col)
                 names.append(f)
+                col_fields.append(field)
                 group_cols.append(col)
             if requested:
                 for f in requested:
                     if f in self._annotations or f in names:
                         continue
-                    col = self._resolve_column(f, dialect, joins)
+                    col, field = self._resolve_column_field(f, dialect, joins)
                     select.append(col)
                     names.append(f)
+                    col_fields.append(field)
                     group_cols.append(col)
         select_params: list[Any] = []
         idx = 1
@@ -2374,6 +2467,7 @@ class QuerySet(Generic[ModelT]):
             expr, idx = self._aggregate_expr(agg, dialect, joins, select_params, idx)
             select.append(f"{expr} AS {q(name)}")
             names.append(name)
+            col_fields.append(None)
 
         where, wparams, idx = self._compile_conditions(dialect, start=idx)
         having, hparams, idx = self._compile_having(dialect, idx, joins)
@@ -2386,7 +2480,7 @@ class QuerySet(Generic[ModelT]):
             f"SELECT {', '.join(select)} FROM {table}"
             f"{''.join(joins.values())}{where}{group}{having}{order}{self._tail_sql(dialect)}"
         )
-        return sql, params, names
+        return sql, params, names, col_fields
 
     async def _values_grouped(
         self,
@@ -2405,8 +2499,11 @@ class QuerySet(Generic[ModelT]):
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
-        sql, params, names = self._grouped_select_sql(dialect, fields)
+        sql, params, names, col_fields = self._grouped_select_sql(dialect, fields)
         rows = await engine.fetch_rows(sql, params)
+        # Decode field columns like the plain values() path; aggregate columns
+        # (col_field is None) are left as the driver returned them.
+        self._decode_rows(rows, self._column_decoders(col_fields, dialect))
         if as_dict:
             return [dict(zip(names, row)) for row in rows]
         return [tuple(row) for row in rows]
@@ -2636,7 +2733,7 @@ class QuerySet(Generic[ModelT]):
         """
         dialect = get_dialect(self.model, using=self._using_name())
         if self._group_by:
-            sql, params, _ = self._grouped_select_sql(dialect)
+            sql, params, _, _ = self._grouped_select_sql(dialect)
             return sql, params
         if self._select_related or self._only_related or self._defer_related:
             # The join plan also carries any annotations (combined shape).
