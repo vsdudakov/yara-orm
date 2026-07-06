@@ -155,6 +155,14 @@ class BaseDialect:
     #: Whether ``CREATE INDEX`` accepts a per-column operator class
     #: (``col gin_trgm_ops``); PostgreSQL does, SQLite has no such syntax.
     index_opclass = True
+    #: Whether ``CREATE INDEX`` accepts an ``IF NOT EXISTS`` guard. PostgreSQL,
+    #: SQLite and Oracle 23ai do; MySQL/MariaDB and SQL Server do not (re-running
+    #: an unguarded create raises), so their dialects clear this.
+    index_if_not_exists = True
+    #: Whether the backend supports partial/filtered indexes (a trailing
+    #: ``WHERE`` predicate on ``CREATE INDEX``). PostgreSQL, SQLite and SQL Server
+    #: do; MySQL/MariaDB and Oracle do not, so the predicate is dropped there.
+    supports_partial_index = True
     #: Whether the backend supports ``CREATE EXTENSION`` (PostgreSQL only).
     supports_extensions = False
     #: Whether ``SELECT ... FOR UPDATE`` row locks are supported
@@ -326,6 +334,37 @@ class BaseDialect:
             A one-argument converter, or None to assign the value directly.
         """
         return None if field.read_identity else field.to_python
+
+    def _compose_read_decoder(
+        self, field: Field, extra_map: dict[str, Callable[[Any], Any]]
+    ) -> Callable[[Any], Any] | None:
+        """Chain a driver-reconstruction step before the field's own decoder.
+
+        A dialect whose driver returns some kinds in a non-native form supplies
+        ``extra_map`` (``field_kind -> converter``). This resolves the field's
+        kind — an FK column adopts its referenced primary key's kind — picks the
+        matching reconstruction converter, and composes it before the base
+        ``to_python``. Shared by every backend that needs such reconstruction
+        (MySQL / Oracle / SQL Server), so the compose/FK-kind boilerplate lives
+        in one place.
+
+        Args:
+            field: The field whose column is being decoded.
+            extra_map: Reconstruction converters keyed by field kind.
+
+        Returns:
+            A one-argument converter, or None to assign the value directly.
+        """
+        base = BaseDialect.read_decoder(self, field)
+        kind = field.field_kind
+        if isinstance(field, ForeignKeyFieldInstance):
+            kind = get_model(field.reference)._meta.pk_field.field_kind
+        extra = extra_map.get(kind)
+        if extra is None:
+            return base
+        if base is None:
+            return extra
+        return lambda value, _extra=extra, _base=base: _base(_extra(value))
 
     def concat_sql(self, parts: list[str]) -> str:
         """Render string concatenation of already-rendered SQL operands.
@@ -815,7 +854,7 @@ class BaseDialect:
         uniq = "UNIQUE " if unique else ""
         method = f" USING {using}" if using and self.index_using else ""
         incl = f" INCLUDE ({include_sql})" if include_sql and self.index_include else ""
-        where = f" WHERE {condition}" if condition else ""
+        where = f" WHERE {condition}" if condition and self.supports_partial_index else ""
         return (
             f"CREATE {uniq}INDEX {ine}{self.quote(name)} "
             f"ON {self.quote(table)}{method} ({columns_sql}){incl}{where}"
@@ -1325,7 +1364,7 @@ class BaseDialect:
         """
         uniq = "UNIQUE " if unique else ""
         conc = "CONCURRENTLY " if concurrently and self.index_concurrently else ""
-        ine = "IF NOT EXISTS " if safe else ""
+        ine = "IF NOT EXISTS " if safe and self.index_if_not_exists else ""
         return [
             "CREATE {u}INDEX {conc}{ine}{name} ON {t} ({c})".format(
                 u=uniq,
@@ -1387,7 +1426,7 @@ class BaseDialect:
         Returns:
             The list with the create-index statement.
         """
-        ine = "IF NOT EXISTS " if safe else ""
+        ine = "IF NOT EXISTS " if safe and self.index_if_not_exists else ""
         include_sql = ", ".join(self.quote(c) for c in include) if include else None
         key_cols = [self.quote(c) for c in columns]
         _validate_index_opclass(opclass)
@@ -2016,6 +2055,9 @@ class MySQLDialect(BaseDialect):
     index_using = False
     index_include = False
     index_opclass = False
+    # MySQL/MariaDB have neither CREATE INDEX IF NOT EXISTS nor partial indexes.
+    index_if_not_exists = False
+    supports_partial_index = False
     # EXTRACT(...) works, but the microseconds part is spelled MICROSECOND.
     _extract_parts = {**BaseDialect._extract_parts, "microsecond": "MICROSECOND"}
 
@@ -2097,20 +2139,9 @@ class MySQLDialect(BaseDialect):
         Returns:
             A one-argument converter, or None to assign the value directly.
         """
-        base = super().read_decoder(field)
-        kind = field.field_kind
-        if isinstance(field, ForeignKeyFieldInstance):
-            kind = get_model(field.reference)._meta.pk_field.field_kind
-        extra: Callable[[Any], Any] | None = None
-        if kind == "uuid":
-            extra = _uuid_from_db
-        elif kind == "datetime":
-            extra = _datetime_from_db
-        if extra is None:
-            return base
-        if base is None:
-            return extra
-        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+        return self._compose_read_decoder(
+            field, {"uuid": _uuid_from_db, "datetime": _datetime_from_db}
+        )
 
     # -- query lookups ------------------------------------------------------
     def date_part_sql(self, part: str, col: str) -> str:
@@ -2473,35 +2504,6 @@ class MySQLDialect(BaseDialect):
                 )
         return out
 
-    def render_create_index(
-        self,
-        table: str,
-        column: str,
-        safe: bool = True,
-        unique: bool = False,
-        concurrently: bool = False,
-        name: str | None = None,
-    ) -> list[str]:
-        """Render a create-index statement (no ``IF NOT EXISTS`` on MySQL).
-
-        Args:
-            table: The table name.
-            column: The column to index.
-            safe: Ignored — MySQL has no ``CREATE INDEX IF NOT EXISTS``, so the
-                statement is never guarded (re-running it raises 1061).
-            unique: Whether to create a ``UNIQUE`` index.
-            concurrently: Ignored (no ``CONCURRENTLY`` on MySQL).
-            name: Explicit index name; defaults to ``idx_<table>_<column>``.
-
-        Returns:
-            The list with the create-index statement.
-        """
-        uniq = "UNIQUE " if unique else ""
-        return [
-            f"CREATE {uniq}INDEX {self.quote(name or f'idx_{table}_{column}')} "
-            f"ON {self.quote(table)} ({self.quote(column)})"
-        ]
-
     def render_drop_index(
         self, table: str, column: str, concurrently: bool = False, name: str | None = None
     ) -> list[str]:
@@ -2518,41 +2520,6 @@ class MySQLDialect(BaseDialect):
         """
         idx = self.quote(name or f"idx_{table}_{column}")
         return [f"ALTER TABLE {self.quote(table)} DROP INDEX {idx}"]
-
-    def render_create_composite_index(
-        self,
-        table: str,
-        name: str,
-        columns: list[str],
-        safe: bool = True,
-        condition: str | None = None,
-        unique: bool = False,
-        using: str | None = None,
-        include: list[str] | None = None,
-        opclass: str | None = None,
-    ) -> list[str]:
-        """Render a multi-column create-index statement without the guard.
-
-        The PostgreSQL-only options (``condition``/``using``/``include``/
-        ``opclass``) are dropped, matching the capability flags.
-
-        Args:
-            table: The table to index.
-            name: The index name.
-            columns: The ordered columns covered by the index.
-            safe: Ignored — no ``CREATE INDEX IF NOT EXISTS`` on MySQL.
-            condition: Ignored (no partial indexes).
-            unique: Whether to render ``CREATE UNIQUE INDEX``.
-            using: Ignored.
-            include: Ignored.
-            opclass: Ignored.
-
-        Returns:
-            The list with the create-index statement.
-        """
-        uniq = "UNIQUE " if unique else ""
-        cols = ", ".join(self.quote(c) for c in columns)
-        return [f"CREATE {uniq}INDEX {self.quote(name)} ON {self.quote(table)} ({cols})"]
 
     def render_drop_composite_index(self, name: str, table: str | None = None) -> list[str]:
         """Render a named-index drop; MySQL's form needs the owning table.
@@ -2817,6 +2784,9 @@ class OracleDialect(BaseDialect):
     index_using = False
     index_include = False
     index_opclass = False
+    # Oracle 23ai has CREATE INDEX IF NOT EXISTS (default True) but no partial
+    # indexes.
+    supports_partial_index = False
     supports_extensions = False
     # Oracle 23ai supports ADD/DROP COLUMN IF [NOT] EXISTS and in-place column,
     # index and constraint changes (MODIFY / ALTER INDEX / RENAME CONSTRAINT).
@@ -2910,25 +2880,19 @@ class OracleDialect(BaseDialect):
         Returns:
             A one-argument converter, or None to assign the value directly.
         """
-        base = super().read_decoder(field)
-        kind = field.field_kind
-        if isinstance(field, ForeignKeyFieldInstance):
-            kind = get_model(field.reference)._meta.pk_field.field_kind
-        extra: Callable[[Any], Any] | None = {
-            "uuid": _uuid_from_db,
-            "datetime": _datetime_from_db,
-            "json": _json_from_db,
-            "time": _time_from_db,
-            "float": _float_from_db,
-            "smallint": _int_from_db,
-            "int": _int_from_db,
-            "bigint": _int_from_db,
-        }.get(kind)
-        if extra is None:
-            return base
-        if base is None:
-            return extra
-        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+        return self._compose_read_decoder(
+            field,
+            {
+                "uuid": _uuid_from_db,
+                "datetime": _datetime_from_db,
+                "json": _json_from_db,
+                "time": _time_from_db,
+                "float": _float_from_db,
+                "smallint": _int_from_db,
+                "int": _int_from_db,
+                "bigint": _int_from_db,
+            },
+        )
 
     # -- query lookups ------------------------------------------------------
     def like_pattern_sql(self, case_insensitive: bool, col: str, placeholder: str) -> str:
@@ -3257,35 +3221,6 @@ class OracleDialect(BaseDialect):
                 out.append(f"ALTER TABLE {t} ADD CONSTRAINT {fk} {clause}")
         return out
 
-    def render_create_index(
-        self,
-        table: str,
-        column: str,
-        safe: bool = True,
-        unique: bool = False,
-        concurrently: bool = False,
-        name: str | None = None,
-    ) -> list[str]:
-        """Render a create-index statement.
-
-        Args:
-            table: The table name.
-            column: The column to index.
-            safe: Whether to emit an ``IF NOT EXISTS`` guard.
-            unique: Whether to create a ``UNIQUE`` index.
-            concurrently: Ignored (no ``CONCURRENTLY`` on Oracle).
-            name: Explicit index name; defaults to ``idx_<table>_<column>``.
-
-        Returns:
-            The list with the create-index statement.
-        """
-        uniq = "UNIQUE " if unique else ""
-        ine = "IF NOT EXISTS " if safe else ""
-        return [
-            f"CREATE {uniq}INDEX {ine}{self.quote(name or f'idx_{table}_{column}')} "
-            f"ON {self.quote(table)} ({self.quote(column)})"
-        ]
-
     def render_drop_index(
         self, table: str, column: str, concurrently: bool = False, name: str | None = None
     ) -> list[str]:
@@ -3302,42 +3237,6 @@ class OracleDialect(BaseDialect):
         """
         idx = self.quote(name or f"idx_{table}_{column}")
         return [f"DROP INDEX IF EXISTS {idx}"]
-
-    def render_create_composite_index(
-        self,
-        table: str,
-        name: str,
-        columns: list[str],
-        safe: bool = True,
-        condition: str | None = None,
-        unique: bool = False,
-        using: str | None = None,
-        include: list[str] | None = None,
-        opclass: str | None = None,
-    ) -> list[str]:
-        """Render a multi-column create-index statement.
-
-        The PostgreSQL-only options (``condition``/``using``/``include``/
-        ``opclass``) are dropped, matching the capability flags.
-
-        Args:
-            table: The table to index.
-            name: The index name.
-            columns: The ordered columns covered by the index.
-            safe: Whether to emit an ``IF NOT EXISTS`` guard.
-            condition: Ignored (no partial indexes).
-            unique: Whether to render ``CREATE UNIQUE INDEX``.
-            using: Ignored.
-            include: Ignored.
-            opclass: Ignored.
-
-        Returns:
-            The list with the create-index statement.
-        """
-        uniq = "UNIQUE " if unique else ""
-        ine = "IF NOT EXISTS " if safe else ""
-        cols = ", ".join(self.quote(c) for c in columns)
-        return [f"CREATE {uniq}INDEX {ine}{self.quote(name)} ON {self.quote(table)} ({cols})"]
 
     def render_drop_composite_index(self, name: str, table: str | None = None) -> list[str]:
         """Render a named-index drop (Oracle drops by bare name).
@@ -3440,6 +3339,9 @@ class SqlServerDialect(BaseDialect):
     index_using = False
     index_include = False
     index_opclass = False
+    # SQL Server has no CREATE INDEX IF NOT EXISTS but does support filtered
+    # (partial) indexes, so supports_partial_index stays True.
+    index_if_not_exists = False
     supports_extensions = False
     column_if_exists = False
     # Default collations are case-insensitive; `like_pattern_sql` adds a binary
@@ -3594,19 +3496,9 @@ class SqlServerDialect(BaseDialect):
         Returns:
             A one-argument converter, or None to assign the value directly.
         """
-        base = super().read_decoder(field)
-        kind = field.field_kind
-        if isinstance(field, ForeignKeyFieldInstance):
-            kind = get_model(field.reference)._meta.pk_field.field_kind
-        extra: Callable[[Any], Any] | None = {
-            "datetime": _datetime_from_db,
-            "json": _json_from_db,
-        }.get(kind)
-        if extra is None:
-            return base
-        if base is None:
-            return extra
-        return lambda value, _extra=extra, _base=base: _base(_extra(value))
+        return self._compose_read_decoder(
+            field, {"datetime": _datetime_from_db, "json": _json_from_db}
+        )
 
     # -- query lookups ------------------------------------------------------
     def like_pattern_sql(self, case_insensitive: bool, col: str, placeholder: str) -> str:
@@ -4294,71 +4186,6 @@ class SqlServerDialect(BaseDialect):
             The list with the ``EXEC sp_rename`` statement.
         """
         return [f"EXEC sp_rename {self._literal(old)}, {self._literal(new)}, 'OBJECT'"]
-
-    def render_create_index(
-        self,
-        table: str,
-        column: str,
-        safe: bool = True,
-        unique: bool = False,
-        concurrently: bool = False,
-        name: str | None = None,
-    ) -> list[str]:
-        """Render a create-index statement (SQL Server has no guard for it).
-
-        Args:
-            table: The table name.
-            column: The column to index.
-            safe: Ignored — SQL Server has no ``CREATE INDEX IF NOT EXISTS``.
-            unique: Whether to create a ``UNIQUE`` index.
-            concurrently: Ignored (no ``CONCURRENTLY``).
-            name: Explicit index name; defaults to ``idx_<table>_<column>``.
-
-        Returns:
-            The list with the create-index statement.
-        """
-        uniq = "UNIQUE " if unique else ""
-        return [
-            f"CREATE {uniq}INDEX {self.quote(name or f'idx_{table}_{column}')} "
-            f"ON {self.quote(table)} ({self.quote(column)})"
-        ]
-
-    def render_create_composite_index(
-        self,
-        table: str,
-        name: str,
-        columns: list[str],
-        safe: bool = True,
-        condition: str | None = None,
-        unique: bool = False,
-        using: str | None = None,
-        include: list[str] | None = None,
-        opclass: str | None = None,
-    ) -> list[str]:
-        """Render a multi-column create-index; keeps only the filtered ``WHERE``.
-
-        SQL Server has no ``IF NOT EXISTS`` guard and none of the PostgreSQL-only
-        ``USING``/``INCLUDE``/``opclass`` clauses, but it does support filtered
-        indexes, so ``condition`` is preserved.
-
-        Args:
-            table: The table to index.
-            name: The index name.
-            columns: The ordered columns covered by the index.
-            safe: Ignored (no guard).
-            condition: Optional filtered-index predicate (``WHERE ...``).
-            unique: Whether to render ``CREATE UNIQUE INDEX``.
-            using: Ignored.
-            include: Ignored.
-            opclass: Ignored.
-
-        Returns:
-            The list with the create-index statement.
-        """
-        uniq = "UNIQUE " if unique else ""
-        cols = ", ".join(self.quote(c) for c in columns)
-        where = f" WHERE {condition}" if condition else ""
-        return [f"CREATE {uniq}INDEX {self.quote(name)} ON {self.quote(table)} ({cols}){where}"]
 
 
 _DIALECTS: dict[str, type[BaseDialect]] = {
