@@ -3066,6 +3066,12 @@ class MigrationManager:
         loaded = self._load_all()  # imported once; reused for state replay + apply
         if target is not None:
             target = _resolve_target(target, [n for n, _ in loaded])
+            # Only consider migrations up to and including the target, so a target
+            # that is already applied is a no-op rather than sweeping in the
+            # migrations that follow it (the `break` below never fires when the
+            # target itself is skipped by the already-applied guard).
+            target_idx = next(i for i, (n, _) in enumerate(loaded) if n == target)
+            loaded = loaded[: target_idx + 1]
         state = self._replay(set(applied), loaded)
         table = dialect.quote(MIGRATION_TABLE)
         cols = ", ".join(dialect.quote(c) for c in ("app", "name", "applied_at"))

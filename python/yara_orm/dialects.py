@@ -1092,12 +1092,14 @@ class BaseDialect:
         if pk:
             lines.append(pk)
         for col, ref in tspec.get("fks", {}).items():
+            # Route through _fk_clause so per-dialect ON DELETE rules apply here
+            # too (Oracle drops RESTRICT/NO ACTION, SQL Server rewrites RESTRICT).
             lines.append(
-                "FOREIGN KEY ({c}) REFERENCES {t} ({p}) ON DELETE {od}".format(
-                    c=self.quote(col),
-                    t=self.quote(ref["table"]),
-                    p=self.quote(ref["pk"]),
-                    od=ref.get("on_delete", "CASCADE"),
+                self._fk_clause(
+                    self.quote(col),
+                    self.quote(ref["table"]),
+                    self.quote(ref["pk"]),
+                    ref.get("on_delete", "CASCADE"),
                 )
             )
         for constraint in tspec.get("constraints", []):
@@ -3158,6 +3160,25 @@ class OracleDialect(BaseDialect):
         """
         return [f"DROP TABLE IF EXISTS {self.quote(table)} CASCADE CONSTRAINTS"]
 
+    def render_add_column(
+        self, table: str, name: str, spec: dict[str, Any], safe: bool = False
+    ) -> list[str]:
+        """Render an Oracle add-column statement.
+
+        Oracle spells this ``ALTER TABLE t ADD (col ...)`` — no ``COLUMN`` keyword
+        and no ``IF NOT EXISTS`` guard (both rejected), so ``safe`` is ignored.
+
+        Args:
+            table: The table name.
+            name: The column name.
+            spec: The migration column spec.
+            safe: Ignored — Oracle has no add-column existence guard.
+
+        Returns:
+            The list with the add-column statement.
+        """
+        return [f"ALTER TABLE {self.quote(table)} ADD ({self.render_column_def(name, spec)})"]
+
     def render_alter_column(
         self,
         table: str,
@@ -4054,6 +4075,190 @@ class SqlServerDialect(BaseDialect):
                 )
             )
         return out
+
+    def render_add_column(
+        self, table: str, name: str, spec: dict[str, Any], safe: bool = False
+    ) -> list[str]:
+        """Render a T-SQL add-column statement.
+
+        SQL Server spells this ``ALTER TABLE t ADD col ...`` — no ``COLUMN``
+        keyword and no add-column existence guard, so ``safe`` is ignored.
+
+        Args:
+            table: The table name.
+            name: The column name.
+            spec: The migration column spec.
+            safe: Ignored — SQL Server has no add-column existence guard.
+
+        Returns:
+            The list with the add-column statement.
+        """
+        return [f"ALTER TABLE {self.quote(table)} ADD {self.render_column_def(name, spec)}"]
+
+    def render_alter_column(
+        self,
+        table: str,
+        name: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+        table_spec: dict[str, Any],
+    ) -> list[str]:
+        """Render column changes in T-SQL (``ALTER COLUMN`` + named constraints).
+
+        Type and nullability changes go through ``ALTER COLUMN`` (which must
+        restate the type); UNIQUE/FK toggles add or drop named constraints. A
+        ``DEFAULT`` change is rejected: SQL Server stores defaults as
+        auto-named constraints that a migration cannot target portably.
+
+        Args:
+            table: The table name.
+            name: The column being altered.
+            old: The column spec before the change.
+            new: The column spec after the change.
+            table_spec: The full table spec (unused; SQL Server alters in place).
+
+        Raises:
+            UnSupportedError: When the column's ``DEFAULT`` changes.
+
+        Returns:
+            The list of SQL statements applying the column change.
+        """
+        if old.get("default") != new.get("default"):
+            raise UnSupportedError(
+                "mssql cannot ALTER a column DEFAULT in a migration (defaults are "
+                "auto-named constraints); use RunSQL"
+            )
+        t = self.quote(table)
+        col = self.quote(name)
+        out: list[str] = []
+        type_changed = old.get("kind") != new.get("kind") or old.get("type_params") != new.get(
+            "type_params"
+        )
+        null_changed = bool(old.get("null")) != bool(new.get("null"))
+        if type_changed or null_changed:
+            null = "NULL" if new.get("null") else "NOT NULL"
+            out.append(f"ALTER TABLE {t} ALTER COLUMN {col} {self._spec_type(new)} {null}")
+        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
+            uq = self.quote(f"{table}_{name}_key")
+            if new.get("unique"):
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
+            else:
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {uq}")
+        if old.get("fk") != new.get("fk"):
+            fk = self.quote(f"{table}_{name}_fkey")
+            if old.get("fk"):
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {fk}")
+            ref = new.get("fk")
+            if ref:
+                clause = self._fk_clause(
+                    col,
+                    self.quote(ref["table"]),
+                    self.quote(ref["pk"]),
+                    ref.get("on_delete", "CASCADE"),
+                )
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {fk} {clause}")
+        return out
+
+    def render_drop_index(
+        self, table: str, column: str, concurrently: bool = False, name: str | None = None
+    ) -> list[str]:
+        """Render a T-SQL drop-index statement (needs the owning table).
+
+        Args:
+            table: The table owning the index.
+            column: The indexed column (used for the default index name).
+            concurrently: Ignored (no ``CONCURRENTLY``).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the ``DROP INDEX ... ON <table>`` statement.
+        """
+        idx = self.quote(name or f"idx_{table}_{column}")
+        return [f"DROP INDEX IF EXISTS {idx} ON {self.quote(table)}"]
+
+    def render_drop_composite_index(self, name: str, table: str | None = None) -> list[str]:
+        """Render a named composite-index drop (T-SQL needs the owning table).
+
+        Args:
+            name: The index name.
+            table: The owning table (the migration ops carry it).
+
+        Raises:
+            UnSupportedError: When no table is given — SQL Server cannot drop an
+                index by bare name.
+
+        Returns:
+            The list with the ``DROP INDEX ... ON <table>`` statement.
+        """
+        if table is None:
+            raise UnSupportedError(
+                "mssql cannot DROP INDEX by name alone (the owning table is required); "
+                "use RunSQL with DROP INDEX ... ON <table>"
+            )
+        return [f"DROP INDEX IF EXISTS {self.quote(name)} ON {self.quote(table)}"]
+
+    def render_rename_table(self, old: str, new: str) -> list[str]:
+        """Render a table rename via ``sp_rename`` (T-SQL has no ``RENAME TO``).
+
+        Args:
+            old: The current table name.
+            new: The new table name.
+
+        Returns:
+            The list with the ``EXEC sp_rename`` statement.
+        """
+        return [f"EXEC sp_rename {self._literal(old)}, {self._literal(new)}"]
+
+    def render_rename_column(self, table: str, old: str, new: str) -> list[str]:
+        """Render a column rename via ``sp_rename ... 'COLUMN'``.
+
+        Args:
+            table: The table name.
+            old: The current column name.
+            new: The new column name.
+
+        Returns:
+            The list with the ``EXEC sp_rename`` statement.
+        """
+        return [f"EXEC sp_rename {self._literal(f'{table}.{old}')}, {self._literal(new)}, 'COLUMN'"]
+
+    def render_rename_index(
+        self,
+        table: str,
+        column: str,
+        old_name: str,
+        new_name: str,
+        unique: bool = False,
+    ) -> list[str]:
+        """Render an index rename via ``sp_rename ... 'INDEX'``.
+
+        Args:
+            table: The table owning the index.
+            column: The indexed column (unused; SQL Server renames in place).
+            old_name: The current index name.
+            new_name: The new index name.
+            unique: Whether the index is unique (unused for an in-place rename).
+
+        Returns:
+            The list with the ``EXEC sp_rename`` statement.
+        """
+        return [
+            f"EXEC sp_rename {self._literal(f'{table}.{old_name}')}, "
+            f"{self._literal(new_name)}, 'INDEX'"
+        ]
+
+    def render_rename_constraint(self, table: str, old: str, new: str) -> list[str]:
+        """Render a constraint rename via ``sp_rename ... 'OBJECT'``.
+
+        Args:
+            table: The table name (unused; constraints are schema-scoped names).
+            old: The current constraint name.
+            new: The new constraint name.
+
+        Returns:
+            The list with the ``EXEC sp_rename`` statement.
+        """
+        return [f"EXEC sp_rename {self._literal(old)}, {self._literal(new)}, 'OBJECT'"]
 
     def render_create_index(
         self,

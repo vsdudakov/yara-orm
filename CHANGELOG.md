@@ -50,6 +50,26 @@ All notable changes to **yara-orm** are documented here. The format is based on
   levels are unavailable; `__search` and JSON `__contains` are unimplemented;
   and `bulk_create` inserts one row per statement. See `docs/backends` for the
   full list.
+- **Microsoft SQL Server backend (beta).**
+  `await YaraOrm.init("mssql://user:pass@host:1433/db")` (or a `sqlserver://`
+  URL) connects to SQL Server 2017+ / Azure SQL. Built on the **pure-Rust
+  `tiberius`** TDS driver — no ODBC / native client / Instant Client, so
+  manylinux wheels stay self-contained — pooled through a custom `deadpool`
+  manager honouring `max_size`/`min_size`/`statement_cache_size` and
+  `require_ssl=true` (rustls). The `SqlServerDialect` renders T-SQL: `[bracket]`
+  identifier quoting and `@PN` binds; the
+  `NVARCHAR`/`BIGINT`/`DATETIME2`/`UNIQUEIDENTIFIER`/`BIT` type family (`BIT`
+  booleans, native `GUID` uuids); `IDENTITY(1,1)` auto-increment read back with a
+  batched `SELECT SCOPE_IDENTITY()` (T-SQL has no `RETURNING`); `OFFSET ... FETCH
+  NEXT` paging; `MERGE` for upserts and m2m links; `CONCAT` concatenation;
+  case-insensitive `LIKE` by default (a binary `COLLATE` folds the
+  case-sensitive lookups). The shared cross-backend suite runs against a live
+  **SQL Server 2022** in CI (`ORM_TEST_MSSQL`) with no backend-specific skips.
+  It is **beta**: regex lookups (no `REGEXP` operator) and `SELECT ... FOR
+  UPDATE` are unsupported, and altering a column's `DEFAULT` in a migration
+  raises (defaults are auto-named constraints). All other migration operations
+  render to T-SQL (`AddField`/`AlterField` run against a live server in the
+  suite). See `docs/backends` for the full list.
 
 ### Changed
 
@@ -58,9 +78,41 @@ All notable changes to **yara-orm** are documented here. The format is based on
   `like_pattern_sql`, `render_upsert`, `supports_multirow_insert` and
   `group_by_functional_dependency`. `UUIDField.to_python` now reconstructs a
   `uuid.UUID` from text (backends that return uuid columns as strings).
+- **Query failures now raise `OperationalError` uniformly.** A statement error
+  (bad SQL, deadlock, serialization failure) raised a bare `RuntimeError` on the
+  default hot path — only the transaction/hook path translated it — so the
+  exception a caller saw depended on unrelated registration state. All query
+  errors now route through the ORM hierarchy (`OperationalError`) at the engine
+  source, so `except OperationalError` and retry-on-deadlock work everywhere.
 
 ### Fixed
 
+- **`YaraOrm.close()` no longer leaks pools when one fails.** A failing
+  `engine.close()` used to abort the loop, leaking every remaining pool and
+  stranding the module globals half-reset. Closes now run concurrently, the
+  globals always reset, and the first error is re-raised after cleanup.
+- **`upgrade(target=...)` no longer overshoots.** Targeting an already-applied
+  migration (or a middle one) applied the migrations *after* it, because the
+  already-applied target was skipped before the stop condition fired. The loop
+  now only considers migrations up to and including the target.
+- **Oracle & SQL Server migration DDL for column changes.** `AddField`,
+  `AlterField` and renames rendered PostgreSQL/ANSI SQL that Oracle and SQL
+  Server reject (`ADD COLUMN`, `ALTER COLUMN ... TYPE`, ANSI `RENAME`). They now
+  render each dialect's spelling — Oracle `ADD (...)`/`MODIFY`, T-SQL
+  `ADD`/`ALTER COLUMN`/`sp_rename`/`DROP INDEX ... ON`. Create-table foreign
+  keys route through the per-dialect `ON DELETE` rules too (Oracle drops an
+  unsupported `RESTRICT`). `AddField`/`AlterField` now run against live Oracle
+  and SQL Server in the cross-backend suite.
+- **Oracle row decoding is panic-safe.** A malformed row from the young
+  `oracle-rs` driver (more values than declared columns) indexed out of bounds
+  and would abort the process; values are now zipped with their columns.
+- **SQL Server rolls back a stale transaction on connection reuse.** A pooled
+  connection returned after a failed commit/rollback could carry an open
+  transaction into the next checkout; recycling now issues
+  `IF @@TRANCOUNT > 0 ROLLBACK` first. Connect-error messages on the Oracle and
+  SQL Server backends are password-redacted, matching PostgreSQL/MySQL.
+- **`values()/values_list().first()` fetches a single row.** It materialised the
+  whole result set and discarded all but the first; it now applies `LIMIT 1`.
 - **`INSERT ... RETURNING` backfill decodes through the dialect read decoder.**
   Values read back from a RETURNING insert now pass through the same decoder as
   a SELECT, so a database-generated UUID primary key stored in a `CHAR(36)`/text

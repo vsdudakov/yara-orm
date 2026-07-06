@@ -1,9 +1,9 @@
 ---
-title: Backends — PostgreSQL, MySQL, Oracle & SQLite
-description: Yara ORM backends — connect the async Python ORM to PostgreSQL (tokio-postgres), MySQL (mysql_async), Oracle (oracle-rs) or SQLite (rusqlite) by URL, with identical model code across all of them.
+title: Backends — PostgreSQL, MySQL, Oracle, SQL Server & SQLite
+description: Yara ORM backends — connect the async Python ORM to PostgreSQL (tokio-postgres), MySQL (mysql_async), Oracle (oracle-rs), Microsoft SQL Server (tiberius) or SQLite (rusqlite) by URL, with identical model code across all of them.
 ---
 
-# Backends: PostgreSQL, MySQL, Oracle & SQLite
+# Backends: PostgreSQL, MySQL, Oracle, SQL Server & SQLite
 
 Yara ORM selects a database **backend by connection URL**. The same model and queryset
 code runs unchanged across backends — only the URL you pass to `YaraOrm.init()` differs.
@@ -14,6 +14,7 @@ from yara_orm import YaraOrm
 await YaraOrm.init("postgres://user:pass@localhost/db")   # PostgreSQL (tokio-postgres)
 await YaraOrm.init("mysql://user:pass@localhost/db")       # MySQL/MariaDB (mysql_async)
 await YaraOrm.init("oracle://user:pass@localhost:1521/FREEPDB1")  # Oracle (oracle-rs)
+await YaraOrm.init("mssql://user:pass@localhost:1433/db")   # SQL Server (tiberius)
 await YaraOrm.init("sqlite:///path/to/app.db")             # SQLite (rusqlite)
 ```
 
@@ -206,7 +207,74 @@ These are why the backend is beta rather than stable; their tests are skipped:
 - **`bulk_create` inserts one row per statement** (Oracle has no multi-row
   `VALUES`), so large bulk loads are slower than on the other backends.
 
-Everything else in the shared cross-backend suite passes.
+Everything else in the shared cross-backend suite passes — including `AddField` /
+`AlterField` migrations, which run against a live Oracle server in CI.
+
+## Microsoft SQL Server
+
+!!! note "Beta"
+
+    The SQL Server backend is **beta**: the ORM surface is complete — the same
+    model code, URL and query API as every other backend — and the shared
+    cross-backend suite (CRUD, relations, aggregations, upserts, transactions
+    and savepoints, `IntegrityError`) runs against a live **SQL Server 2022** in
+    CI with no backend-specific skips. It is beta rather than stable because it
+    landed most recently and a few surfaces are not yet covered (see
+    [remaining limitations](#remaining-limitations_1)). Pin your yara-orm version
+    for production use.
+
+The SQL Server backend is built on the pure-Rust **tiberius** TDS driver — no
+ODBC, native client or Instant Client, so the Python wheels stay self-contained
+(the same invariant as the PostgreSQL/MySQL stacks). Connections are pooled with
+**deadpool**. It targets **SQL Server 2017+** and **Azure SQL**. Both `mssql://`
+and `sqlserver://` URLs connect.
+
+```python
+await YaraOrm.init("mssql://user:password@host:1433/dbname")
+```
+
+### How it maps
+
+- **Connection.** The same `max_size` / `min_size` / `statement_cache_size` URL
+  parameters as the other backends; `require_ssl=true` opts into TLS (rustls —
+  no system OpenSSL). Aware datetimes are stored UTC-naive in `DATETIME2` and
+  read back as aware UTC under `use_tz=True` (SQL Server's `DATETIMEOFFSET` is
+  avoided, as MySQL/SQLite avoid theirs).
+- **Primary keys.** Auto-increment pks use `IDENTITY(1,1)` columns; the
+  generated value is read back with a batched `SELECT SCOPE_IDENTITY()` (T-SQL
+  has no `RETURNING`, and `OUTPUT` cannot be a statement suffix — so, like MySQL,
+  it uses the no-`RETURNING` path). An explicit pk value brackets the INSERT with
+  `SET IDENTITY_INSERT ON/OFF`.
+- **Types.** `BIGINT`/`INT`/`SMALLINT` for integers, `BIT` for booleans,
+  `NVARCHAR(n)` / `NVARCHAR(MAX)` for text, `UNIQUEIDENTIFIER` (native GUID) for
+  uuids, `DATETIME2(6)` for datetimes, `DATE` / `TIME(6)`, `DECIMAL(p,s)`,
+  `FLOAT(53)`, `NVARCHAR(MAX)` for JSON, `VARBINARY(MAX)` for bytes (bound
+  through an explicit `CAST` so SQL Server accepts it).
+- **Identifiers** are `[bracket]`-quoted and bind parameters are `@P1`, `@P2`, …
+- **Queries.** Row slicing renders `OFFSET ... ROWS FETCH NEXT ... ROWS ONLY`
+  (which SQL Server requires an `ORDER BY` for — a stable placeholder ordering is
+  supplied when a query has none); case-insensitive lookups use plain `LIKE`
+  (default collations are case-insensitive) while case-sensitive lookups fold a
+  binary `COLLATE`; string concatenation uses `CONCAT`; random ordering uses
+  `NEWID()`; `DATEPART` / `JSON_VALUE` back the date-part and JSON lookups.
+- **Upserts.** `ignore_conflicts` / `update_fields` upserts (and the m2m
+  join-table insert) render a `MERGE`, which must name its match columns — an
+  `ignore_conflicts` upsert needs an explicit `on_conflict=[...]` target.
+
+### Remaining limitations
+
+These are why the backend is beta rather than stable:
+
+- **Regular-expression lookups** (`__regex` / `__iregex`) raise
+  `UnSupportedError` — SQL Server has no `REGEXP` operator.
+- **`SELECT ... FOR UPDATE`** has no T-SQL statement suffix (locking is done with
+  table hints), so the row-lock clause is dropped, as on SQLite.
+- **Altering a column's `DEFAULT`** in a migration raises `UnSupportedError`:
+  SQL Server stores defaults as auto-named constraints a migration cannot target
+  portably — change a default with hand-written `RunSQL`. Every other migration
+  operation (`AddField`, `AlterField` type/nullability, renames via `sp_rename`,
+  index drops) renders to T-SQL; `AddField`/`AlterField` run against a live
+  server in the cross-backend suite.
 
 ## SQLite
 

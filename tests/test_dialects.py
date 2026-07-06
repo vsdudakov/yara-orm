@@ -14,6 +14,7 @@ from yara_orm.dialects import (
     OracleDialect,
     PostgresDialect,
     SqliteDialect,
+    SqlServerDialect,
     _json_from_db,
     _time_from_db,
 )
@@ -23,6 +24,7 @@ PG = PostgresDialect()
 LITE = SqliteDialect()
 BASE = BaseDialect()
 ORA = OracleDialect()
+MSSQL = SqlServerDialect()
 
 
 @pytest.mark.parametrize(
@@ -394,3 +396,131 @@ def test_uuid_field_to_python_none_and_text():
     assert field.to_python(None) is None
     u = _uuid.uuid4()
     assert field.to_python(str(u)) == u
+
+
+# ---------------------------------------------------------------------------
+# Oracle & SQL Server migration DDL — add-column, create-table FK, and (for
+# SQL Server) the alter/rename/drop-index family. Pure string builders, so the
+# T-SQL/PL-SQL spellings are locked in without needing a live server.
+# ---------------------------------------------------------------------------
+
+
+def test_oracle_add_column_uses_paren_form_no_column_keyword():
+    """
+    GIVEN an add-column operation
+    WHEN rendered on Oracle
+    THEN it is ``ALTER TABLE t ADD (col ...)`` with no ``COLUMN`` keyword and no
+         ``IF NOT EXISTS`` guard (both rejected by Oracle)
+    """
+    out = ORA.render_add_column("t", "age", dict(INT), safe=True)
+    assert len(out) == 1
+    assert out[0].startswith('ALTER TABLE "t" ADD ("age"')
+    assert out[0].endswith(")")
+    assert "COLUMN" not in out[0]
+    assert "IF NOT EXISTS" not in out[0]
+
+
+def test_oracle_create_table_strips_unsupported_on_delete():
+    """
+    GIVEN a create-table spec whose FK uses ``ON DELETE RESTRICT``
+    WHEN rendered on Oracle (which accepts only CASCADE / SET NULL)
+    THEN the FK clause omits the unsupported action rather than emitting it
+    """
+    tspec = {
+        "columns": {"id": INT, "u_id": INT},
+        "pk": "id",
+        "fks": {"u_id": {"table": "u", "pk": "id", "on_delete": "RESTRICT"}},
+        "indexes": [],
+    }
+    sql = ORA.render_create_table("t", tspec, safe=False)[0]
+    assert "RESTRICT" not in sql
+    assert 'FOREIGN KEY ("u_id") REFERENCES "u" ("id")' in sql
+
+
+def test_mssql_add_column_no_column_keyword():
+    """
+    GIVEN an add-column operation
+    WHEN rendered on SQL Server
+    THEN it is ``ALTER TABLE [t] ADD [col] ...`` (no ``COLUMN`` keyword)
+    """
+    out = MSSQL.render_add_column("t", "age", dict(INT))
+    assert out[0].startswith("ALTER TABLE [t] ADD [age]")
+    assert "COLUMN" not in out[0]
+
+
+def test_mssql_alter_column_type_and_nullability():
+    """
+    GIVEN a column change of type and nullability
+    WHEN rendered on SQL Server
+    THEN a single ``ALTER COLUMN`` restates the type with the null flag
+    """
+    old = dict(INT)
+    new = {**INT, "kind": "bigint", "null": True}
+    assert MSSQL.render_alter_column("t", "n", old, new, {}) == [
+        "ALTER TABLE [t] ALTER COLUMN [n] BIGINT NULL"
+    ]
+
+
+def test_mssql_alter_column_default_change_raises():
+    """
+    GIVEN a column change that alters the DEFAULT
+    WHEN rendered on SQL Server (defaults are auto-named constraints)
+    THEN it raises UnSupportedError rather than emitting broken DDL
+    """
+    old = dict(INT)
+    new = {**INT, "default": {"kind": "sql", "sql": "7"}}
+    with pytest.raises(UnSupportedError):
+        MSSQL.render_alter_column("t", "n", old, new, {})
+
+
+def test_mssql_alter_column_unique_and_fk_add_then_drop():
+    """
+    GIVEN a column that gains, then loses, a unique constraint and a foreign key
+    WHEN rendered on SQL Server
+    THEN ADD CONSTRAINT statements are produced forwards and DROP CONSTRAINT
+         backwards (a pk column skips the unique clause)
+    """
+    old = dict(INT)
+    new = {**INT, "unique": True, "fk": {"table": "u", "pk": "id", "on_delete": "CASCADE"}}
+    fwd = "\n".join(MSSQL.render_alter_column("t", "n", old, new, {}))
+    assert "ADD CONSTRAINT [t_n_key] UNIQUE ([n])" in fwd
+    assert "ADD CONSTRAINT [t_n_fkey]" in fwd
+    back = "\n".join(MSSQL.render_alter_column("t", "n", new, old, {}))
+    assert "DROP CONSTRAINT [t_n_key]" in back
+    assert "DROP CONSTRAINT [t_n_fkey]" in back
+    # A pk column never gets a UNIQUE constraint even if the flag flips.
+    pk_new = {**INT, "unique": True, "pk": True}
+    assert MSSQL.render_alter_column("t", "n", old, pk_new, {}) == []
+
+
+def test_mssql_drop_index_and_composite_need_the_table():
+    """
+    GIVEN a single-column and a composite index drop
+    WHEN rendered on SQL Server
+    THEN the owning table is named (``DROP INDEX ... ON [t]``), and a composite
+         drop without a table raises
+    """
+    assert MSSQL.render_drop_index("t", "c") == ["DROP INDEX IF EXISTS [idx_t_c] ON [t]"]
+    assert MSSQL.render_drop_composite_index("myidx", "t") == [
+        "DROP INDEX IF EXISTS [myidx] ON [t]"
+    ]
+    with pytest.raises(UnSupportedError):
+        MSSQL.render_drop_composite_index("myidx")
+
+
+def test_mssql_renames_use_sp_rename():
+    """
+    GIVEN table/column/index/constraint renames
+    WHEN rendered on SQL Server
+    THEN each becomes an ``EXEC sp_rename`` call with the right object class
+    """
+    assert MSSQL.render_rename_table("a", "b") == ["EXEC sp_rename 'a', 'b'"]
+    assert MSSQL.render_rename_column("t", "old", "new") == [
+        "EXEC sp_rename 't.old', 'new', 'COLUMN'"
+    ]
+    assert MSSQL.render_rename_index("t", "c", "idx_old", "idx_new") == [
+        "EXEC sp_rename 't.idx_old', 'idx_new', 'INDEX'"
+    ]
+    assert MSSQL.render_rename_constraint("t", "uq", "uq2") == [
+        "EXEC sp_rename 'uq', 'uq2', 'OBJECT'"
+    ]
