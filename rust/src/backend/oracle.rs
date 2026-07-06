@@ -44,6 +44,7 @@ use oracle_rs::{
 };
 
 use crate::backend::pool::extract_pool_params;
+use crate::backend::postgres::redact;
 use crate::backend::{Backend, TxConn};
 use crate::error::EngineError;
 use crate::value::{value_to_json, Row, Value};
@@ -118,7 +119,7 @@ struct OracleUrl {
 fn parse_oracle_url(url: &str) -> Result<OracleUrl, EngineError> {
     let rest = url
         .strip_prefix("oracle://")
-        .ok_or_else(|| EngineError::Config(format!("not an oracle URL: {url}")))?;
+        .ok_or_else(|| EngineError::Config(redact(format!("not an oracle URL: {url}"), url)))?;
     let (authority, service) = rest
         .split_once('/')
         .ok_or_else(|| EngineError::Config("oracle URL is missing the /service name".into()))?;
@@ -456,8 +457,11 @@ async fn run_fetch(
         for row in result.rows {
             let vals = row.into_values();
             let mut out = Vec::with_capacity(vals.len());
-            for (idx, v) in vals.into_iter().enumerate() {
-                out.push(decode_cell(conn, &cols[idx], v).await?);
+            // Zip values with column metadata so a driver row with more values
+            // than declared columns truncates safely instead of index-panicking
+            // (the desync-prone driver could return a malformed row).
+            for (col, v) in cols.iter().zip(vals) {
+                out.push(decode_cell(conn, col, v).await?);
             }
             rows.push(out);
         }
@@ -636,7 +640,7 @@ impl OracleBackend {
             held.push(
                 pool.get()
                     .await
-                    .map_err(|e| EngineError::Connection(e.to_string()))?,
+                    .map_err(|e| EngineError::Connection(redact(e.to_string(), url)))?,
             );
         }
         drop(held);

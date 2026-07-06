@@ -329,6 +329,35 @@ async def test_migrations_on_sqlite(sqlite_orm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upgrade_target_does_not_overshoot(sqlite_orm, tmp_path):
+    """
+    GIVEN three migrations with only the first applied
+    WHEN upgrade runs with a target of the already-applied first migration, then
+         of the middle one
+    THEN the already-applied target is a no-op (later migrations are NOT swept
+         in) and the middle target stops before the third
+    """
+    mgr = _manager(tmp_path)
+    mgr.make_migrations(name="initial")
+    assert await mgr.upgrade() == ["0001_initial"]
+
+    _attach_field(MgUser, "age", fields.IntField(null=True))
+    try:
+        assert mgr.make_migrations(name="add_age") == "0002_add_age.py"
+        _attach_field(MgUser, "bio", fields.CharField(max_length=50, null=True))
+        assert mgr.make_migrations(name="add_bio") == "0003_add_bio.py"
+        # Target the already-applied 0001: nothing new must run.
+        assert await mgr.upgrade(target="0001") == []
+        assert [h["name"] for h in await mgr.history()] == ["0001_initial"]
+        # Target the middle migration: stop before 0003.
+        assert await mgr.upgrade(target="0002") == ["0002_add_age"]
+        assert [h["name"] for h in await mgr.history()] == ["0001_initial", "0002_add_age"]
+    finally:
+        _detach_field(MgUser, "bio")
+        _detach_field(MgUser, "age")
+
+
+@pytest.mark.asyncio
 async def test_alter_field_on_sqlite_rebuilds_table(sqlite_orm, tmp_path):
     """
     GIVEN an applied column on SQLite

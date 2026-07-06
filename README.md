@@ -1,7 +1,8 @@
 # Yara ORM
 
 **A fast, async Python ORM with a Rust engine — [Tortoise](https://tortoise.github.io/)-style
-models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB and SQLite.**
+models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB, SQLite,
+Oracle and Microsoft SQL Server.**
 
 [![CI](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml/badge.svg)](https://github.com/vsdudakov/yara-orm/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/yara-orm.svg)](https://pypi.org/project/yara-orm/)
@@ -20,8 +21,9 @@ of a Django/Tortoise-style API — models, querysets, relations, aggregation and
 migrations — with a hot path (connection pooling, parameter binding, row decoding)
 written in compiled **Rust** (PyO3 + tokio). It is a drop-in-feel **alternative to
 Tortoise ORM and async SQLAlchemy**: **2–9× faster** than popular pure-Python ORMs
-on common operations, with first-class **PostgreSQL**, **MySQL**, **MariaDB** and **SQLite** backends, full
-type hints, and **100% test coverage**.
+on common operations, with first-class **PostgreSQL**, **MySQL**, **MariaDB** and
+**SQLite** backends — plus **Oracle** and **Microsoft SQL Server** (both beta) —
+full type hints, and **100% test coverage**.
 
 ```python
 from yara_orm import Model, YaraOrm, fields
@@ -46,7 +48,8 @@ print(await User.filter(name__icontains="ad").count())
   `Q` objects, aggregation, `prefetch_related`, transactions, signals. Coming from
   Tortoise? Most code moves across unchanged — see
   [Migrating from Tortoise ORM](https://vsdudakov.github.io/yara-orm/guides/migrating-from-tortoise/).
-- 🗄️ **Pluggable backends** — PostgreSQL, MySQL/MariaDB and SQLite today, selected by
+- 🗄️ **Pluggable backends** — PostgreSQL, MySQL/MariaDB and SQLite, plus beta
+  **Oracle** and **Microsoft SQL Server** backends, selected by
   URL; a new database is one Rust trait + one Python dialect.
 - 🚚 **Migrations** — operation-based, auto-generated, backend-portable
   (`makemigrations` / `upgrade` / `downgrade`).
@@ -182,17 +185,26 @@ trait (`Backend`) plus a Python `BaseDialect` subclass:
 await YaraOrm.init("postgres://user@localhost/db")     # PostgreSQL (tokio-postgres)
 await YaraOrm.init("mysql://user:pass@localhost/db")   # MySQL/MariaDB (mysql_async)
 await YaraOrm.init("sqlite:///path/to/app.db")          # SQLite (rusqlite)
+await YaraOrm.init("oracle://user:pass@localhost:1521/FREEPDB1")  # Oracle 23ai — beta (oracle-rs)
+await YaraOrm.init("mssql://user:pass@localhost:1433/db")  # SQL Server 2017+ — beta (tiberius)
 ```
 
 The SQLite backend maps rich types (uuid/json/datetime/decimal) onto SQLite's
 storage classes and reconstructs them on read from the declared column type, so
 the model layer is identical across backends.
 
+**Oracle** and **Microsoft SQL Server** (both beta) ride on the same
+model/queryset API — both on pure-Rust drivers (`oracle-rs` TNS and `tiberius`
+TDS, no OCI/ODBC/Instant Client, so the wheels stay self-contained). The shared
+cross-backend suite runs against a live SQL Server 2022 and Oracle 23ai in CI.
+See the [backends guide](https://vsdudakov.github.io/yara-orm/backends/) for their
+type maps and the driver caveats that keep them out of the stable tier.
+
 ## Migrations
 
 A Django/Tortoise-style, operation-based migration system. Migrations are
 auto-generated from model changes and **backend-portable** — the same operations
-render to PostgreSQL, MySQL or SQLite DDL at apply time. Applied migrations are tracked
+render to PostgreSQL, MySQL, SQLite, Oracle or SQL Server DDL at apply time. Applied migrations are tracked
 in an `orm_migrations` table.
 
 ```bash
@@ -333,6 +345,8 @@ yourself with `make bench` / `make bench-mysql` / `make bench-sqlite`.
 │     PgBackend ............... tokio-postgres│
 │     MySqlBackend ................ mysql_async│
 │     SqliteBackend ................. rusqlite│
+│     OracleBackend ............... oracle-rs│
+│     MsSqlBackend .................. tiberius│
 │   Value .................. Py⇆Rust⇆SQL types│
 └─────────────────────────────────────────────┘
 ```

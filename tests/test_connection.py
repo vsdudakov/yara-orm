@@ -478,3 +478,40 @@ async def test_raw_list_param_binds_as_array(orm):
         2,
         3,
     ]
+
+
+@pytest.mark.asyncio
+async def test_close_closes_every_pool_even_when_one_fails():
+    """
+    GIVEN several named connections where one engine's close() raises
+    WHEN YaraOrm.close() runs
+    THEN the healthy pools are still closed, the module globals are reset, and
+         the failure is re-raised (a single failing teardown must not leak the
+         rest)
+    """
+    import yara_orm.connection as conn_mod
+
+    closed: list[str] = []
+
+    class _FakeEngine:
+        def __init__(self, name: str, boom: bool = False) -> None:
+            self.name = name
+            self.boom = boom
+
+        async def close(self) -> None:
+            if self.boom:
+                raise RuntimeError("close failed")
+            closed.append(self.name)
+
+    # Start from a clean slate, then install fakes directly in the registry.
+    await YaraOrm.close()
+    conn_mod._CONNECTIONS["default"] = (_FakeEngine("default", boom=True), None)
+    conn_mod._CONNECTIONS["second"] = (_FakeEngine("second"), None)
+    conn_mod._ENGINE = object()  # sentinel to confirm the reset runs
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await YaraOrm.close()
+
+    assert "second" in closed  # the healthy pool was still closed
+    assert conn_mod._CONNECTIONS == {}  # globals cleared despite the error
+    assert conn_mod._ENGINE is None

@@ -35,6 +35,7 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::backend::pool::extract_pool_params;
+use crate::backend::postgres::redact;
 use crate::backend::{Backend, TxConn};
 use crate::error::EngineError;
 use crate::value::{value_to_json, Row, Value};
@@ -214,7 +215,7 @@ fn to_named(names: &[Arc<str>], rows: Vec<Vec<Value>>) -> Vec<Row> {
 
 /// Build a tiberius [`Config`] from an `mssql://user:pass@host:port/db?...` URL.
 fn config_from_url(url: &str) -> Result<Config, EngineError> {
-    let u = url::Url::parse(url).map_err(|e| EngineError::Config(e.to_string()))?;
+    let u = url::Url::parse(url).map_err(|e| EngineError::Config(redact(e.to_string(), url)))?;
     let mut config = Config::new();
     config.host(u.host_str().unwrap_or("localhost"));
     config.port(u.port().unwrap_or(1433));
@@ -263,9 +264,11 @@ impl Manager for MssqlManager {
     }
 
     async fn recycle(&self, conn: &mut MssqlConn, _: &Metrics) -> RecycleResult<EngineError> {
-        // Cheap liveness check that also drains any partial state; a returned
-        // connection carrying an open transaction is the tx guard's job.
-        conn.simple_query("SELECT 1")
+        // Roll back any transaction an aborted checkout left open before reuse,
+        // then a cheap liveness check. Without the rollback a recycled
+        // connection could run the next checkout's statements inside a stale
+        // transaction whose work is silently lost on eventual disconnect.
+        conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK; SELECT 1")
             .await
             .map_err(map_tds)?
             .into_first_result()
@@ -296,7 +299,7 @@ impl MssqlBackend {
         let conn = pool
             .get()
             .await
-            .map_err(|e| EngineError::Connection(e.to_string()))?;
+            .map_err(|e| EngineError::Connection(redact(e.to_string(), url)))?;
         drop(conn);
         Ok(Self { pool })
     }
