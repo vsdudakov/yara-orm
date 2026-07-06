@@ -268,12 +268,23 @@ impl Manager for MssqlManager {
         // then a cheap liveness check. Without the rollback a recycled
         // connection could run the next checkout's statements inside a stale
         // transaction whose work is silently lost on eventual disconnect.
-        conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK; SELECT 1")
-            .await
-            .map_err(map_tds)?
-            .into_first_result()
-            .await
-            .map_err(map_tds)?;
+        //
+        // Also reset the isolation level to the SQL Server default: unlike
+        // MySQL's `SET TRANSACTION` (next-tx only) and Oracle's (current-tx
+        // only), T-SQL's `SET TRANSACTION ISOLATION LEVEL` is a *session*
+        // setting that persists after the transaction that set it commits. A
+        // prior `begin_tx(Some("SERIALIZABLE"))` would otherwise silently pin
+        // every later checkout of this physical connection to SERIALIZABLE.
+        // Both statements ride the same batch, so this adds no round trip.
+        conn.simple_query(
+            "IF @@TRANCOUNT > 0 ROLLBACK; \
+             SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SELECT 1",
+        )
+        .await
+        .map_err(map_tds)?
+        .into_first_result()
+        .await
+        .map_err(map_tds)?;
         Ok(())
     }
 }

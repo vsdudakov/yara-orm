@@ -380,3 +380,21 @@ def test_render_create_index_variants():
     assert d.render_create_composite_index("t", "ix", ["a"], unique=True) == [
         "CREATE UNIQUE INDEX [ix] ON [t] ([a])"
     ]
+
+
+def test_escape_like_value_escapes_bracket():
+    """
+    GIVEN a LIKE lookup value containing a SQL Server character-class bracket
+    WHEN the SQL Server dialect escapes it
+    THEN '[' is backslash-escaped (matched literally under ESCAPE '\\'), while
+         the base dialect leaves it untouched
+
+    Regression: '[' is a T-SQL LIKE metacharacter, so an unescaped value like
+    'a[bc]' silently became a character class and broadened the match.
+    """
+    mssql = SqlServerDialect()
+    base = BaseDialect()
+    assert mssql.escape_like_value("a[bc]") == "a\\[bc]"
+    assert base.escape_like_value("a[bc]") == "a[bc]"
+    # The shared metacharacters are still escaped on both.
+    assert mssql.escape_like_value("50%_x") == "50\\%\\_x"

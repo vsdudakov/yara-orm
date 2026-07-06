@@ -199,6 +199,16 @@ class MetaInfo:
             if isinstance(f, DatetimeField) and (f.auto_now or f.auto_now_add)
         ]
         self.validated_fields = [f for f in self.field_list if f.validators]
+        # Construction plan (``Model.__init__``): only the fields whose
+        # ``to_python_value`` is actually overridden need the per-value coercion
+        # call. The base implementation is identity, so for an all-plain model
+        # (no datetime/date/time-style loose-input coercion) construction assigns
+        # every attribute directly instead of paying a virtual call per column.
+        self.coerced_fields = frozenset(
+            f.model_field_name
+            for f in self.field_list
+            if type(f).to_python_value is not Field.to_python_value
+        )
         # Columns whose value the *database* supplies (``default=Now()`` etc.).
         # The write paths treat these specially: omitted from an INSERT unless
         # explicitly set, and never overwritten with a never-fetched ``None``.
@@ -605,9 +615,14 @@ class ModelMeta(type):
         # accessor, so ``create(rel=...)`` and ``await obj.rel`` break.
         inherited_fk: dict[str, ForeignKeyFieldInstance] = {}
         inherited_m2m: dict[str, ManyToManyFieldInstance] = {}
+        # Names merged in from a base class, so a pk this class declares itself
+        # can be told apart from one it merely inherited (see the pk resolution
+        # below: an own pk supersedes an inherited auto-injected ``id``).
+        inherited_field_names: set[str] = set()
         for parent in parents:
             parent_meta: MetaInfo | None = getattr(parent, "_meta", None)
             if parent_meta is not None:
+                inherited_field_names.update(parent_meta.fields)
                 fields.update(parent_meta.fields)
                 for rel_name, info in parent_meta.relations.items():
                     inherited_fk[rel_name] = info.field
@@ -634,18 +649,35 @@ class ModelMeta(type):
             if not field.db_column:
                 field.db_column = fname
 
-        pk_field = next((f for f in fields.values() if f.pk), None)
-        if pk_field is None:
-            pk_field = IntField(pk=True)
-            pk_field.model_field_name = "id"
-            pk_field.db_column = "id"
-            fields = {"id": pk_field, **fields}
-
         meta_cls = namespace.get("Meta")
         # `abstract` is intentionally read from the class's own Meta only (not
         # inherited): a concrete subclass of an abstract base is itself concrete
         # unless it redeclares `abstract = True`.
         abstract = bool(getattr(meta_cls, "abstract", False))
+
+        # A pk this class declares itself always wins over one inherited from a
+        # base. Without this, an inherited auto-injected ``id`` (synthesised
+        # below for a base — including an abstract one — that declared no pk)
+        # would shadow a subclass naming its pk differently
+        # (``uuid = UUIDField(pk=True)``): ``next(f for f if f.pk)`` returns the
+        # inherited ``id`` first, silently demoting the real pk to a plain
+        # column and leaving a spurious ``id`` serial on the table.
+        own_pk = next(
+            (f for n, f in fields.items() if f.pk and n not in inherited_field_names),
+            None,
+        )
+        if own_pk is not None:
+            for stale in [n for n, f in fields.items() if f._auto_pk and f is not own_pk]:
+                del fields[stale]
+            pk_field: Field | None = own_pk
+        else:
+            pk_field = next((f for f in fields.values() if f.pk), None)
+        if pk_field is None:
+            pk_field = IntField(pk=True)
+            pk_field.model_field_name = "id"
+            pk_field.db_column = "id"
+            pk_field._auto_pk = True  # synthesised default, not user-declared
+            fields = {"id": pk_field, **fields}
         table = getattr(meta_cls, "table", None) or name.lower()
         description = getattr(meta_cls, "table_description", None) or getattr(
             meta_cls, "description", None
@@ -806,6 +838,7 @@ class Model(metaclass=ModelMeta):
                     f"`await obj.{rel_name}.add(...)` after saving"
                 )
 
+        coerced = meta.coerced_fields
         for name, field in meta.fields.items():
             if name in kwargs:
                 value = kwargs.pop(name)
@@ -816,7 +849,9 @@ class Model(metaclass=ModelMeta):
             # Normalise loose input (e.g. an ISO string for a date column) to the
             # field's canonical Python type, so the in-memory attribute matches a
             # fetched row (``create(created_at="...").created_at`` is a datetime).
-            d[name] = field.to_python_value(value)
+            # Only fields that override ``to_python_value`` need the call; the
+            # rest (the majority) assign directly at C speed.
+            d[name] = field.to_python_value(value) if name in coerced else value
 
         for rel_name, (info, value) in rel_overrides.items():
             if value is None:
@@ -2330,10 +2365,18 @@ class Model(metaclass=ModelMeta):
         pk_field = meta.pk_field
         q = dialect.quote
         table = q(meta.table)
-        # (name, writable field, is_relation) — the relation-ness is fixed per
-        # target, so resolve it once here instead of per object in the batch loop.
+        # (writable field, read attribute) — resolved once here, not per object.
+        # For a relation the value comes from the FK backing column
+        # (``<name>_id``), never the relation accessor: the accessor returns a
+        # ``ForwardRelation`` awaitable whenever only the id was set (not a model
+        # instance), which would otherwise be bound verbatim. The descriptor
+        # stores the pk in that column on model assignment too, so reading it
+        # covers both ``author=obj`` and ``author_id=1``.
         targets = [
-            (name, meta.resolve_writable_field(name), name in meta.relations)
+            (
+                meta.resolve_writable_field(name),
+                meta.relations[name].source_attr if name in meta.relations else name,
+            )
             for name in field_names
         ]
         total = 0
@@ -2342,12 +2385,10 @@ class Model(metaclass=ModelMeta):
             params: list[Any] = []
             idx = 1
             set_parts = []
-            for name, field, is_rel in targets:
+            for field, read_attr in targets:
                 whens = []
                 for obj in batch:
-                    value = getattr(obj, name)
-                    if is_rel and hasattr(value, "pk"):
-                        value = value.pk
+                    value = getattr(obj, read_attr, None)
                     whens.append(
                         f"WHEN {dialect.placeholder(idx)} THEN {dialect.placeholder(idx + 1)}"
                     )
