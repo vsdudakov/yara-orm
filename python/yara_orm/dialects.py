@@ -1228,6 +1228,108 @@ class BaseDialect:
         ie = "IF EXISTS " if safe and self.column_if_exists else ""
         return [f"ALTER TABLE {self.quote(table)} DROP COLUMN {ie}{self.quote(name)}"]
 
+    #: Whether the FK-drop spelling is idempotent (PostgreSQL's ``DROP
+    #: CONSTRAINT IF EXISTS``), so a column's FK toggle can drop unconditionally;
+    #: backends whose drop is not guarded only emit it when an FK existed.
+    fk_drop_if_exists = True
+
+    def _drop_unique_constraint_sql(self, uq: str) -> str:
+        """Render the ``ALTER TABLE`` action dropping a column's inline UNIQUE.
+
+        PostgreSQL/Oracle/SQL Server drop the named constraint; MySQL drops it as
+        an index. The default is PostgreSQL's idempotent ``DROP CONSTRAINT IF
+        EXISTS``.
+
+        Args:
+            uq: The already-quoted UNIQUE constraint name.
+
+        Returns:
+            The ``ALTER TABLE`` action fragment (without the leading table).
+        """
+        return f"DROP CONSTRAINT IF EXISTS {uq}"
+
+    def _drop_fk_constraint_sql(self, fk: str) -> str:
+        """Render the ``ALTER TABLE`` action dropping a column's FK constraint.
+
+        MySQL spells this ``DROP FOREIGN KEY``; Oracle/SQL Server ``DROP
+        CONSTRAINT``. The default is PostgreSQL's idempotent ``DROP CONSTRAINT
+        IF EXISTS``.
+
+        Args:
+            fk: The already-quoted FK constraint name.
+
+        Returns:
+            The ``ALTER TABLE`` action fragment (without the leading table).
+        """
+        return f"DROP CONSTRAINT IF EXISTS {fk}"
+
+    def _toggle_unique_sql(
+        self, t: str, col: str, table: str, name: str, old: dict[str, Any], new: dict[str, Any]
+    ) -> list[str]:
+        """Render the ADD/DROP for a column whose inline UNIQUE flag changed.
+
+        The inline column UNIQUE renders as the default-named constraint
+        ``<table>_<column>_key``; toggling it adds or drops that constraint (the
+        drop spelling is dialect-specific — :meth:`_drop_unique_constraint_sql`).
+        Shared by every in-place ``render_alter_column``.
+
+        Args:
+            t: The already-quoted table.
+            col: The already-quoted column.
+            table: The unquoted table name (for the constraint name).
+            name: The unquoted column name (for the constraint name).
+            old: The column spec before the change.
+            new: The column spec after the change.
+
+        Returns:
+            Zero or one ``ALTER TABLE`` statement.
+        """
+        if bool(old.get("unique")) == bool(new.get("unique")) or new.get("pk"):
+            return []
+        uq = self.quote(f"{table}_{name}_key")
+        if new.get("unique"):
+            return [f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})"]
+        return [f"ALTER TABLE {t} {self._drop_unique_constraint_sql(uq)}"]
+
+    def _toggle_fk_sql(
+        self, t: str, col: str, table: str, name: str, old: dict[str, Any], new: dict[str, Any]
+    ) -> list[str]:
+        """Render the DROP/ADD for a column whose FK target changed.
+
+        The FK renders as the default-named constraint ``<table>_<column>_fkey``;
+        a change drops and re-adds it. The drop spelling and whether it is
+        idempotent are dialect-specific (:meth:`_drop_fk_constraint_sql`,
+        :attr:`fk_drop_if_exists`); the ADD clause is uniform via
+        :meth:`_fk_clause`. Shared by every in-place ``render_alter_column``.
+
+        Args:
+            t: The already-quoted table.
+            col: The already-quoted column.
+            table: The unquoted table name (for the constraint name).
+            name: The unquoted column name (for the constraint name).
+            old: The column spec before the change.
+            new: The column spec after the change.
+
+        Returns:
+            The DROP and/or ADD ``ALTER TABLE`` statements.
+        """
+        if old.get("fk") == new.get("fk"):
+            return []
+        fk = self.quote(f"{table}_{name}_fkey")
+        out: list[str] = []
+        if old.get("fk") or self.fk_drop_if_exists:
+            out.append(f"ALTER TABLE {t} {self._drop_fk_constraint_sql(fk)}")
+        ref = new.get("fk")
+        if ref:
+            clause = self._fk_clause(
+                col,
+                self.quote(ref["table"]),
+                self.quote(ref["pk"]),
+                ref.get("on_delete", "CASCADE"),
+            )
+            out.append(f"ALTER TABLE {t} ADD CONSTRAINT {fk} {clause}")
+        return out
+
     def render_alter_column(
         self,
         table: str,
@@ -1271,26 +1373,8 @@ class BaseDialect:
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
             else:
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT")
-        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
-            # The inline column UNIQUE renders as PostgreSQL's default-named
-            # constraint (<table>_<column>_key), so toggle that constraint.
-            uq = self.quote(f"{table}_{name}_key")
-            if new.get("unique"):
-                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
-            else:
-                out.append(f"ALTER TABLE {t} DROP CONSTRAINT IF EXISTS {uq}")
-        if old.get("fk") != new.get("fk"):
-            # Same story for the FOREIGN KEY constraint (<table>_<column>_fkey):
-            # drop and re-add it to change the target or ON DELETE action.
-            fk = self.quote(f"{table}_{name}_fkey")
-            out.append(f"ALTER TABLE {t} DROP CONSTRAINT IF EXISTS {fk}")
-            ref = new.get("fk")
-            if ref:
-                out.append(
-                    f"ALTER TABLE {t} ADD CONSTRAINT {fk} FOREIGN KEY ({col}) "
-                    f"REFERENCES {self.quote(ref['table'])} ({self.quote(ref['pk'])}) "
-                    f"ON DELETE {ref.get('on_delete', 'CASCADE')}"
-                )
+        out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
+        out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
 
     def render_rebuild_table(self, table: str, table_spec: dict[str, Any]) -> list[str]:
@@ -2443,6 +2527,18 @@ class MySQLDialect(BaseDialect):
         """
         return [f"DROP TABLE IF EXISTS {self.quote(table)}"]
 
+    # MySQL has no `DROP CONSTRAINT IF EXISTS`: a UNIQUE is an index (DROP
+    # INDEX), an FK is dropped with DROP FOREIGN KEY, and neither is idempotent.
+    fk_drop_if_exists = False
+
+    def _drop_unique_constraint_sql(self, uq: str) -> str:
+        """Drop a column's inline UNIQUE as an index (MySQL stores it as one)."""
+        return f"DROP INDEX {uq}"
+
+    def _drop_fk_constraint_sql(self, fk: str) -> str:
+        """Drop a column's FK with MySQL's ``DROP FOREIGN KEY`` spelling."""
+        return f"DROP FOREIGN KEY {fk}"
+
     def render_alter_column(
         self,
         table: str,
@@ -2484,24 +2580,8 @@ class MySQLDialect(BaseDialect):
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
             else:
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT")
-        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
-            uq = self.quote(f"{table}_{name}_key")
-            if new.get("unique"):
-                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
-            else:
-                # A UNIQUE constraint is an index in MySQL; DROP INDEX removes it.
-                out.append(f"ALTER TABLE {t} DROP INDEX {uq}")
-        if old.get("fk") != new.get("fk"):
-            fk = self.quote(f"{table}_{name}_fkey")
-            if old.get("fk"):
-                out.append(f"ALTER TABLE {t} DROP FOREIGN KEY {fk}")
-            ref = new.get("fk")
-            if ref:
-                out.append(
-                    f"ALTER TABLE {t} ADD CONSTRAINT {fk} FOREIGN KEY ({col}) "
-                    f"REFERENCES {self.quote(ref['table'])} ({self.quote(ref['pk'])}) "
-                    f"ON DELETE {ref.get('on_delete', 'CASCADE')}"
-                )
+        out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
+        out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
 
     def render_drop_index(
@@ -3161,6 +3241,17 @@ class OracleDialect(BaseDialect):
         """
         return [f"ALTER TABLE {self.quote(table)} ADD ({self.render_column_def(name, spec)})"]
 
+    # Oracle drops both a UNIQUE and an FK by named constraint (no IF EXISTS).
+    fk_drop_if_exists = False
+
+    def _drop_unique_constraint_sql(self, uq: str) -> str:
+        """Drop a column's inline UNIQUE by named constraint (Oracle)."""
+        return f"DROP CONSTRAINT {uq}"
+
+    def _drop_fk_constraint_sql(self, fk: str) -> str:
+        """Drop a column's FK by named constraint (Oracle)."""
+        return f"DROP CONSTRAINT {fk}"
+
     def render_alter_column(
         self,
         table: str,
@@ -3200,25 +3291,8 @@ class OracleDialect(BaseDialect):
                 )
             else:
                 out.append(f"ALTER TABLE {t} MODIFY ({col} DEFAULT NULL)")
-        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
-            uq = self.quote(f"{table}_{name}_key")
-            if new.get("unique"):
-                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
-            else:
-                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {uq}")
-        if old.get("fk") != new.get("fk"):
-            fk = self.quote(f"{table}_{name}_fkey")
-            if old.get("fk"):
-                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {fk}")
-            ref = new.get("fk")
-            if ref:
-                clause = self._fk_clause(
-                    col,
-                    self.quote(ref["table"]),
-                    self.quote(ref["pk"]),
-                    ref.get("on_delete", "CASCADE"),
-                )
-                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {fk} {clause}")
+        out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
+        out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
 
     def render_drop_index(
@@ -4022,6 +4096,17 @@ class SqlServerDialect(BaseDialect):
         """
         return [f"ALTER TABLE {self.quote(table)} ADD {self.render_column_def(name, spec)}"]
 
+    # SQL Server drops both a UNIQUE and an FK by named constraint (no IF EXISTS).
+    fk_drop_if_exists = False
+
+    def _drop_unique_constraint_sql(self, uq: str) -> str:
+        """Drop a column's inline UNIQUE by named constraint (SQL Server)."""
+        return f"DROP CONSTRAINT {uq}"
+
+    def _drop_fk_constraint_sql(self, fk: str) -> str:
+        """Drop a column's FK by named constraint (SQL Server)."""
+        return f"DROP CONSTRAINT {fk}"
+
     def render_alter_column(
         self,
         table: str,
@@ -4065,25 +4150,8 @@ class SqlServerDialect(BaseDialect):
         if type_changed or null_changed:
             null = "NULL" if new.get("null") else "NOT NULL"
             out.append(f"ALTER TABLE {t} ALTER COLUMN {col} {self._spec_type(new)} {null}")
-        if bool(old.get("unique")) != bool(new.get("unique")) and not new.get("pk"):
-            uq = self.quote(f"{table}_{name}_key")
-            if new.get("unique"):
-                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})")
-            else:
-                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {uq}")
-        if old.get("fk") != new.get("fk"):
-            fk = self.quote(f"{table}_{name}_fkey")
-            if old.get("fk"):
-                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {fk}")
-            ref = new.get("fk")
-            if ref:
-                clause = self._fk_clause(
-                    col,
-                    self.quote(ref["table"]),
-                    self.quote(ref["pk"]),
-                    ref.get("on_delete", "CASCADE"),
-                )
-                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {fk} {clause}")
+        out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
+        out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
 
     def render_drop_index(
