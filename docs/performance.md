@@ -26,15 +26,15 @@ PostgreSQL 18, Apple Silicon, Python 3.12, N=5000, median of 5 (ms, lower is bet
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
-| bulk_insert   | 14.7 | 25.7 | 81.6 | 222.9 | 39.7 | 53.2 | 523.6 | 236.4 | 99.2 |
-| single_insert | 34.5 | 81.2 | 156.1 | 61.5 | 40.8 | 48.2 | 53.7 | 163.7 | 88.8 |
-| fetch_all     | 3.5 | 17.3 | 31.1 | 35.3 | 9.2 | 12.3 | 26.5 | 55.6 | 4.3 |
-| count         | 0.3 | 0.6 | 1.0 | 0.4 | 0.4 | 0.4 | 0.3 | 4.9 | 0.4 |
-| group_by      | 0.8 | 1.0 | 1.6 | 2.3 | 1.1 | 0.9 | 0.6 | - | 1.0 |
-| filter        | 2.2 | 9.1 | 8.7 | 17.8 | 5.3 | 7.1 | 9.0 | 21.3 | 2.6 |
-| get_by_pk     | 65.3 | 197.7 | 297.3 | 85.1 | 114.9 | 115.5 | 23.5 | 329.1 | 194.2 |
-| update        | 3.3 | 3.5 | 4.1 | 121.3 | 3.4 | 3.6 | 3.3 | 14.4 | 3.6 |
-| delete        | 0.7 | 0.8 | 1.1 | 95.1 | 0.8 | 0.7 | 0.6 | 2.4 | 0.9 |
+| bulk_insert   | 14.7 | 24.2 | 78.0 | 222.8 | 40.6 | 51.7 | 526.3 | 229.8 | 99.2 |
+| single_insert | 34.4 | 80.7 | 153.1 | 61.8 | 40.5 | 47.1 | 53.5 | 167.4 | 89.5 |
+| fetch_all     | 3.6 | 17.0 | 29.4 | 34.5 | 9.1 | 11.9 | 26.6 | 56.7 | 4.3 |
+| count         | 0.3 | 0.6 | 1.0 | 0.4 | 0.4 | 0.3 | 0.3 | 5.4 | 0.4 |
+| group_by      | 0.7 | 1.0 | 1.6 | 2.4 | 1.0 | 0.8 | 0.6 | - | 1.0 |
+| filter        | 2.3 | 9.1 | 8.1 | 17.9 | 5.3 | 6.7 | 9.1 | 42.2 | 2.6 |
+| get_by_pk     | 65.1 | 196.3 | 292.6 | 85.3 | 115.7 | 114.1 | 23.8 | 333.1 | 196.1 |
+| update        | 3.3 | 3.6 | 4.0 | 120.8 | 3.4 | 3.4 | 3.3 | 15.0 | 3.5 |
+| delete        | 0.7 | 0.8 | 1.1 | 94.3 | 0.8 | 0.7 | 0.6 | 2.4 | 0.8 |
 
 `group_by` is a `GROUP BY … COUNT/SUM … HAVING` aggregate query (Ormar has no
 GROUP BY API, hence `-`).
@@ -43,15 +43,15 @@ GROUP BY API, hence `-`).
 
 | operation     | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
 |---------------|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
-| bulk_insert   | 1.8× | 5.6× | 15.2× | 2.7× | 3.6× | 35.7× | 16.1× | 6.8× |
-| single_insert | 2.4× | 4.5× | 1.8× | 1.2× | 1.4× | 1.6× | 4.8× | 2.6× |
-| fetch_all     | 5.0× | 8.9× | 10.1× | 2.6× | 3.5× | 7.6× | 15.9× | 1.2× |
-| count         | 1.9× | 3.5× | 1.5× | 1.4× | 1.5× | 1.1× | 16.6× | 1.5× |
-| group_by      | 1.3× | 2.1× | 2.9× | 1.3× | 1.1× | 0.7× | - | 1.2× |
-| filter        | 4.1× | 3.9× | 8.0× | 2.4× | 3.2× | 4.1× | 9.6× | 1.2× |
-| get_by_pk     | 3.0× | 4.6× | 1.3× | 1.8× | 1.8× | 0.4× | 5.0× | 3.0× |
-| update        | 1.1× | 1.2× | 36.5× | 1.0× | 1.1× | 1.0× | 4.3× | 1.1× |
-| delete        | 1.2× | 1.6× | 139.1× | 1.1× | 1.0× | 0.9× | 3.6× | 1.3× |
+| bulk_insert   | 1.6x | 5.3x | 15.2x | 2.8x | 3.5x | 35.8x | 15.6x | 6.7x |
+| single_insert | 2.3x | 4.5x | 1.8x | 1.2x | 1.4x | 1.6x | 4.9x | 2.6x |
+| fetch_all     | 4.7x | 8.2x | 9.6x | 2.5x | 3.3x | 7.4x | 15.8x | 1.2x |
+| count         | 2.0x | 3.3x | 1.3x | 1.3x | 1.0x | 1.0x | 18.0x | 1.3x |
+| group_by      | 1.4x | 2.3x | 3.4x | 1.4x | 1.1x | 0.9x | - | 1.4x |
+| filter        | 4.0x | 3.5x | 7.8x | 2.3x | 2.9x | 4.0x | 18.3x | 1.1x |
+| get_by_pk     | 3.0x | 4.5x | 1.3x | 1.8x | 1.8x | 0.4x | 5.1x | 3.0x |
+| update        | 1.1x | 1.2x | 36.6x | 1.0x | 1.0x | 1.0x | 4.5x | 1.1x |
+| delete        | 1.1x | 1.6x | 134.7x | 1.1x | 1.0x | 0.9x | 3.4x | 1.1x |
 
 Yara ORM is fastest or tied on every operation; the only place any ORM edges ahead is
 **SQLObject** on `get_by_pk` (0.4× — 23.5 vs 65.3 ms), where its lean in-process sync
@@ -70,20 +70,20 @@ ORMs over pymysql. Piccolo has no MySQL backend, so it is absent here:
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|
-| bulk_insert   | 47.3 | 53.9 | 568.7 | 403.1 | 91.3 | 83.3 | 974.9 | 236.3 |
-| single_insert | 627.2 | 766.7 | 1043.6 | 867.9 | 751.7 | 798.9 | 867.2 | 1367.5 |
-| fetch_all     | 6.1 | 34.0 | 45.7 | 48.8 | 29.1 | 28.0 | 42.9 | 75.5 |
-| count         | 0.5 | 0.9 | 1.2 | 0.9 | 0.9 | 0.8 | 0.7 | 5.3 |
-| group_by      | 1.2 | 1.4 | 2.1 | 2.6 | 1.5 | 1.2 | 1.0 | - |
-| filter        | 3.3 | 17.8 | 15.8 | 25.2 | 15.2 | 14.9 | 16.7 | 31.0 |
-| get_by_pk     | 110.3 | 212.5 | 484.1 | 275.9 | 200.9 | 195.8 | 58.7 | 804.8 |
-| update        | 6.3 | 11.1 | 10.4 | 222.2 | 9.9 | 7.5 | 7.3 | 10.9 |
-| delete        | 4.9 | 5.5 | 5.9 | 192.4 | 5.4 | 4.8 | 4.9 | 8.4 |
+| bulk_insert   | 49.8 | 50.9 | 600.9 | 443.8 | 89.2 | 88.7 | 1185.8 | 221.7 |
+| single_insert | 605.4 | 816.9 | 1058.2 | 904.5 | 848.3 | 795.2 | 875.4 | 1183.9 |
+| fetch_all     | 5.6 | 33.4 | 44.2 | 48.4 | 29.0 | 28.0 | 43.8 | 73.3 |
+| count         | 0.5 | 0.9 | 1.2 | 0.8 | 1.0 | 1.0 | 0.8 | 4.6 |
+| group_by      | 1.2 | 1.4 | 2.0 | 2.5 | 1.5 | 1.2 | 1.0 | - |
+| filter        | 3.3 | 17.4 | 15.8 | 25.3 | 15.6 | 14.8 | 17.1 | 30.5 |
+| get_by_pk     | 128.3 | 226.7 | 524.1 | 312.5 | 211.7 | 206.2 | 65.8 | 925.0 |
+| update        | 7.0 | 7.4 | 8.2 | 236.3 | 7.2 | 10.1 | 6.9 | 8.8 |
+| delete        | 5.2 | 4.8 | 5.4 | 210.0 | 6.4 | 5.0 | 5.1 | 7.2 |
 
 Yara ORM is fastest or tied on every operation here too (`fetch_all` 4.6–12.4×,
 `filter` 4.5–9.3×, `get_by_pk` 1.8–7.3×), except SQLObject's leaner `get_by_pk` (0.5×) and the sub-millisecond `group_by` where peewee/SQLObject edge it (0.8×).
 The two latency-bound operations include the Docker-network round trip, and
-`single_insert` (~0.6–1.4 s across the board) is dominated by InnoDB's per-commit
+`single_insert` (~0.6–1.2 s across the board) is dominated by InnoDB's per-commit
 fsync — a durability cost every ORM pays equally.
 
 ## MariaDB
@@ -97,20 +97,20 @@ backend, so it is absent here:
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|
-| bulk_insert   | 23.7 | 37.6 | 102.2 | 397.7 | 88.6 | 56.7 | 1086.1 | 209.5 |
-| single_insert | 315.0 | 345.9 | 494.6 | 388.8 | 367.1 | 284.5 | 365.5 | 599.5 |
-| fetch_all     | 5.5 | 34.5 | 27.7 | 47.8 | 28.6 | 29.2 | 42.7 | 71.3 |
-| count         | 0.4 | 0.7 | 1.1 | 0.7 | 0.8 | 0.9 | 0.7 | 5.7 |
-| group_by      | 1.1 | 1.3 | 2.0 | 2.2 | 1.5 | 1.2 | 0.9 | - |
-| filter        | 3.5 | 17.4 | 16.6 | 24.4 | 15.0 | 15.5 | 16.9 | 32.0 |
-| get_by_pk     | 107.3 | 211.6 | 482.3 | 262.8 | 195.7 | 189.8 | 57.2 | 808.3 |
-| update        | 3.5 | 3.6 | 7.6 | 232.3 | 3.9 | 3.8 | 3.7 | 7.7 |
-| delete        | 2.8 | 2.8 | 3.2 | 220.1 | 3.3 | 2.7 | 2.8 | 3.5 |
+| bulk_insert   | 30.5 | 41.5 | 99.0 | 455.0 | 87.7 | 59.5 | 1257.2 | 191.2 |
+| single_insert | 392.8 | 304.8 | 430.8 | 329.6 | 343.6 | 367.3 | 359.8 | 555.3 |
+| fetch_all     | 5.5 | 34.0 | 42.5 | 47.9 | 28.4 | 30.4 | 44.9 | 72.8 |
+| count         | 0.5 | 0.8 | 1.2 | 0.7 | 0.7 | 0.8 | 0.7 | 4.7 |
+| group_by      | 1.3 | 1.3 | 2.1 | 2.2 | 1.5 | 1.1 | 0.9 | - |
+| filter        | 3.2 | 17.8 | 16.0 | 24.5 | 15.5 | 14.7 | 16.9 | 31.9 |
+| get_by_pk     | 123.3 | 228.7 | 534.1 | 310.7 | 214.5 | 206.0 | 66.0 | 916.1 |
+| update        | 3.8 | 3.3 | 6.5 | 265.9 | 4.3 | 4.3 | 4.2 | 7.6 |
+| delete        | 3.2 | 3.2 | 3.3 | 249.9 | 3.3 | 3.0 | 2.9 | 3.6 |
 
 Yara ORM leads or ties every operation except SQLObject's leaner `get_by_pk`
 (0.5×) and the sub-millisecond `group_by` (SQLObject 0.8×). It wins the throughput
 ops decisively (`fetch_all` 5.0–12.9×, `filter` 4.4–9.3×, `bulk_insert` up to 46×
-vs SQLObject). MariaDB's `single_insert` (~315 ms) is notably faster than
+vs SQLObject). MariaDB's `single_insert` (~390 ms) is notably faster than
 MySQL 8's here — a lighter default commit path.
 
 ## SQLite
@@ -121,15 +121,15 @@ Python 3.12, N=5000, median of 5 (ms, lower is better).
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
-| bulk_insert   | 8.0 | 14.2 | 612.4 | 53.0 | 57.9 | 29.0 | 232.1 | 140.8 | 77.2 |
-| single_insert | 32.6 | 29.0 | 231.1 | 118.6 | 130.4 | 121.0 | 131.3 | 306.8 | 242.2 |
-| fetch_all     | 3.5 | 39.6 | 28.9 | 52.3 | 15.8 | 12.5 | 48.0 | 54.3 | 9.1 |
-| count         | 0.1 | 0.2 | 0.7 | 0.2 | 0.2 | 0.2 | 0.1 | 1.7 | 0.4 |
-| group_by      | 0.5 | 0.7 | 1.4 | 1.6 | 0.9 | 0.7 | 0.5 | - | 1.0 |
-| filter        | 2.0 | 20.0 | 7.7 | 26.7 | 8.5 | 6.8 | 17.6 | 20.1 | 5.0 |
-| get_by_pk     | 47.5 | 85.9 | 330.0 | 31.7 | 84.1 | 77.8 | 13.9 | 497.0 | 357.2 |
-| update        | 0.5 | 0.5 | 1.8 | 43.5 | 1.3 | 1.2 | 1.0 | 1.7 | 1.6 |
-| delete        | 0.4 | 0.3 | 1.2 | 36.6 | 0.8 | 0.8 | 0.7 | 1.2 | 1.1 |
+| bulk_insert   | 7.9 | 14.4 | 612.7 | 51.0 | 58.1 | 30.7 | 223.1 | 158.0 | 78.8 |
+| single_insert | 32.6 | 29.3 | 240.0 | 128.3 | 139.0 | 114.7 | 139.9 | 323.2 | 259.1 |
+| fetch_all     | 3.4 | 39.7 | 28.8 | 51.0 | 16.3 | 12.5 | 44.9 | 54.8 | 9.1 |
+| count         | 0.1 | 0.3 | 0.7 | 0.2 | 0.2 | 0.1 | 0.1 | 1.7 | 0.5 |
+| group_by      | 0.5 | 0.8 | 1.4 | 1.5 | 0.9 | 0.7 | 0.5 | - | 1.0 |
+| filter        | 2.0 | 20.5 | 7.7 | 26.2 | 8.5 | 6.7 | 17.3 | 19.6 | 5.1 |
+| get_by_pk     | 47.4 | 87.5 | 330.9 | 30.7 | 83.6 | 77.7 | 13.3 | 501.8 | 359.5 |
+| update        | 0.6 | 0.5 | 1.8 | 43.1 | 1.3 | 1.2 | 1.2 | 1.6 | 1.4 |
+| delete        | 0.4 | 0.4 | 1.2 | 36.3 | 0.9 | 0.7 | 0.8 | 1.3 | 1.2 |
 
 Yara ORM wins the throughput-bound operations decisively (`bulk_insert` 1.8–77×, `fetch_all`
 2.6–15×, `filter` 2.5–13× across the field). It trails only on **latency-bound point reads**:

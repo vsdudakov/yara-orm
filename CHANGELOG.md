@@ -6,6 +6,8 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-07-06
+
 ### Added
 
 - **MariaDB support — first-class backend.**
@@ -119,6 +121,47 @@ All notable changes to **yara-orm** are documented here. The format is based on
   column hydrates as `uuid.UUID` rather than a raw string. Surfaced by MariaDB's
   RETURNING support; applies to any backend whose RETURNING returns a
   non-native column type.
+- **Abstract base no longer hijacks a subclass's primary key.** An abstract base
+  that declared no pk had an `id` serial auto-injected, which a concrete subclass
+  inherited — so a subclass naming its pk differently (`ref = UUIDField(pk=True)`)
+  had that pk silently demoted to a plain column plus a spurious `id`. A pk the
+  class declares itself now supersedes and drops the inherited auto-`id`.
+- **`bulk_update` on a relation field is correct and safe.** It read the relation
+  accessor (an unresolved `ForwardRelation` awaitable when only `<name>_id` was
+  set) and bound it verbatim; it now reads the FK backing column. A target column
+  that was never loaded (`only()`/`defer()`) now raises `FieldError` instead of
+  silently writing `NULL` — an FK source column has no descriptor, so the old
+  `getattr` default swallowed the miss and wiped the foreign key.
+- **`__not_in` against a `Subquery` keeps NULL rows**, matching the literal-list
+  form (`NULL NOT IN (...)` is UNKNOWN, so a bare `NOT IN` dropped a nullable
+  column's NULL rows).
+- **SQL Server `LIKE` escapes `[`.** `[` is a T-SQL character-class metacharacter,
+  so a `__contains`/`__startswith` value such as `a[bc]` silently broadened the
+  match; it is now escaped (other backends are unaffected).
+- **SQL Server resets the session isolation level on connection reuse.**
+  `SET TRANSACTION ISOLATION LEVEL` is session-persistent in T-SQL, so a
+  `SERIALIZABLE` transaction leaked its level onto later checkouts of the pooled
+  connection; recycle now resets to `READ COMMITTED`.
+- **MySQL no longer fabricates a stale synthetic primary key.** A fetched
+  UPDATE/DELETE could return a bogus `[id]` row from a connection-level
+  `last_insert_id` left by an earlier INSERT; only the statement's own id is used.
+- **Migration `applied_at` is stored as naive UTC**, matching its (tz-naive)
+  tracking column, instead of an aware datetime that some backends shift or reject.
+- **Cleaner binding errors from the engine.** A NaN/±Inf (or out-of-`Decimal`-range)
+  float bound to a `NUMERIC` column is rejected instead of misencoding float bytes;
+  a JSON integer above `i64::MAX` decodes exactly (through `u64`); and Oracle
+  surfaces a decode error for an unhandled driver value shape rather than storing
+  its debug string.
+
+### Performance
+
+- **Faster model construction** — `Model.__init__` routes only the fields whose
+  `to_python_value` is overridden through the coercion call (≈1.18× faster
+  construction on the `create`/`bulk_create` path). Raw dict queries intern each
+  result set's column names once instead of once per row.
+- **Benchmark suite refreshed** — the cross-ORM numbers, tables and charts were
+  re-measured against the current engine (PostgreSQL 18 / MySQL 8 / MariaDB 11 /
+  SQLite, Apple Silicon, N=5000, median of 5).
 
 ## [1.13.1] - 2026-07-04
 
