@@ -2267,17 +2267,78 @@ class QuerySet(Generic[ModelT]):
         for obj in await self._fetch():
             yield obj
 
+    def _terminal_field(self, path: str) -> Field | None:
+        """Resolve a ``values()``/``values_list()`` path to the field it selects.
+
+        Mirrors :meth:`_resolve_column`'s traversal but returns the terminal
+        :class:`Field` (so the caller can apply that field's dialect read
+        decoder), or ``None`` when the path does not map to a single model field
+        — the caller then leaves the raw DB value untouched.
+
+        Args:
+            path: A local column, ``pk``, a relation name, or a (possibly
+                multi-level) ``rel__...__col`` path.
+
+        Returns:
+            The terminal ``Field``, or ``None`` when the path has no single
+            owning field.
+        """
+        meta = self.model._meta
+        if "__" not in path:
+            if path == "pk":
+                return meta.pk_field
+            if path in meta.fields:
+                return meta.get_field(path)
+            info = meta.relations.get(path)
+            if info is not None:
+                return info.resolve_target()._meta.pk_field
+            return None
+
+        segments = path.split("__")
+        cur_meta = meta
+        for i, seg in enumerate(segments):
+            last = i == len(segments) - 1
+            info = cur_meta.relations.get(seg)
+            if info is not None:
+                cur_meta = info.resolve_target()._meta
+                if last:
+                    return cur_meta.pk_field
+            elif last:
+                return cur_meta.get_field(seg) if seg in cur_meta.fields else None
+            elif cur_meta is meta and len(segments) == 2:
+                # A single reverse-FK / M2M hop, e.g. ``tags__name``.
+                _relmod = _rel()
+                descriptor = getattr(self.model, seg, None)
+                if isinstance(descriptor, _relmod.ReverseFKDescriptor):
+                    tmeta = registry.get_model(descriptor.source_reference)._meta
+                elif isinstance(descriptor, _relmod.M2MDescriptor):
+                    dinfo = descriptor.info
+                    dinfo.finalize()
+                    target = dinfo.owner if descriptor.reverse else dinfo.resolve_target()
+                    tmeta = target._meta
+                else:
+                    return None
+                col = segments[1]
+                return tmeta.get_field(col) if col in tmeta.fields else None
+            else:
+                return None
+        return None
+
     async def _fetch_columns(self, field_paths: tuple[str, ...]) -> list[Any]:
-        """Fetch raw rows for the given column paths without building models.
+        """Fetch rows for the given column paths without building models.
 
         Each path may traverse a relation (``"author__name"``); the needed
-        ``LEFT JOIN`` is added automatically via :meth:`_resolve_column`.
+        ``LEFT JOIN`` is added automatically via :meth:`_resolve_column`. Each
+        column is decoded with its field's dialect read decoder, so a
+        ``values()``/``values_list()`` value has the same Python type as the
+        attribute on a hydrated instance (e.g. a SQLite ``DecimalField`` comes
+        back as ``Decimal``, not the raw ``str`` the driver returns).
 
         Args:
             field_paths: The field names/paths whose columns to select.
 
         Returns:
-            The raw database rows for the selected columns.
+            The decoded database rows for the selected columns.
         """
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
@@ -2299,7 +2360,23 @@ class QuerySet(Generic[ModelT]):
             f"SELECT {distinct}{cols} FROM {table}{''.join(joins.values())}{where}"
             f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{lock}"
         )
-        return await engine.fetch_rows(sql, params)
+        rows = await engine.fetch_rows(sql, params)
+        # Decode each column through its field's dialect read decoder so the
+        # value matches instance-attribute hydration. Paths that don't map to a
+        # single field (or need no decoder) are left as the driver returned them.
+        decoders = [
+            (i, decoder)
+            for i, path in enumerate(field_paths)
+            if (field := self._terminal_field(path)) is not None
+            and (decoder := dialect.read_decoder(field)) is not None
+        ]
+        if not decoders:
+            return rows
+        for row in rows:
+            for i, decoder in decoders:
+                if row[i] is not None:
+                    row[i] = decoder(row[i])
+        return rows
 
     def _grouped_select_sql(
         self, dialect: BaseDialect, fields: tuple[str, ...] = ()

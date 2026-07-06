@@ -55,7 +55,25 @@ class VtBook(Model):
         table = "vt_book"
 
 
-MODELS = [VtCountry, VtPublisher, VtTag, VtAuthor, VtBook]
+class VtLedger(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=20)
+    balance = fields.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        table = "vt_ledger"
+
+
+class VtEntry(Model):
+    id = fields.IntField(pk=True)
+    amount = fields.DecimalField(max_digits=12, decimal_places=2)
+    ledger = fields.ForeignKeyField("VtLedger", related_name="entries")
+
+    class Meta:
+        table = "vt_entry"
+
+
+MODELS = [VtCountry, VtPublisher, VtTag, VtAuthor, VtBook, VtLedger, VtEntry]
 
 
 async def _seed():
@@ -275,6 +293,52 @@ async def test_values_invalid_deep_relation_path_raises(db):
     await _seed()
     with pytest.raises(FieldError):
         await VtBook.all().values("tags__book__title")
+
+
+@pytest.mark.asyncio
+async def test_values_decode_field_types(db):
+    """
+    GIVEN a model with a DecimalField
+    WHEN reading it through values()/values_list() (tuple and flat)
+    THEN each value is decoded to the field's Python type (``Decimal``),
+        matching instance-attribute hydration rather than the raw DB string
+        SQLite returns (regression: values() skipped read decoders).
+    """
+    from decimal import Decimal
+
+    await VtLedger.create(name="Main", balance=Decimal("100.50"))
+
+    row = (await VtLedger.all().values("name", "balance"))[0]
+    assert row["balance"] == Decimal("100.50")
+    assert isinstance(row["balance"], Decimal)
+
+    pair = (await VtLedger.all().values_list("name", "balance"))[0]
+    assert pair[1] == Decimal("100.50")
+    assert isinstance(pair[1], Decimal)
+
+    flat = await VtLedger.all().values_list("balance", flat=True)
+    assert flat == [Decimal("100.50")]
+    assert isinstance(flat[0], Decimal)
+
+
+@pytest.mark.asyncio
+async def test_values_traversed_field_decoded(db):
+    """
+    GIVEN an entry whose forward relation carries a DecimalField
+    WHEN values() traverses to that related column (ledger__balance)
+    THEN the traversed value is decoded to ``Decimal`` too (the decode path
+        resolves the terminal field across the relation hop)
+    """
+    from decimal import Decimal
+
+    ledger = await VtLedger.create(name="Main", balance=Decimal("100.50"))
+    await VtEntry.create(amount=Decimal("12.30"), ledger=ledger)
+
+    row = (await VtEntry.all().values("amount", "ledger__balance"))[0]
+    assert row["amount"] == Decimal("12.30")
+    assert isinstance(row["amount"], Decimal)
+    assert row["ledger__balance"] == Decimal("100.50")
+    assert isinstance(row["ledger__balance"], Decimal)
 
 
 @pytest.mark.asyncio
