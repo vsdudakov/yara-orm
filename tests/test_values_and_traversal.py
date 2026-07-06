@@ -55,7 +55,46 @@ class VtBook(Model):
         table = "vt_book"
 
 
-MODELS = [VtCountry, VtPublisher, VtTag, VtAuthor, VtBook]
+class VtLedger(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=20)
+    balance = fields.DecimalField(max_digits=12, decimal_places=2)
+    # Nullable decoded column: a NULL value must skip the read decoder.
+    reserve = fields.DecimalField(max_digits=12, decimal_places=2, null=True)
+
+    class Meta:
+        table = "vt_ledger"
+
+
+class VtEntry(Model):
+    id = fields.IntField(pk=True)
+    amount = fields.DecimalField(max_digits=12, decimal_places=2)
+    ledger = fields.ForeignKeyField("VtLedger", related_name="entries")
+
+    class Meta:
+        table = "vt_entry"
+
+
+class VtDoc(Model):
+    # A non-int (uuid) primary key: on MySQL/Oracle/SQL Server it is stored as
+    # text and needs a read decoder, so projecting a relation to it exercises
+    # the pk decode path.
+    ref = fields.UUIDField(pk=True)
+    title = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "vt_doc"
+
+
+class VtNote(Model):
+    id = fields.IntField(pk=True)
+    doc = fields.ForeignKeyField("VtDoc", related_name="notes")
+
+    class Meta:
+        table = "vt_note"
+
+
+MODELS = [VtCountry, VtPublisher, VtTag, VtAuthor, VtBook, VtLedger, VtEntry, VtDoc, VtNote]
 
 
 async def _seed():
@@ -278,6 +317,52 @@ async def test_values_invalid_deep_relation_path_raises(db):
 
 
 @pytest.mark.asyncio
+async def test_values_decode_field_types(db):
+    """
+    GIVEN a model with a DecimalField
+    WHEN reading it through values()/values_list() (tuple and flat)
+    THEN each value is decoded to the field's Python type (``Decimal``),
+        matching instance-attribute hydration rather than the raw DB string
+        SQLite returns (regression: values() skipped read decoders).
+    """
+    from decimal import Decimal
+
+    await VtLedger.create(name="Main", balance=Decimal("100.50"))
+
+    row = (await VtLedger.all().values("name", "balance"))[0]
+    assert row["balance"] == Decimal("100.50")
+    assert isinstance(row["balance"], Decimal)
+
+    pair = (await VtLedger.all().values_list("name", "balance"))[0]
+    assert pair[1] == Decimal("100.50")
+    assert isinstance(pair[1], Decimal)
+
+    flat = await VtLedger.all().values_list("balance", flat=True)
+    assert flat == [Decimal("100.50")]
+    assert isinstance(flat[0], Decimal)
+
+
+@pytest.mark.asyncio
+async def test_values_traversed_field_decoded(db):
+    """
+    GIVEN an entry whose forward relation carries a DecimalField
+    WHEN values() traverses to that related column (ledger__balance)
+    THEN the traversed value is decoded to ``Decimal`` too (the decode path
+        resolves the terminal field across the relation hop)
+    """
+    from decimal import Decimal
+
+    ledger = await VtLedger.create(name="Main", balance=Decimal("100.50"))
+    await VtEntry.create(amount=Decimal("12.30"), ledger=ledger)
+
+    row = (await VtEntry.all().values("amount", "ledger__balance"))[0]
+    assert row["amount"] == Decimal("12.30")
+    assert isinstance(row["amount"], Decimal)
+    assert row["ledger__balance"] == Decimal("100.50")
+    assert isinstance(row["ledger__balance"], Decimal)
+
+
+@pytest.mark.asyncio
 async def test_order_by_random(db):
     """
     GIVEN a set of rows
@@ -287,3 +372,62 @@ async def test_order_by_random(db):
     await _seed()
     titles = await VtBook.all().order_by("?").values_list("title", flat=True)
     assert sorted(titles) == ["A1", "A2", "B1"]
+
+
+@pytest.mark.asyncio
+async def test_values_annotate_decodes_field_columns(db):
+    """
+    GIVEN a ledger with entries and a DecimalField balance
+    WHEN annotate()/group_by() + values() projects that field
+    THEN the field column is decoded to Decimal, not the raw driver value
+
+    Regression: the grouped/annotated projection path skipped read decoders,
+    so annotate(...).values("balance") returned a raw str on SQLite.
+    """
+    from decimal import Decimal
+
+    ledger = await VtLedger.create(name="Main", balance=Decimal("100.50"))
+    await VtEntry.create(amount=Decimal("12.30"), ledger=ledger)
+    await VtEntry.create(amount=Decimal("7.70"), ledger=ledger)
+
+    # annotate(...).values(field) — including a NULL nullable decoded column,
+    # which must skip the decoder rather than fail.
+    row = (await VtLedger.annotate(n=Count("entries")).values("balance", "reserve", "n"))[0]
+    assert row["balance"] == Decimal("100.50")
+    assert isinstance(row["balance"], Decimal)
+    assert row["reserve"] is None
+    assert row["n"] == 2  # the aggregate is left untouched
+
+    # group_by(field).annotate(agg).values(...)
+    grouped = await (
+        VtLedger.all()
+        .group_by("balance")
+        .annotate(total=Sum("entries__amount"))
+        .values("balance", "total")
+    )
+    assert isinstance(grouped[0]["balance"], Decimal)
+    assert grouped[0]["balance"] == Decimal("100.50")
+
+
+@pytest.mark.asyncio
+async def test_values_relation_pk_decoded_consistently(db):
+    """
+    GIVEN a note whose forward relation has a non-int (uuid) primary key
+    WHEN values() projects the bare relation, its ``__pk`` alias, and the id col
+    THEN all three return the same decoded uuid.UUID (not a raw str)
+
+    Regression: values("doc__pk") and the bare relation skipped the read decoder
+    on backends that store uuid as text (MySQL/Oracle/SQL Server), so they
+    diverged from the hydrated attribute type.
+    """
+    import uuid
+
+    doc = await VtDoc.create(ref=uuid.uuid4(), title="D1")
+    await VtNote.create(doc=doc)
+
+    bare = (await VtNote.all().values_list("doc", flat=True))[0]
+    via_pk = (await VtNote.all().values_list("doc__pk", flat=True))[0]
+    via_col = (await VtNote.all().values_list("doc_id", flat=True))[0]
+    assert bare == via_pk == via_col == doc.ref
+    assert isinstance(bare, uuid.UUID)
+    assert isinstance(via_pk, uuid.UUID)

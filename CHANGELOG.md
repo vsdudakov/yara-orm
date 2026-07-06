@@ -6,6 +6,20 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`values()` / `values_list()` now decode column values to their field's
+  Python type.** Previously these projections returned whatever the driver
+  handed back, skipping the per-field read decoder that instance hydration
+  applies — so on SQLite a `DecimalField` came back as `str` (and, on backends
+  that don't express a type natively, a `UUIDField`/`DatetimeField` was
+  likewise under-converted), while `obj.field` on a hydrated instance returned
+  a `Decimal`. Arithmetic on a `values_list(...)` decimal therefore raised
+  `TypeError: can't multiply sequence by non-int of type 'str'`. Each projected
+  column (including values that traverse a relation, e.g. `ledger__balance`) is
+  now decoded through the same dialect read decoder as instance attributes, so
+  a `values()`/`values_list()` value has the same type as `obj.field`.
+
 ## [1.14.0] - 2026-07-06
 
 ### Added
