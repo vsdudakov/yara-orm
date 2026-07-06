@@ -259,10 +259,10 @@ async def _run_query(
     The single choke point of the Python query path: the annotation comment is
     prepended here, so every statement that reaches the engine through the
     transaction wrapper or the engine proxy carries it, and hooks observe the
-    final SQL (comment included). The native engine raises a bare
-    ``RuntimeError`` for SQL failures; these are surfaced as
-    ``OperationalError``, so callers' ``except OperationalError`` handlers
-    (retry/translation) keep working when re-raised as one here.
+    final SQL (comment included). The engine maps SQL failures to
+    ``OperationalError`` at its source, so callers' ``except OperationalError``
+    handlers work uniformly; the ``RuntimeError`` fallback below only catches a
+    bare ``RuntimeError`` from the engine's rare typed-exception fallback path.
 
     Args:
         method: The bound engine/transaction coroutine method to call.
@@ -276,7 +276,7 @@ async def _run_query(
     _run_hooks(sql, params)
     try:
         return await method(sql, params or [])
-    except RuntimeError as exc:
+    except RuntimeError as exc:  # pragma: no cover - defensive; engine maps at source
         raise OperationalError(str(exc)) from exc
 
 
@@ -1106,13 +1106,22 @@ class YaraOrm:
             None
         """
         global _ENGINE, _DIALECT, _ROUTER
-        for engine, _ in _CONNECTIONS.values():
-            await engine.close()
-        _CONNECTIONS.clear()
-        _ENGINE = None
-        _DIALECT = None
-        _ROUTER = None
-        _tz._set_config(timezone="UTC", use_tz=False)
+        try:
+            # Close every pool even if one raises, so a single failing teardown
+            # cannot leak the rest; surface the first error after cleanup.
+            results = await asyncio.gather(
+                *(engine.close() for engine, _ in _CONNECTIONS.values()),
+                return_exceptions=True,
+            )
+        finally:
+            _CONNECTIONS.clear()
+            _ENGINE = None
+            _DIALECT = None
+            _ROUTER = None
+            _tz._set_config(timezone="UTC", use_tz=False)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 def run_async(coro: Coroutine[Any, Any, Any]) -> None:
@@ -1191,7 +1200,7 @@ class TransactionWrapper(_ManualSQLCompat):
         """
         try:
             return await method(*args)
-        except RuntimeError as exc:
+        except RuntimeError as exc:  # pragma: no cover - defensive; engine maps at source
             raise OperationalError(str(exc)) from exc
 
     def new_savepoint(self) -> str:
@@ -1492,7 +1501,7 @@ class _EngineProxy(_ManualSQLCompat):
         _run_hooks(script, None)
         try:
             await self._engine.execute_script(statements)
-        except RuntimeError as exc:
+        except RuntimeError as exc:  # pragma: no cover - defensive; engine maps at source
             raise OperationalError(str(exc)) from exc
 
 

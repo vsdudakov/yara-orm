@@ -76,6 +76,10 @@ pub fn to_pyerr(e: EngineError) -> PyErr {
         EngineError::Connection(_) => typed_pyerr("DBConnectionError", e.to_string()),
         EngineError::Conversion(_) => typed_pyerr("OperationalError", e.to_string()),
         EngineError::Integrity(msg) => typed_pyerr("IntegrityError", msg.clone()),
-        EngineError::Query(_) => PyRuntimeError::new_err(e.to_string()),
+        // Query failures (bad SQL, deadlocks, serialization failures) land in the
+        // ORM hierarchy so callers can catch `OperationalError` uniformly — the
+        // default hot path returns the engine directly (no proxy translation),
+        // and retry loops need a stable, catchable type.
+        EngineError::Query(_) => typed_pyerr("OperationalError", e.to_string()),
     }
 }

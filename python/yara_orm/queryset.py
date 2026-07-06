@@ -2438,28 +2438,34 @@ class QuerySet(Generic[ModelT]):
             ``flat`` is ``True``.
         """
         paths = fields or tuple(self.model._meta.fields.keys())
-        return _ValuesQuery(lambda: self._values_list_impl(fields, flat), self, paths)
+        return _ValuesQuery(
+            lambda limit=None: self._values_list_impl(fields, flat, limit), self, paths
+        )
 
     async def _values_list_impl(
         self,
         fields: tuple[str, ...],
         flat: bool,
+        limit: int | None = None,
     ) -> list[tuple[Any, ...]] | list[Any]:
         """Execute the ``values_list`` query and return its rows.
 
         Args:
             fields: Field names/paths to select; empty for all model fields.
             flat: When ``True`` return scalar values for a single field.
+            limit: Optional row cap applied to the query (used by ``first()`` so
+                it fetches a single row rather than the whole result set).
 
         Returns:
             A list of tuples, or a list of scalars when ``flat`` is ``True``.
         """
-        if self._annotations or self._group_by:
+        q = self if limit is None else self.limit(limit)
+        if q._annotations or q._group_by:
             if not fields:
-                return await self._values_grouped(fields, as_dict=False)
+                return await q._values_grouped(fields, as_dict=False)
             # The grouped SELECT also carries the group-by columns, so project
             # down to exactly the requested fields (by name) before tupling.
-            dict_rows = await self._values_grouped(fields, as_dict=True)
+            dict_rows = await q._values_grouped(fields, as_dict=True)
             if flat:
                 if len(fields) != 1:
                     raise FieldError("flat=True requires exactly one field")
@@ -2469,9 +2475,9 @@ class QuerySet(Generic[ModelT]):
         if flat:
             if len(paths) != 1:
                 raise FieldError("flat=True requires exactly one field")
-            rows = await self._fetch_columns(paths)
+            rows = await q._fetch_columns(paths)
             return [r[0] for r in rows]
-        rows = await self._fetch_columns(paths)
+        rows = await q._fetch_columns(paths)
         return [tuple(r) for r in rows]
 
     def values(self, *fields: str, **aliases: str) -> _ValuesQuery:
@@ -2494,25 +2500,30 @@ class QuerySet(Generic[ModelT]):
             paths: tuple[str, ...] = tuple(self.model._meta.fields.keys())
         else:
             paths = tuple(fields) + tuple(aliases.values())
-        return _ValuesQuery(lambda: self._values_impl(fields, aliases), self, paths)
+        return _ValuesQuery(
+            lambda limit=None: self._values_impl(fields, aliases, limit), self, paths
+        )
 
     async def _values_impl(
-        self, fields: tuple[str, ...], aliases: dict[str, str]
+        self, fields: tuple[str, ...], aliases: dict[str, str], limit: int | None = None
     ) -> list[dict[str, Any]]:
         """Execute the ``values`` query and return its dict rows.
 
         Args:
             fields: Field names/paths to select; empty for all model fields.
             aliases: ``output_name -> field_path`` pairs.
+            limit: Optional row cap applied to the query (used by ``first()`` so
+                it fetches a single row rather than the whole result set).
 
         Returns:
             A list of dicts mapping each requested name to its value.
         """
-        if self._annotations or self._group_by:
+        q = self if limit is None else self.limit(limit)
+        if q._annotations or q._group_by:
             # Select the requested fields plus any alias source paths (which may
             # traverse a relation), then remap to the requested output names.
             sources = fields + tuple(aliases.values())
-            rows = await self._values_grouped(sources, as_dict=True)
+            rows = await q._values_grouped(sources, as_dict=True)
             if not sources:
                 return rows
             out: list[dict[str, Any]] = []
@@ -2527,7 +2538,7 @@ class QuerySet(Generic[ModelT]):
         else:
             names = tuple(fields) + tuple(aliases.keys())
             paths = tuple(fields) + tuple(aliases.values())
-        rows = await self._fetch_columns(paths)
+        rows = await q._fetch_columns(paths)
         return [dict(zip(names, r)) for r in rows]
 
     async def get(self, **kwargs: Any) -> ModelT:
@@ -2977,14 +2988,15 @@ class _ValuesQuery:
 
     def __init__(
         self,
-        run: Callable[[], Awaitable[list[Any]]],
+        run: Callable[..., Awaitable[list[Any]]],
         queryset: QuerySet[Any] | None = None,
         paths: tuple[str, ...] | None = None,
     ) -> None:
-        """Wrap the zero-arg coroutine factory that runs the projection.
+        """Wrap the coroutine factory that runs the projection.
 
         Args:
-            run: A callable returning the awaitable that fetches the rows.
+            run: A callable returning the awaitable that fetches the rows; it
+                accepts an optional row ``limit`` (``first()`` passes ``1``).
             queryset: The source query set, retained so the projection can also
                 render itself as a subquery (``Subquery(qs.values_list(...))``).
             paths: The projected column paths, used when rendering the subquery.
@@ -3042,7 +3054,7 @@ class _ValuesQuery:
         Returns:
             The first row, or ``None``.
         """
-        rows = await self._run()
+        rows = await self._run(1)
         return rows[0] if rows else None
 
 

@@ -180,11 +180,12 @@ async def test_errors_are_deferred_to_the_await(sync_orm):
     """
     GIVEN a raw engine call against a missing table
     WHEN the statement method is called on the fast path
-    THEN the call itself does not raise; the error surfaces on await
+    THEN the call itself does not raise; the error surfaces on await as an
+         OperationalError (query failures route through the ORM hierarchy)
     """
     engine = get_engine()
     awaitable = engine.fetch_rows("SELECT * FROM sp_missing")  # no raise here
-    with pytest.raises(RuntimeError, match="sp_missing"):
+    with pytest.raises(OperationalError, match="sp_missing"):
         await awaitable
 
 

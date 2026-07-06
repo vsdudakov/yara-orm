@@ -129,6 +129,32 @@ class MyMigThing(Model):
 MODELS = [MyAuthor, MyTag, MyPost, MyEverything, MyGuidRow, MyStamped, MyStampedFetch]
 
 
+def _attach_field(model, name, field):
+    """Simulate a model gaining a field, for a live migration-diff test."""
+    field.model_field_name = name
+    field.db_column = name
+    meta = model._meta
+    meta.fields[name] = field
+    meta.field_list.append(field)
+    meta.decoders.append((name, None if field.read_identity else field.to_python))
+    meta._compiled_for = None
+
+
+def _detach_field(model, name):
+    """Remove a field previously attached with :func:`_attach_field`."""
+    meta = model._meta
+    field = meta.fields.pop(name)
+    meta.field_list.remove(field)
+    meta.decoders = [(n, d) for (n, d) in meta.decoders if n != name]
+    meta._compiled_for = None
+
+
+def _replace_field(model, name, field):
+    """Swap an existing field for a new one, preserving its position."""
+    _detach_field(model, name)
+    _attach_field(model, name, field)
+
+
 # -- schema + CRUD round-trip --------------------------------------------------
 
 
@@ -631,4 +657,48 @@ async def test_migration_manager_end_to_end(db, tmp_path):
         assert heads and all(h["applied"] for h in heads)
         assert await mgr.downgrade(steps=1) == ["0001_initial"]
     finally:
+        await _cleanup()
+
+
+@pytest.mark.asyncio
+async def test_migration_add_and_alter_field_end_to_end(db, tmp_path):
+    """
+    GIVEN a managed model created by an initial migration
+    WHEN a nullable column is added, then widened, via generated migrations
+    THEN the AddField and AlterField DDL applies on every backend (exercising the
+         Oracle ``ADD (...)`` / T-SQL ``ADD``/``ALTER COLUMN`` spellings live) and
+         the column stays usable across both changes
+    """
+    engine = get_engine()
+
+    async def _cleanup() -> None:
+        for tbl in ("my_be_mig_thing", "orm_migrations"):
+            await engine.execute(f'DROP TABLE IF EXISTS "{tbl}"')
+
+    await _cleanup()
+    mgr = MigrationManager(directory=str(tmp_path), app="parity", models=[MyMigThing])
+    try:
+        mgr.make_migrations(name="initial")
+        await mgr.upgrade()
+
+        # AddField -> render_add_column on the live backend.
+        _attach_field(MyMigThing, "score", fields.IntField(null=True))
+        assert mgr.make_migrations(name="add_score") == "0002_add_score.py"
+        assert await mgr.upgrade() == ["0002_add_score"]
+        row = await MyMigThing.create(name="r", score=5)
+        assert (await MyMigThing.get(id=row.id)).score == 5
+
+        # AlterField (widen int -> bigint) -> render_alter_column on the backend.
+        # (Avoid re-SELECTing the retyped column on the same connection: on
+        # PostgreSQL a plan cached before the ALTER raises "cached plan must not
+        # change result type". Instead prove the widening by storing a value that
+        # overflows a 32-bit int and counting it.)
+        _replace_field(MyMigThing, "score", fields.BigIntField(null=True))
+        assert mgr.make_migrations(name="widen_score") == "0003_widen_score.py"
+        assert await mgr.upgrade() == ["0003_widen_score"]
+        await MyMigThing.create(name="big", score=5_000_000_000)
+        assert await MyMigThing.filter(name="big").count() == 1
+    finally:
+        if "score" in MyMigThing._meta.fields:
+            _detach_field(MyMigThing, "score")
         await _cleanup()
