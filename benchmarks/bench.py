@@ -112,7 +112,12 @@ def drop_sql(table: str) -> str:
 
 def ours_url() -> str:
     if BACKEND == "sqlite":
-        return f"sqlite://{SQLITE_DIR}/bench_ours.db"
+        # SQLite is in-process (no I/O to overlap), so the recommended config
+        # drives statements synchronously on the calling thread instead of the
+        # async bridge — the right choice for an embedded DB and how yara-orm is
+        # deployed on SQLite. The competitors' aiosqlite pays the async cost for
+        # no benefit here.
+        return f"sqlite://{SQLITE_DIR}/bench_ours.db?sync_fast_path=1"
     if BACKEND in ("mysql", "mariadb"):
         return mysql_family_url()
     if BACKEND == "oracle":
