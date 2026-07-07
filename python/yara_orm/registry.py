@@ -226,7 +226,10 @@ def resolve_relations() -> None:
                             target,
                             related_name,
                             M2MDescriptor(
-                                info, target._meta.pk_field.model_field_name, reverse=True
+                                info,
+                                target._meta.pk_field.model_field_name,
+                                reverse=True,
+                                name=related_name,
                             ),
                         )
                     continue  # already installed by a previous resolve pass
@@ -240,6 +243,8 @@ def resolve_relations() -> None:
             setattr(
                 target,
                 related_name,
-                M2MDescriptor(info, target._meta.pk_field.model_field_name, reverse=True),
+                M2MDescriptor(
+                    info, target._meta.pk_field.model_field_name, reverse=True, name=related_name
+                ),
             )
     _RESOLVED["done"] = True

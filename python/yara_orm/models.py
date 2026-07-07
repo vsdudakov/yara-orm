@@ -43,6 +43,36 @@ if TYPE_CHECKING:
 #: ``fetch_for_list``), so the caller's model type is preserved.
 _ModelT = TypeVar("_ModelT", bound="Model")
 
+#: Every attribute :meth:`MetaInfo.compile` (and the ``_build_decode_plan`` it
+#: calls) produces for one dialect. A compiled plan is stable per (model,
+#: dialect), so these are snapshotted per dialect name and restored wholesale
+#: when a model alternates dialects, instead of recompiling from scratch. This
+#: list MUST stay complete: a missing attribute would keep another dialect's
+#: value after a restore. ``_partial_update_cache`` is intentionally absent — it
+#: is already keyed by dialect name and shared across all of them.
+_COMPILED_PLAN_ATTRS = (
+    "_read_decoders",
+    "decoders",
+    "decoder_names",
+    "active_decoders",
+    "auto_now_fields",
+    "validated_fields",
+    "coerced_fields",
+    "db_default_fields",
+    "_simple_lookup_cache",
+    "_partial_plan_cache",
+    "columns_sql",
+    "select_prefix",
+    "insert_fields",
+    "insert_returning_fields",
+    "insert_refresh_fields",
+    "insert_refresh_sql",
+    "insert_sql",
+    "update_field_list",
+    "update_sql",
+    "delete_sql",
+)
+
 
 class MetaInfo:
     """Resolved metadata for a model: table name, fields and primary key.
@@ -141,6 +171,10 @@ class MetaInfo:
         # keyed by the ordered selected field names, so a partial SELECT reuses
         # the same ``(names, active_decoders)`` split as the full-row fast path.
         self._partial_plan_cache: dict[tuple[str, ...], tuple[list[str], list[tuple]]] = {}
+        # Per-dialect compiled plans (see ``_COMPILED_PLAN_ATTRS``), keyed by
+        # dialect name. Lets a model that alternates dialects restore a prior
+        # dialect's plan instead of recompiling it every switch.
+        self._compiled_plans: dict[str, dict[str, Any]] = {}
 
     def partial_decode_plan(self, fields: list[Field]) -> tuple[list[str], list[tuple]]:
         """Return the cached ``(names, active_decoders)`` plan for a subset.
@@ -303,6 +337,23 @@ class MetaInfo:
         """
         if self._compiled_for == dialect.name:
             return
+        if self._compiled_for is None:
+            # ``_compiled_for = None`` is the "field set changed, recompile"
+            # signal (construction, migrations). That invalidates *every* cached
+            # plan, not just the current dialect's, so drop them all and rebuild.
+            self._compiled_plans.clear()
+        else:
+            # A genuine dialect switch: the field set is unchanged, so a plan
+            # built for ``dialect`` earlier is still exact. Restore it verbatim
+            # rather than recompiling — no re-quoting columns or regenerating
+            # placeholders. The restored cache dicts are the same objects captured
+            # at build time, so entries accumulated since (partial plans,
+            # simple-lookup SQL) survive.
+            cached = self._compiled_plans.get(dialect.name)
+            if cached is not None:
+                self.__dict__.update(cached)
+                self._compiled_for = dialect.name
+                return
         # The field set may have changed since construction (migrations); refresh
         # the hydration plan so it stays in sync with the current columns. The
         # converters come from the dialect (``read_decoder``) so a backend can
@@ -312,7 +363,9 @@ class MetaInfo:
         self.decoders = [
             (f.model_field_name, self._read_decoders[f.model_field_name]) for f in self.field_list
         ]
-        self._partial_plan_cache.clear()
+        # Fresh dict (not ``.clear()``): any prior dialect's plan snapshot holds a
+        # reference to its own cache, which clearing in place would corrupt.
+        self._partial_plan_cache = {}
         self._build_decode_plan()
         q = dialect.quote
         self.columns_sql = ", ".join(q(f.db_column) for f in self.field_list)
@@ -382,6 +435,10 @@ class MetaInfo:
             self.update_sql = None
         self.delete_sql = f"DELETE FROM {q(self.table)} WHERE {pk_col} = {dialect.placeholder(1)}"
         self._compiled_for = dialect.name
+        # Snapshot this dialect's plan so a later switch back restores it in O(1)
+        # instead of rebuilding. The dicts are captured by reference, so caches
+        # populated later (partial plans, simple-lookup SQL) stay visible here.
+        self._compiled_plans[dialect.name] = {k: getattr(self, k) for k in _COMPILED_PLAN_ATTRS}
 
     def partial_update_sql(self, dialect: BaseDialect, fields: list[Field]) -> str:
         """Return a cached ``UPDATE`` statement writing only ``fields`` by pk.
@@ -790,7 +847,7 @@ class ModelMeta(type):
         for rel_name, mm in {**inherited_m2m, **m2m_decls}.items():
             info = M2MInfo(rel_name, mm, cls, mm.reference)
             m2m[rel_name] = info
-            setattr(cls, rel_name, M2MDescriptor(info, pk_field.model_field_name))
+            setattr(cls, rel_name, M2MDescriptor(info, pk_field.model_field_name, name=rel_name))
 
         # Abstract bases contribute their fields to subclasses but have no table
         # of their own, so they stay out of the registry (schema generation,

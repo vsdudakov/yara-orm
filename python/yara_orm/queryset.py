@@ -789,7 +789,12 @@ class QuerySet(Generic[ModelT]):
         # back so the path compiles as a relation lookup. Genuine transforms on a
         # scalar column (`created__year`) and relation-key lookups (`tags__in`,
         # where `Tag` has no `in` member) are unaffected.
-        if op != "exact" and "__" not in base:
+        #
+        # `base in meta.fields` short-circuits the common case: relation names
+        # never land in `meta.fields` (only their source column does), so a base
+        # that is a plain scalar column cannot be the relation this fix targets —
+        # skip the `_relation_target` probe on that hot path.
+        if op != "exact" and "__" not in base and base not in meta.fields:
             target = self._relation_target(base)
             if target is not None:
                 tmeta = target._meta
