@@ -11,6 +11,8 @@ import pytest
 
 from yara_orm.dialects import (
     BaseDialect,
+    MariaDbDialect,
+    MySQLDialect,
     OracleDialect,
     PostgresDialect,
     SqliteDialect,
@@ -25,6 +27,8 @@ LITE = SqliteDialect()
 BASE = BaseDialect()
 ORA = OracleDialect()
 MSSQL = SqlServerDialect()
+MYSQL = MySQLDialect()
+MARIA = MariaDbDialect()
 
 
 @pytest.mark.parametrize(
@@ -488,9 +492,67 @@ def test_mssql_alter_column_unique_and_fk_add_then_drop():
     back = "\n".join(MSSQL.render_alter_column("t", "n", new, old, {}))
     assert "DROP CONSTRAINT [t_n_key]" in back
     assert "DROP CONSTRAINT [t_n_fkey]" in back
-    # A pk column never gets a UNIQUE constraint even if the flag flips.
+    # Promoting a column to primary key emits ADD PRIMARY KEY but never a
+    # redundant UNIQUE constraint even though the unique flag also flips.
     pk_new = {**INT, "unique": True, "pk": True}
-    assert MSSQL.render_alter_column("t", "n", old, pk_new, {}) == []
+    promoted = MSSQL.render_alter_column("t", "n", old, pk_new, {})
+    assert promoted == ["ALTER TABLE [t] ADD PRIMARY KEY ([n])"]
+    assert not any("UNIQUE" in stmt for stmt in promoted)
+
+
+def test_mysql_literal_escapes_backslashes():
+    r"""
+    GIVEN a string containing a backslash (e.g. a Windows path in a COMMENT)
+    WHEN rendered as a MySQL/MariaDB string literal
+    THEN the backslash is doubled (MySQL processes backslash escapes) so it
+         cannot escape the closing quote and splice the surrounding DDL
+    """
+    # One trailing backslash -> doubled; a lone base-dialect literal would leave
+    # it single and let it escape the closing quote.
+    assert MYSQL._literal("C:\\") == "'C:\\\\'"
+    assert MARIA._literal("C:\\") == "'C:\\\\'"
+    # Quotes are still doubled, and both escapes compose.
+    assert MYSQL._literal("a'b\\c") == "'a''b\\\\c'"
+    # The ANSI base dialect leaves the backslash single (correct for PostgreSQL).
+    assert BASE._literal("C:\\") == "'C:\\'"
+
+
+@pytest.mark.parametrize(
+    ("dialect", "add_sql", "drop_sql"),
+    [
+        (PG, 'ALTER TABLE "t" ADD PRIMARY KEY ("n")', 'ALTER TABLE "t" DROP CONSTRAINT "t_pkey"'),
+        (MYSQL, "ALTER TABLE `t` ADD PRIMARY KEY (`n`)", "ALTER TABLE `t` DROP PRIMARY KEY"),
+        (MARIA, "ALTER TABLE `t` ADD PRIMARY KEY (`n`)", "ALTER TABLE `t` DROP PRIMARY KEY"),
+        (ORA, 'ALTER TABLE "t" ADD PRIMARY KEY ("n")', 'ALTER TABLE "t" DROP PRIMARY KEY'),
+    ],
+)
+def test_alter_column_toggles_primary_key(dialect, add_sql, drop_sql):
+    """
+    GIVEN a column whose primary-key flag is turned on, then off
+    WHEN rendered on an in-place dialect
+    THEN it emits ADD PRIMARY KEY promoting it and the dialect's DROP spelling
+         demoting it (so a pk change is no longer silently dropped by the diff)
+    """
+    old = dict(INT)
+    pk_new = {**INT, "pk": True}
+    assert dialect.render_alter_column("t", "n", old, pk_new, {}) == [add_sql]
+    assert dialect.render_alter_column("t", "n", pk_new, old, {}) == [drop_sql]
+
+
+def test_mssql_rejects_primary_key_drop():
+    """
+    GIVEN a column demoted from primary key on SQL Server
+    WHEN rendered
+    THEN it raises (the pk is an auto-named constraint a migration cannot
+         target), while promotion still emits ADD PRIMARY KEY
+    """
+    old = dict(INT)
+    pk_new = {**INT, "pk": True}
+    assert MSSQL.render_alter_column("t", "n", old, pk_new, {}) == [
+        "ALTER TABLE [t] ADD PRIMARY KEY ([n])"
+    ]
+    with pytest.raises(UnSupportedError):
+        MSSQL.render_alter_column("t", "n", pk_new, old, {})
 
 
 def test_mssql_drop_index_and_composite_need_the_table():

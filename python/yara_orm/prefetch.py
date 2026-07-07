@@ -194,14 +194,18 @@ async def _prefetch_one(
     # Many-to-many (forward or reverse); the descriptor is always installed on
     # the class for m2m relations, so an isinstance check covers both cases.
     if isinstance(descriptor, M2MDescriptor):
-        await _prefetch_m2m(instances, name, descriptor, to_attr)
+        await _prefetch_m2m(instances, name, descriptor, to_attr, custom_qs)
         return
 
     raise ValueError(f"Cannot prefetch unknown relation {name!r} on {model.__name__}")
 
 
 async def _prefetch_m2m(
-    instances: Sequence[Model], name: str, descriptor: M2MDescriptor, to_attr: str | None = None
+    instances: Sequence[Model],
+    name: str,
+    descriptor: M2MDescriptor,
+    to_attr: str | None = None,
+    custom_qs: QuerySet[Any] | None = None,
 ) -> None:
     """Prefetch a many-to-many relation with a single join query.
 
@@ -211,6 +215,9 @@ async def _prefetch_m2m(
         descriptor: Descriptor describing the M2M relation.
         to_attr: When set, store the result on this attribute instead of the
             relation accessor.
+        custom_qs: A constrained ``Prefetch(..., queryset=...)`` whose
+            filters/ordering must shape the loaded rows; ``None`` loads the
+            whole relation with a single join query.
 
     Returns:
         None
@@ -238,6 +245,29 @@ async def _prefetch_m2m(
     through = q(info.through)
     pks = [i.pk for i in instances]
     holes = ", ".join(dialect.placeholder(i + 1) for i in range(len(pks)))
+
+    if custom_qs is not None:
+        # A constrained queryset can carry arbitrary WHERE/ORDER BY (and more)
+        # that a raw join cannot express, so load in two steps: read the
+        # owner<->target links from the through table, then fetch the targets
+        # through the queryset so its filters/ordering apply. The custom order
+        # is preserved per owner by distributing the ordered rows into groups.
+        link_sql = (
+            f"SELECT {q(near_key)}, {q(far_key)} FROM {through} WHERE {q(near_key)} IN ({holes})"
+        )
+        links = await engine.fetch_rows(link_sql, pks)
+        owners_by_far: dict = {}
+        for near, far in ((row[0], row[1]) for row in links):
+            owners_by_far.setdefault(far, []).append(near)
+        far_pks = list(owners_by_far)
+        objs = await custom_qs.filter(pk__in=far_pks) if far_pks else []
+        grouped = {i.pk: [] for i in instances}
+        for obj in objs:
+            for owner_id in owners_by_far.get(obj.pk, ()):
+                grouped[owner_id].append(obj)
+        _assign(instances, name, to_attr, {i: grouped.get(i.pk, []) for i in instances})
+        return
+
     cols = ", ".join(f"{ttbl}.{q(f.db_column)}" for f in tmeta.field_list)
     sql = (
         f"SELECT {through}.{q(near_key)}, {cols} FROM {ttbl} "
@@ -245,7 +275,7 @@ async def _prefetch_m2m(
         f"WHERE {through}.{q(near_key)} IN ({holes})"
     )
     rows = await engine.fetch_rows(sql, pks)
-    grouped: dict = {}
+    grouped = {}
     for row in rows:
         owner_id = row[0]
         grouped.setdefault(owner_id, []).append(target._from_db_row(row[1:]))

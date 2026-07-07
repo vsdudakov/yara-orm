@@ -521,6 +521,24 @@ def _int_to_db(value: Any) -> Any:
     return int(value) if isinstance(value, str) else value
 
 
+def _float_to_db(value: Any) -> Any:
+    """Coerce a numeric string to ``float`` before binding.
+
+    The float analog of :func:`_int_to_db`: a float column filtered or populated
+    with a string (``score__in={"1.5", "2.0"}``, a ``str`` from an external
+    system) binds as ``float`` rather than text — otherwise PostgreSQL rejects it
+    with 'operator does not exist: double precision = text'. Non-string values
+    (incl. ``bool``, ``F``, ``None``) pass through unchanged.
+
+    Args:
+        value: The Python value about to be bound.
+
+    Returns:
+        ``float(value)`` for a string, otherwise ``value`` unchanged.
+    """
+    return float(value) if isinstance(value, str) else value
+
+
 def _str_to_db(value: Any) -> Any:
     """Coerce a non-string scalar to ``str`` before binding to a text column.
 
@@ -670,6 +688,17 @@ class FloatField(Field[VT]):
             The value as a ``float``, or ``None``.
         """
         return None if value is None else float(value)
+
+    def to_db(self, value: Any) -> Any:
+        """Coerce a numeric-string value to ``float`` before binding.
+
+        Args:
+            value: The Python value about to be bound.
+
+        Returns:
+            ``float(value)`` for a string, otherwise ``value`` unchanged.
+        """
+        return _float_to_db(value)
 
 
 class DecimalField(Field[VT]):

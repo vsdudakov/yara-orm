@@ -136,7 +136,10 @@ impl PgBackend {
         } else {
             Manager::from_config(pg_config, make_tls_connector()?, mgr_config)
         };
-        let max_size = params.max_size.unwrap_or(DEFAULT_MAX_SIZE);
+        // Clamp to at least 1 (like the mysql/mssql/oracle backends): a
+        // `?max_size=0` URL would otherwise build a zero-capacity pool, leaving
+        // `held` empty and panicking on the `held[0]` pre-warm probe below.
+        let max_size = params.max_size.unwrap_or(DEFAULT_MAX_SIZE).max(1);
         let pool = Pool::builder(mgr)
             .max_size(max_size)
             // Pin every connection to UTC. The engine stores and returns all

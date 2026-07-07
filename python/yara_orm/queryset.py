@@ -728,6 +728,32 @@ class QuerySet(Generic[ModelT]):
         )
         return tmeta, join
 
+    def _relation_target(self, name: str) -> type[Model] | None:
+        """Return the model a relation segment points at, or ``None``.
+
+        Resolves a single relation segment — a forward FK/O2O
+        (``meta.relations``), a reverse FK, or a many-to-many — to the related
+        model. ``None`` when ``name`` is a plain field or not a relation at all.
+
+        Args:
+            name: A single (non-``__``) segment naming a possible relation.
+
+        Returns:
+            The related model class, or ``None``.
+        """
+        rel = _rel()
+        meta = self.model._meta
+        if name in meta.relations:
+            return meta.relations[name].resolve_target()
+        descriptor = getattr(self.model, name, None)
+        if isinstance(descriptor, rel.ReverseFKDescriptor):
+            return registry.get_model(descriptor.source_reference)
+        if isinstance(descriptor, rel.M2MDescriptor):
+            info = descriptor.info
+            info.finalize()
+            return info.owner if descriptor.reverse else info.resolve_target()
+        return None
+
     def _compile_lookup(
         self,
         key: str,
@@ -754,6 +780,21 @@ class QuerySet(Generic[ModelT]):
 
         meta = self.model._meta
         base, op = _split_lookup(key)
+
+        # `_split_lookup` peels a trailing lookup-named token purely by spelling,
+        # so `slot__date` (FK `slot`, `Slot.date` a DateField) wrongly parses as
+        # the `date` transform applied to the FK's integer column. When the base
+        # is a relation and the related model actually has a member named `op`,
+        # the token is the traversal's terminal field, not a transform — put it
+        # back so the path compiles as a relation lookup. Genuine transforms on a
+        # scalar column (`created__year`) and relation-key lookups (`tags__in`,
+        # where `Tag` has no `in` member) are unaffected.
+        if op != "exact" and "__" not in base:
+            target = self._relation_target(base)
+            if target is not None:
+                tmeta = target._meta
+                if op in tmeta.fields or op in tmeta.relations or op in tmeta.m2m:
+                    base, op = key, "exact"
 
         # A multi-segment path is either a JSON-column key path
         # (``data__key``/``data__a__b`` on a JSONField), a JSON ``__filter`` dict,
