@@ -286,40 +286,50 @@ MariaDB and uses its RETURNING dialect. Piccolo has no MySQL backend:
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|
-| bulk_insert   | 30.5 | 41.5 | 99.0 | 455.0 | 87.7 | 59.5 | 1257.2 | 191.2 |
-| single_insert | 392.8 | 304.8 | 430.8 | 329.6 | 343.6 | 367.3 | 359.8 | 555.3 |
-| fetch_all     | 5.5 | 34.0 | 42.5 | 47.9 | 28.4 | 30.4 | 44.9 | 72.8 |
-| count         | 0.5 | 0.8 | 1.2 | 0.7 | 0.7 | 0.8 | 0.7 | 4.7 |
-| group_by      | 1.3 | 1.3 | 2.1 | 2.2 | 1.5 | 1.1 | 0.9 | - |
-| filter        | 3.2 | 17.8 | 16.0 | 24.5 | 15.5 | 14.7 | 16.9 | 31.9 |
-| get_by_pk     | 123.3 | 228.7 | 534.1 | 310.7 | 214.5 | 206.0 | 66.0 | 916.1 |
-| update        | 3.8 | 3.3 | 6.5 | 265.9 | 4.3 | 4.3 | 4.2 | 7.6 |
-| delete        | 3.2 | 3.2 | 3.3 | 249.9 | 3.3 | 3.0 | 2.9 | 3.6 |
+| bulk_insert   | 23.3 | 37.5 | 105.4 | 475.4 | 96.4 | 71.8 | 1266.5 | 209.9 |
+| single_insert | 264.9 | 311.6 | 531.7 | 391.5 | 388.2 | 372.2 | 390.3 | 660.0 |
+| fetch_all     | 5.7 | 35.0 | 43.8 | 48.1 | 28.1 | 37.0 | 42.6 | 72.1 |
+| count         | 0.5 | 0.8 | 1.2 | 0.7 | 0.7 | 0.8 | 0.6 | 6.7 |
+| group_by      | 1.2 | 1.3 | 2.3 | 2.2 | 1.5 | 1.4 | 0.9 | - |
+| filter        | 3.2 | 17.5 | 16.3 | 24.8 | 15.1 | 14.7 | 17.1 | 32.6 |
+| get_by_pk     | 132.9 | 240.8 | 575.0 | 306.7 | 220.7 | 206.5 | 64.4 | 895.2 |
+| update        | 4.0 | 4.4 | 7.8 | 266.3 | 5.4 | 4.2 | 3.7 | 8.2 |
+| delete        | 3.0 | 3.0 | 3.6 | 249.5 | 3.6 | 3.0 | 3.0 | 4.0 |
 
-(MariaDB's `single_insert` ~390 ms is markedly faster than MySQL 8's — a lighter
+(`single_insert`, `update` and `delete` are near ties across every ORM here
+because they're database-bound — single inserts are paced by MariaDB's
+per-commit disk fsync, and `update`/`delete` are one server-side set statement
+each — so there's no client-side marshaling for the Rust hot path to speed up.
+MariaDB's `single_insert` ~265 ms is markedly faster than MySQL 8's — a lighter
 default commit path.)
 
 ### SQLite
 
 ![Yara ORM vs eight Python ORMs on SQLite — latency per operation, log scale, lower is better](docs/assets/benchmark-sqlite.png)
 
+SQLite is in-process, so these use its recommended `sync_fast_path=1` config
+(statements run synchronously on the calling thread — no I/O to overlap):
+
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
-| bulk_insert   | 7.9 | 14.4 | 612.7 | 51.0 | 58.1 | 30.7 | 223.1 | 158.0 | 78.8 |
-| single_insert | 32.6 | 29.3 | 240.0 | 128.3 | 139.0 | 114.7 | 139.9 | 323.2 | 259.1 |
-| fetch_all     | 3.4 | 39.7 | 28.8 | 51.0 | 16.3 | 12.5 | 44.9 | 54.8 | 9.1 |
-| count         | 0.1 | 0.3 | 0.7 | 0.2 | 0.2 | 0.1 | 0.1 | 1.7 | 0.5 |
-| group_by      | 0.5 | 0.8 | 1.4 | 1.5 | 0.9 | 0.7 | 0.5 | - | 1.0 |
-| filter        | 2.0 | 20.5 | 7.7 | 26.2 | 8.5 | 6.7 | 17.3 | 19.6 | 5.1 |
-| get_by_pk     | 47.4 | 87.5 | 330.9 | 30.7 | 83.6 | 77.7 | 13.3 | 501.8 | 359.5 |
-| update        | 0.6 | 0.5 | 1.8 | 43.1 | 1.3 | 1.2 | 1.2 | 1.6 | 1.4 |
-| delete        | 0.4 | 0.4 | 1.2 | 36.3 | 0.9 | 0.7 | 0.8 | 1.3 | 1.2 |
+| bulk_insert   | 7.5 | 13.6 | 607.9 | 50.1 | 55.8 | 29.0 | 218.3 | 143.8 | 73.9 |
+| single_insert | 15.3 | 26.9 | 234.5 | 107.0 | 120.1 | 113.5 | 124.8 | 296.7 | 240.4 |
+| fetch_all     | 3.4 | 38.6 | 27.1 | 51.0 | 16.4 | 12.2 | 44.2 | 52.0 | 9.2 |
+| count         | 0.0 | 0.2 | 0.7 | 0.2 | 0.3 | 0.1 | 0.1 | 1.6 | 0.5 |
+| group_by      | 0.6 | 0.7 | 1.3 | 1.4 | 0.9 | 0.6 | 0.5 | - | 1.0 |
+| filter        | 2.0 | 20.2 | 7.3 | 25.8 | 8.7 | 6.6 | 17.4 | 19.2 | 5.0 |
+| get_by_pk     | 12.5 | 79.4 | 329.6 | 31.3 | 84.6 | 75.5 | 13.3 | 484.1 | 357.2 |
+| update        | 0.5 | 0.5 | 1.7 | 43.0 | 1.3 | 1.2 | 1.1 | 1.7 | 1.5 |
+| delete        | 0.3 | 0.4 | 1.1 | 35.9 | 0.8 | 0.7 | 0.7 | 1.1 | 1.1 |
 
-Yara ORM wins everything throughput-shaped (fetch_all 2.7–16×, filter 2.5–13×,
-bulk_insert 1.8–77×) and trails only the latency-bound point reads, where the
-per-statement asyncio bridge costs tens of µs against in-process sync ORMs
-(SQLObject and Pony on `get_by_pk`) — the opt-in `sqlite://...?sync_fast_path=1`
-URL flag removes that bridge entirely (point queries ~7× faster).
+With the fast path Yara ORM is fastest on **every** operation except the
+sub-millisecond `group_by` (SQLObject's hand-written raw SQL, 0.8×) — including
+the point reads it trailed on under the default async bridge (`get_by_pk` 1.1× vs
+SQLObject, 2.5× vs Pony), while staying far ahead on throughput (bulk_insert
+1.8–81×, fetch_all 2.7–15×, filter 2.5–13×). On the **default** async path the
+per-statement bridge costs tens of µs on sequential point reads, so SQLObject's
+lean sync active-record leads `get_by_pk` there; `sqlite://...?sync_fast_path=1`
+removes that bridge (~7× faster point queries).
 
 Speed comes from the Rust hot path, **positional row decoding** (no per-row dict
 or column-name allocation), **compiled-SQL + prepared-statement caching**, and

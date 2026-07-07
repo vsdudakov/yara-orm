@@ -213,13 +213,14 @@ fn py_to_json(ob: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     }
     if ob.is_instance_of::<PyFloat>() {
         // JSON has no representation for NaN/±Infinity; `serde_json::Value::from`
-        // would silently turn them into `null` (data corruption). Reject them
-        // explicitly, mirroring the Decimal('NaN')/Decimal('Infinity') branch.
+        // would silently turn them into `null` (data corruption). Preserve the
+        // value as its textual form ("inf"/"-inf"/"NaN") instead — this keeps
+        // the insert succeeding (raising would break rows that previously wrote)
+        // and matches `value_to_json`, so both JSON bind paths encode a
+        // non-finite float identically.
         let f = ob.extract::<f64>()?;
         if !f.is_finite() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "non-finite float (NaN/Infinity) has no JSON representation",
-            ));
+            return Ok(serde_json::Value::String(f.to_string()));
         }
         return Ok(serde_json::Value::from(f));
     }

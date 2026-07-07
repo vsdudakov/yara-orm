@@ -6,6 +6,7 @@ returns without a query, using a single query per relation (no N+1).
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -257,14 +258,30 @@ async def _prefetch_m2m(
         )
         links = await engine.fetch_rows(link_sql, pks)
         owners_by_far: dict = {}
-        for near, far in ((row[0], row[1]) for row in links):
+        for near, far in links:
             owners_by_far.setdefault(far, []).append(near)
-        far_pks = list(owners_by_far)
-        objs = await custom_qs.filter(pk__in=far_pks) if far_pks else []
-        grouped = {i.pk: [] for i in instances}
-        for obj in objs:
-            for owner_id in owners_by_far.get(obj.pk, ()):
-                grouped[owner_id].append(obj)
+        grouped: dict = {i.pk: [] for i in instances}
+        if custom_qs._limit is not None or custom_qs._offset is not None:
+            # A LIMIT/OFFSET/slice on the Prefetch queryset must apply *per
+            # owner* (e.g. "the 3 newest tags per book"), so run the queryset
+            # once per owner. A single `pk__in` over every owner's targets would
+            # apply the slice globally and starve owners outside the first window.
+            far_by_owner: dict = {}
+            for far, owner_ids in owners_by_far.items():
+                for owner_id in owner_ids:
+                    far_by_owner.setdefault(owner_id, []).append(far)
+            for owner_id, far_pks in far_by_owner.items():
+                grouped[owner_id] = list(await custom_qs.filter(pk__in=far_pks))
+        else:
+            # No slice: one batched query, then distribute the ordered rows into
+            # per-owner groups. A target shared by several owners gets a distinct
+            # instance per owner (like the join path's per-row `_from_db_row`), so
+            # mutating one owner's prefetched object cannot leak into another's.
+            far_pks = list(owners_by_far)
+            objs = await custom_qs.filter(pk__in=far_pks) if far_pks else []
+            for obj in objs:
+                for n, owner_id in enumerate(owners_by_far.get(obj.pk, ())):
+                    grouped[owner_id].append(obj if n == 0 else copy.copy(obj))
         _assign(instances, name, to_attr, {i: grouped.get(i.pk, []) for i in instances})
         return
 

@@ -97,51 +97,58 @@ backend, so it is absent here:
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|
-| bulk_insert   | 30.5 | 41.5 | 99.0 | 455.0 | 87.7 | 59.5 | 1257.2 | 191.2 |
-| single_insert | 392.8 | 304.8 | 430.8 | 329.6 | 343.6 | 367.3 | 359.8 | 555.3 |
-| fetch_all     | 5.5 | 34.0 | 42.5 | 47.9 | 28.4 | 30.4 | 44.9 | 72.8 |
-| count         | 0.5 | 0.8 | 1.2 | 0.7 | 0.7 | 0.8 | 0.7 | 4.7 |
-| group_by      | 1.3 | 1.3 | 2.1 | 2.2 | 1.5 | 1.1 | 0.9 | - |
-| filter        | 3.2 | 17.8 | 16.0 | 24.5 | 15.5 | 14.7 | 16.9 | 31.9 |
-| get_by_pk     | 123.3 | 228.7 | 534.1 | 310.7 | 214.5 | 206.0 | 66.0 | 916.1 |
-| update        | 3.8 | 3.3 | 6.5 | 265.9 | 4.3 | 4.3 | 4.2 | 7.6 |
-| delete        | 3.2 | 3.2 | 3.3 | 249.9 | 3.3 | 3.0 | 2.9 | 3.6 |
+| bulk_insert   | 23.3 | 37.5 | 105.4 | 475.4 | 96.4 | 71.8 | 1266.5 | 209.9 |
+| single_insert | 264.9 | 311.6 | 531.7 | 391.5 | 388.2 | 372.2 | 390.3 | 660.0 |
+| fetch_all     | 5.7 | 35.0 | 43.8 | 48.1 | 28.1 | 37.0 | 42.6 | 72.1 |
+| count         | 0.5 | 0.8 | 1.2 | 0.7 | 0.7 | 0.8 | 0.6 | 6.7 |
+| group_by      | 1.2 | 1.3 | 2.3 | 2.2 | 1.5 | 1.4 | 0.9 | - |
+| filter        | 3.2 | 17.5 | 16.3 | 24.8 | 15.1 | 14.7 | 17.1 | 32.6 |
+| get_by_pk     | 132.9 | 240.8 | 575.0 | 306.7 | 220.7 | 206.5 | 64.4 | 895.2 |
+| update        | 4.0 | 4.4 | 7.8 | 266.3 | 5.4 | 4.2 | 3.7 | 8.2 |
+| delete        | 3.0 | 3.0 | 3.6 | 249.5 | 3.6 | 3.0 | 3.0 | 4.0 |
 
 Yara ORM leads or ties every operation except SQLObject's leaner `get_by_pk`
 (0.5×) and the sub-millisecond `group_by` (SQLObject 0.8×). It wins the throughput
-ops decisively (`fetch_all` 5.0–12.9×, `filter` 4.4–9.3×, `bulk_insert` up to 46×
-vs SQLObject). MariaDB's `single_insert` (~390 ms) is notably faster than
-MySQL 8's here — a lighter default commit path.
+ops decisively (`fetch_all` 4.9–12.6×, `filter` 4.6–10.2×, `bulk_insert` up to
+54× vs SQLObject). `single_insert`, `update` and `delete` are near ties across every
+ORM because they are **database-bound**, not client-bound: single inserts are
+paced by MariaDB's per-commit disk fsync (high run-to-run variance), and
+`update`/`delete` are one server-side set statement each — the client just sends
+SQL and reads a rowcount, so there is no marshaling for the Rust hot path to
+accelerate. MariaDB's `single_insert` (~265 ms) is notably faster than MySQL 8's
+here — a lighter default commit path.
 
 ## SQLite
 
 ![Yara ORM vs eight Python ORMs on SQLite — latency per operation, log scale, lower is better](assets/benchmark-sqlite.png)
 
-Python 3.12, N=5000, median of 5 (ms, lower is better).
+Python 3.12, N=5000, median of 5 (ms, lower is better). SQLite is in-process, so
+these use its recommended [`sync_fast_path=1`](#opt-in-sqlite-sync-fast-path)
+config — statements run synchronously on the calling thread, since an embedded
+database has no I/O to overlap and the async bridge would be pure overhead.
 
 | operation     | yara-orm | tortoise | sqlalchemy | pony | django | peewee | sqlobject | ormar | piccolo |
 |---------------|---------:|---------:|-----------:|-----:|-------:|-------:|----------:|------:|--------:|
-| bulk_insert   | 7.9 | 14.4 | 612.7 | 51.0 | 58.1 | 30.7 | 223.1 | 158.0 | 78.8 |
-| single_insert | 32.6 | 29.3 | 240.0 | 128.3 | 139.0 | 114.7 | 139.9 | 323.2 | 259.1 |
-| fetch_all     | 3.4 | 39.7 | 28.8 | 51.0 | 16.3 | 12.5 | 44.9 | 54.8 | 9.1 |
-| count         | 0.1 | 0.3 | 0.7 | 0.2 | 0.2 | 0.1 | 0.1 | 1.7 | 0.5 |
-| group_by      | 0.5 | 0.8 | 1.4 | 1.5 | 0.9 | 0.7 | 0.5 | - | 1.0 |
-| filter        | 2.0 | 20.5 | 7.7 | 26.2 | 8.5 | 6.7 | 17.3 | 19.6 | 5.1 |
-| get_by_pk     | 47.4 | 87.5 | 330.9 | 30.7 | 83.6 | 77.7 | 13.3 | 501.8 | 359.5 |
-| update        | 0.6 | 0.5 | 1.8 | 43.1 | 1.3 | 1.2 | 1.2 | 1.6 | 1.4 |
-| delete        | 0.4 | 0.4 | 1.2 | 36.3 | 0.9 | 0.7 | 0.8 | 1.3 | 1.2 |
+| bulk_insert   | 7.5 | 13.6 | 607.9 | 50.1 | 55.8 | 29.0 | 218.3 | 143.8 | 73.9 |
+| single_insert | 15.3 | 26.9 | 234.5 | 107.0 | 120.1 | 113.5 | 124.8 | 296.7 | 240.4 |
+| fetch_all     | 3.4 | 38.6 | 27.1 | 51.0 | 16.4 | 12.2 | 44.2 | 52.0 | 9.2 |
+| count         | 0.0 | 0.2 | 0.7 | 0.2 | 0.3 | 0.1 | 0.1 | 1.6 | 0.5 |
+| group_by      | 0.6 | 0.7 | 1.3 | 1.4 | 0.9 | 0.6 | 0.5 | - | 1.0 |
+| filter        | 2.0 | 20.2 | 7.3 | 25.8 | 8.7 | 6.6 | 17.4 | 19.2 | 5.0 |
+| get_by_pk     | 12.5 | 79.4 | 329.6 | 31.3 | 84.6 | 75.5 | 13.3 | 484.1 | 357.2 |
+| update        | 0.5 | 0.5 | 1.7 | 43.0 | 1.3 | 1.2 | 1.1 | 1.7 | 1.5 |
+| delete        | 0.3 | 0.4 | 1.1 | 35.9 | 0.8 | 0.7 | 0.7 | 1.1 | 1.1 |
 
-Yara ORM wins the throughput-bound operations decisively (`bulk_insert` 1.8–77×, `fetch_all`
-2.6–15×, `filter` 2.5–13× across the field). It trails only on **latency-bound point reads**:
-in-process sync ORMs — SQLObject (`get_by_pk` 0.3×) and Pony (0.7×) — beat us there (plus the
-microsecond `group_by`, where SQLObject's raw-SQL path is a hair ahead at 0.9×). The cost
-is the per-statement asyncio bridge (scheduling the statement on the runtime and waking the
-event loop), tens of microseconds that a synchronous in-process driver avoids on sequential
-point queries. Real workloads rarely fire
-thousands of sequential point reads, and everything throughput-shaped is far ahead. If those
-point operations dominate your workload, the opt-in
-[sync fast path](#opt-in-sqlite-sync-fast-path) below removes exactly that per-statement
-bridge.
+Yara ORM is fastest on **every** operation except the sub-millisecond `group_by`, where
+SQLObject's hand-written raw-SQL aggregate (bypassing its ORM entirely) edges it at 0.8×.
+It now wins the point reads it trailed on with the default async bridge — `get_by_pk`
+**1.1× vs SQLObject** and **2.5× vs Pony** — because the fast path removes the per-statement
+asyncio hop that a synchronous in-process driver never pays. Throughput stays far ahead
+(`bulk_insert` 1.8–81×, `fetch_all` 2.7–15×, `filter` 2.5–13×, `single_insert` 1.8× vs
+Tortoise). On the **default** async path (no fast path), the per-statement bridge costs tens
+of microseconds on sequential point reads, so SQLObject's lean sync active-record leads
+`get_by_pk` there instead — the delta is quantified in
+[the sync fast path section](#opt-in-sqlite-sync-fast-path) below.
 
 ### Opt-in SQLite sync fast path
 
