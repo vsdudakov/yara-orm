@@ -6,6 +6,52 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.2] - 2026-07-07
+
+### Fixed
+
+- **Prefetch correctness.** A custom `Prefetch` queryset's filters/ordering are
+  now honoured for M2M prefetch instead of loading every related row, and a
+  `LIMIT`/`OFFSET`/slice on a custom M2M `Prefetch` applies **per owner**
+  instead of once globally (owners outside the first window were previously
+  starved). Reverse-M2M managers read the prefetch cache under the reverse
+  accessor name (`related_name`), so reverse-M2M prefetch uses its cache
+  instead of silently re-querying per instance (N+1).
+- **Dialect / backend fixes.** Block-comment nesting when splitting
+  multi-statement scripts is now PostgreSQL-only (other dialects end the
+  comment at the first `*/`), guarded by a new `nests_block_comments` flag;
+  MySQL/MariaDB escape backslashes in string literals so a backslash in a
+  `COMMENT` can't splice the DDL; MSSQL percent-decodes URL credentials and
+  honours `?encrypt=strict` for full TLS validation; SQLite rolls back on
+  `COMMIT` failure so a dirty connection isn't recycled; PostgreSQL clamps
+  `max_size` to `>= 1` so `?max_size=0` no longer panics on prewarm.
+- **Query / field fixes.** A relation whose terminal field is named like a
+  lookup operator (e.g. `slot__date`) traverses to that field instead of
+  misparsing the token; `FloatField` coerces numeric-string input to `float`
+  before binding; non-finite floats (`NaN`/`Infinity`) inside JSON parameters
+  are preserved as their textual form across both JSON binders instead of
+  raising or coercing to null.
+- **Migrations / models.** Migration diffing detects primary-key changes and
+  renders `ADD`/`DROP PRIMARY KEY` per dialect (SQLite rebuild; SQL Server
+  rejects an unnameable drop); `bulk_create(update_fields=..., on_conflict=[])`
+  falls back to the pk target; the compiled insert plan is snapshotted before
+  awaiting so a concurrent cross-dialect save can't decode a row against the
+  wrong plan.
+
+### Changed
+
+- **Hot-path optimizations.** The compiled statement plan is cached per dialect
+  so a model that alternates dialects restores a prior plan in O(1) instead of
+  recompiling; the queryset compile path skips the relation-target probe for
+  plain scalar fields; the custom-M2M batched prefetch path drops a redundant
+  per-row generator.
+- **SQLite benchmarks use `sync_fast_path`.** The benchmark SQLite suite now
+  runs with `?sync_fast_path=1` (the recommended config for an in-process
+  database — statements run synchronously on the calling thread, removing the
+  per-statement event-loop hop). With it, yara-orm is fastest on every SQLite
+  operation except the sub-millisecond `group_by`; SQLite and MariaDB tables
+  and charts are refreshed.
+
 ## [1.14.1] - 2026-07-06
 
 ### Fixed
