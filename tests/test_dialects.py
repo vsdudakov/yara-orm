@@ -9,6 +9,7 @@ import datetime as _dt
 
 import pytest
 
+from yara_orm import Model, fields
 from yara_orm.dialects import (
     BaseDialect,
     MariaDbDialect,
@@ -586,3 +587,47 @@ def test_mssql_renames_use_sp_rename():
     assert MSSQL.render_rename_constraint("t", "uq", "uq2") == [
         "EXEC sp_rename 'uq', 'uq2', 'OBJECT'"
     ]
+
+
+class _DlCacheModel(Model):
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "dl_cache_model"
+
+
+def test_compile_caches_plan_per_dialect_and_restores_on_switch():
+    """
+    GIVEN a model compiled for one dialect, then another, then back
+    WHEN ``MetaInfo.compile`` is called for each
+    THEN each dialect's plan is cached and a switch back restores it verbatim
+         (placeholders match the dialect) instead of leaving the other's plan
+    """
+    meta = _DlCacheModel._meta
+    meta.compile(PG)
+    pg_insert = meta.insert_sql
+    assert "$1" in pg_insert  # PostgreSQL positional placeholders
+
+    meta.compile(LITE)
+    assert "?" in meta.insert_sql and meta.insert_sql != pg_insert  # SQLite placeholders
+
+    meta.compile(PG)  # switch back -> restored from cache
+    assert meta._compiled_for == "postgres"
+    assert meta.insert_sql == pg_insert
+    assert set(meta._compiled_plans) == {"postgres", "sqlite"}
+
+
+def test_compile_reset_invalidates_all_cached_plans():
+    """
+    GIVEN a model with cached plans for two dialects
+    WHEN ``_compiled_for`` is reset to ``None`` (the field-set-changed signal)
+    THEN the next compile drops every cached plan and rebuilds
+    """
+    meta = _DlCacheModel._meta
+    meta.compile(PG)
+    meta.compile(LITE)
+    assert set(meta._compiled_plans) == {"postgres", "sqlite"}
+
+    meta._compiled_for = None  # simulate a migration / field-set change
+    meta.compile(PG)
+    assert set(meta._compiled_plans) == {"postgres"}

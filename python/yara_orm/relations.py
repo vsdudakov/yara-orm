@@ -590,13 +590,19 @@ async def _ensure(awaitable: Awaitable[list[MODEL]]) -> list[MODEL]:
 class M2MDescriptor:
     """Descriptor exposing a many-to-many relation as a manager."""
 
-    def __init__(self, info: M2MInfo, owner_pk_attr: str, reverse: bool = False) -> None:
+    def __init__(
+        self, info: M2MInfo, owner_pk_attr: str, reverse: bool = False, name: str | None = None
+    ) -> None:
         """Store the metadata backing this many-to-many descriptor.
 
         Args:
             info: The many-to-many relation metadata.
             owner_pk_attr: The owning model's primary key attribute name.
             reverse: Whether this descriptor is the reverse side of the relation.
+            name: The attribute this descriptor is installed under. On the
+                reverse side this is the ``related_name`` (not ``info.name``),
+                and it is the key ``prefetch_related`` caches results under, so
+                the manager must read the same key. Defaults to ``info.name``.
 
         Returns:
             None
@@ -604,6 +610,7 @@ class M2MDescriptor:
         self.info = info
         self.owner_pk_attr = owner_pk_attr
         self.reverse = reverse
+        self.name = name or info.name
 
     def __get__(
         self, instance: Model | None, owner: type[Model] | None
@@ -620,7 +627,7 @@ class M2MDescriptor:
         """
         if instance is None:
             return self
-        return M2MManager(self.info, instance, self.reverse)
+        return M2MManager(self.info, instance, self.reverse, self.name)
 
 
 class _M2MMembershipSubquery:
@@ -682,13 +689,19 @@ class _M2MMembershipSubquery:
 class M2MManager(_ChainableManager[MODEL]):
     """Many-to-many manager: awaitable to a list, async-iterable, mutable."""
 
-    def __init__(self, info: M2MInfo, instance: Model, reverse: bool) -> None:
+    def __init__(
+        self, info: M2MInfo, instance: Model, reverse: bool, name: str | None = None
+    ) -> None:
         """Bind the manager to an instance and resolve the join key roles.
 
         Args:
             info: The many-to-many relation metadata.
             instance: The model instance owning the relation.
             reverse: Whether this manager is the reverse side of the relation.
+            name: The accessor attribute name (the reverse side's ``related_name``
+                differs from ``info.name``); it is the ``_prefetch`` cache key a
+                prefetch stores under, so the manager reads the same key. Defaults
+                to ``info.name``.
 
         Returns:
             None
@@ -708,7 +721,10 @@ class M2MManager(_ChainableManager[MODEL]):
         # The target class is registry-resolved; ``ManyToManyRelation[X]`` on
         # the declaring model is the static source of truth for ``MODEL``.
         self.target = cast("type[MODEL]", target)
-        self.name = info.name
+        # The prefetch cache key is the accessor name (reverse side: the
+        # ``related_name``), which differs from ``info.name`` on the reverse side;
+        # reading ``info.name`` there would miss the cache and re-query (N+1).
+        self.name = name or info.name
 
     def _sql(self, dialect: BaseDialect) -> dict[str, str]:
         """Return cached static SQL pieces for this side of the relation.

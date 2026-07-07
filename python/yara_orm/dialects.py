@@ -98,6 +98,10 @@ class BaseDialect:
     regex_ops: dict[str, str] = {}
     #: Whether the backend supports the ``__search`` full-text lookup.
     supports_search = False
+    #: Whether ``/* */`` block comments nest (an inner ``/*`` opens another
+    #: level). Only PostgreSQL nests; every other engine ends the comment at the
+    #: first ``*/``. Used when splitting multi-statement scripts.
+    nests_block_comments = False
     #: Statement prefix that returns a query plan for ``QuerySet.explain``.
     explain_prefix = "EXPLAIN "
     #: SQL expression used for random ordering (``order_by("?")``). PostgreSQL
@@ -1732,6 +1736,8 @@ class PostgresDialect(BaseDialect):
     # and case-insensitive); `__search` uses full-text via to_tsvector/tsquery.
     regex_ops = {"regex": "~", "iregex": "~*", "posix_regex": "~", "iposix_regex": "~*"}
     supports_search = True
+    # PostgreSQL is the only supported engine whose block comments nest.
+    nests_block_comments = True
     supports_extensions = True
     supports_for_update = True
 

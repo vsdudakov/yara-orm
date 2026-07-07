@@ -159,6 +159,22 @@ async def test_scalar_types_roundtrip_preserving_python_type(db):
 
 
 @pytest.mark.asyncio
+async def test_non_finite_float_stored_as_text_not_error(db):
+    """
+    GIVEN a JSON document containing a non-finite float (NaN / Infinity), which
+        has no JSON representation
+    WHEN saved and read back
+    THEN the insert succeeds (it is not a hard error) and the value is preserved
+         as its textual form rather than silently dropped to null
+    """
+    row = await JdDoc.create(data={"inf": float("inf"), "ninf": float("-inf"), "nan": float("nan")})
+    stored = (await JdDoc.get(id=row.id)).data
+    assert stored["inf"] == "inf"
+    assert stored["ninf"] == "-inf"
+    assert stored["nan"] == "NaN"
+
+
+@pytest.mark.asyncio
 async def test_bool_not_confused_with_int(db):
     """
     GIVEN JSON booleans and integers side by side

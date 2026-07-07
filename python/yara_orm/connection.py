@@ -280,7 +280,7 @@ async def _run_query(
         raise OperationalError(str(exc)) from exc
 
 
-def _split_sql_statements(script: str) -> list[str]:
+def _split_sql_statements(script: str, nest_block_comments: bool = False) -> list[str]:
     """Split a multi-statement SQL script into individual statements on ``;``.
 
     The native engine runs one command per call (prepared statement), so scripts
@@ -292,6 +292,10 @@ def _split_sql_statements(script: str) -> list[str]:
 
     Args:
         script: The SQL script possibly containing several statements.
+        nest_block_comments: Whether ``/* */`` block comments nest. Only
+            PostgreSQL does; for every other dialect an inner ``/*`` is literal
+            and the comment ends at the first ``*/``. Passing ``True`` where the
+            engine does not nest would swallow a real ``;`` and merge statements.
 
     Returns:
         The non-empty statements, in order.
@@ -303,7 +307,9 @@ def _split_sql_statements(script: str) -> list[str]:
     in_squote = in_dquote = in_line_comment = False
     # PostgreSQL block comments nest, so track depth rather than a boolean: the
     # comment ends only when the outermost ``*/`` closes. Without this, an inner
-    # ``*/`` is mistaken for the end and a following ``;`` wrongly splits.
+    # ``*/`` is mistaken for the end and a following ``;`` wrongly splits. On
+    # dialects that do not nest (``nest_block_comments=False``) an inner ``/*``
+    # is literal and the first ``*/`` closes, so depth never exceeds 1.
     block_depth = 0
     while i < n:
         ch = script[i]
@@ -314,7 +320,7 @@ def _split_sql_statements(script: str) -> list[str]:
                 in_line_comment = False
             i += 1
         elif block_depth > 0:
-            if two == "/*":
+            if nest_block_comments and two == "/*":
                 block_depth += 1
                 buf.append(two)
                 i += 2
@@ -550,7 +556,8 @@ class _ManualSQLCompat:
         Returns:
             None
         """
-        for statement in _split_sql_statements(script):
+        nest = getattr(getattr(self, "dialect", None), "nests_block_comments", False)
+        for statement in _split_sql_statements(script, nest):
             await self.execute(statement)
 
 
@@ -1500,7 +1507,8 @@ class _EngineProxy(_ManualSQLCompat):
         Returns:
             None
         """
-        statements = _split_sql_statements(script)
+        nest = resolve_dialect(self._engine.dialect).nests_block_comments
+        statements = _split_sql_statements(script, nest)
         if not statements:
             return
         # This path hands the split statements straight to the engine (no

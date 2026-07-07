@@ -223,9 +223,24 @@ def test_split_sql_statements_handles_nested_block_comments():
          is one unit and only the real statement terminator splits
     """
     script = "/* a /* b */ c; */ SELECT 1; SELECT 2;"
-    stmts = _split_sql_statements(script)
+    stmts = _split_sql_statements(script, nest_block_comments=True)
     assert len(stmts) == 2
     assert stmts[0].endswith("SELECT 1") and stmts[0].startswith("/* a")
+    assert stmts[1] == "SELECT 2"
+
+
+def test_split_sql_statements_no_nesting_ends_comment_at_first_close():
+    """
+    GIVEN a non-PostgreSQL script (block comments do not nest) whose comment
+        contains a ``/*`` sequence followed by a real statement terminator
+    WHEN it is split with ``nest_block_comments=False`` (the default)
+    THEN the comment ends at the first ``*/``, so the following ``;`` splits and
+         statements are not swallowed and merged
+    """
+    script = "/* note: see /* legacy */ SELECT 1; SELECT 2;"
+    stmts = _split_sql_statements(script)
+    assert len(stmts) == 2
+    assert stmts[0].endswith("SELECT 1") and stmts[0].startswith("/* note")
     assert stmts[1] == "SELECT 2"
 
 

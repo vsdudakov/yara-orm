@@ -118,3 +118,57 @@ async def test_fetch_related_instance(db):
     fresh = await PfBook.get(id=b.id)
     await fresh.fetch_related("author")
     assert fresh.__dict__["_prefetch"]["author"].name == "Lin"
+
+
+@pytest.mark.asyncio
+async def test_prefetch_m2m_custom_queryset_limit_is_per_owner(db):
+    """
+    GIVEN two Books each tagged with three distinct Tags
+    WHEN prefetching tags with Prefetch(queryset=Tag.order_by(...).limit(2))
+    THEN the LIMIT applies per owner (each PfBook gets its own top two tags),
+         not once globally across the whole batch
+    """
+    a = await PfAuthor.create(name="Mel")
+    b1 = await PfBook.create(title="One", author=a)
+    b2 = await PfBook.create(title="Two", author=a)
+    b1_tags = [await PfTag.create(name=f"a{n}") for n in range(3)]
+    b2_tags = [await PfTag.create(name=f"b{n}") for n in range(3)]
+    await b1.tags.add(*b1_tags)
+    await b2.tags.add(*b2_tags)
+
+    books = (
+        await PfBook.all()
+        .prefetch_related(Prefetch("tags", queryset=PfTag.all().order_by("-name").limit(2)))
+        .order_by("title")
+    )
+    # Per-owner top-2 by descending name: b1 -> a2,a1 ; b2 -> b2,b1.
+    assert [t.name for t in await books[0].tags] == ["a2", "a1"]
+    assert [t.name for t in await books[1].tags] == ["b2", "b1"]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_m2m_custom_queryset_shared_target_is_distinct_per_owner(db):
+    """
+    GIVEN two Books sharing the same Tag, prefetched via a custom queryset with
+        no slice (the batched single-query path)
+    WHEN one owner's prefetched target instance is mutated
+    THEN the other owner's copy is unaffected (each owner gets its own instance,
+         matching the join-based prefetch path)
+    """
+    a = await PfAuthor.create(name="Ned")
+    b1 = await PfBook.create(title="One", author=a)
+    b2 = await PfBook.create(title="Two", author=a)
+    shared = await PfTag.create(name="shared")
+    await b1.tags.add(shared)
+    await b2.tags.add(shared)
+
+    books = (
+        await PfBook.all()
+        .prefetch_related(Prefetch("tags", queryset=PfTag.all().order_by("name")))
+        .order_by("title")
+    )
+    t1 = (await books[0].tags)[0]
+    t2 = (await books[1].tags)[0]
+    assert t1 is not t2
+    t1.name = "mutated"
+    assert t2.name == "shared"
