@@ -300,7 +300,11 @@ def _split_sql_statements(script: str) -> list[str]:
     buf: list[str] = []
     i, n = 0, len(script)
     dollar_tag: str | None = None
-    in_squote = in_dquote = in_line_comment = in_block_comment = False
+    in_squote = in_dquote = in_line_comment = False
+    # PostgreSQL block comments nest, so track depth rather than a boolean: the
+    # comment ends only when the outermost ``*/`` closes. Without this, an inner
+    # ``*/`` is mistaken for the end and a following ``;`` wrongly splits.
+    block_depth = 0
     while i < n:
         ch = script[i]
         two = script[i : i + 2]
@@ -309,13 +313,17 @@ def _split_sql_statements(script: str) -> list[str]:
             if ch == "\n":
                 in_line_comment = False
             i += 1
-        elif in_block_comment:
-            buf.append(ch)
-            if two == "*/":
-                buf.append(script[i + 1])
-                in_block_comment = False
+        elif block_depth > 0:
+            if two == "/*":
+                block_depth += 1
+                buf.append(two)
+                i += 2
+            elif two == "*/":
+                block_depth -= 1
+                buf.append(two)
                 i += 2
             else:
+                buf.append(ch)
                 i += 1
         elif dollar_tag is not None:
             if script.startswith(dollar_tag, i):
@@ -349,7 +357,7 @@ def _split_sql_statements(script: str) -> list[str]:
             buf.append(two)
             i += 2
         elif two == "/*":
-            in_block_comment = True
+            block_depth += 1
             buf.append(two)
             i += 2
         elif ch == "'":
@@ -1467,8 +1475,12 @@ class _EngineProxy(_ManualSQLCompat):
             The fetched row as a dict, or None.
         """
         # Like fetch_all, this is a raw-SQL-only method, so a bare list binds
-        # as a PostgreSQL array (asyncpg-compatible) rather than JSON.
-        return await _run_query(self._engine.fetch_one, sql, _arrayify_params(params))
+        # as a PostgreSQL array (asyncpg-compatible) rather than JSON. Wrap the
+        # row in a Record for positional access (row[0]), matching both
+        # fetch_all here and TransactionWrapper.fetch_one — otherwise the same
+        # call raises KeyError on the pooled path but works inside a transaction.
+        row = await _run_query(self._engine.fetch_one, sql, _arrayify_params(params))
+        return Record(row) if isinstance(row, dict) else row
 
     async def execute_script(self, script: str) -> None:
         """Run a multi-statement SQL script on one pinned pooled connection.

@@ -66,6 +66,8 @@ tiberius = { version = "0.12", default-features = false, features = [
     "chrono",
     "rust_decimal",
 ] }
+# `url` returns userinfo still percent-encoded; used to decode MSSQL credentials.
+percent-encoding = "2"
 # tiberius runs over any AsyncRead+AsyncWrite; this bridges a tokio TcpStream.
 tokio-util = { version = "0.7", features = ["compat"] }
 url = "2"

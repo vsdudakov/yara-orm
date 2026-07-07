@@ -212,7 +212,16 @@ fn py_to_json(ob: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         return Ok(serde_json::Value::from(ob.extract::<i64>()?));
     }
     if ob.is_instance_of::<PyFloat>() {
-        return Ok(serde_json::Value::from(ob.extract::<f64>()?));
+        // JSON has no representation for NaN/±Infinity; `serde_json::Value::from`
+        // would silently turn them into `null` (data corruption). Reject them
+        // explicitly, mirroring the Decimal('NaN')/Decimal('Infinity') branch.
+        let f = ob.extract::<f64>()?;
+        if !f.is_finite() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "non-finite float (NaN/Infinity) has no JSON representation",
+            ));
+        }
+        return Ok(serde_json::Value::from(f));
     }
     if ob.is_instance_of::<PyString>() {
         return Ok(serde_json::Value::String(ob.extract::<String>()?));
@@ -589,6 +598,10 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Bytes(b) => J::String(base64_encode(b)),
         Value::Bool(b) => J::Bool(*b),
         Value::Int(i) => J::from(*i),
+        // `J::from(f64)` yields `null` for NaN/±Infinity, silently dropping the
+        // element. This bind path is infallible, so preserve the value as its
+        // textual form ("inf"/"-inf"/"NaN") instead — like Decimal/Uuid below.
+        Value::Float(f) if !f.is_finite() => J::String(f.to_string()),
         Value::Float(f) => J::from(*f),
         Value::Text(s) => J::String(s.clone()),
         Value::Json(j) => j.clone(),

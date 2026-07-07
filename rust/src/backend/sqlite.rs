@@ -198,10 +198,17 @@ fn sql_execute_many(
 ) -> Result<Vec<Row>, EngineError> {
     conn.execute_batch("BEGIN IMMEDIATE").map_err(map_sqlite)?;
     match sql_execute_many_inner(conn, sql, rows, cache) {
-        Ok(out) => {
-            conn.execute_batch("COMMIT").map_err(map_sqlite)?;
-            Ok(out)
-        }
+        Ok(out) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(out),
+            // A failed COMMIT (e.g. SQLITE_BUSY) can leave the write transaction
+            // open; roll it back so a mid-transaction connection is not recycled
+            // into the pool where a later borrower would hit "cannot start a
+            // transaction within a transaction" or silently join the stale tx.
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(map_sqlite(e))
+            }
+        },
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)

@@ -1291,6 +1291,50 @@ class BaseDialect:
             return [f"ALTER TABLE {t} ADD CONSTRAINT {uq} UNIQUE ({col})"]
         return [f"ALTER TABLE {t} {self._drop_unique_constraint_sql(uq)}"]
 
+    def _drop_pk_constraint_sql(self, table: str) -> str:
+        """Render the clause that drops a table's primary-key constraint.
+
+        Defaults to PostgreSQL's convention: the implicit constraint is named
+        ``<table>_pkey``. Dialects that spell it differently (MySQL's unnamed
+        ``DROP PRIMARY KEY``) override this.
+
+        Args:
+            table: The unquoted table name.
+
+        Returns:
+            The ``DROP ...`` clause (without the leading ``ALTER TABLE``).
+        """
+        return f"DROP CONSTRAINT {self.quote(f'{table}_pkey')}"
+
+    def _toggle_pk_sql(
+        self, t: str, col: str, table: str, name: str, old: dict[str, Any], new: dict[str, Any]
+    ) -> list[str]:
+        """Render the ADD/DROP for a column whose primary-key flag changed.
+
+        Promoting a column emits ``ADD PRIMARY KEY (col)``; demoting it drops
+        the table's primary-key constraint (spelling via
+        :meth:`_drop_pk_constraint_sql`). Without this an ``AlterField`` that
+        only changes ``pk`` would render nothing and the change would silently
+        never reach the database. Shared by every in-place ``render_alter_column``.
+
+        Args:
+            t: The already-quoted table.
+            col: The already-quoted column.
+            table: The unquoted table name (for the constraint name).
+            name: The unquoted column name (unused; kept parallel to the other
+                toggles).
+            old: The column spec before the change.
+            new: The column spec after the change.
+
+        Returns:
+            Zero or one ``ALTER TABLE`` statement.
+        """
+        if bool(old.get("pk")) == bool(new.get("pk")):
+            return []
+        if new.get("pk"):
+            return [f"ALTER TABLE {t} ADD PRIMARY KEY ({col})"]
+        return [f"ALTER TABLE {t} {self._drop_pk_constraint_sql(table)}"]
+
     def _toggle_fk_sql(
         self, t: str, col: str, table: str, name: str, old: dict[str, Any], new: dict[str, Any]
     ) -> list[str]:
@@ -1373,6 +1417,7 @@ class BaseDialect:
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
             else:
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT")
+        out.extend(self._toggle_pk_sql(t, col, table, name, old, new))
         out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
         out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
@@ -2372,6 +2417,24 @@ class MySQLDialect(BaseDialect):
         sets = ", ".join(f"{self.quote(c)} = {alias}.{self.quote(c)}" for c in update_columns)
         return f" AS {alias} ON DUPLICATE KEY UPDATE {sets}"
 
+    @staticmethod
+    def _literal(text: str) -> str:
+        r"""Render a SQL string literal for MySQL/MariaDB.
+
+        Unlike ANSI SQL, MySQL processes backslash escapes inside string
+        literals (its default ``sql_mode`` does not set ``NO_BACKSLASH_ESCAPES``),
+        so a backslash must be doubled in addition to the single quote — otherwise
+        a value ending in ``\\`` (e.g. a Windows-path column ``COMMENT``) escapes
+        the closing quote and breaks, or splices, the surrounding DDL.
+
+        Args:
+            text: The text to quote as a literal.
+
+        Returns:
+            The escaped, single-quoted literal.
+        """
+        return "'" + text.replace("\\", "\\\\").replace("'", "''") + "'"
+
     # -- DDL ------------------------------------------------------------------
     def column_sql(self, field: Field) -> str:
         """Render a column definition, adding the inline ``COMMENT`` clause.
@@ -2539,6 +2602,20 @@ class MySQLDialect(BaseDialect):
         """Drop a column's FK with MySQL's ``DROP FOREIGN KEY`` spelling."""
         return f"DROP FOREIGN KEY {fk}"
 
+    def _drop_pk_constraint_sql(self, table: str) -> str:
+        """Drop the primary key with MySQL's unnamed ``DROP PRIMARY KEY``.
+
+        MySQL/MariaDB always name the primary key ``PRIMARY`` and drop it
+        without naming the constraint.
+
+        Args:
+            table: The unquoted table name (unused; a table has one primary key).
+
+        Returns:
+            The ``DROP PRIMARY KEY`` clause.
+        """
+        return "DROP PRIMARY KEY"
+
     def render_alter_column(
         self,
         table: str,
@@ -2580,6 +2657,7 @@ class MySQLDialect(BaseDialect):
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
             else:
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} DROP DEFAULT")
+        out.extend(self._toggle_pk_sql(t, col, table, name, old, new))
         out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
         out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
@@ -3252,6 +3330,20 @@ class OracleDialect(BaseDialect):
         """Drop a column's FK by named constraint (Oracle)."""
         return f"DROP CONSTRAINT {fk}"
 
+    def _drop_pk_constraint_sql(self, table: str) -> str:
+        """Drop the primary key with Oracle's unnamed ``DROP PRIMARY KEY``.
+
+        Oracle's system-generated primary-key constraint name is not
+        predictable, but ``DROP PRIMARY KEY`` removes it without naming it.
+
+        Args:
+            table: The unquoted table name (unused; a table has one primary key).
+
+        Returns:
+            The ``DROP PRIMARY KEY`` clause.
+        """
+        return "DROP PRIMARY KEY"
+
     def render_alter_column(
         self,
         table: str,
@@ -3291,6 +3383,7 @@ class OracleDialect(BaseDialect):
                 )
             else:
                 out.append(f"ALTER TABLE {t} MODIFY ({col} DEFAULT NULL)")
+        out.extend(self._toggle_pk_sql(t, col, table, name, old, new))
         out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
         out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out
@@ -4107,6 +4200,25 @@ class SqlServerDialect(BaseDialect):
         """Drop a column's FK by named constraint (SQL Server)."""
         return f"DROP CONSTRAINT {fk}"
 
+    def _drop_pk_constraint_sql(self, table: str) -> str:
+        """Reject dropping a primary key: SQL Server auto-names it opaquely.
+
+        SQL Server stores the primary key as an auto-named ``PK__...``
+        constraint whose name a migration cannot target portably (mirroring the
+        ``DEFAULT``-change restriction in :meth:`render_alter_column`). Promoting
+        a column (``ADD PRIMARY KEY``) is still supported.
+
+        Args:
+            table: The unquoted table name (unused).
+
+        Raises:
+            UnSupportedError: Always.
+        """
+        raise UnSupportedError(
+            "mssql cannot drop a primary key in a migration (it is an auto-named "
+            "constraint); use RunSQL"
+        )
+
     def render_alter_column(
         self,
         table: str,
@@ -4150,6 +4262,7 @@ class SqlServerDialect(BaseDialect):
         if type_changed or null_changed:
             null = "NULL" if new.get("null") else "NOT NULL"
             out.append(f"ALTER TABLE {t} ALTER COLUMN {col} {self._spec_type(new)} {null}")
+        out.extend(self._toggle_pk_sql(t, col, table, name, old, new))
         out.extend(self._toggle_unique_sql(t, col, table, name, old, new))
         out.extend(self._toggle_fk_sql(t, col, table, name, old, new))
         return out

@@ -980,26 +980,32 @@ class Model(metaclass=ModelMeta):
     # (:func:`_setattr_unmark_db_default`) installed by the metaclass; every
     # other model keeps ``object.__setattr__`` for plain attribute-write speed.
 
-    async def _refresh_inserted_defaults(self, executor: BaseDBAsyncClient, meta: MetaInfo) -> None:
+    async def _refresh_inserted_defaults(
+        self,
+        executor: BaseDBAsyncClient,
+        refresh_sql: str,
+        refresh_fields: Sequence[Field],
+    ) -> None:
         """Read database-supplied default columns back after an insert.
 
         The ``Meta.fetch_db_defaults`` refresh for dialects without
         ``INSERT ... RETURNING`` (MySQL): a follow-up ``SELECT`` by the new
         primary key assigns the database-filled values onto the instance,
-        matching what a RETURNING clause hands back elsewhere.
+        matching what a RETURNING clause hands back elsewhere. The statement and
+        fields are passed in (not read from ``meta``) so a concurrent recompile
+        for another dialect cannot swap them out across the ``await``.
 
         Args:
             executor: The executor the INSERT ran on (so an open transaction
                 sees its own row).
-            meta: The model metadata carrying the cached refresh statement.
+            refresh_sql: The cached ``SELECT`` reading the defaults back by pk.
+            refresh_fields: The fields the refresh row carries, in order.
 
         Returns:
             None
         """
-        refresh_sql = meta.insert_refresh_sql
-        assert refresh_sql is not None  # noqa: S101 - callers gate on it
-        row = await executor.fetch_row(refresh_sql, [meta.pk_field.to_db(self.pk)])
-        for field, value in zip(meta.insert_refresh_fields, row):
+        row = await executor.fetch_row(refresh_sql, [self._meta.pk_field.to_db(self.pk)])
+        for field, value in zip(refresh_fields, row):
             setattr(self, field.model_field_name, field.to_python(value))
 
     def _mark_unfetched_db_defaults(self) -> None:
@@ -1232,21 +1238,30 @@ class Model(metaclass=ModelMeta):
         """
         return [f.to_db(getattr(self, f.model_field_name, None)) for f in fields]
 
-    def _apply_returning(self, row: Sequence[Any], meta: MetaInfo) -> None:
+    def _apply_returning(
+        self,
+        row: Sequence[Any],
+        returning_fields: Sequence[Field],
+        read_decoders: dict[str, Any],
+    ) -> None:
         """Write an INSERT's RETURNING row back onto this instance.
 
         The database-assigned columns (serial pk, ``RETURNING`` defaults) are
-        decoded through the model's read decoders and assigned.
+        decoded through the model's read decoders and assigned. The plan is
+        passed in (not read from ``meta``) so it stays consistent across the
+        caller's ``await`` even if another coroutine recompiles the shared
+        metadata for a different dialect meanwhile.
 
         Args:
-            row: The RETURNING row, in ``meta.insert_returning_fields`` order.
-            meta: The model metadata.
+            row: The RETURNING row, in ``returning_fields`` order.
+            returning_fields: The fields the RETURNING row carries, in order.
+            read_decoders: The per-field read decoders for the active dialect.
 
         Returns:
             None
         """
-        for field, value in zip(meta.insert_returning_fields, row):
-            decode = meta._read_decoders.get(field.model_field_name)
+        for field, value in zip(returning_fields, row):
+            decode = read_decoders.get(field.model_field_name)
             setattr(self, field.model_field_name, decode(value) if decode else value)
 
     async def _perform_save(
@@ -1308,6 +1323,19 @@ class Model(metaclass=ModelMeta):
         table = dialect.quote(meta.table)
         pk_attr = pk_field.model_field_name
         pk_unset = pk_field.auto_increment and getattr(self, pk_attr, None) is None
+        # Snapshot the dialect-specific compiled plan synchronously here: the
+        # caller ran ``meta.compile(dialect)`` immediately before this with no
+        # await between, so these are consistent for ``dialect``. Holding them in
+        # locals (rather than re-reading ``meta.*`` after the awaits below) keeps
+        # a concurrent save of the same model on a *different* dialect — which
+        # recompiles and overwrites the shared ``meta`` attributes — from
+        # decoding this row against the wrong plan.
+        insert_sql = meta.insert_sql
+        insert_fields = meta.insert_fields
+        returning_fields = meta.insert_returning_fields
+        read_decoders = meta._read_decoders
+        refresh_sql = meta.insert_refresh_sql
+        refresh_fields = meta.insert_refresh_fields
         # An explicit value on a database-default column must reach the INSERT
         # (the cached statement omits those columns), so the fast path only
         # applies while every such column is unset.
@@ -1315,13 +1343,13 @@ class Model(metaclass=ModelMeta):
             getattr(self, f.model_field_name, None) is None for f in meta.db_default_fields
         ):
             # Fast path: reuse the cached INSERT statement, bind params only.
-            row = await executor.fetch_row(meta.insert_sql, self._bind_values(meta.insert_fields))
-            self._apply_returning(row, meta)
+            row = await executor.fetch_row(insert_sql, self._bind_values(insert_fields))
+            self._apply_returning(row, returning_fields, read_decoders)
             self._in_db = True
-            if meta.insert_refresh_sql:
+            if refresh_sql:
                 # fetch_db_defaults without RETURNING (MySQL): read the
                 # database-filled defaults back by the new pk.
-                await self._refresh_inserted_defaults(executor, meta)
+                await self._refresh_inserted_defaults(executor, refresh_sql, refresh_fields)
             self._mark_unfetched_db_defaults()
             return
 
@@ -1345,9 +1373,9 @@ class Model(metaclass=ModelMeta):
 
         sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
         if dialect.supports_insert_returning:
-            returning = dialect.insert_returning_clause(meta.insert_returning_fields)
+            returning = dialect.insert_returning_clause(returning_fields)
             row = await executor.fetch_row(f"{sql}{returning}", params)
-            self._apply_returning(row, meta)
+            self._apply_returning(row, returning_fields, read_decoders)
         elif pk_unset:
             # No RETURNING (MySQL): the backend returns the auto-increment id as
             # a synthetic single-value row.
@@ -1361,8 +1389,8 @@ class Model(metaclass=ModelMeta):
                 sql = dialect.identity_insert_sql(table, sql)
             await executor.execute(sql, params)
         self._in_db = True
-        if not dialect.supports_insert_returning and meta.insert_refresh_sql:
-            await self._refresh_inserted_defaults(executor, meta)
+        if not dialect.supports_insert_returning and refresh_sql:
+            await self._refresh_inserted_defaults(executor, refresh_sql, refresh_fields)
         self._mark_unfetched_db_defaults()
 
     async def _update_partial(
@@ -2223,10 +2251,12 @@ class Model(metaclass=ModelMeta):
             update_cols = [column_of(n) for n in (update_fields or ())]
             if on_conflict is not None:
                 conflict_cols = [column_of(n) for n in on_conflict]
-            elif update_cols:
+            # ``DO UPDATE`` is invalid without a conflict target, so when the
+            # caller names update_fields but gives no target — ``on_conflict``
+            # omitted *or* an empty list — fall back to the primary key. (A bare
+            # ``DO NOTHING`` with no update_cols is fine targetless.)
+            if update_cols and not conflict_cols:
                 conflict_cols = [pk_field.db_column]
-            else:
-                conflict_cols = []
             if dialect.upsert_requires_conflict_target and on_conflict is None:
                 # SQL Server's MERGE must name real match columns present in the
                 # inserted set; INSERT IGNORE / ON CONFLICT DO NOTHING catch any
