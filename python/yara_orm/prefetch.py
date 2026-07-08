@@ -6,12 +6,13 @@ returns without a query, using a single query per relation (no N+1).
 
 from __future__ import annotations
 
+import asyncio
 import copy
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import registry
-from .connection import get_dialect, get_executor
+from .connection import _active_tx, get_dialect, get_executor
 from .relations import M2MDescriptor, ReverseFKDescriptor
 
 if TYPE_CHECKING:
@@ -130,6 +131,67 @@ def _assign(
             inst.__dict__.setdefault("_prefetch", {})[name] = value
 
 
+def _is_sliced(qs: QuerySet[Any]) -> bool:
+    """Report whether a custom ``Prefetch`` queryset carries a LIMIT/OFFSET.
+
+    A slice on the Prefetch queryset applies *per owner* (e.g. "the 3 newest
+    tags per book"), not globally, so every relation branch must special-case
+    it the same way.
+
+    Args:
+        qs: The custom Prefetch queryset.
+
+    Returns:
+        True when the queryset is sliced.
+    """
+    return qs._limit is not None or qs._offset is not None
+
+
+def _clone_shared(obj: Model) -> Model:
+    """Copy a related instance shared by several owners.
+
+    Each owner must get an independent instance (like the join path's per-row
+    hydration), including for mutable column values: a plain ``copy.copy``
+    would leave a JSON dict / array list shared, so mutating one owner's
+    prefetched object would leak into another's.
+
+    Args:
+        obj: The instance to copy for an additional owner.
+
+    Returns:
+        A copy safe to hand to a different owner.
+    """
+    clone = copy.copy(obj)
+    d = clone.__dict__
+    for f in type(obj)._meta.field_list:
+        value = d.get(f.model_field_name)
+        if isinstance(value, (dict, list, set, bytearray)):
+            d[f.model_field_name] = copy.deepcopy(value)
+    return clone
+
+
+async def _per_owner(
+    owner_ids: Sequence[Any], run: Callable[[Any], Awaitable[list[Any]]]
+) -> list[list[Any]]:
+    """Run a per-owner sliced prefetch query for every owner.
+
+    The queries are independent, so they run concurrently (one round-trip's
+    latency instead of N) — except inside ``in_transaction()``, where sibling
+    tasks sharing the pinned connection are unsupported and the queries run
+    sequentially instead.
+
+    Args:
+        owner_ids: The owner pks to query for.
+        run: Coroutine function loading one owner's related rows.
+
+    Returns:
+        The per-owner results, aligned with ``owner_ids``.
+    """
+    if _active_tx.get() is not None:
+        return [await run(owner_id) for owner_id in owner_ids]
+    return list(await asyncio.gather(*(run(owner_id) for owner_id in owner_ids)))
+
+
 async def _prefetch_one(
     instances: Sequence[Model],
     name: str,
@@ -163,6 +225,17 @@ async def _prefetch_one(
         # Honour a custom ``Prefetch(..., queryset=...)`` exactly like the
         # reverse/M2M branches: its filters/ordering constrain the lookup.
         base = custom_qs if custom_qs is not None else target.all()
+        if custom_qs is not None and _is_sliced(custom_qs):
+            # A slice applies per owner, and a forward FK has at most one
+            # target per owner: any offset (or a zero limit) empties every
+            # owner's window, and otherwise the slice is a no-op — so strip
+            # it rather than let it cap the batched ``pk__in`` globally.
+            if (custom_qs._offset or 0) > 0 or custom_qs._limit == 0:
+                _assign(instances, name, to_attr, dict.fromkeys(instances))
+                return
+            base = custom_qs._clone()
+            base._limit = None
+            base._offset = None
         objs = await base.filter(pk__in=list(ids)) if ids else []
         by_id = {o.pk: o for o in objs}
         _assign(
@@ -181,10 +254,21 @@ async def _prefetch_one(
         source = registry.get_model(descriptor.source_reference)
         pks = [i.pk for i in instances]
         qs = custom_qs if custom_qs is not None else source.all()
-        children = await qs.filter(**{f"{descriptor.source_attr}__in": pks})
         grouped: dict = {}
-        for child in children:
-            grouped.setdefault(getattr(child, descriptor.source_attr), []).append(child)
+        if custom_qs is not None and _is_sliced(custom_qs):
+            # A slice applies per owner ("the 3 newest books per author"): a
+            # single batched query would apply it globally and starve every
+            # owner outside the first window, so query each owner separately.
+            async def run_one(owner_pk: Any) -> list[Any]:
+                return list(await custom_qs.filter(**{descriptor.source_attr: owner_pk}))
+
+            unique_pks = list(dict.fromkeys(pks))
+            for owner_pk, group in zip(unique_pks, await _per_owner(unique_pks, run_one)):
+                grouped[owner_pk] = group
+        else:
+            children = await qs.filter(**{f"{descriptor.source_attr}__in": pks})
+            for child in children:
+                grouped.setdefault(getattr(child, descriptor.source_attr), []).append(child)
         values = {}
         for inst in instances:
             group = grouped.get(inst.pk, [])
@@ -257,11 +341,21 @@ async def _prefetch_m2m(
             f"SELECT {q(near_key)}, {q(far_key)} FROM {through} WHERE {q(near_key)} IN ({holes})"
         )
         links = await engine.fetch_rows(link_sql, pks)
+        # ``fetch_rows`` returns raw driver values, but the link values are
+        # matched against hydrated pks below (``i.pk`` / ``obj.pk``), so they
+        # need the same dialect decoding hydration applies (e.g. a CHAR(36)
+        # uuid pk comes back as ``str`` on MySQL while ``obj.pk`` is ``UUID``).
+        near_dec = dialect.read_decoder(owner._meta.pk_field)
+        far_dec = dialect.read_decoder(tmeta.pk_field)
         owners_by_far: dict = {}
         for near, far in links:
+            if near_dec is not None:
+                near = near_dec(near)
+            if far_dec is not None:
+                far = far_dec(far)
             owners_by_far.setdefault(far, []).append(near)
         grouped: dict = {i.pk: [] for i in instances}
-        if custom_qs._limit is not None or custom_qs._offset is not None:
+        if _is_sliced(custom_qs):
             # A LIMIT/OFFSET/slice on the Prefetch queryset must apply *per
             # owner* (e.g. "the 3 newest tags per book"), so run the queryset
             # once per owner. A single `pk__in` over every owner's targets would
@@ -270,8 +364,13 @@ async def _prefetch_m2m(
             for far, owner_ids in owners_by_far.items():
                 for owner_id in owner_ids:
                     far_by_owner.setdefault(owner_id, []).append(far)
-            for owner_id, far_pks in far_by_owner.items():
-                grouped[owner_id] = list(await custom_qs.filter(pk__in=far_pks))
+
+            async def run_one(owner_id: Any) -> list[Any]:
+                return list(await custom_qs.filter(pk__in=far_by_owner[owner_id]))
+
+            owner_ids = list(far_by_owner)
+            for owner_id, group in zip(owner_ids, await _per_owner(owner_ids, run_one)):
+                grouped[owner_id] = group
         else:
             # No slice: one batched query, then distribute the ordered rows into
             # per-owner groups. A target shared by several owners gets a distinct
@@ -281,7 +380,7 @@ async def _prefetch_m2m(
             objs = await custom_qs.filter(pk__in=far_pks) if far_pks else []
             for obj in objs:
                 for n, owner_id in enumerate(owners_by_far.get(obj.pk, ())):
-                    grouped[owner_id].append(obj if n == 0 else copy.copy(obj))
+                    grouped[owner_id].append(obj if n == 0 else _clone_shared(obj))
         _assign(instances, name, to_attr, {i: grouped.get(i.pk, []) for i in instances})
         return
 
@@ -292,8 +391,12 @@ async def _prefetch_m2m(
         f"WHERE {through}.{q(near_key)} IN ({holes})"
     )
     rows = await engine.fetch_rows(sql, pks)
+    # The near column is raw from the driver but keys a lookup by the hydrated
+    # ``i.pk`` below, so decode it the way hydration would (see the custom-qs
+    # branch above).
+    near_dec = dialect.read_decoder(owner._meta.pk_field)
     grouped = {}
     for row in rows:
-        owner_id = row[0]
+        owner_id = row[0] if near_dec is None else near_dec(row[0])
         grouped.setdefault(owner_id, []).append(target._from_db_row(row[1:]))
     _assign(instances, name, to_attr, {i: grouped.get(i.pk, []) for i in instances})

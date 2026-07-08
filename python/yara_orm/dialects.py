@@ -2622,6 +2622,35 @@ class MySQLDialect(BaseDialect):
         """
         return "DROP PRIMARY KEY"
 
+    def _toggle_pk_sql(
+        self, t: str, col: str, table: str, name: str, old: dict[str, Any], new: dict[str, Any]
+    ) -> list[str]:
+        """Render a pk toggle, stripping AUTO_INCREMENT before a demotion.
+
+        MySQL rejects ``DROP PRIMARY KEY`` while the column is still
+        ``AUTO_INCREMENT`` (errno 1075: the auto column must be a key), and an
+        auto-increment pk is the common shape — so demoting one first restates
+        the column without the flag via ``MODIFY COLUMN``.
+
+        Args:
+            t: The already-quoted table.
+            col: The already-quoted column.
+            table: The unquoted table name.
+            name: The unquoted column name.
+            old: The column spec before the change.
+            new: The column spec after the change.
+
+        Returns:
+            Zero, one or two ``ALTER TABLE`` statements.
+        """
+        out: list[str] = []
+        demoted = bool(old.get("pk")) and not bool(new.get("pk"))
+        if demoted and old.get("auto_increment"):
+            nullable = "NULL" if new.get("null") else "NOT NULL"
+            out.append(f"ALTER TABLE {t} MODIFY COLUMN {col} {self._spec_type(new)} {nullable}")
+        out.extend(super()._toggle_pk_sql(t, col, table, name, old, new))
+        return out
+
     def render_alter_column(
         self,
         table: str,

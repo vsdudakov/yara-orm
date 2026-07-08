@@ -159,19 +159,21 @@ async def test_scalar_types_roundtrip_preserving_python_type(db):
 
 
 @pytest.mark.asyncio
-async def test_non_finite_float_stored_as_text_not_error(db):
+async def test_non_finite_float_rejected_with_clear_error(db):
     """
     GIVEN a JSON document containing a non-finite float (NaN / Infinity), which
         has no JSON representation
-    WHEN saved and read back
-    THEN the insert succeeds (it is not a hard error) and the value is preserved
-         as its textual form rather than silently dropped to null
+    WHEN saved
+    THEN the write is rejected with a clear ValueError instead of silently
+         corrupting the stored shape (null before 1.14.2, a text "inf"/"NaN"
+         in 1.14.2 — both change the member's type under readers and filters)
     """
-    row = await JdDoc.create(data={"inf": float("inf"), "ninf": float("-inf"), "nan": float("nan")})
-    stored = (await JdDoc.get(id=row.id)).data
-    assert stored["inf"] == "inf"
-    assert stored["ninf"] == "-inf"
-    assert stored["nan"] == "NaN"
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="no JSON representation"):
+            await JdDoc.create(data={"score": bad})
+    # A finite float in the same shape still stores as a JSON number.
+    row = await JdDoc.create(data={"score": 1.5})
+    assert (await JdDoc.get(id=row.id)).data == {"score": 1.5}
 
 
 @pytest.mark.asyncio

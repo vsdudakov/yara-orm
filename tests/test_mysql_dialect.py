@@ -456,6 +456,29 @@ def test_render_alter_column_uses_modify_column():
     ]
 
 
+def test_render_alter_column_pk_demotion_strips_auto_increment_first():
+    """
+    GIVEN an AUTO_INCREMENT primary-key column being demoted
+    WHEN the pk toggle renders on MySQL
+    THEN a MODIFY COLUMN drops AUTO_INCREMENT before DROP PRIMARY KEY
+         (MySQL errno 1075 rejects dropping the pk of a live auto column),
+         while a plain pk demotion/promotion renders the bare toggle
+    """
+    auto_pk = {"kind": "int", "type_params": {}, "null": False, "pk": True, "auto_increment": True}
+    plain = {"kind": "int", "type_params": {}, "null": False, "pk": False, "auto_increment": False}
+    assert MY.render_alter_column("t", "c", auto_pk, plain, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` INT NOT NULL",
+        "ALTER TABLE `t` DROP PRIMARY KEY",
+    ]
+    manual_pk = {**auto_pk, "auto_increment": False}
+    assert MY.render_alter_column("t", "c", manual_pk, plain, {}) == [
+        "ALTER TABLE `t` DROP PRIMARY KEY"
+    ]
+    assert MY.render_alter_column("t", "c", plain, manual_pk, {}) == [
+        "ALTER TABLE `t` ADD PRIMARY KEY (`c`)"
+    ]
+
+
 def test_render_alter_column_toggles_default_unique_and_fk():
     """
     GIVEN default/unique/fk spec changes
