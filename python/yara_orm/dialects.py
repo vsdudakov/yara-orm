@@ -1916,7 +1916,10 @@ class SqliteDialect(BaseDialect):
         """
         if not keys:
             return col
-        path = "$." + ".".join(keys)
+        # Escape double quotes and backslashes so the path is a valid SQL
+        # literal AND a valid JSON path key reference.
+        safe_keys = (key.replace("\\", "\\\\").replace('"', '\\"') for key in keys)
+        path = "$." + ".".join(safe_keys)
         return f"json_extract({col}, {self._literal(path)})"
 
     def json_contains_sql(self, col: str, placeholder: str) -> str:
@@ -2326,8 +2329,14 @@ class MySQLDialect(BaseDialect):
         """
         if not keys:
             return col
+        # Escape backslashes and double quotes at the component level for the
+        # JSON-path layer.  _literal then doubles backslashes for the SQL string
+        # literal layer; MySQL's wire protocol unescapes those on the server, so
+        # the JSON-path parser receives the doubled form (``\\`` → literal
+        # backslash, ``\\"`` → literal quote).  This composes cleanly because
+        # both layers use backslash escaping.
         legs = ".".join('"' + key.replace("\\", "\\\\").replace('"', '\\"') + '"' for key in keys)
-        path = ("$." + legs).replace("\\", "\\\\")
+        path = "$." + legs
         return f"JSON_UNQUOTE(JSON_EXTRACT({col}, {self._literal(path)}))"
 
     def json_contains_sql(self, col: str, placeholder: str) -> str:
