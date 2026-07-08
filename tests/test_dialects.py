@@ -631,3 +631,24 @@ def test_compile_reset_invalidates_all_cached_plans():
     meta._compiled_for = None  # simulate a migration / field-set change
     meta.compile(PG)
     assert set(meta._compiled_plans) == {"postgres"}
+
+
+def test_quote_cache_is_bounded(monkeypatch):
+    """
+    GIVEN more distinct identifiers than the quote cache's size limit
+    WHEN each is quoted
+    THEN the cache stays at the limit (oldest entries evicted) and every
+         identifier — cached or re-computed — still quotes correctly
+    """
+    from yara_orm import dialects
+
+    monkeypatch.setattr(dialects, "_QUOTE_CACHE", {})
+    monkeypatch.setattr(dialects, "_QUOTE_CACHE_MAX", 3)
+
+    for name in ("a", "b", "c", "d"):
+        assert BASE.quote(name) == f'"{name}"'
+
+    assert len(dialects._QUOTE_CACHE) == 3
+    assert "a" not in dialects._QUOTE_CACHE  # oldest insert evicted
+    assert BASE.quote("a") == '"a"'  # evicted identifiers re-compute fine
+    assert BASE.quote('we"ird') == '"we""ird"'  # embedded quotes still escaped

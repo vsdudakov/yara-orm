@@ -172,3 +172,121 @@ async def test_prefetch_m2m_custom_queryset_shared_target_is_distinct_per_owner(
     assert t1 is not t2
     t1.name = "mutated"
     assert t2.name == "shared"
+
+
+class PfnPublisher(Model):
+    name = fields.CharField(max_length=100)
+
+    class Meta:
+        table = "pfn_publisher"
+
+
+class PfnAuthor(Model):
+    name = fields.CharField(max_length=100)
+    publisher = fields.ForeignKeyField("PfnPublisher", related_name="pfn_authors", null=True)
+
+    class Meta:
+        table = "pfn_author"
+
+
+class PfnBook(Model):
+    title = fields.CharField(max_length=100)
+    author = fields.ForeignKeyField("PfnAuthor", related_name="pfn_books", null=True)
+
+    class Meta:
+        table = "pfn_book"
+
+
+MODELS += [PfnPublisher, PfnAuthor, PfnBook]
+
+
+# Unit-only model (not in MODELS, no table): exercises the mutable-column copy.
+class PfNote(Model):
+    data = fields.JSONField(default=dict)
+
+    class Meta:
+        table = "p_note"
+
+
+@pytest.mark.asyncio
+async def test_prefetch_multi_hop_with_null_fk(db):
+    """
+    GIVEN books whose nullable author FK is NULL (or whose author has a NULL
+        publisher FK)
+    WHEN prefetching the multi-hop path ``author__publisher``
+    THEN the query succeeds and each hop resolves to None where the FK is NULL
+
+    Regression: the ``_CachedNone`` marker stored for a None forward hop was
+    fed into the next hop as if it were a model instance, crashing the query.
+    """
+    pub = await PfnPublisher.create(name="Pub")
+    full = await PfnAuthor.create(name="Full", publisher=pub)
+    bare = await PfnAuthor.create(name="Bare", publisher=None)
+    await PfnBook.create(title="orphan", author=None)
+    await PfnBook.create(title="bare", author=bare)
+    await PfnBook.create(title="full", author=full)
+
+    books = await PfnBook.all().prefetch_related("author__publisher").order_by("title")
+
+    assert books[0].author.name == "Bare"
+    assert books[0].author.publisher is None
+    assert books[1].author.publisher.name == "Pub"
+    assert books[2].author is None
+
+
+def test_assign_none_forward_fk_stores_cached_none_marker():
+    """
+    GIVEN a prefetch that resolved a forward FK to None
+    WHEN ``_assign`` stores the result
+    THEN the cache holds a ``_CachedNone`` carrying the FK that produced it,
+         while a resolved instance (or a non-forward relation) is stored as-is
+    """
+    from yara_orm.prefetch import _assign
+    from yara_orm.relations import _CachedNone
+
+    dangling = PfnBook(id=1, title="dangling", author_id=999)
+    _assign([dangling], "author", None, {dangling: None})
+    assert dangling.__dict__["_prefetch"]["author"] == _CachedNone(999)
+
+    author = PfnAuthor(id=1, name="A")
+    hit = PfnBook(id=2, title="hit", author_id=1)
+    _assign([hit], "author", None, {hit: author})
+    assert hit.__dict__["_prefetch"]["author"] is author
+
+
+def test_gather_related_skips_cached_none_marker():
+    """
+    GIVEN a batch where one instance's forward hop resolved to None
+    WHEN ``_gather_related`` collects the loaded children for the next hop
+    THEN the ``_CachedNone`` marker is skipped, not returned as an instance
+    """
+    from yara_orm.prefetch import _assign, _gather_related
+
+    author = PfnAuthor(id=1, name="A")
+    hit = PfnBook(id=1, title="hit", author_id=1)
+    miss = PfnBook(id=2, title="miss", author_id=None)
+    _assign([hit, miss], "author", None, {hit: author, miss: None})
+
+    assert _gather_related([hit, miss], "author") == [author]
+
+
+def test_clone_shared_copies_mutable_columns_but_shares_prefetch_cache():
+    """
+    GIVEN a related instance shared by several owners, carrying a mutable JSON
+        column and a nested prefetched instance
+    WHEN ``_clone_shared`` copies it for an additional owner
+    THEN the JSON column is deep-copied (no cross-owner mutation leaks) while
+         the nested prefetched instance stays shared (aliasing preserved)
+    """
+    from yara_orm.prefetch import _clone_shared
+
+    nested = PfnPublisher(id=1, name="Pub")
+    note = PfNote(id=1, data={"tags": ["a"]})
+    note.__dict__["_prefetch"] = {"publisher": nested}
+
+    clone = _clone_shared(note)
+
+    assert clone.data is not note.data
+    clone.data["tags"].append("b")
+    assert note.data == {"tags": ["a"]}
+    assert clone.__dict__["_prefetch"]["publisher"] is nested

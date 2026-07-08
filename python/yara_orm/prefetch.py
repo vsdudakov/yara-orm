@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import registry
 from .connection import _active_tx, get_dialect, get_executor
-from .relations import M2MDescriptor, ReverseFKDescriptor
+from .relations import M2MDescriptor, ReverseFKDescriptor, _CachedNone
 
 if TYPE_CHECKING:
     from .models import Model
@@ -73,7 +73,7 @@ def _gather_related(instances: Sequence[Model], name: str) -> list[Model]:
     out: list[Model] = []
     for inst in instances:
         value = inst.__dict__.get("_prefetch", {}).get(name)
-        if value is None:
+        if value is None or isinstance(value, _CachedNone):
             continue
         if isinstance(value, list):
             out.extend(value)
@@ -128,6 +128,12 @@ def _assign(
         if to_attr is not None:
             inst.__dict__[to_attr] = value
         else:
+            # A forward relation that resolved to None is stored with the FK
+            # that produced it, so the accessor can invalidate the None when
+            # the FK is later written directly (see ``_CachedNone``).
+            if value is None and name in type(inst)._meta.relations:
+                info = type(inst)._meta.relations[name]
+                value = _CachedNone(inst.__dict__.get(info.source_attr))
             inst.__dict__.setdefault("_prefetch", {})[name] = value
 
 

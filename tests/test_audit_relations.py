@@ -171,7 +171,7 @@ async def test_prefetch_custom_queryset_constrains_forward_fk(sqlite_db):
     )
     by_title = {b.title: b for b in books}
     assert by_title["L"].author.name == "Live"  # served from the prefetch cache
-    assert by_title["D"].__dict__["_prefetch"]["author"] is None
+    assert by_title["D"].author is None  # cached None (as _CachedNone), no query
 
 
 # -- related_name: %(class)s and duplicate detection (finding 8) --------------------

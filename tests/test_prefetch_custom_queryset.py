@@ -156,7 +156,7 @@ async def test_prefetch_forward_fk_sliced_queryset_applies_per_owner(db):
         .prefetch_related(Prefetch("author", queryset=CqAuthor.all()[1:]))
         .order_by("title")
     )
-    assert [b.__dict__["_prefetch"]["author"] for b in books] == [None, None, None, None]
+    assert [b.author for b in books] == [None, None, None, None]  # cached as _CachedNone
 
 
 @pytest.mark.asyncio

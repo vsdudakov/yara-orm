@@ -8,7 +8,7 @@ are cached on the instance under ``_prefetch`` and served without a query.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, Union, cast
 
 from . import registry
 from .connection import get_dialect, get_executor
@@ -25,6 +25,17 @@ if TYPE_CHECKING:
 #: The related model a relation annotation is parameterised over, e.g.
 #: ``books: ReverseRelation["Book"]``.
 MODEL = TypeVar("MODEL", bound="Model")
+
+
+class _CachedNone(NamedTuple):
+    """``_prefetch`` marker: a prefetch resolved a forward relation to ``None``.
+
+    Carries the FK value that produced the ``None`` so the accessor can tell a
+    still-valid cached ``None`` from one made stale by a later direct write to
+    the ``<name>_id`` attribute (which bypasses the descriptor).
+    """
+
+    fk: Any
 
 
 # ---------------------------------------------------------------------------
@@ -181,9 +192,20 @@ class ForwardRelationDescriptor:
         cache = instance.__dict__.get("_prefetch")
         if cache and self.info.name in cache:
             cached = cache[self.info.name]
+            if isinstance(cached, _CachedNone):
+                # A prefetch resolved this relation to None (NULL FK, no row,
+                # or its custom queryset excluded it). Serve that None only
+                # while the FK still matches the value that produced it; a
+                # direct write to the ``<name>_id`` attribute leaves it stale
+                # — drop it and reload.
+                fk = instance.__dict__.get(self.info.source_attr, _MISSING)
+                if fk is _MISSING or fk == cached.fk:
+                    return None
+                del cache[self.info.name]
+                return ForwardRelation(instance, self.info)
             if cached is None:
-                # A prefetch resolved this relation to None (no row, or its
-                # custom queryset excluded it); serve that result.
+                # A join-path hydration (``select_related``) resolved this
+                # relation to None; serve that result.
                 return None
             # Serve a cached object only while it matches the current FK value;
             # a direct write to the ``<name>_id`` attribute (which bypasses

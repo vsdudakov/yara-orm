@@ -20,3 +20,6 @@ docs-requirements.txt
 # macOS Finder metadata
 .DS_Store
 MIGRATION_GAPS.md
+
+# Local agent-harness instructions (per-developer, not part of the repo)
+AGENTS.md

@@ -545,3 +545,36 @@ async def test_close_closes_every_pool_even_when_one_fails():
     assert "second" in closed  # the healthy pool was still closed
     assert conn_mod._CONNECTIONS == {}  # globals cleared despite the error
     assert conn_mod._ENGINE is None
+
+
+def test_arrayify_wraps_lists_and_tuples_recursively():
+    """
+    GIVEN raw-SQL bind parameters that are (possibly nested) lists or tuples
+    WHEN normalised by ``_arrayify``
+    THEN each level is wrapped as ``Array`` so it binds as a SQL array, not JSON
+    """
+    from yara_orm.connection import _arrayify
+    from yara_orm.expressions import Array
+
+    result = _arrayify([1, (2, 3), []])
+    assert isinstance(result, Array)
+    inner = list(result)
+    assert inner[0] == 1
+    assert isinstance(inner[1], Array) and list(inner[1]) == [2, 3]
+    assert isinstance(inner[2], Array) and list(inner[2]) == []
+
+
+def test_arrayify_passes_through_non_sequences_and_arrays():
+    """
+    GIVEN a parameter that is already an ``Array`` or is no sequence at all
+    WHEN normalised by ``_arrayify``
+    THEN the value is returned unchanged
+    """
+    from yara_orm.connection import _arrayify
+    from yara_orm.expressions import Array
+
+    arr = Array([1, 2])
+    assert _arrayify(arr) is arr
+    assert _arrayify("hello") == "hello"
+    assert _arrayify(42) == 42
+    assert _arrayify(None) is None

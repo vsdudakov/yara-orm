@@ -5,12 +5,17 @@ PY := $(VENV)/bin/python
 DB ?= postgres://localhost/orm_demo
 LINT_PATHS := python tests benchmarks examples
 
+# Force the project venv for every recipe. Callers (uv run, IDEs, agent
+# shells) may leak a stale VIRTUAL_ENV that points elsewhere, which breaks
+# ty ("Invalid VIRTUAL_ENV") and maturin; this assignment overrides it.
+export VIRTUAL_ENV := $(CURDIR)/$(VENV)
+
 dev:
 	python3 -m venv $(VENV)
 	$(VENV)/bin/pip install -U pip maturin pytest pytest-asyncio ruff ty
 
 build:
-	VIRTUAL_ENV=$(PWD)/$(VENV) $(VENV)/bin/maturin develop --release
+	$(VENV)/bin/maturin develop --release
 
 # Blocking gate: ruff check + format + ty (matches the AGENTS lint convention).
 lint:

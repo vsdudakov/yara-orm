@@ -27,8 +27,12 @@ if TYPE_CHECKING:
 
 
 #: Memoised identifier -> quoted identifier, shared by every dialect (both quote
-#: identically). Bounded by the set of table/column names in the schema.
+#: identically). Bounded by the set of table/column names in the schema;
+#: ``_QUOTE_CACHE_MAX`` is a safety valve against pathological dynamic
+#: identifiers (e.g. generated column names in raw SQL) — the hit path stays a
+#: plain dict lookup, misses evict the oldest insert once full.
 _QUOTE_CACHE: dict[str, str] = {}
+_QUOTE_CACHE_MAX = 1024
 
 #: Index access methods accepted for ``USING <method>`` (a closed keyword set)
 #: and the safe shape of an operator-class identifier. Both are spliced into
@@ -221,6 +225,8 @@ class BaseDialect:
         """
         quoted = _QUOTE_CACHE.get(identifier)
         if quoted is None:
+            if len(_QUOTE_CACHE) >= _QUOTE_CACHE_MAX:
+                del _QUOTE_CACHE[next(iter(_QUOTE_CACHE))]
             quoted = _QUOTE_CACHE[identifier] = '"{}"'.format(identifier.replace('"', '""'))
         return quoted
 

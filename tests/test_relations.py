@@ -522,3 +522,80 @@ async def test_bulk_update_relation_deferred_column_raises(db):
         await Event.bulk_update(events, ["tournament"])
     # The FK is untouched — nothing was written.
     assert {e.tournament_id for e in await Event.all()} == {a.id}
+
+
+def test_forward_accessor_serves_cached_none_while_fk_unchanged():
+    """
+    GIVEN a prefetch that resolved a nullable forward FK to None
+    WHEN the relation is accessed while the FK still holds the same value
+    THEN the cached None is served without a query
+    """
+    from yara_orm.relations import _CachedNone
+
+    emp = Employee(id=1, name="e", manager_id=None)
+    emp.__dict__["_prefetch"] = {"manager": _CachedNone(None)}
+
+    assert emp.manager is None
+
+
+def test_forward_accessor_drops_cached_none_after_fk_write():
+    """
+    GIVEN a prefetch that resolved a forward FK to None
+    WHEN the ``<name>_id`` attribute is then written directly (bypassing the
+        descriptor) and the relation is accessed
+    THEN the stale None is dropped and a lazy reload is returned
+    """
+    from yara_orm.relations import ForwardRelation, _CachedNone
+
+    emp = Employee(id=1, name="e", manager_id=None)
+    emp.__dict__["_prefetch"] = {"manager": _CachedNone(None)}
+    emp.manager_id = 2
+
+    result = emp.manager
+    assert isinstance(result, ForwardRelation)
+    assert "manager" not in emp.__dict__["_prefetch"]
+
+
+def test_forward_accessor_trusts_cached_none_when_fk_deferred():
+    """
+    GIVEN a cached None whose backing FK column was deferred (no local value)
+    WHEN the relation is accessed
+    THEN the cache is trusted as-is (there is no FK to compare against)
+    """
+    from yara_orm.relations import _CachedNone
+
+    emp = Employee(id=1, name="e")
+    emp.__dict__.pop("manager_id", None)
+    emp.__dict__["_prefetch"] = {"manager": _CachedNone(3)}
+
+    assert emp.manager is None
+
+
+def test_forward_accessor_serves_join_hydrated_plain_none():
+    """
+    GIVEN a plain None in the prefetch cache (a ``select_related`` LEFT-JOIN
+        miss stores None without an FK marker)
+    WHEN the relation is accessed
+    THEN None is served directly
+    """
+    emp = Employee(id=1, name="e", manager_id=None)
+    emp.__dict__["_prefetch"] = {"manager": None}
+
+    assert emp.manager is None
+
+
+def test_forward_accessor_drops_cached_instance_after_fk_write():
+    """
+    GIVEN a prefetched related instance
+    WHEN the ``<name>_id`` attribute is then written directly to a different key
+    THEN the stale instance is dropped and a lazy reload is returned
+    """
+    from yara_orm.relations import ForwardRelation
+
+    boss = Employee(id=7, name="boss")
+    emp = Employee(id=1, name="e", manager_id=7)
+    emp.__dict__["_prefetch"] = {"manager": boss}
+    assert emp.manager is boss
+
+    emp.manager_id = 8
+    assert isinstance(emp.manager, ForwardRelation)

@@ -368,7 +368,7 @@ async def test_multi_level_prefetch_forward_fk_and_empty(db):
     await A3Book.create(title="B1", author=ada)  # editor is null
     books = await A3Book.all().prefetch_related("author__country", "editor__country")
     assert books[0].author.country is not None  # forward-FK hop gathered + country loaded
-    assert books[0].__dict__["_prefetch"].get("editor") is None  # null hop, no grandchildren
+    assert books[0].editor is None  # null hop cached (as _CachedNone), no grandchildren
 
 
 def test_m2m_to_alias_resolves():
