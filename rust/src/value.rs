@@ -212,15 +212,18 @@ fn py_to_json(ob: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         return Ok(serde_json::Value::from(ob.extract::<i64>()?));
     }
     if ob.is_instance_of::<PyFloat>() {
-        // JSON has no representation for NaN/±Infinity; `serde_json::Value::from`
-        // would silently turn them into `null` (data corruption). Preserve the
-        // value as its textual form ("inf"/"-inf"/"NaN") instead — this keeps
-        // the insert succeeding (raising would break rows that previously wrote)
-        // and matches `value_to_json`, so both JSON bind paths encode a
-        // non-finite float identically.
+        // JSON has no representation for NaN/±Infinity, so any silent encoding
+        // corrupts the stored shape: `serde_json::Value::from` would coerce to
+        // `null` (readers lose the value), a textual "inf"/"NaN" changes the
+        // member's type under readers and filters with no decode path back.
+        // Reject the write with a clear error instead, like
+        // `json.dumps(..., allow_nan=False)` and PostgreSQL's jsonb.
         let f = ob.extract::<f64>()?;
         if !f.is_finite() {
-            return Ok(serde_json::Value::String(f.to_string()));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "non-finite float {f} has no JSON representation; \
+                 store None or a string explicitly instead"
+            )));
         }
         return Ok(serde_json::Value::from(f));
     }
@@ -600,8 +603,11 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Bool(b) => J::Bool(*b),
         Value::Int(i) => J::from(*i),
         // `J::from(f64)` yields `null` for NaN/±Infinity, silently dropping the
-        // element. This bind path is infallible, so preserve the value as its
-        // textual form ("inf"/"-inf"/"NaN") instead — like Decimal/Uuid below.
+        // element. Stored documents never reach here (a JSONField binds as
+        // `Value::Json`, whose conversion rejects non-finite floats); this path
+        // only carries comparison parameters (IN lists) on backends that encode
+        // arrays as JSON text, and the driver bind traits are infallible — so
+        // preserve the value as its textual form, like Decimal/Uuid below.
         Value::Float(f) if !f.is_finite() => J::String(f.to_string()),
         Value::Float(f) => J::from(*f),
         Value::Text(s) => J::String(s.clone()),

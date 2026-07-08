@@ -199,11 +199,21 @@ def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[Operation]:
         for col in old_cols:
             if col not in new_cols and col not in renamed_old:
                 ops.append(RemoveFieldIfExists(table, col, old_fields[col]))
+        # A primary key moving between columns renders as two independent
+        # operations; the demotion must be emitted first, or the promotion's
+        # ADD PRIMARY KEY runs while the old constraint still exists and the
+        # database rejects it ("multiple primary keys").
+        pk_demotions: list[Operation] = []
+        column_ops: list[Operation] = []
         for col in new_cols:
             if col not in old_cols and col not in renamed_new:
-                ops.append(AddFieldIfNotExists(table, col, new_fields[col]))
+                column_ops.append(AddFieldIfNotExists(table, col, new_fields[col]))
             elif col in old_cols and _alterable(old_cols[col], new_cols[col]):
-                ops.append(AlterField(table, col, new_fields[col], old_fields[col]))
+                op = AlterField(table, col, new_fields[col], old_fields[col])
+                demoted = bool(old_cols[col].get("pk")) and not bool(new_cols[col].get("pk"))
+                (pk_demotions if demoted else column_ops).append(op)
+        ops.extend(pk_demotions)
+        ops.extend(column_ops)
         for col in sorted(new_idx - old_idx):
             ops.append(AddIndexIfNotExists(table, col))
 

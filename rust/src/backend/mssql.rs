@@ -29,8 +29,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use deadpool::managed::{Manager, Metrics, Object, Pool, RecycleResult};
-use rust_decimal::Decimal;
 use percent_encoding::percent_decode_str;
+use rust_decimal::Decimal;
 use tiberius::{AuthMethod, ColumnData, Config, EncryptionLevel, FromSql, IntoSql, ToSql};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -59,7 +59,11 @@ fn map_tds(e: tiberius::error::Error) -> EngineError {
         if INTEGRITY_CODES.contains(&token.code()) {
             return EngineError::Integrity(token.message().to_string());
         }
-        return EngineError::Query(format!("{} (SQL Server error {})", token.message(), token.code()));
+        return EngineError::Query(format!(
+            "{} (SQL Server error {})",
+            token.message(),
+            token.code()
+        ));
     }
     EngineError::Query(e.to_string())
 }
@@ -115,7 +119,9 @@ fn cd_to_value(cd: ColumnData<'static>) -> Result<Value, EngineError> {
         ColumnData::F32(o) => o.map_or(Value::Null, |v| Value::Float(f64::from(v))),
         ColumnData::F64(o) => o.map_or(Value::Null, Value::Float),
         ColumnData::Bit(o) => o.map_or(Value::Null, Value::Bool),
-        ColumnData::String(o) => o.as_ref().map_or(Value::Null, |s| Value::Text(s.to_string())),
+        ColumnData::String(o) => o
+            .as_ref()
+            .map_or(Value::Null, |s| Value::Text(s.to_string())),
         ColumnData::Guid(o) => o.map_or(Value::Null, Value::Uuid),
         ColumnData::Binary(o) => o.as_ref().map_or(Value::Null, |b| Value::Bytes(b.to_vec())),
         ColumnData::Numeric(o) => match o {
@@ -138,7 +144,9 @@ fn cd_to_value(cd: ColumnData<'static>) -> Result<Value, EngineError> {
         ColumnData::Time(_) => NaiveTime::from_sql(&cd)
             .map_err(map_tds)?
             .map_or(Value::Null, Value::Time),
-        ColumnData::Xml(o) => o.as_ref().map_or(Value::Null, |x| Value::Text(x.to_string())),
+        ColumnData::Xml(o) => o
+            .as_ref()
+            .map_or(Value::Null, |x| Value::Text(x.to_string())),
     })
 }
 
@@ -159,7 +167,11 @@ fn stmt_is_insert(sql: &str) -> bool {
     s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("insert"))
 }
 
-async fn run_fetch(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<Fetched, EngineError> {
+async fn run_fetch(
+    conn: &mut MssqlConn,
+    sql: &str,
+    params: &[Value],
+) -> Result<Fetched, EngineError> {
     let wrappers: Vec<Param> = params.iter().map(Param).collect();
     let refs: Vec<&dyn ToSql> = wrappers.iter().map(|p| p as &dyn ToSql).collect();
     // The model layer calls the fetch path on an auto-increment INSERT to read
@@ -197,7 +209,11 @@ async fn run_fetch(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<
     Ok((names, out))
 }
 
-async fn run_execute(conn: &mut MssqlConn, sql: &str, params: &[Value]) -> Result<u64, EngineError> {
+async fn run_execute(
+    conn: &mut MssqlConn,
+    sql: &str,
+    params: &[Value],
+) -> Result<u64, EngineError> {
     let wrappers: Vec<Param> = params.iter().map(Param).collect();
     let refs: Vec<&dyn ToSql> = wrappers.iter().map(|p| p as &dyn ToSql).collect();
     let result = conn.execute(sql, &refs).await.map_err(map_tds)?;
@@ -230,33 +246,55 @@ fn config_from_url(url: &str) -> Result<Config, EngineError> {
     let user = if u.username().is_empty() {
         "sa".to_string()
     } else {
-        percent_decode_str(u.username()).decode_utf8_lossy().into_owned()
+        decode_userinfo(u.username())
     };
-    let pass = u
-        .password()
-        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned())
-        .unwrap_or_default();
+    let pass = u.password().map(decode_userinfo).unwrap_or_default();
     config.authentication(AuthMethod::sql_server(&user, &pass));
     // TLS is negotiated; the server's certificate is trusted by default (a
     // dev/self-signed cert is the common case). `?encrypt=strict` opts into
     // full certificate validation (encryption required, cert verified against
     // the trust store); `?trust_cert=false` also enforces validation.
     let params: std::collections::HashMap<_, _> = u.query_pairs().collect();
-    let strict = params.get("encrypt").map(|v| v == "strict").unwrap_or(false);
+    let (strict, trust) = tls_options(
+        params.get("encrypt").map(|v| v.as_ref()),
+        params.get("trust_cert").map(|v| v.as_ref()),
+    );
     if strict {
         config.encryption(EncryptionLevel::Required);
     }
-    // Strict mode always validates the certificate, so it overrides the
-    // trust-by-default; otherwise `trust_cert` (default on) controls it.
-    let trust = !strict
-        && params
-            .get("trust_cert")
-            .map(|v| v != "false")
-            .unwrap_or(true);
     if trust {
         config.trust_cert();
     }
     Ok(config)
+}
+
+/// Resolve `(encryption required, trust the server certificate)` from the
+/// `encrypt` / `trust_cert` URL parameters.
+///
+/// `encrypt=strict` flips the trust *default* to full validation, but an
+/// explicit `trust_cert=true` still wins — "encryption required but trust the
+/// (self-signed) server cert" must stay expressible, and silently ignoring the
+/// parameter would leave such deployments no way to connect.
+fn tls_options(encrypt: Option<&str>, trust_cert: Option<&str>) -> (bool, bool) {
+    let strict = encrypt == Some("strict");
+    let trust = match trust_cert {
+        Some(v) => v != "false",
+        None => !strict,
+    };
+    (strict, trust)
+}
+
+/// Percent-decode one userinfo component of the connection URL.
+///
+/// A sequence that does not decode to valid UTF-8 was not percent-encoded in
+/// the first place (a raw credential that merely contains `%`), so it passes
+/// through unchanged — lossy decoding would silently rewrite those bytes to
+/// U+FFFD and the login would fail with no hint the password was altered.
+fn decode_userinfo(raw: &str) -> String {
+    match percent_decode_str(raw).decode_utf8() {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => raw.to_string(),
+    }
 }
 
 async fn connect_client(config: Config) -> Result<MssqlConn, EngineError> {
@@ -549,5 +587,52 @@ impl TxConn for MssqlTx {
             .await
             .map(|_| ())
             .map_err(map_tds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_options_defaults_and_strict_interaction() {
+        // GIVEN no TLS parameters THEN the server certificate is trusted
+        // (dev/self-signed is the common case) without requiring encryption.
+        assert_eq!(tls_options(None, None), (false, true));
+        // GIVEN encrypt=strict alone THEN encryption is required and the
+        // trust *default* flips to full certificate validation.
+        assert_eq!(tls_options(Some("strict"), None), (true, false));
+        // GIVEN an explicit trust_cert=true THEN it wins even under strict —
+        // "encryption required but trust the self-signed cert" must stay
+        // expressible (the 1.14.2 regression silently dropped it).
+        assert_eq!(tls_options(Some("strict"), Some("true")), (true, true));
+        // GIVEN trust_cert=false THEN validation is enforced with or without
+        // strict encryption.
+        assert_eq!(tls_options(None, Some("false")), (false, false));
+        assert_eq!(tls_options(Some("strict"), Some("false")), (true, false));
+        // GIVEN any other encrypt value THEN it does not imply strict.
+        assert_eq!(tls_options(Some("true"), None), (false, true));
+    }
+
+    #[test]
+    fn decode_userinfo_decodes_and_tolerates_raw_credentials() {
+        // GIVEN a properly percent-encoded credential THEN it decodes.
+        assert_eq!(decode_userinfo("p%40ss%2Fword"), "p@ss/word");
+        assert_eq!(decode_userinfo("plain"), "plain");
+        // GIVEN a credential whose %-sequence decodes to invalid UTF-8 (it was
+        // never percent-encoded) THEN it passes through unchanged instead of
+        // being lossily rewritten to U+FFFD.
+        assert_eq!(decode_userinfo("se%FFcret"), "se%FFcret");
+    }
+
+    #[test]
+    fn config_from_url_accepts_credentials_and_tls_params() {
+        // GIVEN a full URL THEN parsing succeeds (smoke: host/port/db/user and
+        // TLS parameters are accepted together).
+        let config = config_from_url(
+            "mssql://sa:p%40ss@db.example.com:1434/app?encrypt=strict&trust_cert=true",
+        )
+        .expect("config parses");
+        assert_eq!(config.get_addr(), "db.example.com:1434");
     }
 }

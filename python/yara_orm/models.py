@@ -2314,7 +2314,11 @@ class Model(metaclass=ModelMeta):
             # ``DO NOTHING`` with no update_cols is fine targetless.)
             if update_cols and not conflict_cols:
                 conflict_cols = [pk_field.db_column]
-            if dialect.upsert_requires_conflict_target and on_conflict is None:
+            # ``not on_conflict``: an empty list means "no explicit target"
+            # exactly like None does, so it must take the same substitution —
+            # otherwise the pk fallback above leaves MERGE matching on the
+            # (uninserted) auto pk column.
+            if dialect.upsert_requires_conflict_target and not on_conflict:
                 # SQL Server's MERGE must name real match columns present in the
                 # inserted set; INSERT IGNORE / ON CONFLICT DO NOTHING catch any
                 # unique violation implicitly, and default to the (uninserted)

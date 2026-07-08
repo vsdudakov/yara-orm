@@ -486,7 +486,6 @@ impl Backend for SqliteBackend {
 
 // --- transaction -----------------------------------------------------------
 
-
 /// A pinned-connection SQLite transaction.
 ///
 /// Like the PostgreSQL twin, the connection only returns to the pool after a

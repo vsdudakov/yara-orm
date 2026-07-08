@@ -251,9 +251,11 @@ async def test_bulk_create_update_fields_empty_conflict_target_falls_back_to_pk(
     GIVEN update_fields with an explicit *empty* on_conflict list
     WHEN bulk_create runs
     THEN the conflict target still falls back to the primary key rather than
-         rendering an invalid targetless ``DO UPDATE``
+         rendering an invalid targetless ``DO UPDATE`` — and MERGE backends
+         substitute the model's unique columns exactly as they do for an
+         omitted ``on_conflict`` (the auto pk is not in the inserted set)
     """
-    if db in ("mssql", "oracle"):
+    if db == "oracle":
         pytest.skip("MERGE backends need a real match column; covered elsewhere")
     # Empty list (not just an omitted arg) must also default the target to the
     # pk; the auto pk never fires, so the statement just inserts cleanly.

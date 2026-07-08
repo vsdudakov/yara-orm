@@ -107,6 +107,42 @@ def test_db_default_change_diffs_to_alterfield():
         _replace_field(AuEvent, "created", fields.DatetimeField(default=Now()))
 
 
+class AuPkMove(Model):
+    id = fields.IntField(pk=True)
+    code = fields.IntField(default=0)
+
+    class Meta:
+        table = "au_pk_move"
+
+
+def test_pk_move_diffs_demotion_before_promotion():
+    """
+    GIVEN the primary key moving from one column to another
+    WHEN the state diff is computed in either direction
+    THEN the demoting AlterField precedes the promoting one, so the rendered
+         DROP PRIMARY KEY runs before ADD PRIMARY KEY ("multiple primary
+         keys" would abort the migration otherwise)
+    """
+    before = model_state([AuPkMove])
+    _replace_field(AuPkMove, "id", fields.IntField(default=0))
+    _replace_field(AuPkMove, "code", fields.IntField(pk=True))
+    try:
+        after = model_state([AuPkMove])
+        forward = [op for op in diff_states(before, after) if isinstance(op, m.AlterField)]
+        assert [(op.name, bool(op.field.pk)) for op in forward] == [
+            ("id", False),  # demotion first
+            ("code", True),
+        ]
+        backward = [op for op in diff_states(after, before) if isinstance(op, m.AlterField)]
+        assert [(op.name, bool(op.field.pk)) for op in backward] == [
+            ("code", False),  # demotion first in this direction too
+            ("id", True),
+        ]
+    finally:
+        _replace_field(AuPkMove, "id", fields.IntField(pk=True))
+        _replace_field(AuPkMove, "code", fields.IntField(default=0))
+
+
 def test_db_default_variants_render_and_round_trip():
     """
     GIVEN fields carrying each built-in database default

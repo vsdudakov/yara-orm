@@ -6,6 +6,44 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Custom-`Prefetch` correctness and performance.** The custom-queryset M2M
+  prefetch path decodes through-table link values the way hydration does, so
+  pk types the driver returns in a non-native form (e.g. a `CHAR(36)` UUID pk
+  on MySQL/MariaDB) group correctly instead of silently producing empty
+  prefetched lists; the plain M2M join path decodes its owner-id column the
+  same way. A target shared by several owners now deep-copies mutable column
+  values (JSON dicts/lists), so mutating one owner's prefetched instance can
+  no longer leak into another's. Per-owner `LIMIT`/`OFFSET` semantics now
+  apply to **every** relation kind (reverse FK and forward FK, not just M2M),
+  and the per-owner queries run concurrently outside a transaction instead of
+  serially (no more N+1 latency for sliced prefetches).
+- **Non-finite floats in JSON documents are rejected.** Binding
+  `NaN`/`±Infinity` inside a `JSONField` value now raises a clear
+  `ValueError` (like `json.dumps(..., allow_nan=False)` and PostgreSQL's
+  `jsonb`) instead of silently storing the strings `"inf"`/`"NaN"` (1.14.2)
+  or `null` (≤ 1.14.1), both of which changed the member's type under readers
+  and filters with no decode path back.
+- **SQL Server connection URLs.** An explicit `trust_cert=true` is honoured
+  even with `encrypt=strict`, so "encryption required but trust the
+  (self-signed) server cert" stays expressible; `encrypt=strict` alone still
+  defaults to full certificate validation. Percent-decoding of URL
+  credentials is no longer lossy: a `%`-sequence that does not decode to
+  valid UTF-8 (a raw password merely containing `%`) passes through unchanged
+  instead of being rewritten to U+FFFD.
+- **Primary-key migrations.** Moving the pk between columns now emits the
+  demoting `AlterField` before the promoting one, so `DROP PRIMARY KEY` runs
+  before `ADD PRIMARY KEY` ("multiple primary keys" previously aborted the
+  migration when the promoted column diffed first). On MySQL/MariaDB,
+  demoting an `AUTO_INCREMENT` pk first restates the column via
+  `MODIFY COLUMN` to strip the flag (MySQL errno 1075 rejects dropping the
+  pk of a live auto column).
+- **`bulk_create(update_fields=..., on_conflict=[])` on SQL Server.** An
+  explicit empty conflict target now takes the same unique-column
+  substitution as an omitted one, instead of rendering a MERGE that matches
+  on the uninserted auto pk column and failing.
+
 ## [1.14.2] - 2026-07-07
 
 ### Fixed
