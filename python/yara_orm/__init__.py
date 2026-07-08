@@ -64,7 +64,7 @@ try:  # populated by maturin; absent only in source checkouts pre-build
 except ImportError:  # pragma: no cover
     _engine_version = "unbuilt"
 
-__version__ = "1.14.2"
+__version__ = "1.14.3"
 
 __all__ = [
     "YaraOrm",
