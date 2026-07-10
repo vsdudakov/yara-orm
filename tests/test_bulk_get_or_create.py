@@ -28,6 +28,14 @@ class BgItem(Model):
         table = "bg_item"
 
 
+class BgCode(Model):
+    code = fields.CharField(pk=True, max_length=20)
+    label = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "bg_code"
+
+
 class BgPair(Model):
     id = fields.IntField(pk=True)
     a = fields.IntField()
@@ -65,7 +73,7 @@ class RfxItem(Model):
         table = "rfx_item"
 
 
-MODELS = [BgItem, BgPair, RfxAuthor, RfxBook, RfxItem]
+MODELS = [BgItem, BgCode, BgPair, RfxAuthor, RfxBook, RfxItem]
 
 
 @pytest.mark.asyncio
@@ -348,6 +356,21 @@ async def test_bulk_get_or_create_allows_mixed_explicit_and_auto_pks(db):
     assert [created for _, created in out] == [True, True]
     assert out[0][0].id == 600
     assert (await BgItem.get(sku="mx4")).id is not None
+
+
+@pytest.mark.asyncio
+async def test_bulk_get_or_create_non_auto_pk_takes_the_plain_path(db):
+    """
+    GIVEN a model whose primary key is not auto-increment
+    WHEN bulk_get_or_create inserts new rows
+    THEN the create list is inserted in one batch (no explicit/auto split)
+    """
+    out = await BgCode.bulk_get_or_create(
+        [{"code": "c1", "label": "a"}, {"code": "c2", "label": "b"}],
+        key_fields=["code"],
+    )
+    assert [created for _, created in out] == [True, True]
+    assert {o.code for o, _ in out} == {"c1", "c2"}
 
 
 def test_filter_create_kwargs_skips_ambiguous_constraints():

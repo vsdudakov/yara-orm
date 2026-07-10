@@ -159,3 +159,18 @@ async def test_reverse_fk_bulk_writes_ignore_manager_scope(db):
     other = await RfeBoard.create()
     await RfePost.create(board=other, deleted=True)
     assert await other.posts.delete() == 1
+
+
+@pytest.mark.asyncio
+async def test_m2m_manager_bulk_writes_use_the_default_write_queryset(db):
+    """
+    GIVEN an m2m manager (no custom write scoping of its own)
+    WHEN .update() is delegated through the manager
+    THEN it runs against the base related queryset (the default _write_qs)
+    """
+    card = await RfeCard.create()
+    label = await RfeLabel.create(deleted=False)
+    await card.labels.add(label)
+
+    await card.labels.update(deleted=False)
+    assert [lb.id for lb in await card.labels] == [label.id]
