@@ -273,6 +273,12 @@ def _field_source(field: Field) -> str:
         args = [repr(field.reference)]
         if field.on_delete != OnDelete.CASCADE:
             args.append(f"on_delete={field.on_delete!r}")
+        if field.pk:
+            # The field's own primary-key flag (e.g. an O2O used as the pk).
+            # It lives inside the constructor call: the resolved_fk wrapper
+            # below has its own ``pk=`` kwarg naming the TARGET model's pk
+            # column, which is a different thing.
+            args.append("pk=True")
         if field.null:
             args.append("null=True")
         if field.unique and not field.is_o2o:

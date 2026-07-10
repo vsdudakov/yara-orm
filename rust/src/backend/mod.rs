@@ -16,6 +16,38 @@ pub mod pool;
 pub mod postgres;
 pub mod sqlite;
 
+thread_local! {
+    /// Set while the engine drives a statement future with `block_on` on the
+    /// calling Python thread (the sync fast path). `block_on` polls the future
+    /// on that same thread, so a backend's pool checkout observes the flag and
+    /// must not wait for a connection: the free connection may be pinned by an
+    /// open transaction whose COMMIT can only run once this thread's event
+    /// loop resumes — waiting would deadlock permanently. The checkout returns
+    /// [`EngineError::PoolBusy`] instead, and the engine retries the statement
+    /// on the normal async bridge.
+    static CHECKOUT_NOWAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the no-wait pool-checkout flag set for this thread (reset on
+/// exit, panic included).
+pub(crate) fn nowait_scope<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CHECKOUT_NOWAIT.with(|c| c.set(false));
+        }
+    }
+    CHECKOUT_NOWAIT.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
+}
+
+/// Whether the current thread is inside [`nowait_scope`] (i.e. a pool checkout
+/// must not wait).
+pub(crate) fn checkout_nowait() -> bool {
+    CHECKOUT_NOWAIT.with(|c| c.get())
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Run a statement that does not return rows; yields the affected row count.

@@ -178,13 +178,19 @@ async fn run_fetch(
     // the new pk back (T-SQL has no `RETURNING`, and `OUTPUT` cannot be a suffix
     // the model appends). Batch a `SELECT` so the identity is read on the same
     // connection immediately after the insert. `SCOPE_IDENTITY()` is the *last*
-    // id, but the model's bulk backfill expects the *first* (MySQL's
-    // `LAST_INSERT_ID` semantics), so subtract `@@ROWCOUNT - 1`: a single-row
-    // insert yields the id itself, and a multi-row insert (contiguous within one
-    // statement) yields the first of the range. Cast to BIGINT so it decodes as
-    // an integer (uuid/explicit-pk inserts never reach this path — they carry
+    // id; the `- @@ROWCOUNT + 1` normalisation to the *first* (MySQL's
+    // `LAST_INSERT_ID` semantics) is the identity itself for the single-row
+    // inserts that reach this branch. Cast to BIGINT so it decodes as an
+    // integer (uuid/explicit-pk inserts never reach this path — they carry
     // their own pk and go through `execute`).
-    let is_insert = stmt_is_insert(sql);
+    //
+    // A *multi-row* bulk insert instead renders its own `OUTPUT INSERTED.<pk>`
+    // clause (the model layer's spelling; SQL Server does not guarantee one
+    // statement allocates consecutive identities under concurrency, so a
+    // first-id range would backfill wrong pks). That statement already
+    // produces the result set the caller wants, so it must be run as-is —
+    // appending the SELECT would only add a discarded second result set.
+    let is_insert = stmt_is_insert(sql) && !sql.contains(" OUTPUT INSERTED.");
     let batched;
     let query = if is_insert {
         batched = format!("{sql}; SELECT CAST(SCOPE_IDENTITY() - @@ROWCOUNT + 1 AS BIGINT) AS id");

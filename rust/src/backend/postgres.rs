@@ -109,11 +109,84 @@ async fn prepare_for(
         .iter()
         .map(|v| v.pg_type().unwrap_or_else(unspecified_type))
         .collect();
+    prepare_typed(client, sql, &types, cache).await
+}
+
+/// Prepare `sql` with explicitly declared parameter types (cached or not).
+async fn prepare_typed(
+    client: &Object,
+    sql: &str,
+    types: &[Type],
+    cache: bool,
+) -> Result<Statement, EngineError> {
     Ok(if cache {
-        client.prepare_typed_cached(sql, &types).await?
+        client.prepare_typed_cached(sql, types).await?
     } else {
-        client.prepare_typed(sql, &types).await?
+        client.prepare_typed(sql, types).await?
     })
+}
+
+/// The common declared type two differing scalar parameter types can both be
+/// encoded into without corruption: the numeric widening lattice
+/// INT8 -> FLOAT8 -> NUMERIC (each step has an exact-enough coercion arm in
+/// `Value::to_sql`). Any pair outside the lattice has no safe common encoding.
+fn widen_pg_type(a: &Type, b: &Type) -> Option<Type> {
+    fn rank(t: &Type) -> Option<u8> {
+        match *t {
+            Type::INT8 => Some(0),
+            Type::FLOAT8 => Some(1),
+            Type::NUMERIC => Some(2),
+            _ => None,
+        }
+    }
+    let (ra, rb) = (rank(a)?, rank(b)?);
+    Some(if ra >= rb { a.clone() } else { b.clone() })
+}
+
+/// Declared parameter types for a batch, unified across *all* rows.
+///
+/// `execute_many` prepares its statement once, so deriving the types from the
+/// first row alone (as the single-statement paths do per call) would make a
+/// later row of a different value type encode into the wrong declared type —
+/// e.g. rows `[[1], [2.5]]` would write row 2's f64 bytes into an
+/// INT8-declared parameter, silently storing a huge bogus integer. Numeric
+/// mixes widen (INT8+FLOAT8 -> FLOAT8, anything+NUMERIC -> NUMERIC, matching
+/// `Value::to_sql`'s coercion arms); values with no definite type (NULL/JSON/
+/// array) don't vote; any other mix is rejected up front with a clear error.
+fn unified_param_types(rows: &[Vec<Value>]) -> Result<Vec<Type>, EngineError> {
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let mut types: Vec<Option<Type>> = first.iter().map(Value::pg_type).collect();
+    for row in &rows[1..] {
+        // Row arity mismatches are the server's to reject at bind time; unify
+        // only the parameters the prepared statement will declare.
+        for (idx, value) in row.iter().enumerate().take(types.len()) {
+            let Some(next) = value.pg_type() else {
+                continue; // NULL/JSON/array: stays inferred from context
+            };
+            match &mut types[idx] {
+                slot @ None => *slot = Some(next),
+                Some(current) if *current == next => {}
+                Some(current) => match widen_pg_type(current, &next) {
+                    Some(widened) => *current = widened,
+                    None => {
+                        return Err(EngineError::Query(format!(
+                            "execute_many parameter {} mixes incompatible types across rows \
+                             ({} vs {}); bind a consistent type per column",
+                            idx + 1,
+                            current.name(),
+                            next.name(),
+                        )))
+                    }
+                },
+            }
+        }
+    }
+    Ok(types
+        .into_iter()
+        .map(|t| t.unwrap_or_else(unspecified_type))
+        .collect())
 }
 
 impl PgBackend {
@@ -227,19 +300,22 @@ impl Backend for PgBackend {
     }
 
     async fn execute_many(&self, sql: &str, rows: &[Vec<Value>]) -> Result<Vec<Row>, EngineError> {
-        let Some(first) = rows.first() else {
+        if rows.is_empty() {
             return Ok(Vec::new());
-        };
+        }
+        // Declare parameter types unified across all rows (see
+        // `unified_param_types`): the statement is prepared once, so a later
+        // row's wider value type (Int in row 1, Float in row 2) must widen
+        // the declared type instead of being mis-encoded into the first
+        // row's.
+        let types = unified_param_types(rows)?;
         // Run the batch inside one transaction so a mid-batch failure applies
         // nothing (all-or-nothing), and the guard's drop-safety keeps a
         // cancelled batch from recycling a mid-transaction connection.
         let tx = PgTx::begin(self.get().await?, None, self.cache_statements).await?;
 
         let result: Result<Vec<Row>, EngineError> = async {
-            // Declare parameter types from the first row's values, matching the
-            // single-statement paths (`prepare_for`), so the server doesn't
-            // mis-infer e.g. a float param compared to an int column.
-            let stmt = prepare_for(tx.client(), sql, first, self.cache_statements).await?;
+            let stmt = prepare_typed(tx.client(), sql, &types, self.cache_statements).await?;
 
             // Bind every row up front so the borrows live across the pipelined
             // await.
@@ -453,7 +529,55 @@ impl TxConn for PgTx {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact, url_password};
+    use super::{redact, unified_param_types, url_password, Type, Value};
+
+    #[test]
+    fn unified_types_widen_numeric_mixes_across_rows() {
+        // Int in row 1, Float in row 2: the single declared type must widen to
+        // FLOAT8 — declaring INT8 (the old first-row behaviour) made row 2's
+        // f64 bytes decode server-side as a huge bogus integer.
+        let rows = vec![vec![Value::Int(1)], vec![Value::Float(2.5)]];
+        assert_eq!(unified_param_types(&rows).unwrap(), vec![Type::FLOAT8]);
+        // Widening is order-independent.
+        let rows = vec![vec![Value::Float(2.5)], vec![Value::Int(1)]];
+        assert_eq!(unified_param_types(&rows).unwrap(), vec![Type::FLOAT8]);
+        // Anything numeric mixed with a Decimal widens to NUMERIC (exact).
+        let rows = vec![
+            vec![Value::Int(1)],
+            vec![Value::Decimal(rust_decimal::Decimal::new(25, 1))],
+            vec![Value::Float(0.5)],
+        ];
+        assert_eq!(unified_param_types(&rows).unwrap(), vec![Type::NUMERIC]);
+    }
+
+    #[test]
+    fn unified_types_keep_uniform_columns_and_skip_null_votes() {
+        // Uniform columns keep their type; a NULL carries no type and must not
+        // reset a column to "inferred", nor stop a later row from setting it.
+        let rows = vec![
+            vec![Value::Null, Value::Text("a".into())],
+            vec![Value::Int(7), Value::Text("b".into())],
+            vec![Value::Null, Value::Text("c".into())],
+        ];
+        let types = unified_param_types(&rows).unwrap();
+        assert_eq!(types[0], Type::INT8);
+        assert_eq!(types[1], Type::TEXT);
+        // An all-NULL column stays server-inferred (OID 0).
+        let rows = vec![vec![Value::Null], vec![Value::Null]];
+        assert_eq!(unified_param_types(&rows).unwrap()[0].oid(), 0);
+        // An empty batch declares nothing.
+        assert!(unified_param_types(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unified_types_reject_mixes_with_no_safe_common_encoding() {
+        // Text + Int has no common declared type both rows can encode into;
+        // erroring up front beats writing mismatched raw bytes.
+        let rows = vec![vec![Value::Text("a".into())], vec![Value::Int(1)]];
+        let err = unified_param_types(&rows).unwrap_err().to_string();
+        assert!(err.contains("parameter 1"), "{err}");
+        assert!(err.contains("text") && err.contains("int8"), "{err}");
+    }
 
     #[test]
     fn url_password_is_extracted_only_when_present() {

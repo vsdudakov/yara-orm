@@ -14,7 +14,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::PyType;
 use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyFrozenSet, PyInt, PyList,
-    PySet, PyString, PyTime, PyTuple,
+    PySet, PyString, PyTime, PyTuple, PyTzInfo, PyTzInfoAccess,
 };
 use pyo3::Borrowed;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
@@ -141,12 +141,23 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
         }
         // datetime must be checked before date (datetime subclasses date).
         if ob.is_instance_of::<PyDateTime>() {
-            // A tz-aware datetime with any offset extracts as FixedOffset; we
-            // normalise it to UTC. (Extracting straight to DateTime<Utc> only
-            // succeeds for UTC-tagged values, so a +05:00 datetime would
-            // otherwise fall through and be mis-handled as naive.)
+            // A tz-aware datetime with any fixed offset extracts as
+            // FixedOffset; we normalise it to UTC. (Extracting straight to
+            // DateTime<Utc> only succeeds for UTC-tagged values, so a +05:00
+            // datetime would otherwise fall through and be mis-handled as
+            // naive.)
             if let Ok(dt) = ob.extract::<DateTime<FixedOffset>>() {
                 return Ok(Value::TimestampTz(dt.with_timezone(&Utc)));
+            }
+            // A variable-offset tzinfo (zoneinfo.ZoneInfo of any zone with
+            // DST) fails the extraction above: pyo3 asks the *zone* for a
+            // datetime-independent offset (tzinfo.utcoffset(None)), which
+            // such zones do not have. The datetime itself still names an
+            // exact instant, so let Python resolve the per-instant offset
+            // (astimezone) and extract the resulting UTC-tagged value.
+            if ob.cast::<PyDateTime>()?.get_tzinfo().is_some() {
+                let utc = ob.call_method1("astimezone", (PyTzInfo::utc(ob.py())?,))?;
+                return Ok(Value::TimestampTz(utc.extract::<DateTime<Utc>>()?));
             }
             return Ok(Value::Timestamp(ob.extract::<NaiveDateTime>()?));
         }
@@ -444,7 +455,10 @@ impl ToSql for Value {
                 Type::NUMERIC => rust_decimal::Decimal::from(*v).to_sql(ty, out),
                 Type::FLOAT4 => (*v as f32).to_sql(ty, out),
                 Type::FLOAT8 => (*v as f64).to_sql(ty, out),
-                _ => v.to_sql(ty, out),
+                // Checked: any type outside the arms above must reject the
+                // value rather than write raw int8 bytes under a mismatched
+                // label (silent corruption).
+                _ => v.to_sql_checked(ty, out),
             },
             Value::Float(v) => match *ty {
                 Type::FLOAT4 => (*v as f32).to_sql(ty, out),
@@ -459,7 +473,10 @@ impl ToSql for Value {
                     )
                     .into()),
                 },
-                _ => v.to_sql(ty, out),
+                // Checked: e.g. a Float bound to an INT8-declared parameter
+                // (a mixed-type execute_many batch) must error, not store the
+                // f64's raw bytes as a huge bogus integer.
+                _ => v.to_sql_checked(ty, out),
             },
             Value::Text(v) => {
                 // A string bound where the server expects a uuid — e.g. an

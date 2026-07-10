@@ -1534,10 +1534,57 @@ class Model(metaclass=ModelMeta):
         if has_signals:
             await signals.emit_pre_delete(cls, self, executor)
         meta.compile(dialect)
+        # On a dialect whose m2m join-table FKs do not cascade (SQL Server pins
+        # them to NO ACTION — see ``SqlServerDialect.create_m2m_table_sql``),
+        # the join rows referencing this row must be removed first or the row
+        # delete raises an FK-conflict IntegrityError. Every other dialect's
+        # join tables carry ON DELETE CASCADE and skip this. The getattr lets a
+        # dialect opt in/out via a capability attribute without requiring one.
+        if not getattr(dialect, "m2m_on_delete_cascades", dialect.name != "mssql"):
+            await self._delete_m2m_rows(executor, dialect)
         await executor.execute(meta.delete_sql, [meta.pk_field.to_db(self.pk)])
         self._in_db = False
         if has_signals:
             await signals.emit_post_delete(cls, self, executor)
+
+    async def _delete_m2m_rows(self, executor: BaseDBAsyncClient, dialect: BaseDialect) -> None:
+        """Delete every m2m join row referencing this instance.
+
+        Covers both sides: relations this model owns (the join row's backward
+        key holds this pk) and relations that target it (the forward key); a
+        self-referential relation clears both columns. Only called on dialects
+        whose join-table FKs do not cascade, so the registry scan for reverse
+        relations is off every other backend's hot path.
+
+        Args:
+            executor: The write-capable executor the row delete will run on.
+            dialect: The dialect the statements render for.
+
+        Returns:
+            None
+        """
+        cls = type(self)
+        meta = self._meta
+        pk_param = meta.pk_field.to_db(self.pk)
+        targets: list[tuple[str, str]] = []
+        for info in meta.m2m.values():
+            info.finalize()
+            targets.append((info.through, info.backward_key))
+        for model in registry.all_models():
+            for info in model._meta.m2m.values():
+                if info.resolve_target() is cls:
+                    info.finalize()
+                    targets.append((info.through, info.forward_key))
+        seen: set[tuple[str, str]] = set()
+        for through, key in targets:
+            if (through, key) in seen:
+                continue
+            seen.add((through, key))
+            sql = (
+                f"DELETE FROM {dialect.quote(through)} "
+                f"WHERE {dialect.quote(key)} = {dialect.placeholder(1)}"
+            )
+            await executor.execute(sql, [pk_param])
 
     def clone(self, pk: Any = None) -> Self:
         """Return an unsaved copy of this instance, ready to insert as a new row.
@@ -2333,10 +2380,42 @@ class Model(metaclass=ModelMeta):
                     if unique_cols:
                         conflict_cols = unique_cols
 
+        # An explicit value on an auto-increment pk must reach the INSERT —
+        # ``save()`` honours one (via the dialect's identity-insert wrapper), so
+        # ``bulk_create`` must not silently discard the supplied ids and rewrite
+        # them with fresh serials. Mirror save()'s per-instance "pk unset" test;
+        # a mixed batch is rejected rather than split, since splitting would
+        # silently reorder the inserts. Conflict handling keeps its documented
+        # behaviour (the pk column stays out of the statement).
+        pk_attr = pk_field.model_field_name
+        explicit_pks = False
+        if pk_field.auto_increment and not upsert:
+            with_pk = sum(1 for obj in objects if getattr(obj, pk_attr, None) is not None)
+            if with_pk == len(objects):
+                explicit_pks = True
+            elif with_pk:
+                raise ValueError(
+                    f"bulk_create() got a mix of instances with and without an "
+                    f"explicit {pk_attr!r}; set the primary key on all instances "
+                    f"or on none"
+                )
+
+        # SQL Server also lacks a RETURNING suffix, but it cannot reuse MySQL's
+        # first-id arithmetic below: SQL Server does not guarantee consecutive
+        # identity values for one multi-row INSERT under concurrency, so
+        # ``first + offset`` could silently assign *other rows'* ids. Render
+        # T-SQL's own returning form instead — an ``OUTPUT INSERTED.<pk>``
+        # clause between the column list and VALUES — and read the real
+        # generated ids back. Caveat: OUTPUT without INTO fails on tables with
+        # triggers (the usual ORM trade-off).
+        output_inserted = (
+            dialect.name == "mssql" and pk_field.auto_increment and not upsert and not explicit_pks
+        )
+
         base_fields = [
             f
             for f in meta.fields.values()
-            if not (f is pk_field and f.auto_increment)
+            if not (f is pk_field and f.auto_increment and not explicit_pks)
             and not isinstance(f.default, DatabaseDefault)
         ]
         db_default_fields = [
@@ -2429,6 +2508,22 @@ class Model(metaclass=ModelMeta):
                     return dialect.render_upsert(
                         table, column_names, nrows, conflict_cols, update_cols, [pk_field.db_column]
                     )
+                if explicit_pks:
+                    # Caller-supplied ids for a serial/IDENTITY column: no
+                    # RETURNING (the pks are already known) and the dialect's
+                    # identity-insert wrapper, exactly as in ``save()`` (a
+                    # no-op except on SQL Server).
+                    return dialect.identity_insert_sql(
+                        table, f"INSERT INTO {table} ({columns}) VALUES {values_clause(nrows)}"
+                    )
+                if output_inserted:
+                    # T-SQL's returning clause sits mid-statement, so it cannot
+                    # ride the suffix path below.
+                    return (
+                        f"INSERT INTO {table} ({columns}) "
+                        f"OUTPUT INSERTED.{dialect.quote(pk_field.db_column)} "
+                        f"VALUES {values_clause(nrows)}"
+                    )
                 # RETURNING is omitted on dialects without it (MySQL reports the
                 # batch's first auto-increment id instead; see the backfill
                 # below); the dialect renders its own clause (Oracle uses
@@ -2473,10 +2568,27 @@ class Model(metaclass=ModelMeta):
                 if upsert:
                     await engine.execute(sql, params)
                     continue
-                if dialect.supports_insert_returning:
+                if explicit_pks:
+                    # The objects already carry their (verified-set) ids;
+                    # nothing to read back and no backfill to apply.
+                    await engine.execute(sql, params)
+                    for obj in batch:
+                        obj._in_db = True
+                        obj._mark_unfetched_db_defaults()
+                elif dialect.supports_insert_returning:
                     returned = await engine.fetch_rows(sql, params)
                     for obj, row in zip(batch, returned):
                         setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
+                        obj._in_db = True
+                        obj._mark_unfetched_db_defaults()
+                elif output_inserted:
+                    # OUTPUT rows are not guaranteed to arrive in VALUES order;
+                    # identity values within one statement *are* assigned in
+                    # row order (ascending), so sort the ids to restore batch
+                    # order before zipping.
+                    returned = await engine.fetch_rows(sql, params)
+                    for obj, new_id in zip(batch, sorted(row[0] for row in returned)):
+                        setattr(obj, pk_field.model_field_name, pk_field.to_python(new_id))
                         obj._in_db = True
                         obj._mark_unfetched_db_defaults()
                 elif pk_field.auto_increment:

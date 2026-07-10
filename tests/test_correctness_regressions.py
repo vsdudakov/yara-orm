@@ -6,12 +6,15 @@ breakage), empty M2M ``__in``, range-checked integer binding on PostgreSQL,
 ``auto_now`` honouring ``use_tz``, and ``RandomHex`` width honouring ``size``.
 """
 
+import contextlib
 import os
 
 import pytest
 import pytest_asyncio
+from test_bulk_get_or_create import RfxAuthor, RfxBook, RfxItem
 
 from yara_orm import (
+    Count,
     Model,
     RandomHex,
     YaraOrm,
@@ -56,7 +59,7 @@ class A4Post(Model):
         table = "a4_post"
 
 
-MODELS = [A4Country, A4Tag, A4Post, A4City]
+MODELS = [A4Country, A4Tag, A4Post, A4City, RfxAuthor, RfxBook, RfxItem]
 
 
 # --- SQLite foreign-key enforcement (was silently off) -----------------------
@@ -255,3 +258,105 @@ async def test_random_hex_width(db):
         assert len(rows[0][0]) == 16
     finally:
         await eng.execute("DROP TABLE IF EXISTS a4_token")
+
+
+# -- read paths hydrate with the decode plan captured before the await --------
+
+
+class _PlanSwappingExecutor:
+    """Executor proxy that swaps the model's shared decode plan mid-fetch.
+
+    Simulates a concurrent ``meta.compile`` for a *different* dialect landing
+    between the fetch await and hydration: ``fetch_rows`` resolves, then the
+    shared plan attributes are overwritten before control returns to the read
+    path. A read path that re-reads ``meta`` after the await decodes with the
+    corrupted plan; one that snapshotted it beforehand is unaffected.
+    """
+
+    def __init__(self, inner, swap):
+        self._inner = inner
+        self._swap = swap
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def fetch_rows(self, sql, params):
+        rows = await self._inner.fetch_rows(sql, params)
+        self._swap()
+        return rows
+
+
+def _corrupt_plan(meta):
+    """Overwrite ``meta``'s shared decode plan with visibly-wrong entries."""
+    meta.decoder_names = [f"wrong_{n}" for n in meta.decoder_names]
+    meta.active_decoders = [
+        (i, name, lambda v: "SWAPPED") for i, (name, _) in enumerate(meta.decoders)
+    ]
+
+
+@contextlib.contextmanager
+def _plan_swapped_on_fetch(monkeypatch, *metas):
+    """Swap the given metas' decode plans during every queryset fetch await."""
+    import yara_orm.queryset as queryset_mod
+
+    saved = [(m, m.decoder_names, m.active_decoders) for m in metas]
+    real_get_executor = queryset_mod.get_executor
+
+    def swap():
+        for m in metas:
+            _corrupt_plan(m)
+
+    def fake_get_executor(model, *args, **kwargs):
+        return _PlanSwappingExecutor(real_get_executor(model, *args, **kwargs), swap)
+
+    monkeypatch.setattr(queryset_mod, "get_executor", fake_get_executor)
+    try:
+        yield
+    finally:
+        for m, names, active in saved:
+            m.decoder_names = names
+            m.active_decoders = active
+
+
+@pytest.mark.asyncio
+async def test_fetch_uses_decode_plan_snapshotted_before_await(db, monkeypatch):
+    """
+    GIVEN a plain fetch whose shared decode plan is swapped during the await
+        (as a concurrent other-dialect compile would)
+    WHEN the rows are hydrated
+    THEN the values decode with the plan captured before the await
+    """
+    await RfxItem.create(name="keep", qty=7)
+    with _plan_swapped_on_fetch(monkeypatch, RfxItem._meta):
+        items = await RfxItem.all()
+    assert [(i.name, i.qty) for i in items] == [("keep", 7)]
+
+
+@pytest.mark.asyncio
+async def test_select_related_uses_decode_plan_snapshotted_before_await(db, monkeypatch):
+    """
+    GIVEN a select_related fetch whose base and target decode plans are both
+        swapped during the await
+    WHEN the rows are hydrated
+    THEN base and related instances decode with the pre-await plans
+    """
+    ada = await RfxAuthor.create(name="Ada")
+    await RfxBook.create(title="T", author=ada, qty=1)
+    with _plan_swapped_on_fetch(monkeypatch, RfxBook._meta, RfxAuthor._meta):
+        books = await RfxBook.all().select_related("author")
+    assert books[0].title == "T"
+    assert (await books[0].author).name == "Ada"
+
+
+@pytest.mark.asyncio
+async def test_annotated_fetch_uses_decode_plan_snapshotted_before_await(db, monkeypatch):
+    """
+    GIVEN an annotated fetch whose shared decode plan is swapped during the await
+    WHEN the rows are hydrated
+    THEN the base instance decodes with the pre-await plan and keeps the annotation
+    """
+    ada = await RfxAuthor.create(name="Ada")
+    await RfxBook.create(title="T", author=ada)
+    with _plan_swapped_on_fetch(monkeypatch, RfxAuthor._meta):
+        authors = await RfxAuthor.all().annotate(n=Count("books"))
+    assert [(a.name, a.n) for a in authors] == [("Ada", 1)]

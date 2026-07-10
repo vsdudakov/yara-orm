@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast
 
 from . import registry
 from .connection import get_dialect, get_executor
+from .manager import Manager
 from .queryset import QuerySet
 
 if TYPE_CHECKING:
@@ -502,10 +503,14 @@ class RelatedManager(_ChainableManager[MODEL]):
     def _qs(self) -> QuerySet[MODEL]:
         """Build a filtered queryset for the related rows.
 
+        Built through the model's manager (``Model.all()``) — not a bare
+        ``QuerySet`` — so a custom ``Meta.manager`` scope (e.g. soft-delete)
+        applies to lazy relation reads exactly as it does to the prefetch path.
+
         Returns:
             A queryset filtered by the manager's criteria.
         """
-        return QuerySet(self.model).filter(**self._filters)
+        return self.model.all().filter(**self._filters)
 
     async def _as_list(self) -> list[MODEL]:
         """Resolve the related rows, serving the prefetch cache when present.
@@ -775,6 +780,12 @@ class M2MManager(_ChainableManager[MODEL]):
         cache = self.instance.__dict__.get("_prefetch")
         if cache and self.name in cache:
             return cache[self.name]
+        # The raw join below selects straight from the target table; a custom
+        # ``Meta.manager`` scope (e.g. soft-delete) would be bypassed, so those
+        # targets read through the manager-scoped queryset instead. The default
+        # manager adds no scope, so the common case keeps the fast path.
+        if type(self.target._meta.manager) is not Manager:
+            return await self._qs()._fetch()
         owner = type(self.instance)
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=False)
@@ -784,6 +795,11 @@ class M2MManager(_ChainableManager[MODEL]):
     def _qs(self) -> QuerySet[MODEL]:
         """Build a queryset over the target rows linked to this instance.
 
+        Built through the target's manager (``Model.all()``) so a custom
+        ``Meta.manager`` scope applies to relation reads; ``add``/``remove``/
+        ``clear`` deliberately stay raw — they operate on join-table rows, not
+        target-model rows, so the manager scope does not apply there.
+
         Returns:
             A ``QuerySet`` on the target model constrained, through the join
             table, to the rows related to the owning instance.
@@ -791,7 +807,7 @@ class M2MManager(_ChainableManager[MODEL]):
         sub = _M2MMembershipSubquery(
             self.info.through, self.near_key, self.far_key, self.instance.pk
         )
-        return QuerySet(self.target).filter(pk__in=sub)
+        return self.target.all().filter(pk__in=sub)
 
     async def add(self, *objects: Model | Any) -> None:
         """Add related objects to the join table.

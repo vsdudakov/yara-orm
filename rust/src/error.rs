@@ -30,6 +30,13 @@ pub enum EngineError {
     /// `yara_orm.exceptions.OperationalError` so it lands in the ORM hierarchy.
     #[error("type conversion error: {0}")]
     Conversion(String),
+
+    /// A no-wait pool checkout (the engine's sync fast path; see
+    /// `backend::nowait_scope`) found no free connection. Engine-internal: the
+    /// engine catches it and retries the statement on the async bridge, so it
+    /// never reaches Python under normal operation.
+    #[error("connection pool has no free connection")]
+    PoolBusy,
 }
 
 impl From<tokio_postgres::Error> for EngineError {
@@ -81,5 +88,8 @@ pub fn to_pyerr(e: EngineError) -> PyErr {
         // default hot path returns the engine directly (no proxy translation),
         // and retry loops need a stable, catchable type.
         EngineError::Query(_) => typed_pyerr("OperationalError", e.to_string()),
+        // Engine-internal (the sync fast path retries it asynchronously); if it
+        // ever escapes, treat it like any other pool-acquire failure.
+        EngineError::PoolBusy => typed_pyerr("OperationalError", e.to_string()),
     }
 }

@@ -366,18 +366,21 @@ def test_render_create_table_spec_paths():
 def test_render_create_index_variants():
     """
     GIVEN single- and multi-column index renderers
-    WHEN rendered for SQL Server
+    WHEN rendered for SQL Server with safe=False
     THEN UNIQUE and filtered (WHERE) variants render without any guard clause
+         (safe=True prefixes a sys.indexes existence check instead)
     """
     d = SqlServerDialect()
-    assert d.render_create_index("t", "c", unique=True) == [
+    assert d.render_create_index("t", "c", safe=False, unique=True) == [
         "CREATE UNIQUE INDEX [idx_t_c] ON [t] ([c])"
     ]
-    assert d.render_create_index("t", "c", name="myidx") == ["CREATE INDEX [myidx] ON [t] ([c])"]
-    assert d.render_create_composite_index("t", "ix", ["a", "b"], condition="[a] > 0") == [
-        "CREATE INDEX [ix] ON [t] ([a], [b]) WHERE [a] > 0"
+    assert d.render_create_index("t", "c", safe=False, name="myidx") == [
+        "CREATE INDEX [myidx] ON [t] ([c])"
     ]
-    assert d.render_create_composite_index("t", "ix", ["a"], unique=True) == [
+    assert d.render_create_composite_index(
+        "t", "ix", ["a", "b"], safe=False, condition="[a] > 0"
+    ) == ["CREATE INDEX [ix] ON [t] ([a], [b]) WHERE [a] > 0"]
+    assert d.render_create_composite_index("t", "ix", ["a"], safe=False, unique=True) == [
         "CREATE UNIQUE INDEX [ix] ON [t] ([a])"
     ]
 
@@ -398,3 +401,81 @@ def test_escape_like_value_escapes_bracket():
     assert base.escape_like_value("a[bc]") == "a[bc]"
     # The shared metacharacters are still escaped on both.
     assert mssql.escape_like_value("50%_x") == "50\\%\\_x"
+
+
+# ---------------------------------------------------------------------------
+# Guarded creates are re-run safe: each CREATE INDEX takes a sys.indexes guard
+# ---------------------------------------------------------------------------
+MS = SqlServerDialect()
+
+_TSPEC = {
+    "columns": {
+        "id": {
+            "kind": "int",
+            "type_params": {},
+            "null": False,
+            "unique": False,
+            "pk": True,
+            "auto_increment": True,
+        },
+        "tag": {
+            "kind": "varchar",
+            "type_params": {"max_length": 20},
+            "null": False,
+            "unique": False,
+            "pk": False,
+            "auto_increment": False,
+        },
+        "rank": {
+            "kind": "int",
+            "type_params": {},
+            "null": True,
+            "unique": False,
+            "pk": False,
+            "auto_increment": False,
+        },
+    },
+    "pk": "id",
+    "fks": {},
+    "indexes": ["tag"],
+    "composite_indexes": {"ix_tag_rank": {"columns": ["tag", "rank"], "unique": True}},
+}
+
+
+def test_mssql_migration_create_table_guards_indexes():
+    """
+    GIVEN a guarded migration table spec with indexes
+    WHEN render_create_table renders it on SQL Server
+    THEN each CREATE INDEX is prefixed with a sys.indexes existence check
+         (re-running against an existing schema would otherwise abort with
+         error 1913), while safe=False keeps the bare statements
+    """
+    out = MS.render_create_table("t", _TSPEC, safe=True)
+    assert out[0].startswith("IF OBJECT_ID(N'[t]', 'U') IS NULL")
+    assert out[1] == (
+        "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'idx_t_tag' "
+        "AND object_id = OBJECT_ID(N'[t]'))\n"
+        "CREATE INDEX [idx_t_tag] ON [t] ([tag])"
+    )
+    assert out[2] == (
+        "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix_tag_rank' "
+        "AND object_id = OBJECT_ID(N'[t]'))\n"
+        "CREATE UNIQUE INDEX [ix_tag_rank] ON [t] ([tag], [rank])"
+    )
+    unguarded = MS.render_create_table("t", _TSPEC, safe=False)
+    assert unguarded[1] == "CREATE INDEX [idx_t_tag] ON [t] ([tag])"
+    assert unguarded[2] == "CREATE UNIQUE INDEX [ix_tag_rank] ON [t] ([tag], [rank])"
+
+
+def test_mssql_standalone_index_renderers_take_the_guard():
+    """
+    GIVEN the standalone index renderers (AddIndexIfNotExists and friends)
+    WHEN they render on SQL Server with safe=True
+    THEN the sys.indexes guard prefixes the statement
+    """
+    [sql] = MS.render_create_index("t", "c", safe=True)
+    assert sql.startswith("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'idx_t_c' ")
+    assert sql.endswith("CREATE INDEX [idx_t_c] ON [t] ([c])")
+    [sql] = MS.render_create_composite_index("t", "ix", ["a", "b"], safe=True, unique=True)
+    assert sql.startswith("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix' ")
+    assert sql.endswith("CREATE UNIQUE INDEX [ix] ON [t] ([a], [b])")

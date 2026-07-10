@@ -1135,18 +1135,17 @@ class BaseDialect:
             return ""
         return "PRIMARY KEY ({})".format(", ".join(self.quote(c) for c in cols))
 
-    def render_create_table(
-        self, table: str, tspec: dict[str, Any], safe: bool = True
-    ) -> list[str]:
-        """Render statements to create a table from a migration table spec.
+    def _create_table_lines(self, tspec: dict[str, Any]) -> list[str]:
+        """Render the ``CREATE TABLE`` body lines (columns, pk, FKs, constraints).
+
+        Split out of :meth:`render_create_table` so dialects that fold more
+        into the table body (MySQL inlines the indexes) reuse the shared part.
 
         Args:
-            table: The table name.
             tspec: The migration table spec.
-            safe: Whether to emit ``IF NOT EXISTS`` guards.
 
         Returns:
-            The list of SQL statements creating the table.
+            The body lines, before comma-joining.
         """
         lines = [self.render_column_def(n, s) for n, s in tspec["columns"].items()]
         pk = self._pk_clause(tspec)
@@ -1165,6 +1164,22 @@ class BaseDialect:
             )
         for constraint in tspec.get("constraints", []):
             lines.append(self._constraint_clause(constraint))
+        return lines
+
+    def render_create_table(
+        self, table: str, tspec: dict[str, Any], safe: bool = True
+    ) -> list[str]:
+        """Render statements to create a table from a migration table spec.
+
+        Args:
+            table: The table name.
+            tspec: The migration table spec.
+            safe: Whether to emit ``IF NOT EXISTS`` guards.
+
+        Returns:
+            The list of SQL statements creating the table.
+        """
+        lines = self._create_table_lines(tspec)
         ine = "IF NOT EXISTS " if safe else ""
         body = ",\n  ".join(lines)
         out = [f"CREATE TABLE {ine}{self.quote(table)} (\n  {body}\n)"]
@@ -2585,6 +2600,42 @@ class MySQLDialect(BaseDialect):
         )
 
     # -- migration rendering overrides ---------------------------------------
+    def render_create_table(
+        self, table: str, tspec: dict[str, Any], safe: bool = True
+    ) -> list[str]:
+        """Render a migration ``CREATE TABLE`` with its indexes folded inline.
+
+        MySQL has no ``CREATE INDEX IF NOT EXISTS``, so emitting the spec's
+        indexes as separate statements would break the idempotency of a
+        guarded (``safe=True``) create: re-running ``CreateModelIfNotExists``
+        against an existing schema would abort with errno 1061 (duplicate key
+        name) on the first index. Folding single-column and composite indexes
+        into the table body (as the model-based ``create_table_sql`` already
+        does) keeps the whole operation one guarded statement. Index names
+        match the standalone renderers (``idx_<table>_<column>`` / the spec
+        name), so later drops and renames still resolve them; the
+        PostgreSQL-only composite options (condition/using/include/opclass)
+        are dropped exactly as the standalone renderer drops them.
+
+        Args:
+            table: The table name.
+            tspec: The migration table spec.
+            safe: Whether to emit the ``IF NOT EXISTS`` guard.
+
+        Returns:
+            The list with the single create-table statement.
+        """
+        lines = self._create_table_lines(tspec)
+        for col in tspec.get("indexes", []):
+            lines.append(f"INDEX {self.quote(f'idx_{table}_{col}')} ({self.quote(col)})")
+        for name, spec in tspec.get("composite_indexes", {}).items():
+            uniq = "UNIQUE " if spec.get("unique") else ""
+            cols = ", ".join(self.quote(c) for c in spec["columns"])
+            lines.append(f"{uniq}INDEX {self.quote(name)} ({cols})")
+        ine = "IF NOT EXISTS " if safe else ""
+        body = ",\n  ".join(lines)
+        return [f"CREATE TABLE {ine}{self.quote(table)} (\n  {body}\n)"]
+
     def render_drop_table(self, table: str) -> list[str]:
         """Render a drop-table statement (MySQL has no ``CASCADE``).
 
@@ -2646,10 +2697,33 @@ class MySQLDialect(BaseDialect):
         out: list[str] = []
         demoted = bool(old.get("pk")) and not bool(new.get("pk"))
         if demoted and old.get("auto_increment"):
-            nullable = "NULL" if new.get("null") else "NOT NULL"
-            out.append(f"ALTER TABLE {t} MODIFY COLUMN {col} {self._spec_type(new)} {nullable}")
+            out.append(self._modify_column_sql(t, col, new))
         out.extend(super()._toggle_pk_sql(t, col, table, name, old, new))
         return out
+
+    def _modify_column_sql(self, t: str, col: str, new: dict[str, Any]) -> str:
+        """Render the full ``MODIFY COLUMN`` restatement for a column spec.
+
+        MySQL's ``MODIFY COLUMN`` replaces the *entire* column definition, so
+        it must restate the ``DEFAULT`` or an existing database default is
+        silently dropped (an inline UNIQUE or FK survives — MySQL stores those
+        as separate indexes/constraints, not in the column definition).
+
+        Args:
+            t: The already-quoted table.
+            col: The already-quoted column.
+            new: The column spec after the change.
+
+        Returns:
+            One ``ALTER TABLE ... MODIFY COLUMN`` statement.
+        """
+        nullable = "NULL" if new.get("null") else "NOT NULL"
+        sql = f"ALTER TABLE {t} MODIFY COLUMN {col} {self._spec_type(new)} {nullable}"
+        if new.get("default"):
+            # Parenthesised like render_column_def (MySQL 8.0.13+ expression
+            # default syntax, which also accepts plain literals).
+            sql += f" DEFAULT ({self._render_default(new['default'])})"
+        return sql
 
     def render_alter_column(
         self,
@@ -2661,11 +2735,11 @@ class MySQLDialect(BaseDialect):
     ) -> list[str]:
         """Render column changes with MySQL's ``MODIFY COLUMN`` spelling.
 
-        Type and nullability changes restate the full definition in one
-        ``MODIFY COLUMN``; defaults use ``ALTER COLUMN SET/DROP DEFAULT``;
-        the inline-UNIQUE and FK constraints toggle via ``ADD CONSTRAINT`` /
-        ``DROP INDEX`` / ``DROP FOREIGN KEY`` (MySQL has no ``DROP CONSTRAINT
-        IF EXISTS``).
+        Type and nullability changes restate the full definition — default
+        included — in one ``MODIFY COLUMN``; a lone default change uses
+        ``ALTER COLUMN SET/DROP DEFAULT``; the inline-UNIQUE and FK constraints
+        toggle via ``ADD CONSTRAINT`` / ``DROP INDEX`` / ``DROP FOREIGN KEY``
+        (MySQL has no ``DROP CONSTRAINT IF EXISTS``).
 
         Args:
             table: The table name.
@@ -2683,10 +2757,13 @@ class MySQLDialect(BaseDialect):
         type_changed = old.get("kind") != new.get("kind") or old.get("type_params") != new.get(
             "type_params"
         )
-        if type_changed or bool(old.get("null")) != bool(new.get("null")):
-            nullable = "NULL" if new.get("null") else "NOT NULL"
-            out.append(f"ALTER TABLE {t} MODIFY COLUMN {col} {self._spec_type(new)} {nullable}")
-        if old.get("default") != new.get("default"):
+        modified = type_changed or bool(old.get("null")) != bool(new.get("null"))
+        if modified:
+            out.append(self._modify_column_sql(t, col, new))
+        # MODIFY COLUMN restates the whole definition (default included), so
+        # the targeted SET/DROP DEFAULT is only needed when nothing else forced
+        # a MODIFY.
+        if not modified and old.get("default") != new.get("default"):
             if new.get("default"):
                 expr = self._render_default(new["default"])
                 out.append(f"ALTER TABLE {t} ALTER COLUMN {col} SET DEFAULT ({expr})")
@@ -3541,8 +3618,9 @@ class SqlServerDialect(BaseDialect):
     index_using = False
     index_include = False
     index_opclass = False
-    # SQL Server has no CREATE INDEX IF NOT EXISTS but does support filtered
-    # (partial) indexes, so supports_partial_index stays True.
+    # SQL Server has no CREATE INDEX IF NOT EXISTS (guarded creates prefix a
+    # sys.indexes existence check instead; see ``_index_guard``) but does
+    # support filtered (partial) indexes, so supports_partial_index stays True.
     index_if_not_exists = False
     supports_extensions = False
     column_if_exists = False
@@ -4203,6 +4281,99 @@ class SqlServerDialect(BaseDialect):
                     unique=spec.get("unique", False),
                 )
             )
+        return out
+
+    def _index_guard(self, table: str, name: str) -> str:
+        """Render the existence check guarding an idempotent ``CREATE INDEX``.
+
+        T-SQL has no ``CREATE INDEX IF NOT EXISTS``; the standard spelling is a
+        ``sys.indexes`` lookup in front of the statement (mirroring the
+        ``OBJECT_ID`` guard on :meth:`render_create_table`), so a guarded
+        create re-runs cleanly instead of failing with error 1913.
+
+        Args:
+            table: The unquoted table name.
+            name: The unquoted index name.
+
+        Returns:
+            The ``IF NOT EXISTS (...)`` prefix (with a trailing newline).
+        """
+        return (
+            f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{name}' "
+            f"AND object_id = OBJECT_ID(N'{self.quote(table)}'))\n"
+        )
+
+    def render_create_index(
+        self,
+        table: str,
+        column: str,
+        safe: bool = True,
+        unique: bool = False,
+        concurrently: bool = False,
+        name: str | None = None,
+    ) -> list[str]:
+        """Render a create-index statement, guarded via ``sys.indexes`` when safe.
+
+        Args:
+            table: The table name.
+            column: The column to index.
+            safe: Whether to prefix the ``sys.indexes`` existence guard.
+            unique: Whether to create a ``UNIQUE`` index.
+            concurrently: Ignored (no ``CONCURRENTLY`` on SQL Server).
+            name: Explicit index name; defaults to ``idx_<table>_<column>``.
+
+        Returns:
+            The list with the create-index statement.
+        """
+        out = super().render_create_index(
+            table, column, safe=False, unique=unique, concurrently=concurrently, name=name
+        )
+        if safe:
+            guard = self._index_guard(table, name or f"idx_{table}_{column}")
+            out = [guard + sql for sql in out]
+        return out
+
+    def render_create_composite_index(
+        self,
+        table: str,
+        name: str,
+        columns: list[str],
+        safe: bool = True,
+        condition: str | None = None,
+        unique: bool = False,
+        using: str | None = None,
+        include: list[str] | None = None,
+        opclass: str | None = None,
+    ) -> list[str]:
+        """Render a multi-column index, guarded via ``sys.indexes`` when safe.
+
+        Args:
+            table: The table to index.
+            name: The index name.
+            columns: The ordered columns covered by the index.
+            safe: Whether to prefix the ``sys.indexes`` existence guard.
+            condition: Optional filtered-index predicate (``WHERE`` clause).
+            unique: Whether to render ``CREATE UNIQUE INDEX``.
+            using: Dropped (PostgreSQL-only).
+            include: Dropped (PostgreSQL-only).
+            opclass: Dropped (PostgreSQL-only).
+
+        Returns:
+            The list with the create-index statement.
+        """
+        out = super().render_create_composite_index(
+            table,
+            name,
+            columns,
+            safe=False,
+            condition=condition,
+            unique=unique,
+            using=using,
+            include=include,
+            opclass=opclass,
+        )
+        if safe:
+            out = [self._index_guard(table, name) + sql for sql in out]
         return out
 
     def render_add_column(

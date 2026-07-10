@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Config, Hook, HookError, Object, Pool, Runtime};
+use deadpool_sqlite::{Config, Hook, HookError, Object, Pool, PoolError, Runtime, Timeouts};
 use rusqlite::Connection;
 
 use crate::backend::pool::extract_pool_params;
@@ -338,6 +338,25 @@ impl SqliteBackend {
     }
 
     async fn obj(&self) -> Result<Object, EngineError> {
+        if crate::backend::checkout_nowait() {
+            // The engine is driving this future with `block_on` on the
+            // caller's event-loop thread (sync fast path). Waiting on the
+            // pool there can deadlock permanently: the connection may be
+            // pinned by an open transaction whose COMMIT can only run once
+            // that thread's event loop resumes (an in-memory database pins
+            // max_size=1, so a single open transaction empties the pool).
+            // Take a connection only if one is free right now; `PoolBusy`
+            // makes the engine retry this statement on the async bridge.
+            let nowait = Timeouts {
+                wait: Some(std::time::Duration::ZERO),
+                ..Timeouts::default()
+            };
+            return match self.pool.timeout_get(&nowait).await {
+                Ok(obj) => Ok(obj),
+                Err(PoolError::Timeout(_)) => Err(EngineError::PoolBusy),
+                Err(e) => Err(EngineError::Connection(e.to_string())),
+            };
+        }
         self.pool
             .get()
             .await
@@ -445,7 +464,10 @@ impl Backend for SqliteBackend {
         // rusqlite call, no real I/O awaits), so the engine may legally drive
         // them with `block_on` from the Python caller thread. `begin_tx` is
         // exempt — the engine always keeps it async, because BEGIN IMMEDIATE
-        // can park on `busy_timeout` for up to 5s.
+        // can park on `busy_timeout` for up to 5s. The pool checkout itself is
+        // no-wait under `block_on` (see `obj`): with every connection pinned
+        // (e.g. an open transaction on an in-memory database), the engine
+        // falls back to the async bridge instead of blocking the event loop.
         self.sync_fast_path
     }
 

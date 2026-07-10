@@ -16,6 +16,7 @@ from decimal import Decimal
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
+from . import timezone as _tz
 from .db_defaults import DatabaseDefault
 from .exceptions import ConfigurationError, FieldError
 
@@ -1034,23 +1035,55 @@ class DatetimeField(_TemporalField[VT]):
         self.auto_now = auto_now
         self.auto_now_add = auto_now_add
 
-    def to_python_value(self, value: Any) -> Any:
-        """Coerce an ISO-8601 string to a ``datetime``.
+    def to_db(self, value: Any) -> Any:
+        """Coerce the value for binding, keeping a bare ``date`` un-widened.
 
-        Values often arrive as ISO strings (e.g. from a JSON layer); coercing
-        on assignment keeps the in-memory attribute a ``datetime`` (and binding
-        a string verbatim would otherwise reach the engine as text, which the
-        timestamp column rejects). Non-string values (incl. a bare ``date``,
-        which the database implicitly casts) pass through unchanged.
+        Unlike :meth:`to_python_value` (whose date-to-midnight widening runs on
+        assignment/construction, so stored values always carry a time part), a
+        bare ``date`` binds as-is here: the ``__date`` truncation lookup routes
+        its comparison value through this method, and SQLite's ``date(col)``
+        yields date-only text that only matches a date-only bind (and every
+        backend casts a bound date against a timestamp column for the ordinary
+        comparison lookups).
 
         Args:
-            value: The value supplied by the caller.
+            value: The Python value to convert.
 
         Returns:
             A ``datetime`` parsed from a string; otherwise ``value`` unchanged.
         """
         if isinstance(value, str):
             return _parse_iso_datetime(value)
+        return value
+
+    def to_python_value(self, value: Any) -> Any:
+        """Coerce an ISO-8601 string or a bare ``date`` to a ``datetime``.
+
+        Values often arrive as ISO strings (e.g. from a JSON layer); coercing
+        on assignment keeps the in-memory attribute a ``datetime`` (and binding
+        a string verbatim would otherwise reach the engine as text, which the
+        timestamp column rejects). A bare ``date`` widens to midnight: bound
+        as-is it would store as date-only ``YYYY-MM-DD`` text on SQLite, which
+        the engine's datetime decoder cannot parse back (refetch returns a
+        plain ``str``) and which sorts before every same-day timestamp in TEXT
+        comparisons, breaking range filters. Under ``use_tz`` the midnight
+        value is localised to the default timezone — the same form
+        :func:`yara_orm.timezone.now` gives other datetimes — so the stored
+        representation stays uniform. Other values pass through unchanged.
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            A ``datetime`` parsed from a string or widened from a ``date``;
+            otherwise ``value`` unchanged.
+        """
+        if isinstance(value, str):
+            return _parse_iso_datetime(value)
+        if isinstance(value, date) and not isinstance(value, datetime):
+            value = datetime(value.year, value.month, value.day)
+            if _tz.get_use_tz():
+                value = _tz.make_aware(value)
         return value
 
 
@@ -1664,10 +1697,11 @@ class ManyToManyFieldInstance(Field[Any]):
             reference: Dotted path or name of the target model.
             related_name: Name of the reverse accessor on the target model.
             through: Name of the join table; synthesised when omitted.
-            forward_key: Join-table column referencing the owning model.
-            backward_key: Join-table column referencing the target model.
-            through_fields: Alternate spelling of ``(forward_key, backward_key)``;
-                used to fill those when they are not given explicitly.
+            forward_key: Join-table column referencing the target model.
+            backward_key: Join-table column referencing the owning model.
+            through_fields: Django-order ``(owner_column, target_column)``
+                spelling — i.e. ``(backward_key, forward_key)``; used to fill
+                those when they are not given explicitly.
             to: Modern alias for ``reference``.
             **kwargs: Additional options forwarded to :class:`Field`.
 
@@ -1677,8 +1711,13 @@ class ManyToManyFieldInstance(Field[Any]):
         if to is not None:
             reference = to
         if through_fields is not None:
-            forward_key = forward_key or through_fields[0]
-            backward_key = backward_key or through_fields[1]
+            # Django's through_fields order is (source, target): the column
+            # referencing the OWNING model first — the reverse of the
+            # (forward, backward) attribute order here, where every consumer
+            # (M2MInfo, dialects, prefetch, migrations) reads ``forward_key``
+            # as the target-referencing column.
+            backward_key = backward_key or through_fields[0]
+            forward_key = forward_key or through_fields[1]
         if reference is None:
             raise TypeError("ManyToManyField requires a target model (pass reference= or to=)")
         super().__init__(**kwargs)
@@ -1770,9 +1809,10 @@ def ManyToManyField(
         reference: Dotted path or name of the target model.
         related_name: Name of the reverse accessor on the target model.
         through: Name of the join table; synthesised when omitted.
-        forward_key: Join-table column referencing the owning model.
-        backward_key: Join-table column referencing the target model.
-        through_fields: Alternate spelling of ``(forward_key, backward_key)``.
+        forward_key: Join-table column referencing the target model.
+        backward_key: Join-table column referencing the owning model.
+        through_fields: Django-order ``(owner_column, target_column)`` spelling
+            — i.e. ``(backward_key, forward_key)``.
         to: Modern alias for ``reference``.
         **kwargs: Additional options forwarded to :class:`Field`.
 

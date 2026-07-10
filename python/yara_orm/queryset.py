@@ -191,6 +191,77 @@ def _is_model(value: Any) -> bool:
     return hasattr(value, "_meta") and hasattr(value, "pk")
 
 
+def _hydrate_row(
+    cls: type[ModelT],
+    values: list[Any],
+    names: list[str],
+    active: list[tuple[int, str, Callable[[Any], Any]]],
+) -> ModelT:
+    """Build one instance from a row using a pre-captured decode plan.
+
+    Mirrors :meth:`Model._from_db_row`, but takes the plan (``decoder_names`` /
+    ``active_decoders``, or a partial plan) as arguments instead of reading it
+    from ``cls._meta`` at call time. The read paths capture the plan *before*
+    awaiting the fetch (cf. ``Model._perform_save``): ``meta.compile`` for a
+    different dialect swaps the shared per-model plan attributes, so a
+    concurrent cross-dialect compile between the await and hydration would
+    otherwise decode the rows with the wrong dialect's decoders.
+
+    Args:
+        cls: The model class to instantiate.
+        values: Raw column values in plan order.
+        names: The attribute name per column (``decoder_names``).
+        active: The ``(index, name, decoder)`` triples needing a Python decode.
+
+    Returns:
+        A new instance marked as already persisted.
+    """
+    obj = cls.__new__(cls)
+    d = obj.__dict__
+    d["_in_db"] = True
+    d.update(zip(names, values))
+    for i, name, decode in active:
+        value = values[i]
+        if value is not None:
+            d[name] = decode(value)
+    return obj
+
+
+def _hydrate_rows(
+    cls: type[ModelT],
+    rows: list[list[Any]],
+    names: list[str],
+    active: list[tuple[int, str, Callable[[Any], Any]]],
+) -> list[ModelT]:
+    """Build instances for many rows using a pre-captured decode plan.
+
+    The batch counterpart of :func:`_hydrate_row` (mirroring
+    :meth:`Model._from_db_rows`): the per-row invariants are hoisted once.
+
+    Args:
+        cls: The model class to instantiate.
+        rows: Raw column-value lists in plan order.
+        names: The attribute name per column (``decoder_names``).
+        active: The ``(index, name, decoder)`` triples needing a Python decode.
+
+    Returns:
+        The hydrated instances.
+    """
+    new = cls.__new__
+    out: list[ModelT] = []
+    for values in rows:
+        obj = new(cls)
+        d = obj.__dict__
+        d["_in_db"] = True
+        d.update(zip(names, values))
+        for i, name, decode in active:
+            value = values[i]
+            if value is not None:
+                d[name] = decode(value)
+        out.append(obj)
+    return out
+
+
 class QuerySet(Generic[ModelT]):
     """Lazy, chainable builder that compiles and executes SQL queries.
 
@@ -1921,11 +1992,18 @@ class QuerySet(Generic[ModelT]):
         dialect = get_dialect(self.model, using=self._using_name())
         engine = get_executor(self.model, using=self._using)
         sql, params, sel = self._plain_select_sql(dialect)
+        # Snapshot the decode plan for ``dialect`` (just compiled, no await in
+        # between) before fetching: a concurrent compile for a *different*
+        # dialect swaps the shared ``meta`` plan attributes, so re-reading them
+        # after the await could decode the rows with the wrong decoders.
+        meta = self.model._meta
+        names, active = (
+            meta.partial_decode_plan(sel)
+            if sel is not None
+            else (meta.decoder_names, meta.active_decoders)
+        )
         rows = await engine.fetch_rows(sql, params)
-        if sel is not None:
-            instances = self.model._from_db_rows_fields(rows, sel)
-        else:
-            instances = self.model._from_db_rows(rows)
+        instances = _hydrate_rows(self.model, rows, names, active)
         if self._prefetch:
             # Deferred: breaks the queryset <-> prefetch import cycle.
             from .prefetch import prefetch_instances
@@ -2137,14 +2215,21 @@ class QuerySet(Generic[ModelT]):
         # Trailing annotation columns: (column index, attribute name) pairs.
         ann_plan = [(ann_base + i, name) for i, name in enumerate(self._annotations)]
         # Per-node hydration plan, resolved once instead of per row: the column
-        # slice, the hydrating classmethod and (for a partial only()/defer()
-        # projection) the field subset it decodes with.
-        plan: list[tuple[str, str | None, str, int, int, Any, list[Any] | None]] = []
+        # slice, the target class and its decode plan (partial under a per-
+        # relation only()/defer() projection). The decode plans are snapshotted
+        # here, *before* the await below (see ``_fetch``): a concurrent
+        # other-dialect compile swaps each meta's shared plan attributes.
+        plan: list[tuple[str, str | None, str, int, int, Any, list[str], list[Any]]] = []
         for path in order:
             node = nodes[path]
             start = node["offset"]
-            partial = node["partial"]
             target = node["target"]
+            tmeta = target._meta
+            tnames, tactive = (
+                tmeta.partial_decode_plan(node["fields"])
+                if node["partial"]
+                else (tmeta.decoder_names, tmeta.active_decoders)
+            )
             plan.append(
                 (
                     path,
@@ -2152,47 +2237,42 @@ class QuerySet(Generic[ModelT]):
                     node["seg"],
                     start,
                     start + node["width"],
-                    target._from_db_row_fields if partial else target._from_db_row,
-                    node["fields"] if partial else None,
+                    target,
+                    tnames,
+                    tactive,
                 )
             )
-        rows = await engine.fetch_rows(sql, params)
         model = self.model
-        from_row = model._from_db_row
-        from_row_fields = model._from_db_row_fields
+        meta = model._meta
+        base_names, base_active = (
+            meta.partial_decode_plan(base_sel)
+            if base_sel is not None
+            else (meta.decoder_names, meta.active_decoders)
+        )
+        rows = await engine.fetch_rows(sql, params)
         instances = []
         if len(plan) == 1 and plan[0][1] is None:
             # Common case — a single direct relation: skip the per-row ``built``
             # path map and assign the prefetch slot in one dict display.
-            _, _, seg, start, end, hydrate, sel = plan[0]
+            _, _, seg, start, end, target, tnames, tactive = plan[0]
             for row in rows:
-                obj = (
-                    from_row_fields(row[:ncols], base_sel)
-                    if base_sel is not None
-                    else from_row(row[:ncols])
-                )
+                obj = _hydrate_row(model, row[:ncols], base_names, base_active)
                 chunk = row[start:end]
                 if not any(v is not None for v in chunk):
                     child = None
-                elif sel is not None:
-                    child = hydrate(chunk, sel)
                 else:
-                    child = hydrate(chunk)
+                    child = _hydrate_row(target, chunk, tnames, tactive)
                 obj.__dict__["_prefetch"] = {seg: child}
                 for col, name in ann_plan:
                     setattr(obj, name, row[col])
                 instances.append(obj)
         else:
             for row in rows:
-                obj = (
-                    from_row_fields(row[:ncols], base_sel)
-                    if base_sel is not None
-                    else from_row(row[:ncols])
-                )
+                obj = _hydrate_row(model, row[:ncols], base_names, base_active)
                 prefetch: dict[str, Model | None] = {}
                 obj.__dict__["_prefetch"] = prefetch
                 built: dict[str | None, Model | None] = {None: obj}
-                for path, parent, seg, start, end, hydrate, sel in plan:
+                for path, parent, seg, start, end, target, tnames, tactive in plan:
                     parent_inst = built[parent]
                     if parent_inst is None:
                         built[path] = None
@@ -2200,10 +2280,8 @@ class QuerySet(Generic[ModelT]):
                     chunk = row[start:end]
                     if not any(v is not None for v in chunk):
                         child = None
-                    elif sel is not None:
-                        child = hydrate(chunk, sel)
                     else:
-                        child = hydrate(chunk)
+                        child = _hydrate_row(target, chunk, tnames, tactive)
                     if parent is None:
                         prefetch[seg] = child
                     else:
@@ -2305,15 +2383,19 @@ class QuerySet(Generic[ModelT]):
         sql, params = self._annotated_select_sql(dialect)
         base_sel = self._selected_fields() if (self._only is not None or self._defer) else None
         annotation_names = list(self._annotations.keys())
+        # Snapshot the decode plan before awaiting (see ``_fetch``): a
+        # concurrent other-dialect compile swaps the shared meta plan.
+        meta = self.model._meta
+        names, active = (
+            meta.partial_decode_plan(base_sel)
+            if base_sel is not None
+            else (meta.decoder_names, meta.active_decoders)
+        )
+        ncols = len(names)
         rows = await engine.fetch_rows(sql, params)
-        ncols = len(base_sel) if base_sel is not None else len(self.model._meta.field_list)
         instances = []
         for row in rows:
-            obj = (
-                self.model._from_db_row_fields(row[:ncols], base_sel)
-                if base_sel is not None
-                else self.model._from_db_row(row[:ncols])
-            )
+            obj = _hydrate_row(self.model, row[:ncols], names, active)
             for offset, name in enumerate(annotation_names):
                 setattr(obj, name, row[ncols + offset])
             instances.append(obj)
@@ -2507,8 +2589,15 @@ class QuerySet(Generic[ModelT]):
                     group_cols.append(col)
         select_params: list[Any] = []
         idx = 1
+        # An annotation the effective ordering references must stay in the
+        # SELECT even when the projection omits it: ORDER BY names it by alias,
+        # and an alias with no select column errors on PostgreSQL/MySQL/MSSQL
+        # (and silently becomes a constant string literal on SQLite). The extra
+        # column never reaches the caller — the values()/values_list() impls
+        # re-project each row down to exactly the requested names.
+        order_names = {n for n, _ in (self._order or meta.ordering)}
         for name, agg in self._annotations.items():
-            if requested and name not in requested:
+            if requested and name not in requested and name not in order_names:
                 continue
             expr, idx = self._aggregate_expr(agg, dialect, joins, select_params, idx)
             select.append(f"{expr} AS {q(name)}")
@@ -2710,6 +2799,49 @@ class QuerySet(Generic[ModelT]):
             )
         return rows[0] if rows else None
 
+    def _filter_create_kwargs(self) -> dict[str, Any]:
+        """Collect the unambiguous ``field=value`` constraints this query applies.
+
+        ``get_or_create``/``update_or_create`` look the row up scoped by the
+        query set's own filters (a related manager's ``fk=pk``, an explicit
+        ``filter(...)``), so a row created on a miss must carry those same
+        values — otherwise the created row would not match the query that just
+        failed to find it. Only root-level exact matches are usable: anything
+        under an OR, a negation, a non-``exact`` lookup or a relation traversal
+        has no single creatable value and is skipped, as are expression values
+        (``F``/``Subquery``/...), which are not concrete field values.
+
+        Returns:
+            Field values derived from the filter tree, keyed by field name.
+        """
+        meta = self.model._meta
+        out: dict[str, Any] = {}
+
+        def walk(node: Q) -> None:
+            if node.negated:
+                return
+            # An OR node's branches are alternatives, not guaranteed values
+            # (a single-branch node's connector is moot).
+            if node.connector != Q.AND and (len(node.children) + len(node.filters)) > 1:
+                return
+            for key, value in node.filters.items():
+                base, op = _split_lookup(key)
+                if op != "exact" or "__" in base:
+                    continue
+                if isinstance(value, (Expression, Function, Aggregate)):
+                    continue
+                if base == "pk":
+                    base = meta.pk_field.model_field_name
+                elif base not in meta.fields and base not in meta.relations:
+                    continue
+                out[base] = value
+            for child in node.children:
+                walk(child)
+
+        for node in self._conditions:
+            walk(node)
+        return out
+
     async def get_or_create(
         self, defaults: dict[str, Any] | None = None, **kwargs: Any
     ) -> tuple[ModelT, bool]:
@@ -2725,7 +2857,11 @@ class QuerySet(Generic[ModelT]):
         obj = await self.get_or_none(**kwargs)
         if obj is not None:
             return obj, False
-        return await self.model.create(**{**kwargs, **(defaults or {})}), True
+        # The create must run on this query set's connection and carry its
+        # filter constraints (the related-manager fk, using_db routing), with
+        # the explicit kwargs/defaults taking precedence.
+        values = {**self._filter_create_kwargs(), **kwargs, **(defaults or {})}
+        return await self.model.create(using_db=self._using, **values), True
 
     async def update_or_create(
         self, defaults: dict[str, Any] | None = None, **kwargs: Any
@@ -2742,10 +2878,15 @@ class QuerySet(Generic[ModelT]):
         defaults = defaults or {}
         obj = await self.get_or_none(**kwargs)
         if obj is None:
-            return await self.model.create(**{**kwargs, **defaults}), True
+            # Same create semantics as get_or_create: bound connection plus the
+            # query set's filter constraints, overridden by kwargs/defaults.
+            values = {**self._filter_create_kwargs(), **kwargs, **defaults}
+            return await self.model.create(using_db=self._using, **values), True
         if defaults:
             obj.update_from_dict(defaults)
-            await obj.save()
+            # The row was fetched on this query set's connection; write the
+            # update back to the same one.
+            await obj.save(using_db=self._using)
         return obj, False
 
     def sql(self) -> str:
@@ -2999,6 +3140,79 @@ class QuerySet(Generic[ModelT]):
             return sub
         return f"SELECT * FROM ({sub}) {dialect.quote('_yara_having')}"
 
+    def _m2m_join_targets(self) -> list[tuple[str, str]]:
+        """Return each m2m join table and the key column referencing this model.
+
+        Mirrors :meth:`Model._delete_m2m_rows`'s enumeration: relations the
+        model owns (the join row's backward key) and relations that target it
+        (the forward key), deduplicated for the self-referential case.
+
+        Returns:
+            Unique ``(through_table, key_column)`` pairs.
+        """
+        model = self.model
+        targets: list[tuple[str, str]] = []
+        for info in model._meta.m2m.values():
+            info.finalize()
+            targets.append((info.through, info.backward_key))
+        for other in registry.all_models():
+            for info in other._meta.m2m.values():
+                if info.resolve_target() is model:
+                    info.finalize()
+                    targets.append((info.through, info.forward_key))
+        return list(dict.fromkeys(targets))
+
+    async def _delete_with_m2m_cleanup(
+        self,
+        dialect: BaseDialect,
+        engine: BaseDBAsyncClient,
+        targets: list[tuple[str, str]],
+    ) -> int:
+        """Bulk-delete the matching rows, removing their m2m join rows first.
+
+        The bulk counterpart of :meth:`Model._delete_m2m_rows`, used on a
+        dialect whose m2m join-table FKs do not cascade (SQL Server pins them
+        to NO ACTION), where leftover join rows make the row delete raise an
+        FK-conflict IntegrityError. The affected primary keys are resolved
+        *before* any deletion: removing join rows first would change the result
+        of a filter that depends on the join table (an m2m traversal lookup or
+        an aggregate annotation), so neither delete may re-evaluate the filter.
+        Both statements then restrict to the resolved pks, chunked to stay
+        within parameter limits (SQL Server caps a statement at ~2100).
+
+        Args:
+            dialect: The active SQL dialect.
+            engine: The write executor the deletes run on.
+            targets: The ``(through_table, key_column)`` pairs to clear.
+
+        Returns:
+            The number of rows deleted.
+        """
+        meta = self.model._meta
+        q = dialect.quote
+        table = q(meta.table)
+        pk = f"{table}.{q(meta.pk_field.db_column)}"
+        if self._having:
+            sub, params = self._pk_having_subselect(dialect)
+        else:
+            where, params, _ = self._compile_conditions(dialect)
+            sub = f"SELECT {pk} FROM {table}{where}"  # noqa: S608
+        pks = [row[0] for row in await engine.fetch_rows(sub, params)]
+        deleted = 0
+        for start in range(0, len(pks), 500):
+            chunk = pks[start : start + 500]
+            marks = ", ".join(dialect.placeholder(i) for i in range(1, len(chunk) + 1))
+            for through, key in targets:
+                await engine.execute(
+                    f"DELETE FROM {q(through)} WHERE {q(key)} IN ({marks})",  # noqa: S608
+                    chunk,
+                )
+            deleted += await engine.execute(
+                f"DELETE FROM {table} WHERE {pk} IN ({marks})",  # noqa: S608
+                chunk,
+            )
+        return deleted
+
     async def delete(self) -> int:
         """Delete all rows matching the current conditions.
 
@@ -3015,6 +3229,14 @@ class QuerySet(Generic[ModelT]):
         engine = get_executor(self.model, write=True, using=self._using)
         meta = self.model._meta
         table = dialect.quote(meta.table)
+        # On a dialect whose m2m join-table FKs do not cascade (SQL Server; see
+        # Model._delete_m2m_rows), the join rows referencing the matched rows
+        # must be removed first or the row delete raises an FK-conflict
+        # IntegrityError. Every other dialect skips straight to the delete.
+        if not getattr(dialect, "m2m_on_delete_cascades", dialect.name != "mssql"):
+            targets = self._m2m_join_targets()
+            if targets:
+                return await self._delete_with_m2m_cleanup(dialect, engine, targets)
         if self._having:
             # Annotation filters compile to HAVING (which DELETE cannot carry);
             # without this restriction they were dropped — a full-table wipe.

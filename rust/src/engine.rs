@@ -16,6 +16,15 @@
 //! GIL is released for the duration (`py.detach`), so other Python threads
 //! keep running. What *does* stay blocked is the current thread's event loop —
 //! which is exactly the documented trade-off of the opt-in.
+//!
+//! The one thing a fast-path statement must never block on is the *pool*: the
+//! free connection may be pinned by an open transaction on this very event
+//! loop, whose COMMIT can only run once the loop resumes — waiting would
+//! deadlock the whole application. The engine therefore drives the future
+//! under a no-wait pool checkout ([`backend::nowait_scope`]; `block_on` polls
+//! on this same thread, so the backend observes the flag) and, when the
+//! backend reports [`EngineError::PoolBusy`], retries that one statement on
+//! the normal async bridge, which may legally wait for the pool.
 
 use std::sync::Arc;
 
@@ -26,7 +35,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use tokio::sync::Mutex;
 
 use crate::backend::{self, Backend, TxConn};
-use crate::error::{to_pyerr, typed_pyerr};
+use crate::error::{to_pyerr, typed_pyerr, EngineError};
 use crate::value::{PyRow, PyRows, Value};
 
 /// What one `__next__` step of a completed awaitable must do.
@@ -90,8 +99,47 @@ impl Ready {
     }
 }
 
-/// Run a statement future to completion synchronously and wrap the outcome in
-/// a [`Ready`] awaitable (the sync fast path; see the module docs).
+/// Attempt the sync fast path for an *engine* statement: drive the future to
+/// completion on the calling thread under a no-wait pool checkout, wrapping
+/// the outcome in a [`Ready`] awaitable. Returns `None` when the backend
+/// reported [`EngineError::PoolBusy`] (every connection is checked out, e.g.
+/// pinned by an open transaction) — the caller then falls back to the async
+/// bridge, which may legally wait for the pool (see the module docs).
+fn try_run_sync<'p, T, F>(py: Python<'p>, fut: F) -> Option<PyResult<Bound<'p, PyAny>>>
+where
+    F: std::future::Future<Output = Result<T, EngineError>> + Send,
+    T: for<'py> IntoPyObject<'py> + Send,
+{
+    // block_on from this thread is legal (see `run_sync`). `block_on` polls
+    // the future on this same thread, so the backend's pool checkout observes
+    // the nowait scope and fails fast instead of parking the event loop.
+    let result = py.detach(|| {
+        backend::nowait_scope(|| pyo3_async_runtimes::tokio::get_runtime().block_on(fut))
+    });
+    if matches!(result, Err(EngineError::PoolBusy)) {
+        return None;
+    }
+    // Errors are *stored*, not raised here: they must surface on `await`,
+    // exactly like the async path.
+    let result = result
+        .map_err(to_pyerr)
+        .and_then(|value| value.into_py_any(py));
+    Some(
+        Bound::new(
+            py,
+            Ready {
+                result: Some(result),
+            },
+        )
+        .map(Bound::into_any),
+    )
+}
+
+/// Run a *transaction* statement future to completion synchronously and wrap
+/// the outcome in a [`Ready`] awaitable (the sync fast path; see the module
+/// docs). Transactions already hold their pinned connection, so — unlike the
+/// engine statements above — nothing here can wait on the pool and no async
+/// fallback is needed.
 fn run_sync<'p, T, F>(py: Python<'p>, fut: F) -> PyResult<Bound<'p, PyAny>>
 where
     F: std::future::Future<Output = PyResult<T>> + Send,
@@ -138,10 +186,16 @@ impl Engine {
         params: Vec<Value>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
-        let fut = async move { backend.execute(&sql, &params).await.map_err(to_pyerr) };
         if self.sync {
-            return run_sync(py, fut);
+            // The sync attempt only *borrows* the inputs, so when the pool is
+            // busy they are still owned here and move into the async fallback
+            // below (no clone on either path).
+            let fut = async { backend.execute(&sql, &params).await };
+            if let Some(ready) = try_run_sync(py, fut) {
+                return ready;
+            }
         }
+        let fut = async move { backend.execute(&sql, &params).await.map_err(to_pyerr) };
         future_into_py(py, fut)
     }
 
@@ -154,13 +208,16 @@ impl Engine {
         params: Vec<Value>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
+        if self.sync {
+            let fut = async { backend.fetch_all(&sql, &params).await.map(PyRows) };
+            if let Some(ready) = try_run_sync(py, fut) {
+                return ready;
+            }
+        }
         let fut = async move {
             let rows = backend.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
             Ok(PyRows(rows))
         };
-        if self.sync {
-            return run_sync(py, fut);
-        }
         future_into_py(py, fut)
     }
 
@@ -174,15 +231,18 @@ impl Engine {
         params: Vec<Value>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
+        if self.sync {
+            let fut = async { backend.fetch_all_values(&sql, &params).await };
+            if let Some(ready) = try_run_sync(py, fut) {
+                return ready;
+            }
+        }
         let fut = async move {
             backend
                 .fetch_all_values(&sql, &params)
                 .await
                 .map_err(to_pyerr)
         };
-        if self.sync {
-            return run_sync(py, fut);
-        }
         future_into_py(py, fut)
     }
 
@@ -195,6 +255,15 @@ impl Engine {
         params: Vec<Value>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
+        if self.sync {
+            let fut = async {
+                let rows = backend.fetch_all_values(&sql, &params).await?;
+                Ok(rows.into_iter().next())
+            };
+            if let Some(ready) = try_run_sync(py, fut) {
+                return ready;
+            }
+        }
         let fut = async move {
             let rows = backend
                 .fetch_all_values(&sql, &params)
@@ -202,9 +271,6 @@ impl Engine {
                 .map_err(to_pyerr)?;
             Ok(rows.into_iter().next())
         };
-        if self.sync {
-            return run_sync(py, fut);
-        }
         future_into_py(py, fut)
     }
 
@@ -218,13 +284,16 @@ impl Engine {
         rows: Vec<Vec<Value>>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
+        if self.sync {
+            let fut = async { backend.execute_many(&sql, &rows).await.map(PyRows) };
+            if let Some(ready) = try_run_sync(py, fut) {
+                return ready;
+            }
+        }
         let fut = async move {
             let out = backend.execute_many(&sql, &rows).await.map_err(to_pyerr)?;
             Ok(PyRows(out))
         };
-        if self.sync {
-            return run_sync(py, fut);
-        }
         future_into_py(py, fut)
     }
 
@@ -237,13 +306,19 @@ impl Engine {
         params: Vec<Value>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();
+        if self.sync {
+            let fut = async {
+                let rows = backend.fetch_all(&sql, &params).await?;
+                Ok(rows.into_iter().next().map(PyRow))
+            };
+            if let Some(ready) = try_run_sync(py, fut) {
+                return ready;
+            }
+        }
         let fut = async move {
             let rows = backend.fetch_all(&sql, &params).await.map_err(to_pyerr)?;
             Ok(rows.into_iter().next().map(PyRow))
         };
-        if self.sync {
-            return run_sync(py, fut);
-        }
         future_into_py(py, fut)
     }
 

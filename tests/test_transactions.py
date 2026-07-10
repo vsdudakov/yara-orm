@@ -1,10 +1,21 @@
-"""Transactions: in_transaction, atomic, rollback, nested savepoints and
-isolation levels."""
+"""Transactions: in_transaction, atomic, rollback, nested savepoints,
+isolation levels, and routing interplay (read-your-own-writes under a
+read/write-splitting router, object-form ``using_db`` dialect resolution)."""
 
 import pytest
+from test_agg_group_by_having import RvfAuthor
 
-from yara_orm import IsolationLevel, Model, YaraOrm, atomic, fields, in_transaction
-from yara_orm.connection import get_engine
+from yara_orm import (
+    IsolationLevel,
+    Model,
+    YaraOrm,
+    atomic,
+    fields,
+    in_transaction,
+    transactions,
+)
+from yara_orm.connection import get_dialect, get_engine, get_executor
+from yara_orm.dialects import SqliteDialect
 from yara_orm.exceptions import (
     ConfigurationError,
     TransactionManagementError,
@@ -21,7 +32,7 @@ class TxAccount(Model):
 
 
 #: Used by the cross-backend ``db`` fixture for the nesting/isolation tests.
-MODELS = [TxAccount]
+MODELS = [TxAccount, RvfAuthor]
 
 
 async def _reset():
@@ -247,3 +258,80 @@ async def test_atomic_decorator_with_isolation(db):
 
     await seed()
     assert await TxAccount.all().count() == 1
+
+
+# ---------------------------------------------------------------------------
+# read-your-own-writes under a read/write-splitting router
+# ---------------------------------------------------------------------------
+
+
+class _SplitRouter:
+    """Routes reads to a (non-existent) replica and writes to default."""
+
+    def db_for_read(self, model):
+        return "replica"
+
+    def db_for_write(self, model):
+        return "default"
+
+
+@pytest.mark.asyncio
+async def test_router_reads_inside_transaction_see_its_writes(db):
+    """
+    GIVEN a router splitting reads to a replica connection
+    WHEN a read runs inside an open transaction on the write connection
+    THEN the transaction captures the read (read-your-own-writes) instead of
+         routing it to the replica pool
+    """
+    YaraOrm.set_router(_SplitRouter())
+    try:
+        async with in_transaction():
+            await RvfAuthor.create(name="tx-only")
+            # Routed read: db_for_read says "replica", but the open default
+            # transaction must absorb it and see the uncommitted row.
+            executor = get_executor(RvfAuthor, write=False)
+            assert getattr(executor, "connection_name", None) == "default"
+            assert await RvfAuthor.get_or_none(name="tx-only") is not None
+    finally:
+        YaraOrm.set_router(None)
+
+
+# ---------------------------------------------------------------------------
+# using_db=<transaction object> renders for that connection's dialect
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_object_using_db_resolves_transaction_dialect(db):
+    """
+    GIVEN a transaction wrapper on a named second (sqlite) connection
+    WHEN get_dialect resolves an object-form using_db
+    THEN it returns the wrapper's own dialect, not the model-routed one
+    """
+    # The db fixture's YaraOrm.close() tears the extra connection down.
+    await YaraOrm.add_connection("second", "sqlite://:memory:")
+    async with in_transaction("second") as tx:
+        assert isinstance(get_dialect(RvfAuthor, using=tx), SqliteDialect)
+
+
+# ---------------------------------------------------------------------------
+# transactions.atomic keeps working with the per-name transaction map
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_atomic_decorator_still_wraps(db):
+    """
+    GIVEN the atomic() decorator from transactions
+    WHEN a decorated coroutine raises midway
+    THEN its writes roll back
+    """
+
+    @transactions.atomic()
+    async def boom():
+        await RvfAuthor.create(name="ghost")
+        raise RuntimeError("kaboom")
+
+    with pytest.raises(RuntimeError):
+        await boom()
+    assert await RvfAuthor.filter(name="ghost").count() == 0

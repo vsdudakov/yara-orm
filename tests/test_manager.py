@@ -1,8 +1,11 @@
-"""Custom model managers scope every query entry point."""
+"""Custom model managers scope every query entry point, including lazy
+relation reads (reverse FK and m2m), which build their queryset through the
+model's ``Meta.manager`` to match the prefetch path's scoping."""
 
 import pytest
 
 from yara_orm import Manager, Model, fields
+from yara_orm.connection import get_dialect, get_engine
 
 
 class ActiveManager(Manager):
@@ -20,7 +23,46 @@ class MgrItem(Model):
         manager = ActiveManager()
 
 
-MODELS = [MgrItem]
+class RfeActiveManager(Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(deleted=False)
+
+
+class RfeBoard(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "rfe_board"
+
+
+class RfePost(Model):
+    id = fields.IntField(pk=True)
+    board = fields.ForeignKeyField("RfeBoard", related_name="posts")
+    deleted = fields.BooleanField(default=False)
+
+    class Meta:
+        table = "rfe_post"
+        manager = RfeActiveManager()
+
+
+class RfeCard(Model):
+    id = fields.IntField(pk=True)
+    labels = fields.ManyToManyField("RfeLabel", related_name="cards")
+
+    class Meta:
+        table = "rfe_card"
+
+
+class RfeLabel(Model):
+    id = fields.IntField(pk=True)
+    deleted = fields.BooleanField(default=False)
+
+    class Meta:
+        table = "rfe_label"
+        manager = RfeActiveManager()
+
+
+MODELS = [MgrItem, RfeBoard, RfePost, RfeCard, RfeLabel]
 
 
 @pytest.mark.asyncio
@@ -40,3 +82,56 @@ async def test_custom_manager_scopes_queries(db):
 
     # A row excluded by the manager is still absent after it would match.
     assert await MgrItem.all().count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Lazy relation reads honour a custom Meta.manager
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_reverse_fk_lazy_read_matches_prefetch_under_soft_delete(db):
+    """
+    GIVEN a reverse FK whose source model has a soft-delete Meta.manager
+    WHEN the relation is read lazily and via prefetch_related
+    THEN both exclude the soft-deleted rows (pre-fix the lazy read leaked them)
+    """
+    board = await RfeBoard.create()
+    live = await RfePost.create(board=board, deleted=False)
+    await RfePost.create(board=board, deleted=True)
+
+    lazy_ids = [p.id for p in await board.posts]
+    assert lazy_ids == [live.id]
+    # Chained access goes through the same manager-scoped queryset.
+    assert [p.id for p in await board.posts.all()] == [live.id]
+    assert await board.posts.filter(id=live.id).count() == 1
+
+    prefetched = await RfeBoard.filter(id=board.id).prefetch_related("posts")
+    assert [p.id for p in await prefetched[0].posts] == lazy_ids
+
+
+@pytest.mark.asyncio
+async def test_m2m_lazy_read_honours_target_manager(db):
+    """
+    GIVEN an m2m whose target model has a soft-delete Meta.manager
+    WHEN links to a live and a soft-deleted target exist
+    THEN lazy reads exclude the soft-deleted target while the join rows (and
+    add/remove/clear, which operate on the join table) are unaffected
+    """
+    card = await RfeCard.create()
+    live = await RfeLabel.create(deleted=False)
+    gone = await RfeLabel.create(deleted=True)
+    await card.labels.add(live, gone)
+
+    # Reads are manager-scoped, both awaited and chained.
+    assert [x.id for x in await card.labels] == [live.id]
+    assert [x.id for x in await card.labels.all()] == [live.id]
+
+    # The join table still holds both links: manager scoping only affects
+    # reads of target-model rows, not join-table writes.
+    q = get_dialect(RfeCard).quote
+    rows = await get_engine().fetch_rows(f"SELECT COUNT(*) FROM {q('rfecard_rfelabel')}", [])
+    assert rows[0][0] == 2
+
+    # remove() still unlinks a soft-deleted target.
+    await card.labels.remove(gone)
+    rows = await get_engine().fetch_rows(f"SELECT COUNT(*) FROM {q('rfecard_rfelabel')}", [])
+    assert rows[0][0] == 1

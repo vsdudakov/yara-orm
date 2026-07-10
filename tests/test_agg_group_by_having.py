@@ -8,6 +8,7 @@ resolves via the shared LEFT JOIN rather than a correlated subquery).
 """
 
 import pytest
+from test_bulk_get_or_create import RfxAuthor, RfxBook
 
 from yara_orm import Avg, Count, F, FieldError, Max, Min, Model, Q, Sum, fields
 
@@ -33,7 +34,25 @@ class AggghBook(Model):
         table = "aggh_book"
 
 
-MODELS = [AggghAuthor, AggghBook]
+class RvfAuthor(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "rvf_author"
+
+
+class RvfBook(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=100)
+    rating = fields.IntField(default=0)
+    author = fields.ForeignKeyField("RvfAuthor", related_name="books")
+
+    class Meta:
+        table = "rvf_book"
+
+
+MODELS = [AggghAuthor, AggghBook, RfxAuthor, RfxBook, RvfAuthor, RvfBook]
 
 
 async def _seed():
@@ -471,3 +490,89 @@ async def test_flat_multi_field_rejected_when_grouped(db):
             .group_by("author_id")
             .values_list("author_id", "n", flat=True)
         )
+
+
+# -- grouped ORDER BY on an annotation the projection omits -------------------
+
+
+async def _seed_authors_with_books():
+    """Create three authors with 2, 1 and 3 books respectively."""
+    a = await RfxAuthor.create(name="A")
+    b = await RfxAuthor.create(name="B")
+    c = await RfxAuthor.create(name="C")
+    for author, count in ((a, 2), (b, 1), (c, 3)):
+        for i in range(count):
+            await RfxBook.create(title=f"{author.name}{i}", author=author)
+    return a, b, c
+
+
+@pytest.mark.asyncio
+async def test_values_list_order_by_nonprojected_annotation(db):
+    """
+    GIVEN authors annotated with their book count
+    WHEN values_list projects only the id but orders by the annotation
+    THEN the ids come back in annotation order (both directions)
+    """
+    a, b, c = await _seed_authors_with_books()
+    asc = await RfxAuthor.annotate(n=Count("books")).order_by("n").values_list("id", flat=True)
+    assert asc == [b.id, a.id, c.id]
+    desc = await RfxAuthor.annotate(n=Count("books")).order_by("-n").values_list("id", flat=True)
+    assert desc == [c.id, a.id, b.id]
+
+
+@pytest.mark.asyncio
+async def test_values_order_by_nonprojected_annotation(db):
+    """
+    GIVEN authors annotated with their book count
+    WHEN values() projects only the name but orders by the annotation
+    THEN rows are ordered by the annotation and carry only the requested key
+    """
+    await _seed_authors_with_books()
+    rows = await RfxAuthor.annotate(n=Count("books")).order_by("-n").values("name")
+    assert rows == [{"name": "C"}, {"name": "A"}, {"name": "B"}]
+
+
+@pytest.mark.asyncio
+async def test_grouped_sql_selects_order_by_annotation(db):
+    """
+    GIVEN a grouped projection omitting an annotation the ordering references
+    WHEN the grouped SELECT is compiled
+    THEN the annotation stays in the select list so the ORDER BY alias resolves
+    """
+    from yara_orm.connection import get_dialect
+
+    qs = RfxAuthor.annotate(n=Count("books")).order_by("-n")
+    dialect = get_dialect(RfxAuthor)
+    sql, _, names, _ = qs._grouped_select_sql(dialect, ("id",))
+    assert f"AS {dialect.quote('n')}" in sql
+    assert f"ORDER BY {dialect.quote('n')} DESC" in sql
+    assert "n" in names
+
+
+# ---------------------------------------------------------------------------
+# exclude() must negate the conjunction of its annotation lookups
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exclude_negates_annotation_conjunction(db):
+    """
+    GIVEN authors annotated with two aggregates
+    WHEN exclude() names both in one call
+    THEN a row failing the conjunction is returned (NOT (a AND b)), not
+         dropped by the unsound NOT a AND NOT b split
+    """
+    high = await RvfAuthor.create(name="high")  # n=2, sum=20: fails rating<5
+    both = await RvfAuthor.create(name="both")  # n=2, sum=4: matches both
+    await RvfBook.create(title="h1", rating=10, author=high)
+    await RvfBook.create(title="h2", rating=10, author=high)
+    await RvfBook.create(title="b1", rating=2, author=both)
+    await RvfBook.create(title="b2", rating=2, author=both)
+
+    rows = await (
+        RvfAuthor.annotate(n=Count("books"), total=Sum("books__rating"))
+        .exclude(n__gt=1, total__lt=5)
+        .values_list("name")
+    )
+    # Only "both" satisfies (n>1 AND total<5); "high" must survive the exclude.
+    assert [r[0] for r in rows] == ["high"]
