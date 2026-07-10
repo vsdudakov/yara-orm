@@ -4,7 +4,7 @@ import datetime as dt
 
 import pytest
 
-from yara_orm import DatabaseDefault, Model, Now, RandomHex, SqlDefault, fields
+from yara_orm import DatabaseDefault, Model, Now, RandomHex, SqlDefault, db_defaults, fields
 from yara_orm.dialects import PostgresDialect, SqliteDialect
 
 
@@ -19,7 +19,16 @@ class DdDoc(Model):
         table = "dd_doc"
 
 
-MODELS = [DdDoc]
+class RvfDoc(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=50)
+    expires = fields.DatetimeField(null=True, default=db_defaults.Now())
+
+    class Meta:
+        table = "rvf_doc"
+
+
+MODELS = [DdDoc, RvfDoc]
 
 
 def test_to_sql_per_dialect():
@@ -77,3 +86,39 @@ async def test_database_default_with_explicit_pk(db):
     assert doc.id == 99
     fresh = await DdDoc.get(id=99)
     assert fresh.created is not None and fresh.flag == 7
+
+
+# ---------------------------------------------------------------------------
+# explicit None on a nullable db-default column must persist
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_explicit_none_on_db_default_column_persists(db):
+    """
+    GIVEN a fetched row whose nullable db-default column holds a DB value
+    WHEN the attribute is explicitly set to None and the instance fully saved
+    THEN the column is written and reads back as NULL
+    """
+    created = await RvfDoc.create(title="d")
+    doc = await RvfDoc.get(id=created.id)
+    assert doc.expires is not None
+    doc.expires = None
+    await doc.save()
+    assert (await RvfDoc.get(id=created.id)).expires is None
+
+
+@pytest.mark.asyncio
+async def test_unfetched_db_default_still_protected_on_full_save(db):
+    """
+    GIVEN a create() that did not fetch the DB-supplied default
+    WHEN the instance is fully saved without touching the column
+    THEN the database keeps its generated value (not overwritten with None)
+    """
+    doc = await RvfDoc.create(title="d")
+    assert doc.expires is None  # not fetched (fetch_db_defaults off)
+    doc.title = "renamed"
+    await doc.save()
+    refreshed = await RvfDoc.get(id=doc.id)
+    assert refreshed.title == "renamed"
+    assert refreshed.expires is not None

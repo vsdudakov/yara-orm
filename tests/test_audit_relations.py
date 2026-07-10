@@ -390,3 +390,92 @@ def test_assigning_raw_key_without_prefetch_cache_sets_source_column():
     book.author = 7
     assert "_prefetch" not in book.__dict__
     assert book.__dict__["author_id"] == 7
+
+
+# -- qualified references disambiguate same-named models ----------------------
+
+
+def test_qualified_reference_disambiguates_same_named_models():
+    """
+    GIVEN two registered models sharing a bare class name
+    WHEN resolving bare and (partially) qualified references
+    THEN the bare name raises, while qualified forms resolve each model
+    """
+    saved = dict(registry._MODELS)
+    try:
+        first = type("RvDupe", (), {})
+        second = type("RvDupe", (), {})
+        registry._MODELS["app_one.models.RvDupe"] = first
+        registry._MODELS["app_two.models.RvDupe"] = second
+        registry._RESOLVE_CACHE.clear()
+        with pytest.raises(ConfigurationError):
+            registry.get_model("RvDupe")
+        # Exact keys resolve; an ambiguous *suffix* ("models.RvDupe" matches
+        # both) still raises rather than guessing.
+        assert registry.get_model("app_one.models.RvDupe") is first
+        assert registry.get_model("app_two.models.RvDupe") is second
+        with pytest.raises(ConfigurationError):
+            registry.get_model("models.RvDupe")
+    finally:
+        registry._MODELS.clear()
+        registry._MODELS.update(saved)
+        registry._RESOLVE_CACHE.clear()
+
+
+def test_partially_qualified_suffix_resolves_when_unique():
+    """
+    GIVEN two same-named models registered under different module paths
+    WHEN resolving by a unique module suffix (as a FK reference string would)
+    THEN the suffix picks the matching model instead of raising ambiguity
+    """
+    saved = dict(registry._MODELS)
+    try:
+        first = type("RvSfx", (), {})
+        second = type("RvSfx", (), {})
+        registry._MODELS["proj.app_one.models.RvSfx"] = first
+        registry._MODELS["proj.app_two.models.RvSfx"] = second
+        registry._RESOLVE_CACHE.clear()
+        assert registry.get_model("app_one.models.RvSfx") is first
+        assert registry.get_model("app_two.models.RvSfx") is second
+    finally:
+        registry._MODELS.clear()
+        registry._MODELS.update(saved)
+        registry._RESOLVE_CACHE.clear()
+
+
+# -- resolve_relations stays idempotent across module re-registration ----------
+
+
+def test_resolve_relations_idempotent_for_rebuilt_m2m_info():
+    """
+    GIVEN resolve_relations already installed an M2M reverse descriptor
+    WHEN the source model is re-registered (fresh info object, same relation)
+    THEN a second resolve pass does not raise a false duplicate-related_name
+    """
+
+    class RvTagA(Model):
+        id = fields.IntField(pk=True)
+
+        class Meta:
+            table = "rv_tag_a"
+
+    class RvPostA(Model):
+        id = fields.IntField(pk=True)
+        tags = fields.ManyToManyField("RvTagA", related_name="rv_posts")
+
+        class Meta:
+            table = "rv_post_a"
+
+    registry.resolve_relations()
+
+    # Re-declare the source model under the same module/name, as a module
+    # reload or notebook cell re-run does: a fresh M2MInfo for the same
+    # logical relation.
+    class RvPostA(Model):  # noqa: F811
+        id = fields.IntField(pk=True)
+        tags = fields.ManyToManyField("RvTagA", related_name="rv_posts")
+
+        class Meta:
+            table = "rv_post_a"
+
+    registry.resolve_relations()  # must not raise

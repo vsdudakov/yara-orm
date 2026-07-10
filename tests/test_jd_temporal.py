@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 
 from yara_orm import Model, YaraOrm, fields
+from yara_orm import timezone as tz
 from yara_orm.exceptions import UnSupportedError
 
 UTC = dt.timezone.utc
@@ -40,7 +41,16 @@ class JdMoment(Model):
         table = "jd_moment"
 
 
-MODELS = [JdStamp, JdMoment]
+class RfeEvent(Model):
+    id = fields.IntField(pk=True)
+    at = fields.DatetimeField(null=True)
+    on_day = fields.DateField(null=True)
+
+    class Meta:
+        table = "rfe_event"
+
+
+MODELS = [JdStamp, JdMoment, RfeEvent]
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +261,11 @@ async def test_date_truncation_lookup(db):
     await JdMoment.create(at=dt.datetime(2023, 8, 10, 0, 0, 0))
 
     assert await JdMoment.filter(at__date=dt.date(2023, 8, 9)).count() == 2
+    # A datetime value narrows to its date part (DatetimeField.to_db would
+    # widen a bare date, so the lookup normalises the value itself)...
+    assert await JdMoment.filter(at__date=dt.datetime(2023, 8, 9, 15, 30)).count() == 2
+    # ...and an ISO string parses, then narrows the same way.
+    assert await JdMoment.filter(at__date="2023-08-09T15:30:00").count() == 2
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +400,122 @@ async def _sleep_tick() -> None:
     import asyncio
 
     await asyncio.sleep(0.005)
+
+
+# ---------------------------------------------------------------------------
+# DatetimeField widens a bare date to a midnight datetime
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_datetime_field_bare_date_roundtrips_as_midnight(db):
+    """
+    GIVEN a DatetimeField assigned a bare ``date``
+    WHEN the row is created and re-read
+    THEN the column round-trips as a ``datetime`` at midnight (not a string:
+    binding the date as-is stores date-only text on SQLite, which the engine's
+    datetime decoder cannot parse back)
+    """
+    row = await RfeEvent.create(at=dt.date(2024, 5, 3))
+    fresh = await RfeEvent.get(id=row.id)
+    assert isinstance(fresh.at, dt.datetime)
+    if db == "sqlite":
+        assert fresh.at == dt.datetime(2024, 5, 3, 0, 0)
+        assert fresh.at.tzinfo is None
+    else:
+        assert fresh.at.replace(tzinfo=None) == dt.datetime(2024, 5, 3, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_datetime_field_bare_date_under_use_tz_localises(db):
+    """
+    GIVEN ``use_tz`` enabled (default timezone UTC)
+    WHEN a bare ``date`` is written to a DatetimeField and re-read
+    THEN it stores as the aware midnight instant, matching what ``timezone.now``
+    produces for other datetimes under ``use_tz``
+    """
+    tz._set_config(use_tz=True)
+    try:
+        row = await RfeEvent.create(at=dt.date(2024, 6, 1))
+        fresh = await RfeEvent.get(id=row.id)
+    finally:
+        tz._set_config(use_tz=False)
+    # Every backend returns the aware UTC instant: PG/SQLite store it, and the
+    # naive-DATETIME dialects (MySQL/MariaDB/Oracle/MSSQL) re-attach UTC on
+    # read under ``use_tz`` (see ``_datetime_from_db``).
+    assert fresh.at == dt.datetime(2024, 6, 1, tzinfo=UTC)
+    assert fresh.at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_datetime_write_paths_widen_bare_dates(db):
+    """
+    GIVEN a DatetimeField written a bare ``date`` via plain attribute
+    assignment + save() and via QuerySet.update() (paths that bypass the
+    assignment-time coercion and bind through ``to_db``)
+    WHEN the rows are re-read
+    THEN both stored a midnight datetime, not date-only text
+    """
+    row = await RfeEvent.create(at=dt.datetime(2024, 4, 30, 12, 0))
+    row.at = dt.date(2024, 5, 3)
+    await row.save()
+    fresh = await RfeEvent.get(id=row.id)
+    assert isinstance(fresh.at, dt.datetime)
+    assert fresh.at.replace(tzinfo=None) == dt.datetime(2024, 5, 3, 0, 0)
+
+    await RfeEvent.filter(id=row.id).update(at=dt.date(2024, 6, 1))
+    fresh = await RfeEvent.get(id=row.id)
+    assert isinstance(fresh.at, dt.datetime)
+    assert fresh.at.replace(tzinfo=None) == dt.datetime(2024, 6, 1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_datetime_update_widens_bare_date_under_use_tz(db):
+    """
+    GIVEN ``use_tz`` enabled and a bare ``date`` written via QuerySet.update()
+    WHEN the row is re-read
+    THEN it stored the aware midnight instant (to_db's widening localises,
+    matching the assignment-time coercion)
+    """
+    row = await RfeEvent.create(at=dt.datetime(2024, 4, 30, 12, 0))
+    tz._set_config(use_tz=True)
+    try:
+        await RfeEvent.filter(id=row.id).update(at=dt.date(2024, 6, 1))
+        fresh = await RfeEvent.get(id=row.id)
+    finally:
+        tz._set_config(use_tz=False)
+    assert fresh.at == dt.datetime(2024, 6, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_datetime_range_filters_accept_bare_dates(db):
+    """
+    GIVEN a same-day datetime row and a row created from a bare date
+    WHEN filtering with ``__gte``/``__lt`` bounds given as bare dates
+    THEN both rows match (pre-fix, SQLite compared 'YYYY-MM-DD' text against
+    'YYYY-MM-DD HH:MM:SS' text and dropped rows from same-day ranges)
+    """
+    a = await RfeEvent.create(at=dt.date(2024, 5, 3))
+    b = await RfeEvent.create(at=dt.datetime(2024, 5, 3, 10, 30))
+
+    got = {e.id for e in await RfeEvent.filter(at__gte=dt.date(2024, 5, 3))}
+    assert {a.id, b.id} <= got
+    got = {e.id for e in await RfeEvent.filter(at__lt=dt.date(2024, 5, 4))}
+    assert {a.id, b.id} <= got
+    # The midnight row also matches a datetime lower bound at midnight.
+    got = {e.id for e in await RfeEvent.filter(at__gte=dt.datetime(2024, 5, 3, 0, 0))}
+    assert {a.id, b.id} <= got
+    # And ordering by the column keeps the bare-date row first (midnight < 10:30).
+    ordered = [e.id for e in await RfeEvent.filter(at__lt=dt.date(2024, 5, 4)).order_by("at")]
+    assert ordered.index(a.id) < ordered.index(b.id)
+
+
+@pytest.mark.asyncio
+async def test_date_field_still_stores_bare_dates(db):
+    """
+    GIVEN a DateField (the date-only column)
+    WHEN a bare ``date`` is written and re-read
+    THEN it round-trips as a ``date`` — the datetime widening does not leak in
+    """
+    row = await RfeEvent.create(on_day=dt.date(2024, 5, 3))
+    fresh = await RfeEvent.get(id=row.id)
+    assert fresh.on_day == dt.date(2024, 5, 3)
+    assert not isinstance(fresh.on_day, dt.datetime)

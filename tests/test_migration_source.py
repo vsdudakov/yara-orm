@@ -13,6 +13,7 @@ import pytest
 
 from yara_orm import MigrationManager, Model, fields
 from yara_orm import migrations as m
+from yara_orm.migrations import diff
 
 
 def _roundtrip(op: m.Operation) -> m.Operation:
@@ -377,3 +378,59 @@ def test_generated_migration_file_is_valid_python(tmp_path):
     # The wide field maps are broken out (readability is the point).
     assert "fields={\n" in text
     assert "from yara_orm import fields" in text
+
+
+# -- _field_source emits the FK/O2O field's own pk flag ----------------------
+class RfeUser(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "rfe_user"
+
+
+class RfeProfile(Model):
+    user = fields.OneToOneField("RfeUser", pk=True)
+    bio = fields.CharField(max_length=50, null=True)
+
+    class Meta:
+        table = "rfe_profile"
+
+
+def test_o2o_pk_survives_field_source_roundtrip():
+    """
+    GIVEN a OneToOneField used as the model's primary key
+    WHEN it is rendered by ``_field_source`` and the source is re-executed
+    THEN the rebuilt field keeps pk=True (pre-fix the flag was dropped, so the
+    migrated table was created with no PRIMARY KEY)
+    """
+    field = RfeProfile._meta.fields["user_id"]
+    assert field.pk is True
+    src = m._field_source(field)
+    ast.parse(src)
+    # The field's own flag lives inside the constructor call; the resolved_fk
+    # wrapper's ``pk=`` names the TARGET model's pk column — a different thing.
+    assert "fields.OneToOneField('RfeUser', pk=True)" in src
+    assert "pk='id'" in src
+    rebuilt = eval(src, {"m": m, "fields": fields})  # noqa: S307 - generator-produced
+    assert rebuilt.pk is True
+    assert rebuilt.is_o2o is True
+    assert rebuilt.unique is True  # O2O default, not double-emitted
+
+
+def test_o2o_pk_migration_state_converges():
+    """
+    GIVEN the live model state of an O2O-as-pk model
+    WHEN every field is serialised to migration source and rebuilt
+    THEN the rebuilt state produces a table spec with the pk intact and a diff
+    against the live state yields no operations (no phantom AlterField loop)
+    """
+    live = diff.model_state([RfeUser, RfeProfile])
+    rebuilt_tables = {}
+    for tname, tstate in live["tables"].items():
+        rebuilt_fields = {
+            col: eval(m._field_source(f), {"m": m, "fields": fields})  # noqa: S307
+            for col, f in tstate["fields"].items()
+        }
+        rebuilt_tables[tname] = {**tstate, "fields": rebuilt_fields}
+    assert m._tspec(rebuilt_tables["rfe_profile"])["pk"] == "user_id"
+    assert diff.diff_states({"tables": rebuilt_tables}, live) == []

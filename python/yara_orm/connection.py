@@ -727,6 +727,31 @@ def get_executor(
     return _EngineProxy(engine) if _QUERY_HOOKS or _QUERY_ANNOTATORS else engine
 
 
+def resolve_connection_name(
+    model: type[Model] | None = None,
+    write: bool = False,
+    using: str | BaseDBAsyncClient | None = None,
+) -> str | None:
+    """Return the connection name statements for ``model`` resolve to.
+
+    Lets a caller holding an executor open an ``in_transaction`` block on the
+    same connection (transactions are keyed by name). Returns None when
+    ``using`` is a connection/executor object — a raw object has no registered
+    name to open a transaction on.
+
+    Args:
+        model: Model class used to route to a connection, or None.
+        write: Whether the statements are writes (affects router choice).
+        using: Explicit connection override, as in :func:`get_executor`.
+
+    Returns:
+        The resolved connection name, or None for a raw connection object.
+    """
+    if using is not None and not isinstance(using, str):
+        return None
+    return using if using is not None else _route(model, write)
+
+
 def get_dialect(
     model: type[Model] | None = None, using: str | BaseDBAsyncClient | None = None
 ) -> BaseDialect:

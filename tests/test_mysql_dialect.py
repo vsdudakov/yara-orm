@@ -621,3 +621,174 @@ def test_compile_builds_a_refresh_select_for_fetch_db_defaults():
         assert [f.model_field_name for f in MyDlStamped._meta.insert_refresh_fields] == ["created"]
     finally:
         MyDlStamped._meta._compiled_for = None
+
+
+# ---------------------------------------------------------------------------
+# MODIFY COLUMN restates the DEFAULT (MODIFY replaces the whole definition)
+# ---------------------------------------------------------------------------
+def test_mysql_null_toggle_keeps_unchanged_default():
+    """
+    GIVEN a nullability-only change on a column with an (unchanged) default
+    WHEN it renders on MySQL
+    THEN the MODIFY COLUMN restates the DEFAULT (MODIFY replaces the whole
+         definition, so omitting it would drop the database default) and no
+         separate SET DEFAULT is emitted
+    """
+    old = {"kind": "int", "type_params": {}, "null": False, "default": {"kind": "sql", "sql": "7"}}
+    new = {**old, "null": True}
+    assert MY.render_alter_column("t", "c", old, new, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` INT NULL DEFAULT (7)"
+    ]
+
+
+def test_mysql_null_toggle_keeps_now_default():
+    """
+    GIVEN a null toggle on a datetime column defaulting to Now()
+    WHEN it renders on MySQL
+    THEN the MODIFY COLUMN carries DEFAULT (CURRENT_TIMESTAMP(6))
+    """
+    old = {"kind": "datetime", "type_params": {}, "null": False, "default": {"kind": "now"}}
+    new = {**old, "null": True}
+    assert MY.render_alter_column("t", "c", old, new, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` DATETIME(6) NULL DEFAULT (CURRENT_TIMESTAMP(6))"
+    ]
+
+
+def test_mysql_null_toggle_without_default_is_unchanged():
+    """
+    GIVEN a nullability-only change on a column with no default
+    WHEN it renders on MySQL
+    THEN the MODIFY COLUMN has no DEFAULT clause (the historical output)
+    """
+    old = {"kind": "int", "type_params": {}, "null": False}
+    new = {**old, "null": True}
+    assert MY.render_alter_column("t", "c", old, new, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` INT NULL"
+    ]
+
+
+def test_mysql_type_and_default_change_render_one_modify():
+    """
+    GIVEN a type change combined with a default change
+    WHEN it renders on MySQL
+    THEN one MODIFY COLUMN carries the new default (no redundant SET DEFAULT),
+         and a default removal alongside a type change emits no DROP DEFAULT
+         (the restated definition already has none)
+    """
+    old = {"kind": "int", "type_params": {}, "null": False, "default": {"kind": "sql", "sql": "7"}}
+    new = {
+        "kind": "bigint",
+        "type_params": {},
+        "null": False,
+        "default": {"kind": "sql", "sql": "9"},
+    }
+    assert MY.render_alter_column("t", "c", old, new, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` BIGINT NOT NULL DEFAULT (9)"
+    ]
+    dropped = {"kind": "bigint", "type_params": {}, "null": False}
+    assert MY.render_alter_column("t", "c", old, dropped, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` BIGINT NOT NULL"
+    ]
+
+
+def test_mysql_lone_default_change_still_uses_set_drop_default():
+    """
+    GIVEN a default-only change (no type/null change forcing a MODIFY)
+    WHEN it renders on MySQL
+    THEN the targeted ALTER COLUMN SET/DROP DEFAULT is kept
+    """
+    base = {"kind": "int", "type_params": {}, "null": True}
+    with_default = {**base, "default": {"kind": "sql", "sql": "7"}}
+    assert MY.render_alter_column("t", "c", base, with_default, {}) == [
+        "ALTER TABLE `t` ALTER COLUMN `c` SET DEFAULT (7)"
+    ]
+    assert MY.render_alter_column("t", "c", with_default, base, {}) == [
+        "ALTER TABLE `t` ALTER COLUMN `c` DROP DEFAULT"
+    ]
+
+
+def test_mysql_pk_demotion_modify_keeps_default():
+    """
+    GIVEN an AUTO_INCREMENT pk demotion where the demoted column has a default
+    WHEN the pk toggle renders on MySQL
+    THEN the AUTO_INCREMENT-stripping MODIFY COLUMN restates the DEFAULT
+    """
+    default = {"kind": "sql", "sql": "0"}
+    auto_pk = {
+        "kind": "int",
+        "type_params": {},
+        "null": False,
+        "pk": True,
+        "auto_increment": True,
+        "default": default,
+    }
+    plain = {
+        "kind": "int",
+        "type_params": {},
+        "null": False,
+        "pk": False,
+        "auto_increment": False,
+        "default": default,
+    }
+    assert MY.render_alter_column("t", "c", auto_pk, plain, {}) == [
+        "ALTER TABLE `t` MODIFY COLUMN `c` INT NOT NULL DEFAULT (0)",
+        "ALTER TABLE `t` DROP PRIMARY KEY",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Guarded creates are re-run safe: indexes fold into CREATE TABLE
+# ---------------------------------------------------------------------------
+_TSPEC = {
+    "columns": {
+        "id": {
+            "kind": "int",
+            "type_params": {},
+            "null": False,
+            "unique": False,
+            "pk": True,
+            "auto_increment": True,
+        },
+        "tag": {
+            "kind": "varchar",
+            "type_params": {"max_length": 20},
+            "null": False,
+            "unique": False,
+            "pk": False,
+            "auto_increment": False,
+        },
+        "rank": {
+            "kind": "int",
+            "type_params": {},
+            "null": True,
+            "unique": False,
+            "pk": False,
+            "auto_increment": False,
+        },
+    },
+    "pk": "id",
+    "fks": {},
+    "indexes": ["tag"],
+    "composite_indexes": {"ix_tag_rank": {"columns": ["tag", "rank"], "unique": True}},
+}
+
+
+def test_mysql_migration_create_table_inlines_indexes():
+    """
+    GIVEN a guarded migration table spec with single-column and composite indexes
+    WHEN render_create_table renders it on MySQL
+    THEN everything folds into one CREATE TABLE IF NOT EXISTS statement (MySQL
+         has no CREATE INDEX IF NOT EXISTS, so separate statements would fail
+         with errno 1061 on a re-run), keeping the standalone index names
+    """
+    out = MY.render_create_table("t", _TSPEC, safe=True)
+    assert len(out) == 1
+    create = out[0]
+    assert create.startswith("CREATE TABLE IF NOT EXISTS `t`")
+    assert "INDEX `idx_t_tag` (`tag`)" in create
+    assert "UNIQUE INDEX `ix_tag_rank` (`tag`, `rank`)" in create
+    # Unguarded renders fold the same way, just without the guard.
+    unguarded = MY.render_create_table("t", _TSPEC, safe=False)
+    assert len(unguarded) == 1
+    assert unguarded[0].startswith("CREATE TABLE `t`")
+    assert "INDEX `idx_t_tag` (`tag`)" in unguarded[0]

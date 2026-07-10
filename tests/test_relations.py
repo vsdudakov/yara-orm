@@ -1,9 +1,25 @@
 """Relations: FK forward/reverse, O2O, M2M, recursive self-FK, plus relation
-managers, aggregation joins and prefetch variants."""
+managers, aggregation joins, prefetch variants, and m2m join-row cleanup on
+instance/queryset delete for dialects whose join-table FKs do not cascade."""
 
 import pytest
 
-from yara_orm import Avg, Count, FieldError, Max, Min, Model, Prefetch, Sum, fields
+from yara_orm import (
+    Avg,
+    Count,
+    FieldError,
+    Max,
+    Min,
+    Model,
+    Prefetch,
+    Sum,
+    connections,
+    fields,
+    in_transaction,
+)
+from yara_orm.connection import get_dialect
+from yara_orm.dialects import PostgresDialect
+from yara_orm.exceptions import OperationalError
 
 
 class Tournament(Model):
@@ -82,7 +98,83 @@ class CvProfile(Model):
         table = "cov_profile"
 
 
-MODELS = [Tournament, Team, Event, Address, Employee, CvAuthor, CvTag, CvBook, CvProfile]
+class RfbTag(Model):
+    id = fields.IntField(pk=True)
+    label = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "rfb_tag"
+
+
+class RfbPost(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=50)
+    tags = fields.ManyToManyField("RfbTag", related_name="posts", through="rfb_post_tag")
+
+    class Meta:
+        table = "rfb_post"
+
+
+class RfbMirrorA(Model):
+    id = fields.IntField(pk=True)
+    partners = fields.ManyToManyField(
+        "RfbMirrorB",
+        related_name="mirror_rev_a",
+        through="rfb_mirror_link",
+        forward_key="b_id",
+        backward_key="a_id",
+    )
+
+    class Meta:
+        table = "rfb_mirror_a"
+
+
+class RfbMirrorB(Model):
+    id = fields.IntField(pk=True)
+    partners = fields.ManyToManyField(
+        "RfbMirrorA",
+        related_name="mirror_rev_b",
+        through="rfb_mirror_link",
+        forward_key="a_id",
+        backward_key="b_id",
+    )
+
+    class Meta:
+        table = "rfb_mirror_b"
+
+
+class RfxTag(Model):
+    id = fields.IntField(pk=True)
+    label = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "rfx_tag"
+
+
+class RfxPost(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=50)
+    tags = fields.ManyToManyField("RfxTag", related_name="posts", through="rfx_post_tag")
+
+    class Meta:
+        table = "rfx_post"
+
+
+MODELS = [
+    Tournament,
+    Team,
+    Event,
+    Address,
+    Employee,
+    CvAuthor,
+    CvTag,
+    CvBook,
+    CvProfile,
+    RfbTag,
+    RfbPost,
+    RfxTag,
+    RfxPost,
+]
 
 
 @pytest.mark.asyncio
@@ -522,3 +614,242 @@ async def test_bulk_update_relation_deferred_column_raises(db):
         await Event.bulk_update(events, ["tournament"])
     # The FK is untouched — nothing was written.
     assert {e.tournament_id for e in await Event.all()} == {a.id}
+
+
+# ---------------------------------------------------------------------------
+# m2m join-row cleanup on delete (non-cascading dialects)
+# ---------------------------------------------------------------------------
+async def _link_counts() -> tuple[int, int]:
+    """Return (rows for post 1, rows for tag 1) in the join table."""
+    conn = connections.get()
+    rows = await conn.execute_query_dict(
+        "SELECT "
+        "SUM(CASE WHEN rfbpost_id = 1 THEN 1 ELSE 0 END) AS posts, "
+        "SUM(CASE WHEN rfbtag_id = 1 THEN 1 ELSE 0 END) AS tags "
+        "FROM rfb_post_tag"
+    )
+    return rows[0]["posts"] or 0, rows[0]["tags"] or 0
+
+
+@pytest.mark.asyncio
+async def test_delete_m2m_rows_clears_both_sides(db):
+    """
+    GIVEN join rows on both sides of an m2m relation
+    WHEN _delete_m2m_rows runs for the owning and the target instance
+    THEN each instance's join rows are removed (other rows untouched)
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+    post1 = await RfbPost.create(id=1, title="p1")
+    post2 = await RfbPost.create(id=2, title="p2")
+    tag1 = await RfbTag.create(id=1, label="t1")
+    tag2 = await RfbTag.create(id=2, label="t2")
+    await post1.tags.add(tag1, tag2)
+    await post2.tags.add(tag1)
+    assert await _link_counts() == (2, 2)
+
+    dialect = get_dialect(RfbPost)
+    executor = connections.get()
+    # Owning side: post1's rows go via the backward key.
+    await post1._delete_m2m_rows(executor, dialect)
+    assert await _link_counts() == (0, 1)
+    # Reverse side: tag1 is only the *target* of the relation; its rows go
+    # via the forward key (found through the registry scan).
+    await tag1._delete_m2m_rows(executor, dialect)
+    assert await _link_counts() == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_delete_m2m_rows_dedupes_mirrored_declarations():
+    """
+    GIVEN two models that each declare the same m2m join table (mirrored
+    forward/backward keys), so the owner-side scan and the registry scan
+    produce the same (table, column) target
+    WHEN _delete_m2m_rows runs for one instance
+    THEN the shared join-table target is deleted once, not twice
+    """
+    executed: list[tuple[str, list]] = []
+
+    class _StubExecutor:
+        async def execute(self, sql, params):
+            executed.append((sql, params))
+
+    a = RfbMirrorA(id=7)
+    await a._delete_m2m_rows(_StubExecutor(), PostgresDialect())
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert '"rfb_mirror_link"' in sql
+    assert '"a_id"' in sql
+    assert params == [7]
+
+
+@pytest.mark.asyncio
+async def test_delete_clears_m2m_rows_when_dialect_does_not_cascade(db, monkeypatch):
+    """
+    GIVEN a dialect whose m2m join-table FKs do not cascade (simulated flag)
+    WHEN an instance with m2m rows is deleted
+    THEN its join rows are removed before the row delete (no FK conflict)
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+    post = await RfbPost.create(id=1, title="p1")
+    tag = await RfbTag.create(id=1, label="t1")
+    await post.tags.add(tag)
+    assert await _link_counts() == (1, 1)
+
+    dialect = get_dialect(RfbPost)
+    monkeypatch.setattr(dialect, "m2m_on_delete_cascades", False, raising=False)
+    await post.delete()
+    assert await _link_counts() == (0, 0)
+    # Deleting the target side cleans its join rows too (none left here, but
+    # the delete itself must not raise on the reverse-scan path).
+    await tag.delete()
+    assert await RfbTag.all().count() == 0
+
+
+# -- bulk delete clears m2m join rows on non-cascading dialects ---------------
+
+
+async def _join_rows() -> list[tuple[int, int]]:
+    """Return the (post_id, tag_id) pairs currently in the join table."""
+    rows = await connections.get().fetch_rows(
+        "SELECT rfxpost_id, rfxtag_id FROM rfx_post_tag ORDER BY rfxpost_id, rfxtag_id"
+    )
+    return [tuple(r) for r in rows]
+
+
+async def _rebuild_join_table_without_fks() -> None:
+    """Recreate the join table with no FK constraints.
+
+    SQLite's generated join table carries ON DELETE CASCADE, which would clean
+    the rows up itself and mask a missing explicit cleanup; a bare table makes
+    leftover join rows observable, matching SQL Server's NO ACTION behaviour.
+    """
+    conn = connections.get()
+    await conn.execute("DROP TABLE rfx_post_tag")
+    await conn.execute(
+        'CREATE TABLE rfx_post_tag ("rfxpost_id" INT NOT NULL, "rfxtag_id" INT NOT NULL, '
+        'PRIMARY KEY ("rfxpost_id", "rfxtag_id"))'
+    )
+
+
+@pytest.mark.asyncio
+async def test_queryset_delete_clears_m2m_rows_when_dialect_does_not_cascade(db, monkeypatch):
+    """
+    GIVEN a dialect whose m2m join-table FKs do not cascade (simulated flag)
+    WHEN a filtered bulk delete removes rows holding m2m join rows
+    THEN the matching rows' join rows are removed first, on both directions,
+        leaving other rows' links untouched
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+
+    await _rebuild_join_table_without_fks()
+    p1 = await RfxPost.create(id=1, title="del1")
+    p2 = await RfxPost.create(id=2, title="keep")
+    t1 = await RfxTag.create(id=1, label="t1")
+    t2 = await RfxTag.create(id=2, label="t2")
+    await p1.tags.add(t1, t2)
+    await p2.tags.add(t1)
+    assert await _join_rows() == [(1, 1), (1, 2), (2, 1)]
+
+    monkeypatch.setattr(get_dialect(RfxPost), "m2m_on_delete_cascades", False, raising=False)
+
+    # Owning side: deleting post 1 by filter clears only its join rows.
+    assert await RfxPost.filter(title="del1").delete() == 1
+    assert await _join_rows() == [(2, 1)]
+    # Reverse side: the tag is only the relation's *target*; its join rows go
+    # via the forward key (found through the registry scan).
+    assert await RfxTag.filter(label="t1").delete() == 1
+    assert await _join_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_m2m_cleanup_rolls_back_when_the_row_delete_fails(db, monkeypatch):
+    """
+    GIVEN a non-cascading dialect and a row whose DELETE is blocked (trigger)
+    WHEN instance delete and bulk delete fail on the row statement
+    THEN the already-executed join-row deletes are rolled back — a failed
+    delete must not silently strip the surviving row's m2m links
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+
+    await _rebuild_join_table_without_fks()
+    post = await RfxPost.create(id=1, title="blocked")
+    tag = await RfxTag.create(id=1, label="t1")
+    await post.tags.add(tag)
+    await connections.get().execute(
+        "CREATE TRIGGER rfx_no_delete BEFORE DELETE ON rfx_post "
+        "BEGIN SELECT RAISE(ABORT, 'delete blocked'); END"
+    )
+    monkeypatch.setattr(get_dialect(RfxPost), "m2m_on_delete_cascades", False, raising=False)
+    try:
+        with pytest.raises(OperationalError):
+            await post.delete()
+        assert await _join_rows() == [(1, 1)]
+        with pytest.raises(OperationalError):
+            await RfxPost.filter(id=1).delete()
+        assert await _join_rows() == [(1, 1)]
+    finally:
+        await connections.get().execute("DROP TRIGGER rfx_no_delete")
+
+
+@pytest.mark.asyncio
+async def test_m2m_cleanup_delete_inside_transaction_and_on_raw_connection(db, monkeypatch):
+    """
+    GIVEN a non-cascading dialect
+    WHEN deletes run inside an open transaction and on a raw connection object
+    THEN both paths still clear the join rows (the former reuses the active
+    transaction; the latter has no named connection to open one on)
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+
+    await _rebuild_join_table_without_fks()
+    p1 = await RfxPost.create(id=1, title="in-tx")
+    p2 = await RfxPost.create(id=2, title="raw-conn")
+    p3 = await RfxPost.create(id=3, title="raw-inst")
+    t1 = await RfxTag.create(id=1, label="t1")
+    for p in (p1, p2, p3):
+        await p.tags.add(t1)
+    conn = connections.get()
+    # The raw-connection path resolves a fresh dialect instance per call, so
+    # the capability flag is simulated at the class level.
+    from yara_orm.dialects import SqliteDialect
+
+    monkeypatch.setattr(SqliteDialect, "m2m_on_delete_cascades", False, raising=False)
+
+    async with in_transaction():
+        assert await RfxPost.filter(id=1).delete() == 1
+    assert await _join_rows() == [(2, 1), (3, 1)]
+
+    assert await RfxPost.all().using_db(conn).filter(id=2).delete() == 1
+    assert await _join_rows() == [(3, 1)]
+    await p3.delete(using_db=conn)
+    assert await _join_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_annotation_filtered_delete_clears_m2m_rows(db, monkeypatch):
+    """
+    GIVEN a non-cascading dialect and a delete restricted by an annotation
+        filter (the HAVING pk-subselect path)
+    WHEN the bulk delete runs
+    THEN the join rows of exactly the surviving-filter rows are removed
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+
+    await _rebuild_join_table_without_fks()
+    p1 = await RfxPost.create(id=1, title="two-tags")
+    p2 = await RfxPost.create(id=2, title="one-tag")
+    t1 = await RfxTag.create(id=1, label="t1")
+    t2 = await RfxTag.create(id=2, label="t2")
+    await p1.tags.add(t1, t2)
+    await p2.tags.add(t1)
+
+    monkeypatch.setattr(get_dialect(RfxPost), "m2m_on_delete_cascades", False, raising=False)
+    assert await RfxPost.annotate(n=Count("tags")).filter(n__gte=2).delete() == 1
+    assert await _join_rows() == [(2, 1)]
+    assert [p.title async for p in RfxPost.all()] == ["one-tag"]

@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 from yara_orm import Model, fields
+from yara_orm.connection import get_dialect, get_engine
 
 
 class CvAll(Model):
@@ -92,7 +93,57 @@ class FldEnc(Model):
         table = "fld_enc"
 
 
-MODELS = [CvAll, CvSmallPk, CvBigPk, CompatParent, CompatChild, FldParent, FldChild, FldEnc]
+class RfeStudent(Model):
+    id = fields.IntField(pk=True)
+    # Django-order through_fields: (owner column, target column).
+    courses = fields.ManyToManyField(
+        "RfeCourse",
+        related_name="students",
+        through="rfe_enrolment",
+        through_fields=("owner_ref", "target_ref"),
+    )
+
+    class Meta:
+        table = "rfe_student"
+
+
+class RfeCourse(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "rfe_course"
+
+
+class RfeAuthor(Model):
+    id = fields.IntField(pk=True)
+    # No explicit keys: the defaults (<owner>_id / <target>_id) must keep working.
+    tags = fields.ManyToManyField("RfeTag", related_name="authors")
+
+    class Meta:
+        table = "rfeauthor"
+
+
+class RfeTag(Model):
+    id = fields.IntField(pk=True)
+
+    class Meta:
+        table = "rfetag"
+
+
+MODELS = [
+    CvAll,
+    CvSmallPk,
+    CvBigPk,
+    CompatParent,
+    CompatChild,
+    FldParent,
+    FldChild,
+    FldEnc,
+    RfeStudent,
+    RfeCourse,
+    RfeAuthor,
+    RfeTag,
+]
 
 
 @pytest.mark.asyncio
@@ -291,13 +342,15 @@ def test_field_accepts_and_ignores_blank_and_max_length_kwargs():
 
 def test_m2m_through_fields_alias_sets_forward_and_backward_keys():
     """
-    GIVEN a ManyToManyField declared with a ``through_fields`` tuple
+    GIVEN a ManyToManyField declared with a Django-order ``through_fields``
+        tuple (owner column first, target column second)
     WHEN the field is constructed
-    THEN ``forward_key``/``backward_key`` are filled from the tuple
+    THEN ``backward_key`` (owner-referencing) takes the first entry and
+        ``forward_key`` (target-referencing) the second
     """
-    m2m = fields.ManyToManyField("CompatParent", through_fields=("fwd", "bwd"))
-    assert m2m.forward_key == "fwd"
-    assert m2m.backward_key == "bwd"
+    m2m = fields.ManyToManyField("CompatParent", through_fields=("owner_col", "target_col"))
+    assert m2m.backward_key == "owner_col"
+    assert m2m.forward_key == "target_col"
 
 
 class FzThing(Model):
@@ -411,3 +464,85 @@ async def test_jsonfield_encoder_returning_string_is_parsed_back(db):
     """
     row = await FldEnc.create(data={"x": 1})
     assert (await FldEnc.get(id=row.id)).data == {"wrapped": {"x": 1}}
+
+
+# ---------------------------------------------------------------------------
+# through_fields follows Django's (owner, target) order
+# ---------------------------------------------------------------------------
+def test_through_fields_map_to_owner_and_target_columns():
+    """
+    GIVEN an m2m declared with Django-order through_fields
+    WHEN the relation info is finalised
+    THEN the owner-referencing key is through_fields[0] and the
+    target-referencing key is through_fields[1]
+    """
+    info = RfeStudent.courses.info
+    info.finalize()
+    # Internally ``backward_key`` is the owner-referencing join column and
+    # ``forward_key`` the target-referencing one (see M2MInfo).
+    assert info.backward_key == "owner_ref"
+    assert info.forward_key == "target_ref"
+
+
+@pytest.mark.asyncio
+async def test_explicit_through_fields_write_the_right_columns(db):
+    """
+    GIVEN an m2m with explicit Django-order through_fields
+    WHEN a related object is added
+    THEN the join row holds the owner pk in the owner column and the target pk
+    in the target column (pre-fix the columns were crossed), and both relation
+    directions read back the right objects
+    """
+    student = await RfeStudent.create()
+    await RfeCourse.create()  # throwaway so the target pk differs from the owner pk
+    course = await RfeCourse.create()
+    assert student.pk != course.pk
+
+    await student.courses.add(course)
+    q = get_dialect(RfeStudent).quote
+    rows = await get_engine().fetch_rows(
+        f"SELECT {q('owner_ref')}, {q('target_ref')} FROM {q('rfe_enrolment')}", []
+    )
+    assert [list(r) for r in rows] == [[student.pk, course.pk]]
+
+    assert [c.pk for c in await student.courses] == [course.pk]
+    assert [s.pk for s in await course.students] == [student.pk]
+
+    await student.courses.remove(course)
+    assert await student.courses.all().count() == 0
+
+
+@pytest.mark.asyncio
+async def test_default_m2m_keys_still_work(db):
+    """
+    GIVEN an m2m declared without through/forward/backward kwargs
+    WHEN a related object is added
+    THEN the default join columns (<owner>_id / <target>_id) are wired the
+    right way round and both directions read back correctly
+    """
+    author = await RfeAuthor.create()
+    await RfeTag.create()  # throwaway so pks differ
+    tag = await RfeTag.create()
+
+    await author.tags.add(tag)
+    q = get_dialect(RfeAuthor).quote
+    rows = await get_engine().fetch_rows(
+        f"SELECT {q('rfeauthor_id')}, {q('rfetag_id')} FROM {q('rfeauthor_rfetag')}", []
+    )
+    assert [list(r) for r in rows] == [[author.pk, tag.pk]]
+    assert [t.pk for t in await author.tags] == [tag.pk]
+    assert [a.pk for a in await tag.authors] == [author.pk]
+
+
+def test_datetime_to_db_parses_iso_strings():
+    """
+    GIVEN a DatetimeField binding value supplied as an ISO-8601 string or a
+    bare date
+    WHEN to_db converts it for the engine
+    THEN the string parses to a datetime and the bare date widens to midnight
+    """
+    f = fields.DatetimeField()
+    assert f.to_db("2024-05-03T10:30:00") == dt.datetime(2024, 5, 3, 10, 30)
+    widened = f.to_db(dt.date(2024, 5, 3))
+    assert isinstance(widened, dt.datetime)
+    assert widened == dt.datetime(2024, 5, 3, 0, 0)

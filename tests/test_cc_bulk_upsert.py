@@ -32,7 +32,15 @@ class CcuPair(Model):
         table = "ccu_pair"
 
 
-MODELS = [CcuItem, CcuPair]
+class RfbUser(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "rfb_user"
+
+
+MODELS = [CcuItem, CcuPair, RfbUser]
 
 
 # -- bulk_create conflict handling -------------------------------------------
@@ -247,3 +255,63 @@ async def test_bulk_update_or_create_all_existing(db):
     assert (await CcuItem.get(sku="A")).qty == 10
     assert (await CcuItem.get(sku="B")).qty == 20
     assert await CcuItem.all().count() == 2
+
+
+# ---------------------------------------------------------------------------
+# bulk_create with explicit auto-increment pks
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_bulk_create_explicit_pks_are_preserved(db):
+    """
+    GIVEN instances carrying explicit values for an auto-increment pk
+    WHEN they are inserted with bulk_create
+    THEN the supplied ids reach the database and stay on the objects
+    """
+    created = await RfbUser.bulk_create(
+        [RfbUser(id=100, name="a"), RfbUser(id=205, name="b"), RfbUser(id=301, name="c")]
+    )
+    assert [u.id for u in created] == [100, 205, 301]
+    rows = await RfbUser.all().order_by("id")
+    assert [(u.id, u.name) for u in rows] == [(100, "a"), (205, "b"), (301, "c")]
+    # The instances round-trip: an explicit-pk object can update its own row.
+    created[0].name = "a2"
+    await created[0].save()
+    assert (await RfbUser.get(id=100)).name == "a2"
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_auto_pks_unchanged(db):
+    """
+    GIVEN instances without pk values
+    WHEN they are inserted with bulk_create
+    THEN generated ids are backfilled onto the objects, matching the rows
+    """
+    created = await RfbUser.bulk_create([RfbUser(name="x"), RfbUser(name="y")])
+    assert all(u.id is not None for u in created)
+    by_name = {u.name: u.id async for u in RfbUser.all()}
+    assert {u.name: u.id for u in created} == by_name
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_mixed_pks_raise(db):
+    """
+    GIVEN a batch mixing explicit and unset auto-increment pks
+    WHEN bulk_create runs
+    THEN a ValueError is raised (silent splitting would reorder the inserts)
+    """
+    with pytest.raises(ValueError, match="mix of instances"):
+        await RfbUser.bulk_create([RfbUser(id=7, name="a"), RfbUser(name="b")])
+    assert await RfbUser.all().count() == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_explicit_pks_after_auto_rows(db):
+    """
+    GIVEN rows already inserted with generated ids
+    WHEN a later bulk_create supplies explicit non-clashing ids
+    THEN both sets coexist with the ids the caller chose
+    """
+    await RfbUser.bulk_create([RfbUser(name="auto1"), RfbUser(name="auto2")])
+    await RfbUser.bulk_create([RfbUser(id=500, name="manual")])
+    assert (await RfbUser.get(id=500)).name == "manual"
+    assert await RfbUser.all().count() == 3

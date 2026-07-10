@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import threading
 
 import pytest
 import pytest_asyncio
@@ -274,3 +275,75 @@ async def test_postgres_urls_reject_the_flag():
     """
     with pytest.raises(ValueError, match="SQLite-only"):
         await engine_connect("postgres://localhost:1/nope?sync_fast_path=1")
+
+
+# ---------------------------------------------------------------------------
+# Pool-exhaustion fallback: no event-loop deadlock while a transaction holds
+# the pool's only connection.
+# ---------------------------------------------------------------------------
+class RfaItem(Model):
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "rfa_item"
+
+
+def test_sync_fast_path_query_during_open_transaction_does_not_deadlock():
+    """
+    GIVEN sync_fast_path=1 on an in-memory database (the pool pins exactly one
+        connection)
+    WHEN task A holds an open transaction and task B runs a plain query on the
+        same event loop
+    THEN task B falls back to the async path and completes after A commits,
+        instead of block_on-ing the event-loop thread into a permanent
+        deadlock
+
+    The scenario runs on its own thread: a regression blocks that loop's
+    thread outright (asyncio.wait_for could never fire there), so the guard is
+    a bounded join that fails the test rather than hanging the suite.
+    """
+    result: dict = {}
+
+    async def scenario():
+        await YaraOrm.init("sqlite://:memory:?sync_fast_path=1")
+        try:
+            await YaraOrm.generate_schemas(models=[RfaItem])
+            in_tx = asyncio.Event()
+
+            async def holder():
+                async with in_transaction():
+                    await RfaItem.create(name="pinned")
+                    in_tx.set()
+                    # Keep the transaction (and the only connection) open while
+                    # the concurrent query runs; this sleep only ever finishes
+                    # if the event loop stays responsive.
+                    await asyncio.sleep(0.3)
+
+            async def prober():
+                await in_tx.wait()
+                # Plain query with no free connection: must not block the
+                # loop; it completes once the holder commits.
+                return await RfaItem.all().count()
+
+            _, count = await asyncio.wait_for(asyncio.gather(holder(), prober()), timeout=15)
+            result["count"] = count
+        finally:
+            await YaraOrm.close()
+
+    def run() -> None:
+        try:
+            asyncio.run(scenario())
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=30)
+    if thread.is_alive():
+        pytest.fail(
+            "deadlock: the sync fast path blocked the event loop while a "
+            "transaction pinned the pool's only connection"
+        )
+    if "error" in result:
+        raise result["error"]
+    assert result["count"] == 1

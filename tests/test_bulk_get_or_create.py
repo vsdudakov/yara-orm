@@ -4,11 +4,18 @@ Existing rows are matched by a natural key in a single query; missing rows are
 inserted with one ``bulk_create`` (and, for update-or-create, existing rows are
 written back with one ``bulk_update``). A ``(instance, created)`` tuple is
 returned per input record, in order.
+
+Also covers the single-row ``get_or_create`` / ``update_or_create`` honouring
+the query set's connection and filter constraints.
 """
+
+import contextlib
+import os
+import tempfile
 
 import pytest
 
-from yara_orm import Model, fields
+from yara_orm import Count, F, Model, Q, YaraOrm, connections, fields
 
 
 class BgItem(Model):
@@ -21,6 +28,14 @@ class BgItem(Model):
         table = "bg_item"
 
 
+class BgCode(Model):
+    code = fields.CharField(pk=True, max_length=20)
+    label = fields.CharField(max_length=20)
+
+    class Meta:
+        table = "bg_code"
+
+
 class BgPair(Model):
     id = fields.IntField(pk=True)
     a = fields.IntField()
@@ -31,7 +46,34 @@ class BgPair(Model):
         table = "bg_pair"
 
 
-MODELS = [BgItem, BgPair]
+class RfxAuthor(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "rfx_author"
+
+
+class RfxBook(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=50)
+    qty = fields.IntField(default=0)
+    author = fields.ForeignKeyField("RfxAuthor", related_name="books")
+
+    class Meta:
+        table = "rfx_book"
+
+
+class RfxItem(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50)
+    qty = fields.IntField(default=0)
+
+    class Meta:
+        table = "rfx_item"
+
+
+MODELS = [BgItem, BgCode, BgPair, RfxAuthor, RfxBook, RfxItem]
 
 
 @pytest.mark.asyncio
@@ -184,3 +226,228 @@ async def test_bulk_ops_empty_input_and_missing_key(db):
         await BgItem.bulk_get_or_create([{"sku": "A"}], key_fields=[])
     with pytest.raises(ValueError, match="key field"):
         await BgItem.bulk_update_or_create([{"sku": "A"}], key_fields=[])
+
+
+# -- get_or_create / update_or_create: filter constraints reach the create ----
+
+
+@pytest.mark.asyncio
+async def test_related_manager_get_or_create_sets_fk(db):
+    """
+    GIVEN an author with no books
+    WHEN get_or_create runs through the reverse-FK related manager
+    THEN the created book carries the author FK, and a second call finds it
+    """
+    ada = await RfxAuthor.create(name="Ada")
+    other = await RfxAuthor.create(name="Other")
+
+    book, created = await ada.books.get_or_create(title="X")
+    assert created is True
+    assert book.author_id == ada.id
+
+    again, created = await ada.books.get_or_create(title="X")
+    assert created is False
+    assert again.id == book.id
+    assert await RfxBook.all().count() == 1
+
+    # The row is scoped per author: the same title under another author creates
+    # a second row bound to that author.
+    theirs, created = await other.books.get_or_create(title="X")
+    assert created is True
+    assert theirs.author_id == other.id
+    assert theirs.id != book.id
+
+
+@pytest.mark.asyncio
+async def test_related_manager_update_or_create_sets_fk(db):
+    """
+    GIVEN an author with no books
+    WHEN update_or_create runs through the reverse-FK related manager
+    THEN the created book carries the author FK; a second call updates in place
+    """
+    ada = await RfxAuthor.create(name="Ada")
+
+    book, created = await ada.books.update_or_create(title="X", defaults={"qty": 1})
+    assert created is True
+    assert book.author_id == ada.id
+    assert book.qty == 1
+
+    updated, created = await ada.books.update_or_create(title="X", defaults={"qty": 5})
+    assert created is False
+    assert updated.id == book.id
+    assert (await RfxBook.get(id=book.id)).qty == 5
+    assert await RfxBook.all().count() == 1
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_inherits_filter_values_and_kwargs_win(db):
+    """
+    GIVEN a query set filtered by simple equalities
+    WHEN get_or_create misses and creates the row
+    THEN the filter values are applied, with explicit kwargs/defaults winning
+    """
+    obj, created = await RfxItem.filter(qty=5).get_or_create(name="plain")
+    assert created is True
+    assert obj.qty == 5  # derived from the filter
+
+    obj, created = await RfxItem.filter(qty=5).get_or_create(name="over", defaults={"qty": 9})
+    assert created is True
+    assert obj.qty == 9  # defaults beat the filter-derived value
+
+    # A relation filter value (a model instance) reaches the create too.
+    ada = await RfxAuthor.create(name="Ada")
+    book, created = await RfxBook.filter(author=ada).get_or_create(title="Z")
+    assert created is True
+    assert book.author_id == ada.id
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_backfills_ids_on_triggered_table(db):
+    """
+    GIVEN a SQL Server table with an enabled DML trigger
+    WHEN bulk_create inserts multiple rows
+    THEN the generated ids are read back per object (a bare OUTPUT clause
+    without INTO is rejected on triggered tables with error 334; the ids
+    route through a table variable instead)
+    """
+    if db != "mssql":
+        pytest.skip("OUTPUT-with-trigger interaction is SQL Server specific")
+    conn = connections.get()
+    await conn.execute_script(
+        "CREATE TRIGGER bg_item_audit ON bg_item AFTER INSERT AS BEGIN SET NOCOUNT ON END"
+    )
+    try:
+        objs = [BgItem(sku=f"tr{i}", name="t") for i in range(3)]
+        await BgItem.bulk_create(objs)
+        ids = [o.id for o in objs]
+        assert all(ids) and len(set(ids)) == 3
+        fetched = {i.sku: i.id for i in await BgItem.filter(sku__in=["tr0", "tr1", "tr2"])}
+        assert ids == [fetched["tr0"], fetched["tr1"], fetched["tr2"]]
+    finally:
+        await conn.execute_script("DROP TRIGGER bg_item_audit")
+
+
+@pytest.mark.asyncio
+async def test_bulk_get_or_create_allows_mixed_explicit_and_auto_pks(db):
+    """
+    GIVEN new-row records where some carry an explicit id and some do not
+    WHEN bulk_get_or_create / bulk_update_or_create insert them
+    THEN the mix is partitioned and inserted (bulk_create alone rejects it),
+    explicit ids preserved and the rest auto-assigned
+    """
+    out = await BgItem.bulk_get_or_create(
+        [
+            {"id": 500, "sku": "mx1", "name": "a"},
+            {"sku": "mx2", "name": "b"},
+        ],
+        key_fields=["sku"],
+    )
+    assert [created for _, created in out] == [True, True]
+    assert out[0][0].id == 500
+    assert out[1][0].id is not None and out[1][0].id != 500
+
+    out = await BgItem.bulk_update_or_create(
+        [
+            {"id": 600, "sku": "mx3", "name": "c"},
+            {"sku": "mx4", "name": "d"},
+        ],
+        key_fields=["sku"],
+    )
+    assert [created for _, created in out] == [True, True]
+    assert out[0][0].id == 600
+    assert (await BgItem.get(sku="mx4")).id is not None
+
+
+@pytest.mark.asyncio
+async def test_bulk_get_or_create_non_auto_pk_takes_the_plain_path(db):
+    """
+    GIVEN a model whose primary key is not auto-increment
+    WHEN bulk_get_or_create inserts new rows
+    THEN the create list is inserted in one batch (no explicit/auto split)
+    """
+    out = await BgCode.bulk_get_or_create(
+        [{"code": "c1", "label": "a"}, {"code": "c2", "label": "b"}],
+        key_fields=["code"],
+    )
+    assert [created for _, created in out] == [True, True]
+    assert {o.code for o, _ in out} == {"c1", "c2"}
+
+
+def test_filter_create_kwargs_skips_ambiguous_constraints():
+    """
+    GIVEN a filter tree mixing exact matches with lookups, OR and negation
+    WHEN the create kwargs are derived from it
+    THEN only the unambiguous root-level exact matches are kept
+    """
+    qs = (
+        RfxItem.filter(qty__gte=3)  # lookup operator: skipped
+        .filter(Q(name="a") | Q(name="b"))  # OR: skipped
+        .exclude(name="c")  # negation: skipped
+        .filter(name="x")  # root-level exact: kept
+    )
+    assert qs._filter_create_kwargs() == {"name": "x"}
+
+
+def test_filter_create_kwargs_pk_alias_expressions_and_nested_q():
+    """
+    GIVEN root-level filters using pk, an expression value, an annotation
+    name and AND-nested Q objects
+    WHEN the create kwargs are derived from the filter tree
+    THEN pk maps to the concrete pk field, nested AND branches contribute,
+    and expression values / non-column names are skipped
+    """
+    qs = (
+        RfxItem.filter(pk=11)  # pk aliases the concrete pk field: kept as id
+        .filter(Q(Q(name="x"), Q(qty=7)))  # AND-nested children are walked
+        .filter(name=F("name"))  # expression value: skipped (keeps "x")
+        .filter(n=Count("id"))  # aggregate value on a non-column: skipped
+        .filter(items=2)  # not a field or relation (lazy validation): skipped
+    )
+    assert qs._filter_create_kwargs() == {"id": 11, "name": "x", "qty": 7}
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_uses_bound_connection():
+    """
+    GIVEN a query set bound to a second connection via using_db
+    WHEN get_or_create misses and creates the row
+    THEN the insert lands on the second connection, not the default one
+    """
+    paths = []
+    for _ in range(2):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.remove(path)
+        paths.append(path)
+    await YaraOrm.init(f"sqlite://{paths[0]}")
+    await YaraOrm.add_connection("second", f"sqlite://{paths[1]}")
+    try:
+        await YaraOrm.generate_schemas(models=[RfxItem])
+        await connections.get("second").execute(
+            'CREATE TABLE "rfx_item" ('
+            '"id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, '
+            '"name" VARCHAR(50) NOT NULL, "qty" INT NOT NULL)'
+        )
+
+        obj, created = await RfxItem.all().using_db("second").get_or_create(name="s")
+        assert created is True
+        assert await RfxItem.all().using_db("second").count() == 1
+        assert await RfxItem.all().count() == 0  # nothing leaked to default
+
+        again, created = await RfxItem.all().using_db("second").get_or_create(name="s")
+        assert created is False
+        assert again.id == obj.id
+
+        # update_or_create's update half writes back to the same connection.
+        updated, created = await (
+            RfxItem.all().using_db("second").update_or_create(name="s", defaults={"qty": 3})
+        )
+        assert created is False
+        assert (await RfxItem.all().using_db("second").get(name="s")).qty == 3
+        assert await RfxItem.all().count() == 0
+    finally:
+        await YaraOrm.close()
+        for path in paths:
+            for suffix in ("", "-wal", "-shm"):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path + suffix)

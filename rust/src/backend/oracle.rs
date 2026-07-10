@@ -183,14 +183,34 @@ fn to_ora(v: &Value) -> OraValue {
         Value::Uuid(u) => OraValue::String(u.to_string()),
         // Text form keeps NUMBER exact (the server parses it server-side).
         Value::Decimal(d) => OraValue::Number(OracleNumber::new(d.to_string())),
-        Value::Timestamp(dt) => OraValue::Timestamp(naive_to_ots(dt)),
+        Value::Timestamp(dt) => naive_to_ora(dt),
         // No tz-aware storage: canonicalise to UTC and store naive.
-        Value::TimestampTz(dt) => OraValue::Timestamp(naive_to_ots(&dt.naive_utc())),
+        Value::TimestampTz(dt) => naive_to_ora(&dt.naive_utc()),
         Value::Date(d) => {
             OraValue::Date(OracleDate::date(d.year(), d.month() as u8, d.day() as u8))
         }
         // Oracle has no TIME type; store the time-of-day as ISO text.
         Value::Time(t) => OraValue::String(t.format("%H:%M:%S%.6f").to_string()),
+    }
+}
+
+/// A zero-fraction datetime binds as DATE: the server stores such TIMESTAMPs
+/// in the canonical 7-byte form, and the driver's 11-byte zero-fraction bind
+/// compares unequal to them byte-wise (`col >= :midnight` drops the row whose
+/// stored value is exactly midnight). DATE carries full second precision, so
+/// nothing is lost, and Oracle promotes it to TIMESTAMP in mixed comparisons.
+fn naive_to_ora(dt: &NaiveDateTime) -> OraValue {
+    if dt.nanosecond() == 0 {
+        OraValue::Date(OracleDate::new(
+            dt.year(),
+            dt.month() as u8,
+            dt.day() as u8,
+            dt.hour() as u8,
+            dt.minute() as u8,
+            dt.second() as u8,
+        ))
+    } else {
+        OraValue::Timestamp(naive_to_ots(dt))
     }
 }
 
@@ -932,6 +952,24 @@ mod tests {
                 assert_eq!(ts.microsecond, 123_456);
             }
             other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_fraction_datetimes_bind_as_date() {
+        // GIVEN a naive datetime with no sub-second part WHEN encoded THEN it
+        // binds as the 7-byte DATE form (the 11-byte zero-fraction TIMESTAMP
+        // bind compares unequal to the server's canonical 7-byte storage).
+        let dt = NaiveDate::from_ymd_opt(2024, 5, 3)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        match to_ora(&Value::Timestamp(dt)) {
+            OraValue::Date(d) => {
+                assert_eq!((d.year, d.month, d.day), (2024, 5, 3));
+                assert_eq!((d.hour, d.minute, d.second), (0, 0, 0));
+            }
+            other => panic!("expected Date, got {other:?}"),
         }
     }
 

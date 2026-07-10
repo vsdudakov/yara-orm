@@ -235,8 +235,9 @@ fewer edits:
   Tortoise's `contrib.postgres.indexes.GinIndex(opclass=...)`.
 - **`_meta.db_table` is assignable** (`Model._meta.db_table = "..."`) alongside its
   read access.
-- **`ManyToManyField(through_fields=(fwd, bwd))`** is accepted (alias of
-  `forward_key=`/`backward_key=`); bare **`fields.SET_NULL` / `fields.CASCADE` …**
+- **`ManyToManyField(through_fields=(owner_col, target_col))`** is accepted in
+  Django's `(source, target)` order (an alias of `backward_key=`/`forward_key=`);
+  bare **`fields.SET_NULL` / `fields.CASCADE` …**
   on-delete constants exist alongside `fields.OnDelete.*`; **`blank=` / `max_length=`**
   on length-less fields are accepted and ignored.
 - **Relation type hints** (`ForeignKeyRelation`, `ReverseRelation`,

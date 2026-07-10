@@ -582,3 +582,38 @@ def test_meta_index_opclass_emitted_in_create_table_sql():
 
     sql = "\n".join(PostgresDialect().create_table_sql(GenDoc._meta))
     assert "gin_trgm_ops" in sql
+
+
+def test_create_model_if_not_exists_is_rerun_safe_per_dialect():
+    """
+    GIVEN a CreateModelIfNotExists operation with an indexed column
+    WHEN its forward SQL renders on MySQL, SQL Server, PostgreSQL and SQLite
+    THEN every emitted statement carries its own existence guard (inline fold
+         on MySQL, sys.indexes check on SQL Server, native IF NOT EXISTS on
+         PostgreSQL/SQLite)
+    """
+    from yara_orm.dialects import MySQLDialect, PostgresDialect, SqliteDialect, SqlServerDialect
+
+    op = m.CreateModelIfNotExists(
+        "t",
+        fields={
+            "id": fields.IntField(pk=True),
+            "tag": fields.CharField(max_length=20, index=True),
+        },
+    )
+    mysql_sql = op.forward_sql(MySQLDialect(), {})
+    assert len(mysql_sql) == 1
+    assert mysql_sql[0].startswith("CREATE TABLE IF NOT EXISTS `t`")
+    assert "INDEX `idx_t_tag` (`tag`)" in mysql_sql[0]
+
+    mssql_sql = op.forward_sql(SqlServerDialect(), {})
+    assert mssql_sql[0].startswith("IF OBJECT_ID(")
+    assert all(
+        stmt.startswith("IF NOT EXISTS (SELECT 1 FROM sys.indexes") for stmt in mssql_sql[1:]
+    )
+
+    for dialect in (PostgresDialect(), SqliteDialect()):
+        sqls = op.forward_sql(dialect, {})
+        assert sqls[0].startswith("CREATE TABLE IF NOT EXISTS")
+        assert all(stmt.startswith("CREATE INDEX IF NOT EXISTS") for stmt in sqls[1:])
+        assert len(sqls) == 2  # native guards keep the separate index statement

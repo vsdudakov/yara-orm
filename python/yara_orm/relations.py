@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast
 
 from . import registry
 from .connection import get_dialect, get_executor
+from .manager import Manager
 from .queryset import QuerySet
 
 if TYPE_CHECKING:
@@ -404,6 +405,19 @@ class _ChainableManager(Generic[MODEL]):
         """Return the base queryset over the related rows."""
         raise NotImplementedError
 
+    def _write_qs(self) -> QuerySet[MODEL]:
+        """Return the queryset bulk writes delegate to.
+
+        Defaults to :meth:`_qs`; managers whose read queryset applies a custom
+        ``Meta.manager`` scope override this so ``.update()`` / ``.delete()``
+        still reach every related row (a soft-delete read scope must not make
+        a relation-wide write silently skip rows).
+
+        Returns:
+            The queryset to run delegated write methods against.
+        """
+        return self._qs()
+
     async def _as_list(self) -> list[MODEL]:  # pragma: no cover - abstract
         """Resolve the related rows to a list, serving the prefetch cache."""
         raise NotImplementedError
@@ -473,6 +487,10 @@ class _ChainableManager(Generic[MODEL]):
         """
         if name.startswith("_"):
             raise AttributeError(name)
+        if name in ("update", "delete"):
+            # Bulk writes must cover every related row, not just the ones the
+            # model's custom manager scope exposes to reads.
+            return getattr(self._write_qs(), name)
         return getattr(self._qs(), name)
 
 
@@ -502,8 +520,25 @@ class RelatedManager(_ChainableManager[MODEL]):
     def _qs(self) -> QuerySet[MODEL]:
         """Build a filtered queryset for the related rows.
 
+        Built through the model's manager (``Model.all()``) — not a bare
+        ``QuerySet`` — so a custom ``Meta.manager`` scope (e.g. soft-delete)
+        applies to lazy relation reads exactly as it does to the prefetch path.
+
         Returns:
             A queryset filtered by the manager's criteria.
+        """
+        return self.model.all().filter(**self._filters)
+
+    def _write_qs(self) -> QuerySet[MODEL]:
+        """Build the unscoped queryset delegated bulk writes run against.
+
+        A custom ``Meta.manager`` scope applies to reads (:meth:`_qs`), but
+        ``parent.children.update(...)`` / ``.delete()`` must reach every
+        related row — a soft-delete read scope silently skipping rows would
+        leave their FK pointing at a parent the caller believes detached.
+
+        Returns:
+            A bare queryset filtered only by the relation's criteria.
         """
         return QuerySet(self.model).filter(**self._filters)
 
@@ -775,6 +810,12 @@ class M2MManager(_ChainableManager[MODEL]):
         cache = self.instance.__dict__.get("_prefetch")
         if cache and self.name in cache:
             return cache[self.name]
+        # The raw join below selects straight from the target table; a custom
+        # ``Meta.manager`` scope (e.g. soft-delete) would be bypassed, so those
+        # targets read through the manager-scoped queryset instead. The default
+        # manager adds no scope, so the common case keeps the fast path.
+        if type(self.target._meta.manager) is not Manager:
+            return await self._qs()._fetch()
         owner = type(self.instance)
         dialect = get_dialect(owner)
         engine = get_executor(owner, write=False)
@@ -784,6 +825,11 @@ class M2MManager(_ChainableManager[MODEL]):
     def _qs(self) -> QuerySet[MODEL]:
         """Build a queryset over the target rows linked to this instance.
 
+        Built through the target's manager (``Model.all()``) so a custom
+        ``Meta.manager`` scope applies to relation reads; ``add``/``remove``/
+        ``clear`` deliberately stay raw — they operate on join-table rows, not
+        target-model rows, so the manager scope does not apply there.
+
         Returns:
             A ``QuerySet`` on the target model constrained, through the join
             table, to the rows related to the owning instance.
@@ -791,7 +837,7 @@ class M2MManager(_ChainableManager[MODEL]):
         sub = _M2MMembershipSubquery(
             self.info.through, self.near_key, self.far_key, self.instance.pk
         )
-        return QuerySet(self.target).filter(pk__in=sub)
+        return self.target.all().filter(pk__in=sub)
 
     async def add(self, *objects: Model | Any) -> None:
         """Add related objects to the join table.
