@@ -135,3 +135,27 @@ async def test_m2m_lazy_read_honours_target_manager(db):
     await card.labels.remove(gone)
     rows = await get_engine().fetch_rows(f"SELECT COUNT(*) FROM {q('rfecard_rfelabel')}", [])
     assert rows[0][0] == 1
+
+
+@pytest.mark.asyncio
+async def test_reverse_fk_bulk_writes_ignore_manager_scope(db):
+    """
+    GIVEN a reverse FK whose source model has a soft-delete Meta.manager
+    WHEN .update() / .delete() are delegated through the related manager
+    THEN every related row is written, not just the manager-visible ones
+    (a read scope silently narrowing a relation-wide write would leave
+    soft-deleted children pointing at a parent the caller detached)
+    """
+    board = await RfeBoard.create()
+    await RfePost.create(board=board, deleted=False)
+    await RfePost.create(board=board, deleted=True)
+
+    # The soft-deleted row is invisible to reads but the write reaches it
+    # (MySQL counts only changed rows, so assert on state, not the count).
+    assert len(await board.posts) == 1
+    await board.posts.update(deleted=False)
+    assert len(await board.posts) == 2
+
+    other = await RfeBoard.create()
+    await RfePost.create(board=other, deleted=True)
+    assert await other.posts.delete() == 1

@@ -1036,24 +1036,30 @@ class DatetimeField(_TemporalField[VT]):
         self.auto_now_add = auto_now_add
 
     def to_db(self, value: Any) -> Any:
-        """Coerce the value for binding, keeping a bare ``date`` un-widened.
+        """Coerce the value for binding, widening a bare ``date`` to midnight.
 
-        Unlike :meth:`to_python_value` (whose date-to-midnight widening runs on
-        assignment/construction, so stored values always carry a time part), a
-        bare ``date`` binds as-is here: the ``__date`` truncation lookup routes
-        its comparison value through this method, and SQLite's ``date(col)``
-        yields date-only text that only matches a date-only bind (and every
-        backend casts a bound date against a timestamp column for the ordinary
-        comparison lookups).
+        Mirrors :meth:`to_python_value`: writes that bypass assignment coercion
+        (plain ``setattr`` + ``save()``, ``QuerySet.update()``,
+        ``bulk_update()``) would otherwise bind the bare ``date`` as-is, which
+        stores date-only ``YYYY-MM-DD`` text on SQLite — unreadable by the
+        engine's datetime decoder and mis-sorted against same-day timestamps.
+        The ``__date`` truncation lookup narrows its comparison value to a
+        ``date`` itself (before this method's widening can apply), so
+        date-truncated comparisons still bind date-only values.
 
         Args:
             value: The Python value to convert.
 
         Returns:
-            A ``datetime`` parsed from a string; otherwise ``value`` unchanged.
+            A ``datetime`` parsed from a string or widened from a ``date``;
+            otherwise ``value`` unchanged.
         """
         if isinstance(value, str):
-            return _parse_iso_datetime(value)
+            value = _parse_iso_datetime(value)
+        if isinstance(value, date) and not isinstance(value, datetime):
+            value = datetime(value.year, value.month, value.day)
+            if _tz.get_use_tz():
+                value = _tz.make_aware(value)
         return value
 
     def to_python_value(self, value: Any) -> Any:
@@ -1812,7 +1818,12 @@ def ManyToManyField(
         forward_key: Join-table column referencing the target model.
         backward_key: Join-table column referencing the owning model.
         through_fields: Django-order ``(owner_column, target_column)`` spelling
-            — i.e. ``(backward_key, forward_key)``.
+            — i.e. ``(backward_key, forward_key)``. .. versionchanged:: 1.15
+            Earlier releases read this tuple in the opposite,
+            ``(forward_key, backward_key)`` order; declarations written
+            against that order must swap their two elements (or switch to the
+            explicit ``forward_key=``/``backward_key=`` kwargs, whose meaning
+            has never changed).
         to: Modern alias for ``reference``.
         **kwargs: Additional options forwarded to :class:`Field`.
 

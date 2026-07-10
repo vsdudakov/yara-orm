@@ -261,6 +261,11 @@ async def test_date_truncation_lookup(db):
     await JdMoment.create(at=dt.datetime(2023, 8, 10, 0, 0, 0))
 
     assert await JdMoment.filter(at__date=dt.date(2023, 8, 9)).count() == 2
+    # A datetime value narrows to its date part (DatetimeField.to_db would
+    # widen a bare date, so the lookup normalises the value itself)...
+    assert await JdMoment.filter(at__date=dt.datetime(2023, 8, 9, 15, 30)).count() == 2
+    # ...and an ISO string parses, then narrows the same way.
+    assert await JdMoment.filter(at__date="2023-08-09T15:30:00").count() == 2
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +443,46 @@ async def test_datetime_field_bare_date_under_use_tz_localises(db):
     # read under ``use_tz`` (see ``_datetime_from_db``).
     assert fresh.at == dt.datetime(2024, 6, 1, tzinfo=UTC)
     assert fresh.at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_datetime_write_paths_widen_bare_dates(db):
+    """
+    GIVEN a DatetimeField written a bare ``date`` via plain attribute
+    assignment + save() and via QuerySet.update() (paths that bypass the
+    assignment-time coercion and bind through ``to_db``)
+    WHEN the rows are re-read
+    THEN both stored a midnight datetime, not date-only text
+    """
+    row = await RfeEvent.create(at=dt.datetime(2024, 4, 30, 12, 0))
+    row.at = dt.date(2024, 5, 3)
+    await row.save()
+    fresh = await RfeEvent.get(id=row.id)
+    assert isinstance(fresh.at, dt.datetime)
+    assert fresh.at.replace(tzinfo=None) == dt.datetime(2024, 5, 3, 0, 0)
+
+    await RfeEvent.filter(id=row.id).update(at=dt.date(2024, 6, 1))
+    fresh = await RfeEvent.get(id=row.id)
+    assert isinstance(fresh.at, dt.datetime)
+    assert fresh.at.replace(tzinfo=None) == dt.datetime(2024, 6, 1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_datetime_update_widens_bare_date_under_use_tz(db):
+    """
+    GIVEN ``use_tz`` enabled and a bare ``date`` written via QuerySet.update()
+    WHEN the row is re-read
+    THEN it stored the aware midnight instant (to_db's widening localises,
+    matching the assignment-time coercion)
+    """
+    row = await RfeEvent.create(at=dt.datetime(2024, 4, 30, 12, 0))
+    tz._set_config(use_tz=True)
+    try:
+        await RfeEvent.filter(id=row.id).update(at=dt.date(2024, 6, 1))
+        fresh = await RfeEvent.get(id=row.id)
+    finally:
+        tz._set_config(use_tz=False)
+    assert fresh.at == dt.datetime(2024, 6, 1, tzinfo=UTC)
 
 
 @pytest.mark.asyncio

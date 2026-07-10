@@ -536,10 +536,13 @@ async def test_default_m2m_keys_still_work(db):
 
 def test_datetime_to_db_parses_iso_strings():
     """
-    GIVEN a DatetimeField binding value supplied as an ISO-8601 string
+    GIVEN a DatetimeField binding value supplied as an ISO-8601 string or a
+    bare date
     WHEN to_db converts it for the engine
-    THEN it is parsed to a datetime (other values pass through unchanged)
+    THEN the string parses to a datetime and the bare date widens to midnight
     """
     f = fields.DatetimeField()
     assert f.to_db("2024-05-03T10:30:00") == dt.datetime(2024, 5, 3, 10, 30)
-    assert f.to_db(dt.date(2024, 5, 3)) == dt.date(2024, 5, 3)  # bare date stays
+    widened = f.to_db(dt.date(2024, 5, 3))
+    assert isinstance(widened, dt.datetime)
+    assert widened == dt.datetime(2024, 5, 3, 0, 0)

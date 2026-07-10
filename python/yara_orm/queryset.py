@@ -7,12 +7,19 @@ terminal coroutine (``get``, ``count`` ...) runs.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from . import registry
 from .aggregations import Aggregate
-from .connection import get_dialect, get_executor
+from .connection import (
+    TransactionWrapper,
+    get_dialect,
+    get_executor,
+    in_transaction,
+    resolve_connection_name,
+)
 from .exceptions import FieldError, UnSupportedError
 from .expressions import Expression
 from .functions import Function
@@ -1004,9 +1011,16 @@ class QuerySet(Generic[ModelT]):
             # REGEXP_LIKE(...) call on MySQL; raises where unsupported (SQLite).
             return dialect.regex_sql(op, col, dialect.placeholder(idx)), [value], idx + 1
         if op == "date":
+            # Bind a date-only value: a datetime narrows to its date and a bare
+            # date binds as-is — DatetimeField.to_db would widen it to a
+            # midnight datetime, which the date-truncated column must not be
+            # compared against (SQLite's date(col) yields date-only text).
+            date_value = coerce(value) if isinstance(value, str) else value
+            if isinstance(date_value, _dt.datetime):
+                date_value = date_value.date()
             return (
                 f"{dialect.truncate_date_sql(col)} = {dialect.placeholder(idx)}",
-                [coerce(value)],
+                [date_value],
                 idx + 1,
             )
         if op == "search":
@@ -3236,7 +3250,19 @@ class QuerySet(Generic[ModelT]):
         if not getattr(dialect, "m2m_on_delete_cascades", dialect.name != "mssql"):
             targets = self._m2m_join_targets()
             if targets:
-                return await self._delete_with_m2m_cleanup(dialect, engine, targets)
+                # The join-row and row deletes must be atomic: a mid-sequence
+                # failure would otherwise leave surviving rows stripped of
+                # their m2m links (and earlier chunks deleted) with no
+                # rollback. Reuse an active transaction; otherwise open one.
+                if isinstance(engine, TransactionWrapper):
+                    return await self._delete_with_m2m_cleanup(dialect, engine, targets)
+                name = resolve_connection_name(self.model, write=True, using=self._using)
+                if name is None:
+                    # A raw connection object has no registered name to open a
+                    # transaction on; run the sequence on it directly.
+                    return await self._delete_with_m2m_cleanup(dialect, engine, targets)
+                async with in_transaction(name) as tx:
+                    return await self._delete_with_m2m_cleanup(dialect, tx, targets)
         if self._having:
             # Annotation filters compile to HAVING (which DELETE cannot carry);
             # without this restriction they were dropped — a full-table wipe.

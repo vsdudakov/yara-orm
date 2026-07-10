@@ -293,6 +293,63 @@ async def test_get_or_create_inherits_filter_values_and_kwargs_win(db):
     assert book.author_id == ada.id
 
 
+@pytest.mark.asyncio
+async def test_bulk_create_backfills_ids_on_triggered_table(db):
+    """
+    GIVEN a SQL Server table with an enabled DML trigger
+    WHEN bulk_create inserts multiple rows
+    THEN the generated ids are read back per object (a bare OUTPUT clause
+    without INTO is rejected on triggered tables with error 334; the ids
+    route through a table variable instead)
+    """
+    if db != "mssql":
+        pytest.skip("OUTPUT-with-trigger interaction is SQL Server specific")
+    conn = connections.get()
+    await conn.execute_script(
+        "CREATE TRIGGER bg_item_audit ON bg_item AFTER INSERT AS BEGIN SET NOCOUNT ON END"
+    )
+    try:
+        objs = [BgItem(sku=f"tr{i}", name="t") for i in range(3)]
+        await BgItem.bulk_create(objs)
+        ids = [o.id for o in objs]
+        assert all(ids) and len(set(ids)) == 3
+        fetched = {i.sku: i.id for i in await BgItem.filter(sku__in=["tr0", "tr1", "tr2"])}
+        assert ids == [fetched["tr0"], fetched["tr1"], fetched["tr2"]]
+    finally:
+        await conn.execute_script("DROP TRIGGER bg_item_audit")
+
+
+@pytest.mark.asyncio
+async def test_bulk_get_or_create_allows_mixed_explicit_and_auto_pks(db):
+    """
+    GIVEN new-row records where some carry an explicit id and some do not
+    WHEN bulk_get_or_create / bulk_update_or_create insert them
+    THEN the mix is partitioned and inserted (bulk_create alone rejects it),
+    explicit ids preserved and the rest auto-assigned
+    """
+    out = await BgItem.bulk_get_or_create(
+        [
+            {"id": 500, "sku": "mx1", "name": "a"},
+            {"sku": "mx2", "name": "b"},
+        ],
+        key_fields=["sku"],
+    )
+    assert [created for _, created in out] == [True, True]
+    assert out[0][0].id == 500
+    assert out[1][0].id is not None and out[1][0].id != 500
+
+    out = await BgItem.bulk_update_or_create(
+        [
+            {"id": 600, "sku": "mx3", "name": "c"},
+            {"sku": "mx4", "name": "d"},
+        ],
+        key_fields=["sku"],
+    )
+    assert [created for _, created in out] == [True, True]
+    assert out[0][0].id == 600
+    assert (await BgItem.get(sku="mx4")).id is not None
+
+
 def test_filter_create_kwargs_skips_ambiguous_constraints():
     """
     GIVEN a filter tree mixing exact matches with lookups, OR and negation

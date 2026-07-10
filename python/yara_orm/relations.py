@@ -405,6 +405,19 @@ class _ChainableManager(Generic[MODEL]):
         """Return the base queryset over the related rows."""
         raise NotImplementedError
 
+    def _write_qs(self) -> QuerySet[MODEL]:
+        """Return the queryset bulk writes delegate to.
+
+        Defaults to :meth:`_qs`; managers whose read queryset applies a custom
+        ``Meta.manager`` scope override this so ``.update()`` / ``.delete()``
+        still reach every related row (a soft-delete read scope must not make
+        a relation-wide write silently skip rows).
+
+        Returns:
+            The queryset to run delegated write methods against.
+        """
+        return self._qs()
+
     async def _as_list(self) -> list[MODEL]:  # pragma: no cover - abstract
         """Resolve the related rows to a list, serving the prefetch cache."""
         raise NotImplementedError
@@ -474,6 +487,10 @@ class _ChainableManager(Generic[MODEL]):
         """
         if name.startswith("_"):
             raise AttributeError(name)
+        if name in ("update", "delete"):
+            # Bulk writes must cover every related row, not just the ones the
+            # model's custom manager scope exposes to reads.
+            return getattr(self._write_qs(), name)
         return getattr(self._qs(), name)
 
 
@@ -511,6 +528,19 @@ class RelatedManager(_ChainableManager[MODEL]):
             A queryset filtered by the manager's criteria.
         """
         return self.model.all().filter(**self._filters)
+
+    def _write_qs(self) -> QuerySet[MODEL]:
+        """Build the unscoped queryset delegated bulk writes run against.
+
+        A custom ``Meta.manager`` scope applies to reads (:meth:`_qs`), but
+        ``parent.children.update(...)`` / ``.delete()`` must reach every
+        related row — a soft-delete read scope silently skipping rows would
+        leave their FK pointing at a parent the caller believes detached.
+
+        Returns:
+            A bare queryset filtered only by the relation's criteria.
+        """
+        return QuerySet(self.model).filter(**self._filters)
 
     async def _as_list(self) -> list[MODEL]:
         """Resolve the related rows, serving the prefetch cache when present.

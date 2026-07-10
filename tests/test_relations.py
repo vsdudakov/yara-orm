@@ -4,9 +4,22 @@ instance/queryset delete for dialects whose join-table FKs do not cascade."""
 
 import pytest
 
-from yara_orm import Avg, Count, FieldError, Max, Min, Model, Prefetch, Sum, connections, fields
+from yara_orm import (
+    Avg,
+    Count,
+    FieldError,
+    Max,
+    Min,
+    Model,
+    Prefetch,
+    Sum,
+    connections,
+    fields,
+    in_transaction,
+)
 from yara_orm.connection import get_dialect
 from yara_orm.dialects import PostgresDialect
+from yara_orm.exceptions import OperationalError
 
 
 class Tournament(Model):
@@ -748,6 +761,72 @@ async def test_queryset_delete_clears_m2m_rows_when_dialect_does_not_cascade(db,
     # Reverse side: the tag is only the relation's *target*; its join rows go
     # via the forward key (found through the registry scan).
     assert await RfxTag.filter(label="t1").delete() == 1
+    assert await _join_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_m2m_cleanup_rolls_back_when_the_row_delete_fails(db, monkeypatch):
+    """
+    GIVEN a non-cascading dialect and a row whose DELETE is blocked (trigger)
+    WHEN instance delete and bulk delete fail on the row statement
+    THEN the already-executed join-row deletes are rolled back — a failed
+    delete must not silently strip the surviving row's m2m links
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+
+    await _rebuild_join_table_without_fks()
+    post = await RfxPost.create(id=1, title="blocked")
+    tag = await RfxTag.create(id=1, label="t1")
+    await post.tags.add(tag)
+    await connections.get().execute(
+        "CREATE TRIGGER rfx_no_delete BEFORE DELETE ON rfx_post "
+        "BEGIN SELECT RAISE(ABORT, 'delete blocked'); END"
+    )
+    monkeypatch.setattr(get_dialect(RfxPost), "m2m_on_delete_cascades", False, raising=False)
+    try:
+        with pytest.raises(OperationalError):
+            await post.delete()
+        assert await _join_rows() == [(1, 1)]
+        with pytest.raises(OperationalError):
+            await RfxPost.filter(id=1).delete()
+        assert await _join_rows() == [(1, 1)]
+    finally:
+        await connections.get().execute("DROP TRIGGER rfx_no_delete")
+
+
+@pytest.mark.asyncio
+async def test_m2m_cleanup_delete_inside_transaction_and_on_raw_connection(db, monkeypatch):
+    """
+    GIVEN a non-cascading dialect
+    WHEN deletes run inside an open transaction and on a raw connection object
+    THEN both paths still clear the join rows (the former reuses the active
+    transaction; the latter has no named connection to open one on)
+    """
+    if db != "sqlite":
+        pytest.skip("dialect-capability simulation is exercised on sqlite only")
+
+    await _rebuild_join_table_without_fks()
+    p1 = await RfxPost.create(id=1, title="in-tx")
+    p2 = await RfxPost.create(id=2, title="raw-conn")
+    p3 = await RfxPost.create(id=3, title="raw-inst")
+    t1 = await RfxTag.create(id=1, label="t1")
+    for p in (p1, p2, p3):
+        await p.tags.add(t1)
+    conn = connections.get()
+    # The raw-connection path resolves a fresh dialect instance per call, so
+    # the capability flag is simulated at the class level.
+    from yara_orm.dialects import SqliteDialect
+
+    monkeypatch.setattr(SqliteDialect, "m2m_on_delete_cascades", False, raising=False)
+
+    async with in_transaction():
+        assert await RfxPost.filter(id=1).delete() == 1
+    assert await _join_rows() == [(2, 1), (3, 1)]
+
+    assert await RfxPost.all().using_db(conn).filter(id=2).delete() == 1
+    assert await _join_rows() == [(3, 1)]
+    await p3.delete(using_db=conn)
     assert await _join_rows() == []
 
 

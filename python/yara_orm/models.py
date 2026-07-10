@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
 
 from . import registry, signals
 from . import timezone as _tz
-from .connection import get_dialect, get_executor
+from .connection import (
+    TransactionWrapper,
+    get_dialect,
+    get_executor,
+    in_transaction,
+    resolve_connection_name,
+)
 from .db_defaults import DatabaseDefault
 from .exceptions import DoesNotExist, FieldError, MultipleObjectsReturned
 from .fields import (
@@ -1484,8 +1490,20 @@ class Model(metaclass=ModelMeta):
         # join tables carry ON DELETE CASCADE and skip this. The getattr lets a
         # dialect opt in/out via a capability attribute without requiring one.
         if not getattr(dialect, "m2m_on_delete_cascades", dialect.name != "mssql"):
-            await self._delete_m2m_rows(executor, dialect)
-        await executor.execute(meta.delete_sql, [meta.pk_field.to_db(self.pk)])
+            # The join-row deletes and the row delete must be atomic: a failed
+            # row delete would otherwise leave the surviving row stripped of
+            # its m2m links. Reuse an active transaction; otherwise open one
+            # (a raw connection object has no registered name to open on).
+            name = resolve_connection_name(cls, write=True, using=using_db)
+            if isinstance(executor, TransactionWrapper) or name is None:
+                await self._delete_m2m_rows(executor, dialect)
+                await executor.execute(meta.delete_sql, [meta.pk_field.to_db(self.pk)])
+            else:
+                async with in_transaction(name) as tx:
+                    await self._delete_m2m_rows(tx, dialect)
+                    await tx.execute(meta.delete_sql, [meta.pk_field.to_db(self.pk)])
+        else:
+            await executor.execute(meta.delete_sql, [meta.pk_field.to_db(self.pk)])
         self._in_db = False
         if has_signals:
             await signals.emit_post_delete(cls, self, executor)
@@ -2101,6 +2119,34 @@ class Model(metaclass=ModelMeta):
         return out
 
     @classmethod
+    async def _bulk_create_partitioned(cls, objects: list[Self], batch_size: int) -> None:
+        """Insert ``objects``, splitting a mixed explicit/auto-pk batch.
+
+        ``bulk_create`` rejects a batch mixing instances with and without an
+        explicit auto-increment pk (splitting there would silently reorder a
+        caller's inserts). The batch helpers build their create lists straight
+        from caller records — where such a mix is legitimate — so they
+        partition here and insert each group separately instead.
+
+        Args:
+            objects: The unsaved instances to insert.
+            batch_size: Maximum rows per INSERT statement.
+
+        Returns:
+            None
+        """
+        pk_field = cls._meta.pk_field
+        attr = pk_field.model_field_name
+        if pk_field.auto_increment:
+            with_pk = [o for o in objects if getattr(o, attr, None) is not None]
+            if with_pk and len(with_pk) != len(objects):
+                without_pk = [o for o in objects if getattr(o, attr, None) is None]
+                await cls.bulk_create(with_pk, batch_size=batch_size)
+                await cls.bulk_create(without_pk, batch_size=batch_size)
+                return
+        await cls.bulk_create(objects, batch_size=batch_size)
+
+    @classmethod
     async def bulk_get_or_create(
         cls,
         records: Iterable[dict[str, Any]],
@@ -2145,7 +2191,7 @@ class Model(metaclass=ModelMeta):
                 to_create.append(obj)
                 results.append((obj, True))
         if to_create:
-            await cls.bulk_create(to_create, batch_size=batch_size)
+            await cls._bulk_create_partitioned(to_create, batch_size)
         return results
 
     @classmethod
@@ -2208,7 +2254,7 @@ class Model(metaclass=ModelMeta):
                 to_create.append(obj)
                 results.append((obj, True))
         if to_create:
-            await cls.bulk_create(to_create, batch_size=batch_size)
+            await cls._bulk_create_partitioned(to_create, batch_size)
         if to_update:
             # bulk_update no-ops when ``updates`` is empty (all fields are keys).
             await cls.bulk_update(list(to_update.values()), fields=updates, batch_size=batch_size)
@@ -2461,11 +2507,18 @@ class Model(metaclass=ModelMeta):
                     )
                 if output_inserted:
                     # T-SQL's returning clause sits mid-statement, so it cannot
-                    # ride the suffix path below.
+                    # ride the suffix path below. The ids route through a table
+                    # variable: a bare OUTPUT clause (no INTO) is rejected on
+                    # any table with an enabled trigger (error 334), while
+                    # OUTPUT ... INTO works either way. BIGINT holds every
+                    # IDENTITY kind the dialect emits (small/int/bigint).
+                    pk_col = dialect.quote(pk_field.db_column)
                     return (
+                        f"DECLARE @yara_ids TABLE ({pk_col} BIGINT); "
                         f"INSERT INTO {table} ({columns}) "
-                        f"OUTPUT INSERTED.{dialect.quote(pk_field.db_column)} "
-                        f"VALUES {values_clause(nrows)}"
+                        f"OUTPUT INSERTED.{pk_col} INTO @yara_ids "
+                        f"VALUES {values_clause(nrows)}; "
+                        f"SELECT {pk_col} FROM @yara_ids"  # noqa: S608
                     )
                 # RETURNING is omitted on dialects without it (MySQL reports the
                 # batch's first auto-increment id instead; see the backfill
@@ -2525,13 +2578,13 @@ class Model(metaclass=ModelMeta):
                         obj._in_db = True
                         obj._mark_unfetched_db_defaults()
                 elif output_inserted:
-                    # OUTPUT rows are not guaranteed to arrive in VALUES order;
-                    # identity values within one statement *are* assigned in
-                    # row order (ascending), so sort the ids to restore batch
-                    # order before zipping.
+                    # The table variable receives one OUTPUT row per VALUES row
+                    # as each is inserted, so the ids read back in batch order.
+                    # (Sorting instead would misassign ids under a negative
+                    # IDENTITY increment.)
                     returned = await engine.fetch_rows(sql, params)
-                    for obj, new_id in zip(batch, sorted(row[0] for row in returned)):
-                        setattr(obj, pk_field.model_field_name, pk_field.to_python(new_id))
+                    for obj, row in zip(batch, returned):
+                        setattr(obj, pk_field.model_field_name, pk_field.to_python(row[0]))
                         obj._in_db = True
                         obj._mark_unfetched_db_defaults()
                 elif pk_field.auto_increment:
