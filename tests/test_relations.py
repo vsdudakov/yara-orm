@@ -6,6 +6,7 @@ import pytest
 
 from yara_orm import Avg, Count, FieldError, Max, Min, Model, Prefetch, Sum, connections, fields
 from yara_orm.connection import get_dialect
+from yara_orm.dialects import PostgresDialect
 
 
 class Tournament(Model):
@@ -99,6 +100,34 @@ class RfbPost(Model):
 
     class Meta:
         table = "rfb_post"
+
+
+class RfbMirrorA(Model):
+    id = fields.IntField(pk=True)
+    partners = fields.ManyToManyField(
+        "RfbMirrorB",
+        related_name="mirror_rev_a",
+        through="rfb_mirror_link",
+        forward_key="b_id",
+        backward_key="a_id",
+    )
+
+    class Meta:
+        table = "rfb_mirror_a"
+
+
+class RfbMirrorB(Model):
+    id = fields.IntField(pk=True)
+    partners = fields.ManyToManyField(
+        "RfbMirrorA",
+        related_name="mirror_rev_b",
+        through="rfb_mirror_link",
+        forward_key="a_id",
+        backward_key="b_id",
+    )
+
+    class Meta:
+        table = "rfb_mirror_b"
 
 
 class RfxTag(Model):
@@ -615,6 +644,30 @@ async def test_delete_m2m_rows_clears_both_sides(db):
     # via the forward key (found through the registry scan).
     await tag1._delete_m2m_rows(executor, dialect)
     assert await _link_counts() == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_delete_m2m_rows_dedupes_mirrored_declarations():
+    """
+    GIVEN two models that each declare the same m2m join table (mirrored
+    forward/backward keys), so the owner-side scan and the registry scan
+    produce the same (table, column) target
+    WHEN _delete_m2m_rows runs for one instance
+    THEN the shared join-table target is deleted once, not twice
+    """
+    executed: list[tuple[str, list]] = []
+
+    class _StubExecutor:
+        async def execute(self, sql, params):
+            executed.append((sql, params))
+
+    a = RfbMirrorA(id=7)
+    await a._delete_m2m_rows(_StubExecutor(), PostgresDialect())
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert '"rfb_mirror_link"' in sql
+    assert '"a_id"' in sql
+    assert params == [7]
 
 
 @pytest.mark.asyncio

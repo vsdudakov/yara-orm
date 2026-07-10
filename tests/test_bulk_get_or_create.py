@@ -15,7 +15,7 @@ import tempfile
 
 import pytest
 
-from yara_orm import Model, Q, YaraOrm, connections, fields
+from yara_orm import Count, F, Model, Q, YaraOrm, connections, fields
 
 
 class BgItem(Model):
@@ -306,6 +306,24 @@ def test_filter_create_kwargs_skips_ambiguous_constraints():
         .filter(name="x")  # root-level exact: kept
     )
     assert qs._filter_create_kwargs() == {"name": "x"}
+
+
+def test_filter_create_kwargs_pk_alias_expressions_and_nested_q():
+    """
+    GIVEN root-level filters using pk, an expression value, an annotation
+    name and AND-nested Q objects
+    WHEN the create kwargs are derived from the filter tree
+    THEN pk maps to the concrete pk field, nested AND branches contribute,
+    and expression values / non-column names are skipped
+    """
+    qs = (
+        RfxItem.filter(pk=11)  # pk aliases the concrete pk field: kept as id
+        .filter(Q(Q(name="x"), Q(qty=7)))  # AND-nested children are walked
+        .filter(name=F("name"))  # expression value: skipped (keeps "x")
+        .filter(n=Count("id"))  # aggregate value on a non-column: skipped
+        .filter(items=2)  # not a field or relation (lazy validation): skipped
+    )
+    assert qs._filter_create_kwargs() == {"id": 11, "name": "x", "qty": 7}
 
 
 @pytest.mark.asyncio

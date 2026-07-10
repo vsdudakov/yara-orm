@@ -532,3 +532,14 @@ async def test_default_m2m_keys_still_work(db):
     assert [list(r) for r in rows] == [[author.pk, tag.pk]]
     assert [t.pk for t in await author.tags] == [tag.pk]
     assert [a.pk for a in await tag.authors] == [author.pk]
+
+
+def test_datetime_to_db_parses_iso_strings():
+    """
+    GIVEN a DatetimeField binding value supplied as an ISO-8601 string
+    WHEN to_db converts it for the engine
+    THEN it is parsed to a datetime (other values pass through unchanged)
+    """
+    f = fields.DatetimeField()
+    assert f.to_db("2024-05-03T10:30:00") == dt.datetime(2024, 5, 3, 10, 30)
+    assert f.to_db(dt.date(2024, 5, 3)) == dt.date(2024, 5, 3)  # bare date stays

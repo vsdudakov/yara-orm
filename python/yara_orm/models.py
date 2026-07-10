@@ -1143,63 +1143,6 @@ class Model(metaclass=ModelMeta):
             out.append(obj)
         return out
 
-    @classmethod
-    def _from_db_row_fields(cls, values: list[Any], fields: list[Field]) -> Self:
-        """Build a partially-populated instance from a subset of columns.
-
-        Powers ``only()`` / ``defer()``: only ``fields`` are set, so reading any
-        other column raises ``FieldError`` (via the field descriptor) rather
-        than returning a stale or wrong value. Uses the cached partial decode
-        plan (:meth:`MetaInfo.partial_decode_plan`) so the per-field
-        read-identity branch is resolved once, not per row.
-
-        Args:
-            values: Raw column values in ``fields`` order.
-            fields: The selected fields, matching the SELECT column order.
-
-        Returns:
-            A new, partially-populated instance marked as already persisted.
-        """
-        names, active = cls._meta.partial_decode_plan(fields)
-        obj = cls.__new__(cls)
-        d = obj.__dict__
-        d["_in_db"] = True
-        d.update(zip(names, values))
-        for i, name, decode in active:
-            value = values[i]
-            if value is not None:
-                d[name] = decode(value)
-        return obj
-
-    @classmethod
-    def _from_db_rows_fields(cls, rows: list[list[Any]], fields: list[Field]) -> list[Self]:
-        """Build partially-populated instances for many rows (batch fast path).
-
-        The ``only()``/``defer()`` counterpart of :meth:`_from_db_rows`: the
-        cached decode plan and ``__new__`` are resolved once for the batch.
-
-        Args:
-            rows: Raw column-value lists in ``fields`` order.
-            fields: The selected fields, matching the SELECT column order.
-
-        Returns:
-            The hydrated, partially-populated instances.
-        """
-        names, active = cls._meta.partial_decode_plan(fields)
-        new = cls.__new__
-        out: list[Self] = []
-        for values in rows:
-            obj = new(cls)
-            d = obj.__dict__
-            d["_in_db"] = True
-            d.update(zip(names, values))
-            for i, name, decode in active:
-                value = values[i]
-                if value is not None:
-                    d[name] = decode(value)
-            out.append(obj)
-        return out
-
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         """Return a debugging representation showing the type and primary key.
 

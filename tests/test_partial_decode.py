@@ -1,8 +1,8 @@
 """Partial-selection hydration (``only()``/``defer()``) over non-identity fields.
 
-Exercises the cached partial decode plan and its active-decoder loop for both the
-batch (`_from_db_rows_fields`) and single-row (`_from_db_row_fields`, via a
-partial ``select_related``) builders, including the NULL skip path.
+Exercises the cached partial decode plan (``MetaInfo.partial_decode_plan``) and
+its active-decoder loop on both the batch fetch and single-row (partial
+``select_related``) read paths, including the NULL skip path.
 """
 
 from decimal import Decimal
