@@ -1818,7 +1818,7 @@ def ManyToManyField(
         forward_key: Join-table column referencing the target model.
         backward_key: Join-table column referencing the owning model.
         through_fields: Django-order ``(owner_column, target_column)`` spelling
-            — i.e. ``(backward_key, forward_key)``. .. versionchanged:: 1.15
+            — i.e. ``(backward_key, forward_key)``. .. versionchanged:: 1.14.4
             Earlier releases read this tuple in the opposite,
             ``(forward_key, backward_key)`` order; declarations written
             against that order must swap their two elements (or switch to the

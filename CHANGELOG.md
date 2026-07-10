@@ -4,6 +4,56 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.4] - 2026-07-11
+
+### Changed
+
+- **`ManyToManyField(through_fields=...)` now reads Django's
+  `(owner_column, target_column)` order.** Declarations written against the
+  previous `(forward_key, backward_key)` reading must swap the two elements,
+  or switch to the explicit `forward_key=` / `backward_key=` kwargs (whose
+  meaning is unchanged).
+- **Related-manager bulk writes are unscoped.** `parent.children.update(...)`
+  / `.delete()` now reach every related row even when the model's custom
+  `Meta.manager` (e.g. soft-delete) hides some from reads — lazy relation
+  *reads* keep the manager scope, matching prefetch.
+
+### Fixed
+
+- **Oracle: zero-fraction datetime binds.** The driver's 11-byte TIMESTAMP
+  bind with a zero fractional part compared unequal to the server's canonical
+  7-byte storage, so `col >= :midnight` silently dropped exact-midnight rows;
+  such values now bind as DATE (full second precision).
+- **Bare `date` values on every datetime write path.** `DatetimeField.to_db`
+  widens a bare `date` to a (tz-aware under `use_tz`) midnight datetime, so
+  plain-attribute `save()`, `QuerySet.update()` and `bulk_update()` no longer
+  store date-only text; the `__date` lookup narrows its comparison value to a
+  date itself. Assignment/construction coercion (1.14.3-era fix) is unchanged.
+- **m2m join-row cleanup is atomic.** On dialects whose join-table FKs do not
+  cascade (SQL Server), `Model.delete()` and `QuerySet.delete()` run the
+  join-row deletes and the row delete in one transaction — a failed row
+  delete no longer silently strips the surviving rows' m2m links.
+- **SQL Server `bulk_create`.** Generated ids return via
+  `OUTPUT ... INTO` a table variable — works on tables with enabled triggers
+  (a bare OUTPUT clause raises server error 334) — and are assigned in
+  arrival order (sorting misassigned ids under a negative IDENTITY
+  increment).
+- **`bulk_get_or_create` / `bulk_update_or_create` accept mixed pks.** A
+  create list mixing records with and without an explicit auto-increment id
+  is partitioned and inserted in two batches instead of tripping
+  `bulk_create`'s mixed-batch `ValueError`.
+- **PostgreSQL `execute_many` type unification.** Differing numeric mixes
+  now widen to NUMERIC (INT8→FLOAT8 silently rounded integers above 2^53);
+  naive/aware datetime mixes unify to TIMESTAMPTZ and str/UUID mixes to UUID
+  instead of rejecting the batch.
+- Plus the fifteen correctness fixes from the full-codebase review that
+  opened this release's PR: ZoneInfo-aware datetime binds, per-batch
+  parameter-type unification, the sync-fast-path pool deadlock,
+  `get_or_create`/`update_or_create` connection binding and root-filter
+  inheritance, decode-plan snapshots on all read paths, order_by-referenced
+  annotations in grouped projections, and lazy relation reads built through
+  `Meta.manager`.
+
 ## [1.14.3] - 2026-07-08
 
 ### Fixed
