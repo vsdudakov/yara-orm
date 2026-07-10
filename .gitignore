@@ -20,3 +20,7 @@ docs-requirements.txt
 # macOS Finder metadata
 .DS_Store
 MIGRATION_GAPS.md
+
+# Claude Code local config
+/.claude/
+/CLAUDE.md
