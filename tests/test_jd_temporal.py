@@ -433,13 +433,11 @@ async def test_datetime_field_bare_date_under_use_tz_localises(db):
         fresh = await RfeEvent.get(id=row.id)
     finally:
         tz._set_config(use_tz=False)
-    expected = dt.datetime(2024, 6, 1, tzinfo=UTC)
-    if db in ("mysql", "mariadb", "oracle", "mssql"):
-        # DATETIME/TIMESTAMP is naive on these backends: same UTC instant, no tz.
-        assert fresh.at == expected.replace(tzinfo=None)
-    else:
-        assert fresh.at == expected
-        assert fresh.at.tzinfo is not None
+    # Every backend returns the aware UTC instant: PG/SQLite store it, and the
+    # naive-DATETIME dialects (MySQL/MariaDB/Oracle/MSSQL) re-attach UTC on
+    # read under ``use_tz`` (see ``_datetime_from_db``).
+    assert fresh.at == dt.datetime(2024, 6, 1, tzinfo=UTC)
+    assert fresh.at.tzinfo is not None
 
 
 @pytest.mark.asyncio
