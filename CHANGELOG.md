@@ -4,6 +4,34 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-07-16
+
+### Added
+
+- **`yara_orm.RawText`** — a thin ``str`` subclass (the ``Array`` pattern)
+  that binds as an *untyped* text parameter on PostgreSQL: the engine
+  declares OID 0 so the server infers the parameter's type from context (the
+  target column, a ``<=>`` operand) and sends the value with the text format
+  code, so the type's own input function parses it. This lets a custom field
+  kind (pgvector ``vector``, ``inet``, ``citext``, ...) write into a column
+  that has no implicit cast from ``text`` — previously every ORM
+  INSERT/UPDATE failed with SQLSTATE 42804 unless the database installed a
+  global ``CREATE CAST (text AS ...) WITH INOUT AS IMPLICIT``. On every other
+  backend ``RawText`` binds exactly like a plain string.
+- **`Field.select_as_text`** — new field-class attribute; PostgreSQL SELECT
+  and RETURNING projections read the column through ``CAST(col AS text)``
+  (the cast keeps the column's result name, so decode plans are unaffected)
+  and the field's ``to_python`` parses the text form. Previously selecting a
+  custom-typed column raised ``unsupported PostgreSQL type OID`` — the engine
+  requests binary results, which it cannot decode for such types — forcing
+  ``.defer()`` workarounds. Rendering goes through the new
+  ``BaseDialect.select_column`` hook at every projection site (full-row
+  selects, ``only()``/``defer()``, ``select_related``, ``values()``/
+  ``values_list()``, m2m prefetch, RETURNING); comparison and grouping
+  references keep the column's real type.
+- The custom-fields guide documents both on a complete pgvector
+  ``VectorField`` example.
+
 ## [1.14.5] - 2026-07-16
 
 ### Fixed
