@@ -1907,6 +1907,9 @@ class SqliteDialect(BaseDialect):
     """Dialect rendering SQL for SQLite."""
 
     name = "sqlite"
+    # SQLite's default SQLITE_MAX_VARIABLE_NUMBER (3.32+); the base class's
+    # 65535 would let bulk statements exceed it.
+    max_bind_params = 32766
     # SQLite has no ILIKE; its LIKE is case-insensitive for ASCII text.
     ilike = "LIKE"
     # SQLite's human-readable plan comes from EXPLAIN QUERY PLAN.

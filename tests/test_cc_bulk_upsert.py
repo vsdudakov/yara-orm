@@ -141,6 +141,83 @@ async def test_bulk_update_multiple_batches_only_named_field(db):
     assert reload["s4"] == (104, "orig")
 
 
+class _ExecuteSpy:
+    """Executor proxy recording every (sql, params) passed to ``execute``."""
+
+    def __init__(self, inner, log):
+        self._inner = inner
+        self._log = log
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def execute(self, sql, params=None):
+        self._log.append((sql, list(params or [])))
+        return await self._inner.execute(sql, params)
+
+
+def _spy_on_execute(monkeypatch):
+    """Route ``models.get_executor`` through a spy; returns the statement log."""
+    import yara_orm.models as models_mod
+
+    log = []
+    real_get_executor = models_mod.get_executor
+
+    def fake_get_executor(model, *args, **kwargs):
+        return _ExecuteSpy(real_get_executor(model, *args, **kwargs), log)
+
+    monkeypatch.setattr(models_mod, "get_executor", fake_get_executor)
+    return log
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_emits_single_where_in_clause(db, monkeypatch):
+    """
+    GIVEN a bulk_update writing several fields in one batch
+    WHEN the UPDATE statement is generated
+    THEN it carries exactly one WHERE and one IN clause (never one per field)
+    and one CASE per written field
+    """
+    await CcuItem.bulk_create([CcuItem(sku=f"w{i}", qty=i) for i in range(3)])
+    objs = await CcuItem.all().order_by("sku")
+    for o in objs:
+        o.qty += 10
+        o.name = "upd"
+    log = _spy_on_execute(monkeypatch)
+    await CcuItem.bulk_update(objs, ["qty", "name"])
+    assert len(log) == 1
+    sql = log[0][0]
+    assert sql.count("WHERE") == 1
+    assert sql.count(" IN (") == 1
+    assert sql.count("CASE") == 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_clamps_batches_under_bind_param_cap(db, monkeypatch):
+    """
+    GIVEN a dialect bind-parameter ceiling smaller than batch_size would need
+    WHEN bulk_update runs with the default (larger) batch_size
+    THEN it splits into statements that each stay under the ceiling and all
+    rows still update
+    """
+    from yara_orm.connection import get_dialect
+
+    await CcuItem.bulk_create([CcuItem(sku=f"c{i}", qty=i) for i in range(5)])
+    objs = await CcuItem.all().order_by("sku")
+    for o in objs:
+        o.qty += 100
+        o.name = "cap"
+    # 2 fields -> 2*2+1 = 5 params per row; cap 10 -> 2 rows per statement.
+    monkeypatch.setattr(get_dialect(CcuItem), "max_bind_params", 10)
+    log = _spy_on_execute(monkeypatch)
+    n = await CcuItem.bulk_update(objs, ["qty", "name"])
+    assert n == 5
+    assert len(log) == 3  # 2 + 2 + 1 rows
+    assert all(len(params) <= 10 for _, params in log)
+    reload = {i.sku: (i.qty, i.name) for i in await CcuItem.all()}
+    assert reload == {f"c{i}": (i + 100, "cap") for i in range(5)}
+
+
 # -- bulk_get_or_create extra corners ----------------------------------------
 
 
