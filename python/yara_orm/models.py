@@ -375,7 +375,9 @@ class MetaInfo:
         self._partial_plan_cache = {}
         self._build_decode_plan()
         q = dialect.quote
-        self.columns_sql = ", ".join(q(f.db_column) for f in self.field_list)
+        self.columns_sql = ", ".join(
+            dialect.select_column(f, q(f.db_column)) for f in self.field_list
+        )
         self.select_prefix = f"SELECT {self.columns_sql} FROM {q(self.table)}"
 
         # Single-row INSERT for the common case of an unset auto-increment pk.

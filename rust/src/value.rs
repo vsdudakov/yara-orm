@@ -17,7 +17,7 @@ use pyo3::types::{
     PySet, PyString, PyTime, PyTuple, PyTzInfo, PyTzInfoAccess,
 };
 use pyo3::Borrowed;
-use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+use tokio_postgres::types::{to_sql_checked, Format, IsNull, ToSql, Type};
 
 use crate::error::EngineError;
 
@@ -49,6 +49,9 @@ static DECIMAL_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 // `yara_orm.Array` marks a sequence to bind as a PostgreSQL array (a bare list
 // binds as JSON). Resolved by import and cached like the scalar types above.
 static ARRAY_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+// `yara_orm.RawText` marks a string to bind as an untyped text parameter on
+// PostgreSQL (custom column types with no implicit cast from `text`).
+static RAW_TEXT_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 // `enum.Enum` base, to coerce enum members inside a JSON value (their `.value`).
 static ENUM_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
@@ -62,6 +65,10 @@ fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
 
 fn array_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     ARRAY_TYPE.import(py, "yara_orm", "Array")
+}
+
+fn raw_text_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    RAW_TEXT_TYPE.import(py, "yara_orm", "RawText")
 }
 
 fn enum_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
@@ -101,6 +108,13 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Text(String),
+    /// A `yara_orm.RawText` string: bound as an *untyped* text parameter so
+    /// PostgreSQL infers the type from context and parses the text through the
+    /// target type's input function. This is how a custom field kind (pgvector
+    /// `vector`, `inet`, `citext`, ...) binds a text rendering into a column
+    /// that has no implicit cast from `text` (SQLSTATE 42804 otherwise). On
+    /// every other backend it behaves exactly like `Text`.
+    RawText(String),
     Bytes(Vec<u8>),
     Json(serde_json::Value),
     Array(Vec<Value>),
@@ -137,6 +151,14 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
             return Ok(Value::Float(ob.extract::<f64>()?));
         }
         if ob.is_instance_of::<PyString>() {
+            // ``yara_orm.RawText`` (a str subclass) binds untyped on PostgreSQL
+            // (server-inferred type, text encoding); the exact-type test keeps
+            // the plain-str hot path to a single cheap check.
+            if !ob.is_exact_instance_of::<PyString>()
+                && ob.is_instance(raw_text_type(ob.py())?.as_any())?
+            {
+                return Ok(Value::RawText(ob.extract::<String>()?));
+            }
             return Ok(Value::Text(ob.extract::<String>()?));
         }
         // datetime must be checked before date (datetime subclasses date).
@@ -307,7 +329,7 @@ impl<'py> IntoPyObject<'py> for Value {
             Value::Bool(v) => v.into_pyobject(py)?.to_owned().into_any(),
             Value::Int(v) => v.into_pyobject(py)?.into_any(),
             Value::Float(v) => v.into_pyobject(py)?.into_any(),
-            Value::Text(v) => v.into_pyobject(py)?.into_any(),
+            Value::Text(v) | Value::RawText(v) => v.into_pyobject(py)?.into_any(),
             Value::Bytes(v) => PyBytes::new(py, &v).into_any(),
             Value::Json(v) => json_to_py(py, &v)?,
             Value::Array(items) => {
@@ -393,7 +415,9 @@ impl Value {
             Value::Time(_) => Type::TIME,
             // Defer arrays to the server: the element type comes from the
             // ``::type[]`` cast or the target column, not from the value alone.
-            Value::Null | Value::Json(_) | Value::Array(_) => return None,
+            // RawText is untyped by design — the server infers the target type
+            // (e.g. a pgvector column) and parses the text form itself.
+            Value::Null | Value::Json(_) | Value::Array(_) | Value::RawText(_) => return None,
         })
     }
 
@@ -413,7 +437,9 @@ impl Value {
             Value::TimestampTz(v) => Some(v.to_rfc3339()),
             Value::Date(v) => Some(v.format(FMT_DATE).to_string()),
             Value::Time(v) => Some(v.format(FMT_TIME).to_string()),
-            Value::Null | Value::Text(_) | Value::Bytes(_) | Value::Array(_) => None,
+            Value::Null | Value::Text(_) | Value::RawText(_) | Value::Bytes(_) | Value::Array(_) => {
+                None
+            }
         }
     }
 }
@@ -488,6 +514,10 @@ impl ToSql for Value {
                 }
                 v.to_sql(ty, out)
             }
+            // Untyped text: the bytes are the value's text form, sent with the
+            // *text* format code (see `encode_format`), so the server parses
+            // them through the inferred type's input function.
+            Value::RawText(v) => v.to_sql(ty, out),
             Value::Bytes(v) => v.to_sql(ty, out),
             Value::Json(v) => v.to_sql(ty, out),
             Value::Array(items) => items.to_sql(ty, out),
@@ -504,6 +534,17 @@ impl ToSql for Value {
         // Dispatch happens per-value in `to_sql`; accept everything and let the
         // server reject genuine mismatches.
         true
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        // RawText carries a text rendering of a type the client doesn't know
+        // (pgvector etc.): declare the text format so the server runs the
+        // value through the target type's input function. Everything else
+        // keeps the binary format the `to_sql` arms encode.
+        match self {
+            Value::RawText(_) => Format::Text,
+            _ => Format::Binary,
+        }
     }
 
     to_sql_checked!();
@@ -627,7 +668,7 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
         // preserve the value as its textual form, like Decimal/Uuid below.
         Value::Float(f) if !f.is_finite() => J::String(f.to_string()),
         Value::Float(f) => J::from(*f),
-        Value::Text(s) => J::String(s.clone()),
+        Value::Text(s) | Value::RawText(s) => J::String(s.clone()),
         Value::Json(j) => j.clone(),
         Value::Array(items) => J::Array(items.iter().map(value_to_json).collect()),
         Value::Uuid(u) => J::String(u.to_string()),
@@ -651,7 +692,7 @@ impl rusqlite::types::ToSql for Value {
             Value::Bool(b) => ToSqlOutput::Owned(S::Integer(if *b { 1 } else { 0 })),
             Value::Int(i) => ToSqlOutput::Owned(S::Integer(*i)),
             Value::Float(f) => ToSqlOutput::Owned(S::Real(*f)),
-            Value::Text(s) => ToSqlOutput::Borrowed(R::Text(s.as_bytes())),
+            Value::Text(s) | Value::RawText(s) => ToSqlOutput::Borrowed(R::Text(s.as_bytes())),
             Value::Bytes(b) => ToSqlOutput::Borrowed(R::Blob(b)),
             Value::Json(j) => ToSqlOutput::Owned(S::Text(j.to_string())),
             // SQLite has no array type; store as a JSON text array.

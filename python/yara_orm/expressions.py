@@ -176,6 +176,24 @@ class Array(list):  # noqa: FURB189 - a thin marker subclass, not a full list re
     """
 
 
+class RawText(str):  # noqa: FURB189 - a thin marker subclass, not a str reimpl
+    """A string bound as an *untyped* text parameter on PostgreSQL.
+
+    A plain ``str`` binds with a declared ``text`` type, which PostgreSQL will
+    not implicitly cast to a custom column type (SQLSTATE 42804) — a pgvector
+    ``vector`` column rejects a text parameter, for example. Wrapping the text
+    rendering in ``RawText`` leaves the parameter's type to the server (it is
+    inferred from context, e.g. the target column) and sends the value in the
+    text format, so the server parses it through the type's own input
+    function. Custom field kinds return it from ``to_db``::
+
+        def to_db(self, value):
+            return RawText("[" + ",".join(map(str, value)) + "]")
+
+    On every other backend ``RawText`` binds exactly like a plain string.
+    """
+
+
 class Value(Expression):
     """A literal value usable where an expression is expected (compat shim).
 

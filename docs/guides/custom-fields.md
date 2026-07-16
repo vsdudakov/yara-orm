@@ -129,6 +129,51 @@ bindable value), `to_python` (database value → Python value, set
 `read_identity = False` so it runs on reads) and `to_python_value`
 (assignment coercion), exactly like the built-in fields do.
 
+### PostgreSQL custom column types: `RawText` + `select_as_text`
+
+A custom *column type* (pgvector's `vector`, `inet`, `citext`, ...) needs two
+extra declarations on PostgreSQL, because the engine's driver knows neither
+the type's parameter encoding nor its binary result format:
+
+- **Writes** — return the value's text rendering wrapped in
+  `yara_orm.RawText` from `to_db`. A plain `str` binds with a declared `text`
+  type, which PostgreSQL will not implicitly cast to the column's type
+  (SQLSTATE 42804); `RawText` binds *untyped*, so the server infers the type
+  from the target column and parses the text through the type's own input
+  function. On every other backend `RawText` binds exactly like a plain
+  string.
+- **Reads** — set `select_as_text = True` on the field class. SELECT and
+  RETURNING projections then read the column through `CAST(col AS text)` on
+  PostgreSQL, and your `to_python` parses the text form (set
+  `read_identity = False` alongside). Other backends ignore the flag — there
+  the column already stores text.
+
+The complete pgvector field:
+
+```python
+from yara_orm import RawText, fields, register_field_kind
+
+
+class VectorField(fields.Field):
+    field_kind = "vector"
+    read_identity = False   # to_python runs on reads
+    select_as_text = True   # PostgreSQL reads via CAST(col AS text)
+
+    def __init__(self, dim: int = 3, **kwargs):
+        super().__init__(**kwargs)
+        self.type_params = {"dim": dim}
+
+    def to_db(self, value):
+        if isinstance(value, (list, tuple)):
+            return RawText("[" + ",".join(map(str, value)) + "]")
+        return value
+
+    def to_python(self, value):
+        if isinstance(value, str):
+            return [float(x) for x in value.strip("[]").split(",") if x]
+        return value
+```
+
 ## See also
 
 - [Models & fields](models-and-fields.md)

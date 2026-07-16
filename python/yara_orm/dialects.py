@@ -235,6 +235,25 @@ class BaseDialect:
         """
         raise NotImplementedError
 
+    def select_column(self, field: Field, ref: str) -> str:
+        """Render a column reference for a SELECT/RETURNING projection list.
+
+        The default is the reference unchanged. PostgreSQL overrides this to
+        read a ``select_as_text`` column through ``CAST(ref AS text)`` (the
+        engine cannot decode a custom type's binary result format); the cast
+        keeps the source column's result name, so decode plans are unaffected.
+        Applies to *projection* positions only — comparison and grouping
+        references keep the column's real type.
+
+        Args:
+            field: The field the reference projects.
+            ref: The already-quoted (possibly table-qualified) column reference.
+
+        Returns:
+            The projection SQL fragment.
+        """
+        return ref
+
     # -- query lookups ----------------------------------------------------
     def date_part_sql(self, part: str, col: str) -> str:
         """Render an expression extracting a date/time part from a column.
@@ -668,7 +687,9 @@ class BaseDialect:
         Returns:
             The clause fragment with a leading space.
         """
-        return " RETURNING " + ", ".join(self.quote(f.db_column) for f in fields)
+        return " RETURNING " + ", ".join(
+            self.select_column(f, self.quote(f.db_column)) for f in fields
+        )
 
     # -- type rendering ---------------------------------------------------
     def _kind_template(self, kind: str) -> str:
@@ -1755,6 +1776,26 @@ class PostgresDialect(BaseDialect):
     nests_block_comments = True
     supports_extensions = True
     supports_for_update = True
+
+    def select_column(self, field: Field, ref: str) -> str:
+        """Read a ``select_as_text`` column through ``CAST(ref AS text)``.
+
+        The engine requests binary result values, which it cannot decode for a
+        custom column type (pgvector ``vector``, ``inet``, ...); the cast makes
+        the server send the text form, which the field's ``to_python`` parses.
+        PostgreSQL names a bare column cast after the column itself, so named
+        and positional decode plans see the usual column name.
+
+        Args:
+            field: The field the reference projects.
+            ref: The already-quoted (possibly table-qualified) reference.
+
+        Returns:
+            The projection SQL fragment.
+        """
+        if field.select_as_text:
+            return f"CAST({ref} AS text)"
+        return ref
 
     def date_part_sql(self, part: str, col: str) -> str:
         """Render ``EXTRACT(<part> FROM col)``.

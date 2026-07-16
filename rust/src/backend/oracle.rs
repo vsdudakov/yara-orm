@@ -173,7 +173,7 @@ fn to_ora(v: &Value) -> OraValue {
         Value::Bool(b) => OraValue::Integer(i64::from(*b)),
         Value::Int(i) => OraValue::Integer(*i),
         Value::Float(f) => OraValue::Float(*f),
-        Value::Text(s) => OraValue::String(s.clone()),
+        Value::Text(s) | Value::RawText(s) => OraValue::String(s.clone()),
         Value::Bytes(b) => OraValue::Bytes(b.clone()),
         Value::Json(j) => OraValue::String(j.to_string()),
         // Oracle has no array type; store as a JSON text array (like SQLite/MySQL).

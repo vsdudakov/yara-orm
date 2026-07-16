@@ -384,7 +384,7 @@ async def _prefetch_m2m(
         _assign(instances, name, to_attr, {i: grouped.get(i.pk, []) for i in instances})
         return
 
-    cols = ", ".join(f"{ttbl}.{q(f.db_column)}" for f in tmeta.field_list)
+    cols = ", ".join(dialect.select_column(f, f"{ttbl}.{q(f.db_column)}") for f in tmeta.field_list)
     sql = (
         f"SELECT {through}.{q(near_key)}, {cols} FROM {ttbl} "
         f"JOIN {through} ON {ttbl}.{q(tmeta.pk_field.db_column)} = {through}.{q(far_key)} "

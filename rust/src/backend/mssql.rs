@@ -85,7 +85,7 @@ impl ToSql for Param<'_> {
             Value::Bool(b) => ColumnData::Bit(Some(*b)),
             Value::Int(i) => ColumnData::I64(Some(*i)),
             Value::Float(f) => ColumnData::F64(Some(*f)),
-            Value::Text(s) => ColumnData::String(Some(s.as_str().into())),
+            Value::Text(s) | Value::RawText(s) => ColumnData::String(Some(s.as_str().into())),
             Value::Bytes(b) => ColumnData::Binary(Some(b.as_slice().into())),
             Value::Uuid(u) => ColumnData::Guid(Some(*u)),
             Value::Decimal(d) => d.to_sql(),

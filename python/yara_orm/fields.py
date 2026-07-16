@@ -117,6 +117,14 @@ class Field(Generic[VT]):
     #: When True, the engine already returns this field's native Python type, so
     #: the read path can assign DB values directly and skip ``to_python``.
     read_identity: bool = True
+    #: When True, PostgreSQL SELECT/RETURNING lists read this column through
+    #: ``CAST(col AS text)``. The engine requests binary result values, which it
+    #: cannot decode for a custom column type (pgvector ``vector``, ``inet``,
+    #: ...); the cast makes the server send the type's text form instead, which
+    #: ``to_python`` then parses (set ``read_identity = False`` alongside).
+    #: Other backends ignore the flag. Pair with returning :class:`RawText`
+    #: from ``to_db`` so writes bind untyped — see the custom-fields guide.
+    select_as_text: bool = False
     #: Compatibility flag: every concrete yara field backs a real column, so
     #: code that branches on ``field.has_db_field`` keeps working.
     has_db_field: bool = True

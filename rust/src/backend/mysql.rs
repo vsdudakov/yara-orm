@@ -75,7 +75,7 @@ fn to_my_value(v: &Value) -> MyValue {
         Value::Bool(b) => MyValue::Int(i64::from(*b)),
         Value::Int(i) => MyValue::Int(*i),
         Value::Float(f) => MyValue::Double(*f),
-        Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
+        Value::Text(s) | Value::RawText(s) => MyValue::Bytes(s.clone().into_bytes()),
         Value::Bytes(b) => MyValue::Bytes(b.clone()),
         Value::Json(j) => MyValue::Bytes(j.to_string().into_bytes()),
         // MySQL has no array type; store as a JSON text array (like SQLite).
