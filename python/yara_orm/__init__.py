@@ -48,7 +48,7 @@ from .exceptions import (
     UnSupportedError,
     ValidationError,
 )
-from .expressions import Array, Case, F, RawSQL, Subquery, Value, When
+from .expressions import Array, Case, F, RawSQL, RawText, Subquery, Value, When
 from .fields import register_field_kind, unregister_field_kind
 from .functions import Coalesce, Concat, Length, Lower, Random, Trim, Upper
 from .manager import Manager
@@ -76,6 +76,7 @@ __all__ = [
     "Case",
     "When",
     "RawSQL",
+    "RawText",
     "Subquery",
     "Value",
     "Array",

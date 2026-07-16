@@ -1935,7 +1935,7 @@ class QuerySet(Generic[ModelT]):
         tail = f"{self._order_sql(dialect)}{self._tail_sql(dialect)}{self._lock_sql(dialect)}"
         if self._only is not None or self._defer:
             sel = self._selected_fields()
-            cols = ", ".join(dialect.quote(f.db_column) for f in sel)
+            cols = ", ".join(dialect.select_column(f, dialect.quote(f.db_column)) for f in sel)
             prefix = self._distinct_prefix(f"SELECT {cols} FROM {dialect.quote(meta.table)}")
             return f"{prefix}{where}{tail}", params, sel
         prefix = self._distinct_prefix(meta.select_prefix)
@@ -2097,7 +2097,7 @@ class QuerySet(Generic[ModelT]):
         # loaded in full); the JOINs reference the FK columns directly, so
         # restricting the SELECT does not affect them.
         base_fields = self._selected_fields()
-        select = [f"{table}.{q(f.db_column)}" for f in base_fields]
+        select = [dialect.select_column(f, f"{table}.{q(f.db_column)}") for f in base_fields]
         joins: list[str] = []
         # One node per (possibly nested) relation path, in join order. Each
         # records its parent path (None = base), the last segment, target model
@@ -2140,7 +2140,9 @@ class QuerySet(Generic[ModelT]):
                 f"ON {left_alias}.{fk_col} = {alias}.{q(tmeta.pk_field.db_column)}"
             )
             proj_fields, partial = self._related_projected_fields(path, tmeta)
-            select.extend(f"{alias}.{q(f.db_column)}" for f in proj_fields)
+            select.extend(
+                dialect.select_column(f, f"{alias}.{q(f.db_column)}") for f in proj_fields
+            )
             node = {
                 "parent": parent,
                 "seg": seg,
@@ -2509,7 +2511,7 @@ class QuerySet(Generic[ModelT]):
         # One traversal per path yields both the column reference (for SQL) and
         # the terminal field (for the read decoder).
         resolved = [self._resolve_column_field(p, dialect, joins) for p in field_paths]
-        cols = ", ".join(col for col, _ in resolved)
+        cols = ", ".join(dialect.select_column(field, col) for col, field in resolved)
         where, params, _ = self._compile_conditions(dialect)
         table = dialect.quote(meta.table)
         distinct = "DISTINCT " if self._distinct else ""
