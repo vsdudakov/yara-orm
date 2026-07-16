@@ -2667,9 +2667,14 @@ class Model(metaclass=ModelMeta):
             )
             for name in field_names
         ]
+        # Keep batches under the dialect's bind-parameter ceiling (65535 on
+        # PostgreSQL, 2000 on SQL Server): each row costs one (pk, value) pair
+        # per field in the CASE arms plus one pk slot in the WHERE IN list.
+        params_per_row = 2 * len(targets) + 1
+        size = min(batch_size, max(1, dialect.max_bind_params // params_per_row))
         total = 0
-        for start in range(0, len(objects), batch_size):
-            batch = objects[start : start + batch_size]
+        for start in range(0, len(objects), size):
+            batch = objects[start : start + size]
             params: list[Any] = []
             idx = 1
             set_parts = []
