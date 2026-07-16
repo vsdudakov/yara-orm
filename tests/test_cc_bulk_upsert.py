@@ -178,7 +178,9 @@ async def test_bulk_update_emits_single_where_in_clause(db, monkeypatch):
     THEN it carries exactly one WHERE and one IN clause (never one per field)
     and one CASE per written field
     """
-    await CcuItem.bulk_create([CcuItem(sku=f"w{i}", qty=i) for i in range(3)])
+    # ``name`` is explicit: Oracle treats '' (the field default) as NULL,
+    # which would violate the column's NOT NULL constraint on insert.
+    await CcuItem.bulk_create([CcuItem(sku=f"w{i}", qty=i, name="orig") for i in range(3)])
     objs = await CcuItem.all().order_by("sku")
     for o in objs:
         o.qty += 10
@@ -202,7 +204,8 @@ async def test_bulk_update_clamps_batches_under_bind_param_cap(db, monkeypatch):
     """
     from yara_orm.connection import get_dialect
 
-    await CcuItem.bulk_create([CcuItem(sku=f"c{i}", qty=i) for i in range(5)])
+    # Explicit ``name`` for Oracle ('' default would insert NULL, see above).
+    await CcuItem.bulk_create([CcuItem(sku=f"c{i}", qty=i, name="orig") for i in range(5)])
     objs = await CcuItem.all().order_by("sku")
     for o in objs:
         o.qty += 100
