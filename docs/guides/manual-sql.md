@@ -182,6 +182,31 @@ rows = await conn.execute_query(
 )
 ```
 
+### Binding custom-typed parameters with `RawText`
+
+A plain `str` binds with a declared `text` type, which PostgreSQL will not
+implicitly cast to a custom column type (SQLSTATE 42804). Wrap the value's
+text rendering in `RawText` to bind it *untyped*: the server infers the type
+from context (the target column, an operator's other operand) and parses the
+text through the type's own input function — no `::type` cast on the
+placeholder, no `CREATE CAST` in the database. A pgvector KNN search, for
+example:
+
+```python
+from yara_orm import RawText
+
+rows = await conn.execute_query(
+    "SELECT id, text FROM chunk ORDER BY embedding <=> $1 LIMIT 5",
+    [RawText("[0.1,0.2,0.3]")],
+)
+```
+
+On every other backend `RawText` binds exactly like a plain string. For model
+columns of such types, see
+[Custom fields](custom-fields.md#postgresql-custom-column-types-rawtext-select_as_text) —
+the field class declares the binding (`to_db` returning `RawText`) and the
+read path (`select_as_text = True`) once for every query path.
+
 ## Positional and named row access
 
 Rows returned by `execute_query` / `fetch_all` support **both** positional and

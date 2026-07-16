@@ -13,7 +13,7 @@ from yara_orm import (
     YaraOrm, Model, Index, QuerySet, Q, F, fields, migrations,
     Count, Sum, Avg, Min, Max, Aggregate,
     Lower, Upper, Length, Trim, Concat, Coalesce, Random,
-    Case, When, RawSQL, Subquery, Value, Array, Prefetch, Manager,
+    Case, When, RawSQL, Subquery, Value, Array, RawText, Prefetch, Manager,
     Now, RandomHex, SqlDefault, DatabaseDefault,
     connections, in_transaction, atomic,
     pre_save, post_save, pre_delete, post_delete,
@@ -158,6 +158,9 @@ table with per-lookup SQL and examples.
 (embed a lazy single-column query as a value), `Value` (a literal wrapper) and
 `Array` (bind a sequence as a PostgreSQL array) are also usable as `annotate()` /
 `update()` expressions. See [Aggregation & grouping](guides/aggregation.md).
+`RawText` binds a string as an *untyped* text parameter on PostgreSQL, for
+custom column types with no implicit cast from `text` (pgvector `vector`,
+`inet`, ...) — see [Custom fields](guides/custom-fields.md#postgresql-custom-column-types-rawtext-select_as_text).
 
 ## Relations
 
