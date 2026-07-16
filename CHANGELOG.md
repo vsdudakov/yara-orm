@@ -4,6 +4,25 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.5] - 2026-07-16
+
+### Fixed
+
+- **Create paths return canonical Python types.** `create()`,
+  `get_or_create()`, `update_or_create()`, `bulk_create()` and their QuerySet
+  variants build instances through `Model.__init__`, which coerced loose
+  input only for the temporal fields — a string for a decimal or UUID column
+  stayed a raw `str` on the returned instance until the row was re-fetched,
+  while `get()` yielded `Decimal`/`UUID`. `DecimalField`, `UUIDField`,
+  `BooleanField` (semantic string handling — `bool("false")` would be
+  `True`), `TimeDeltaField`, `IntEnumField` and `CharEnumField` now normalise
+  on assignment, so `create(balance="12.34").balance` is a `Decimal` and
+  matches a fetched row. `update_from_dict` — the `update_or_create` update
+  path — applies the same coercion. `JSONField` is deliberately unchanged (a
+  string is a valid JSON value, parsing it on assignment would change
+  semantics); int/float/char fields stay identity to keep the plain
+  construction fast path.
+
 ## [1.14.4] - 2026-07-11
 
 ### Changed
