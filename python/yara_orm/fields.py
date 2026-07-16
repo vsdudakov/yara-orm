@@ -791,6 +791,20 @@ class DecimalField(Field[VT]):
             return value
         return Decimal(str(value))
 
+    def to_python_value(self, value: Any) -> Decimal | None:
+        """Coerce a loose value (string, int, float) to a ``Decimal``.
+
+        Applied on assignment so ``create(balance="12.34").balance`` is a
+        ``Decimal``, matching what a fetched row holds.
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            The value as a ``Decimal``, or ``None``.
+        """
+        return self.to_python(value)
+
 
 # ---------------------------------------------------------------------------
 # Text / binary
@@ -946,6 +960,23 @@ class BooleanField(Field[VT]):
             The value as a ``bool``, or ``None``.
         """
         return None if value is None else bool(value)
+
+    def to_python_value(self, value: Any) -> bool | None:
+        """Coerce a loose value (``0``/``1``, true/false spelling) to ``bool``.
+
+        Delegates to :meth:`to_db`, whose semantic string handling is the
+        canonical loose-input rule (``bool("false")`` would be ``True``).
+
+        Args:
+            value: The value supplied by the caller.
+
+        Raises:
+            ValueError: For a string that spells neither true nor false.
+
+        Returns:
+            The value as a ``bool``, or ``None``.
+        """
+        return self.to_db(value)
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1245,17 @@ class TimeDeltaField(Field[VT]):
             return value
         return timedelta(microseconds=int(value))
 
+    def to_python_value(self, value: Any) -> timedelta | None:
+        """Coerce a microsecond count to a ``timedelta`` (same rule as reads).
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            The value as a ``timedelta``, or ``None``.
+        """
+        return self.to_python(value)
+
 
 # ---------------------------------------------------------------------------
 # Misc
@@ -1286,6 +1328,20 @@ class UUIDField(Field[VT]):
         if value is None:
             return None
         return value if isinstance(value, _uuid.UUID) else _uuid.UUID(str(value))
+
+    def to_python_value(self, value: Any) -> _uuid.UUID | None:
+        """Coerce a UUID string to a ``UUID`` instance.
+
+        Applied on assignment so ``create(token="<hex>").token`` is a ``UUID``,
+        matching what a fetched row holds.
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            The value as a ``UUID``, or ``None``.
+        """
+        return self.to_python(value)
 
 
 class JSONField(Field[VT]):
@@ -1445,6 +1501,17 @@ class IntEnumField(Field[VT]):
         """
         return None if value is None else self.enum_type(value)
 
+    def to_python_value(self, value: Any) -> IntEnum | None:
+        """Coerce a raw integer to its enum member (members pass through).
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            The corresponding enum member, or ``None``.
+        """
+        return self.to_python(value)
+
 
 class CharEnumField(Field[VT]):
     """Stores a string ``Enum`` as its ``.value``; reads back enum members."""
@@ -1517,6 +1584,17 @@ class CharEnumField(Field[VT]):
             The corresponding enum member, or ``None``.
         """
         return None if value is None else self.enum_type(value)
+
+    def to_python_value(self, value: Any) -> Enum | None:
+        """Coerce a raw string to its enum member (members pass through).
+
+        Args:
+            value: The value supplied by the caller.
+
+        Returns:
+            The corresponding enum member, or ``None``.
+        """
+        return self.to_python(value)
 
 
 # ---------------------------------------------------------------------------

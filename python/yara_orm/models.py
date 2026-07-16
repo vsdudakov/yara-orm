@@ -241,9 +241,10 @@ class MetaInfo:
         self.validated_fields = [f for f in self.field_list if f.validators]
         # Construction plan (``Model.__init__``): only the fields whose
         # ``to_python_value`` is actually overridden need the per-value coercion
-        # call. The base implementation is identity, so for an all-plain model
-        # (no datetime/date/time-style loose-input coercion) construction assigns
-        # every attribute directly instead of paying a virtual call per column.
+        # call (temporal, decimal, uuid, bool, timedelta and enum fields). The
+        # base implementation is identity, so for an all-plain model
+        # construction assigns every attribute directly instead of paying a
+        # virtual call per column.
         self.coerced_fields = frozenset(
             f.model_field_name
             for f in self.field_list
@@ -2747,8 +2748,14 @@ class Model(metaclass=ModelMeta):
             ``self``, for chaining (call ``save()`` to persist).
         """
         meta = self._meta
+        coerced = meta.coerced_fields
         for key, value in data.items():
             if key in meta.fields or key in meta.relations:
+                # Same loose-input normalisation as ``__init__``, so
+                # ``update_or_create(defaults={"balance": "12.34"})`` leaves a
+                # Decimal on the instance, not the raw string.
+                if key in coerced:
+                    value = meta.fields[key].to_python_value(value)
                 setattr(self, key, value)
             elif meta.extra_kwargs == "store":
                 self.__dict__[key] = value
