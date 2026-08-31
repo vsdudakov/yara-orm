@@ -84,6 +84,45 @@ await YaraOrm.init(
 These parameters apply to SQLite too (`max_size`/`min_size`/`statement_cache_size`);
 in-memory databases always pin a single connection regardless of `max_size`.
 
+### TLS (`sslmode`)
+
+TLS is served by **rustls** — no system OpenSSL — and `sslmode` behaves as it
+does in libpq, so a URL that worked with asyncpg or psycopg works here:
+
+| `sslmode`            | TLS                          | Certificate checked                  |
+| -------------------- | ---------------------------- | ------------------------------------ |
+| `disable`            | no                           | —                                    |
+| `prefer` *(default)* | yes, plaintext if unsupported | no                                  |
+| `require`            | yes                          | no                                   |
+| `verify-ca`          | yes                          | chain must reach a trusted root      |
+| `verify-full`        | yes                          | chain **and** hostname               |
+
+`prefer` and `require` encrypt the connection without authenticating the server:
+`require` promises TLS, not identity. Ask for verification explicitly when you
+want it:
+
+```python
+await YaraOrm.init(
+    "postgres://user:pass@db.example.com/app"
+    "?sslmode=verify-full&sslrootcert=/etc/ssl/certs/rds-global-bundle.pem"
+)
+```
+
+`sslrootcert` points at a PEM file whose certificates are added to the OS trust
+store for that connection — the CA bundle of a managed database, typically.
+Managed PostgreSQL (Amazon RDS/Aurora, Cloud SQL, Azure) presents a certificate
+signed by the provider's own CA, which no OS trust store carries, so the
+verifying modes need this parameter; download the provider's bundle and name it
+here. As in libpq, `sslrootcert` alone does not turn verification on — pair it
+with `verify-ca` or `verify-full`. A file that cannot be read, or that holds no
+certificate, raises at `init()` rather than quietly verifying against the OS
+roots instead.
+
+!!! note "Reaching a database through another name"
+    `verify-full` rejects a certificate that does not name the host you dialled,
+    which is what a proxy endpoint, an SSH tunnel or a bare IP usually means.
+    `verify-ca` is the mode for those: the chain is still verified.
+
 ## MySQL
 
 The MySQL backend is built on the pure-Rust **mysql_async** driver and its own

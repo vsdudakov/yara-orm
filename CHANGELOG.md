@@ -4,6 +4,34 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-08-31
+
+### Fixed
+
+- **PostgreSQL `sslmode` now follows libpq.** Every mode except `disable`
+  verified the server certificate against the OS trust store, so `prefer` — the
+  default, and the mode most URLs inherit without saying so — could not reach a
+  managed database at all: Amazon RDS/Aurora, Cloud SQL and Azure present a
+  certificate signed by their own private CA, which no OS trust store carries,
+  and the connection failed the handshake with `UnknownIssuer` before the first
+  query. libpq (and therefore asyncpg and psycopg, which callers migrate from)
+  authenticates the server only under `verify-ca` and `verify-full`; `prefer`
+  and `require` encrypt and nothing more. `prefer` and `require` now do the
+  same. The connection is still TLS — this is not a fallback to plaintext.
+
+### Added
+
+- **`sslmode=verify-ca` and `sslmode=verify-full`** are accepted in PostgreSQL
+  URLs, and are the way to ask for certificate verification now that `require`
+  no longer implies it. `verify-ca` checks the chain, `verify-full` also checks
+  the hostname. tokio-postgres does not parse either spelling, so the engine
+  consumes them and hands the driver `sslmode=require`.
+- **`sslrootcert=<path>`** adds the PEM roots in that file to the trust store
+  for the verifying modes — the RDS/Cloud SQL CA bundle, typically. As in
+  libpq, it does not by itself turn verification on. An unreadable file, or one
+  holding no certificate, is a configuration error rather than a silent
+  fallback to the OS roots.
+
 ## [1.16.0] - 2026-08-31
 
 ### Added
