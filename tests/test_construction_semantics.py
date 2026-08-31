@@ -79,6 +79,35 @@ async def test_explicit_relation_id_does_not_cache_a_mismatched_object(db):
 
 
 @pytest.mark.asyncio
+async def test_explicit_relation_id_wins_over_a_none_relation(db):
+    """
+    GIVEN ``<relation>=None`` alongside an explicit ``<name>_id``
+    WHEN the instance is constructed
+    THEN the id is kept rather than cleared
+    """
+    tag = await CsTag.create(name="kept")
+
+    ref = await CsRef.create(tag=None, tag_id=tag.id)
+
+    assert ref.tag_id == tag.id
+
+
+@pytest.mark.asyncio
+async def test_explicit_relation_id_wins_over_a_raw_relation_value(db):
+    """
+    GIVEN a raw pk passed under the relation name and an explicit ``<name>_id``
+    WHEN the instance is constructed
+    THEN the explicit id wins over the value given under the relation name
+    """
+    wanted = await CsTag.create(name="wanted")
+    other = await CsTag.create(name="other")
+
+    ref = await CsRef.create(tag=other.id, tag_id=wanted.id)
+
+    assert ref.tag_id == wanted.id
+
+
+@pytest.mark.asyncio
 async def test_relation_object_still_sets_the_id_when_no_explicit_id(db):
     """
     GIVEN only a relation object (the ordinary case)
