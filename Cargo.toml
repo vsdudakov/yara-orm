@@ -30,7 +30,7 @@ chrono = "0.4"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 rust_decimal = { version = "1.42", features = ["db-tokio-postgres"] }
 deadpool-sqlite = "0.14.0"
-rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 # Pure-Rust MySQL driver (ships its own pool). `minimal-rust` keeps the build
 # free of C dependencies (rust-backend flate2); TLS goes through rustls with
 # the ring provider (matching the PostgreSQL stack — never native-tls, so
