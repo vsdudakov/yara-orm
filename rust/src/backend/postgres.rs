@@ -1,9 +1,18 @@
 //! PostgreSQL backend built on tokio-postgres + deadpool connection pooling.
 
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    CertificateError, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{Kind, ToSql, Type};
 use tokio_postgres::{NoTls, Statement};
@@ -17,45 +26,280 @@ use crate::value::{decode_pg_row, decode_pg_row_values, decode_pg_rows, Row, Val
 /// Default pool size when the URL does not specify `max_size`.
 const DEFAULT_MAX_SIZE: usize = 16;
 
-/// The process-wide TLS connector, built once on first use.
+/// How far the server's certificate is checked, decided by the URL's `sslmode`.
 ///
-/// Constructing it parses the entire OS trust store
+/// These are libpq's semantics, which callers coming from asyncpg/psycopg were
+/// written against: `prefer` and `require` encrypt the connection but
+/// authenticate nothing — `require` only promises that TLS is used — while
+/// `verify-ca` and `verify-full` are the modes that check the certificate.
+/// Verifying under `prefer` (the default) cannot reach a managed database whose
+/// CA is private: Amazon RDS/Aurora, Cloud SQL and Azure all present a
+/// certificate signed by their own CA, which the OS trust store does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertCheck {
+    /// `prefer` / `require`: encrypt, accept whatever certificate is presented.
+    None,
+    /// `verify-ca`: the chain must reach a trusted root; the hostname is not checked.
+    Chain,
+    /// `verify-full`: chain *and* hostname.
+    Full,
+}
+
+/// The TLS settings libpq spells in the URL but tokio-postgres does not parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SslParams {
+    check: CertCheck,
+    /// `sslrootcert`: a PEM file of extra roots, added to the OS trust store.
+    /// Only consulted by the verifying modes, as in libpq.
+    root_cert: Option<String>,
+}
+
+impl Default for SslParams {
+    fn default() -> Self {
+        SslParams {
+            check: CertCheck::None,
+            root_cert: None,
+        }
+    }
+}
+
+/// Split libpq's `verify-ca` / `verify-full` and `sslrootcert` out of `url`.
+///
+/// tokio-postgres understands only `sslmode=disable|prefer|require` and rejects
+/// the rest of libpq's vocabulary as an invalid connection string. Both
+/// verifying modes require TLS, so they are handed to the driver as
+/// `sslmode=require` and the verification level travels separately.
+fn extract_ssl_params(url: &str) -> (String, SslParams) {
+    let mut params = SslParams::default();
+    let Some((base, query)) = url.split_once('?') else {
+        return (url.to_string(), params);
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
+        match (key, val) {
+            ("sslmode", "verify-ca") => {
+                params.check = CertCheck::Chain;
+                kept.push("sslmode=require");
+            }
+            ("sslmode", "verify-full") => {
+                params.check = CertCheck::Full;
+                kept.push("sslmode=require");
+            }
+            ("sslrootcert", path) => params.root_cert = Some(path.to_string()),
+            _ => kept.push(pair),
+        }
+    }
+
+    let cleaned = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (cleaned, params)
+}
+
+/// Process-wide TLS connectors, built once per verification level on first use.
+///
+/// Constructing a verifying connector parses the entire OS trust store
 /// (`rustls_native_certs::load_native_certs`), which reads and decodes ~100–150
-/// system CA certificates — tens of milliseconds. It holds only an
-/// `Arc<ClientConfig>`, so it is cached here and cloned (a refcount bump) for
+/// system CA certificates — tens of milliseconds. Each holds only an
+/// `Arc<ClientConfig>`, so they are cached here and cloned (a refcount bump) for
 /// every connection instead of being rebuilt per `connect()` — otherwise each
 /// `YaraOrm.init()` re-parsed the whole trust store (measured ~95ms of the
 /// ~100ms per-init cost, since tokio-postgres defaults to `sslmode=prefer` and
 /// so takes the TLS path even for a plaintext localhost URL).
-static TLS_CONNECTOR: OnceLock<MakeRustlsConnect> = OnceLock::new();
+static TLS_NO_VERIFY: OnceLock<MakeRustlsConnect> = OnceLock::new();
+static TLS_VERIFY_CHAIN: OnceLock<MakeRustlsConnect> = OnceLock::new();
+static TLS_VERIFY_FULL: OnceLock<MakeRustlsConnect> = OnceLock::new();
 
-/// Return the shared rustls TLS connector, building it once (see
-/// [`TLS_CONNECTOR`]) and cloning it thereafter.
-fn make_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
-    if let Some(connector) = TLS_CONNECTOR.get() {
+/// Return the shared TLS connector for `params`, building it once (see
+/// [`TLS_NO_VERIFY`]) and cloning it thereafter.
+fn make_tls_connector(params: &SslParams) -> Result<MakeRustlsConnect, EngineError> {
+    // A caller-supplied CA file is not cached: two URLs may name different
+    // files, and one process-wide slot cannot hold both.
+    if params.root_cert.is_some() {
+        return build_tls_connector(params);
+    }
+    let cache = match params.check {
+        CertCheck::None => &TLS_NO_VERIFY,
+        CertCheck::Chain => &TLS_VERIFY_CHAIN,
+        CertCheck::Full => &TLS_VERIFY_FULL,
+    };
+    if let Some(connector) = cache.get() {
         return Ok(connector.clone());
     }
     // Build outside the lock; on a first-connect race the loser's connector is
     // simply dropped and every caller clones the single cached one.
-    let connector = build_tls_connector()?;
-    Ok(TLS_CONNECTOR.get_or_init(|| connector).clone())
+    let connector = build_tls_connector(params)?;
+    Ok(cache.get_or_init(|| connector).clone())
 }
 
-/// Build a rustls TLS connector: server certs are verified against the OS trust
-/// store, using the pure-Rust `ring` crypto provider (no system OpenSSL).
-fn build_tls_connector() -> Result<MakeRustlsConnect, EngineError> {
-    let mut roots = rustls::RootCertStore::empty();
+/// The OS trust store, plus the certificates in `extra_ca` when given.
+fn root_store(extra_ca: Option<&str>) -> Result<RootCertStore, EngineError> {
+    let mut roots = RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert); // ignore individual malformed OS certs
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| EngineError::Config(e.to_string()))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let Some(path) = extra_ca else {
+        return Ok(roots);
+    };
+    let file = File::open(path)
+        .map_err(|e| EngineError::Config(format!("sslrootcert {path:?} cannot be read: {e}")))?;
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut BufReader::new(file)) {
+        let cert =
+            cert.map_err(|e| EngineError::Config(format!("sslrootcert {path:?} is not PEM: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| EngineError::Config(format!("sslrootcert {path:?} is unusable: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        // Silently falling back to the OS store would verify against roots the
+        // caller deliberately replaced.
+        return Err(EngineError::Config(format!(
+            "sslrootcert {path:?} holds no certificates"
+        )));
+    }
+    Ok(roots)
+}
+
+/// Build a rustls TLS connector for `params`, using the pure-Rust `ring` crypto
+/// provider (no system OpenSSL).
+fn build_tls_connector(params: &SslParams) -> Result<MakeRustlsConnect, EngineError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| EngineError::Config(e.to_string()))?;
+    let verifier: Arc<dyn ServerCertVerifier> = match params.check {
+        CertCheck::None => Arc::new(AcceptAnyCert(provider)),
+        check => {
+            let roots = root_store(params.root_cert.as_deref())?;
+            let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| EngineError::Config(e.to_string()))?;
+            if check == CertCheck::Full {
+                webpki
+            } else {
+                Arc::new(ChainOnly(webpki))
+            }
+        }
+    };
+    let config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     Ok(MakeRustlsConnect::new(config))
+}
+
+/// Accepts any server certificate: the verifier behind libpq's `prefer` and
+/// `require`, which encrypt without authenticating the server.
+///
+/// The handshake signature is still checked against the key in the presented
+/// certificate — that is what makes the session's encryption meaningful; what
+/// goes unchecked is whether that certificate belongs to anyone we trust.
+#[derive(Debug)]
+struct AcceptAnyCert(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// libpq's `verify-ca`: the chain is verified, the hostname is not.
+///
+/// Managed databases are routinely reached through a name the certificate does
+/// not carry (an RDS proxy endpoint, a tunnel, an IP), which is exactly the case
+/// `verify-ca` exists for.
+#[derive(Debug)]
+struct ChainOnly(Arc<WebPkiServerVerifier>);
+
+impl ServerCertVerifier for ChainOnly {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(RustlsError::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
 }
 
 /// The password embedded in a `scheme://user:password@host...` URL, if present.
@@ -199,6 +443,7 @@ fn unified_param_types(rows: &[Vec<Value>]) -> Result<Vec<Type>, EngineError> {
 impl PgBackend {
     pub async fn connect(url: &str) -> Result<Self, EngineError> {
         let (clean_url, params) = extract_pool_params(url)?;
+        let (clean_url, ssl) = extract_ssl_params(&clean_url);
         let pg_config: tokio_postgres::Config = clean_url
             .parse()
             .map_err(|e: tokio_postgres::Error| EngineError::Config(redact(e.to_string(), url)))?;
@@ -206,15 +451,15 @@ impl PgBackend {
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        // Honour `sslmode` with a real (rustls) TLS connector: `require`/
-        // `verify-ca`/`verify-full` actually encrypt and verify the cert against
-        // the OS trust store instead of silently running in plaintext. `disable`
-        // opts out; `prefer` (the libpq default) attempts TLS and falls back to
-        // plaintext when the server has no SSL.
+        // Honour `sslmode` with a real (rustls) TLS connector, to libpq's
+        // semantics: `disable` opts out of TLS; `prefer` (the libpq default)
+        // attempts TLS and falls back to plaintext when the server has no SSL;
+        // `require` insists on TLS; and `verify-ca`/`verify-full` are the modes
+        // that additionally check the certificate (see [`CertCheck`]).
         let mgr = if pg_config.get_ssl_mode() == SslMode::Disable {
             Manager::from_config(pg_config, NoTls, mgr_config)
         } else {
-            Manager::from_config(pg_config, make_tls_connector()?, mgr_config)
+            Manager::from_config(pg_config, make_tls_connector(&ssl)?, mgr_config)
         };
         // Clamp to at least 1 (like the mysql/mssql/oracle backends): a
         // `?max_size=0` URL would otherwise build a zero-capacity pool, leaving
@@ -536,7 +781,10 @@ impl TxConn for PgTx {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact, unified_param_types, url_password, Type, Value};
+    use super::{
+        extract_ssl_params, make_tls_connector, redact, root_store, unified_param_types,
+        url_password, CertCheck, SslParams, Type, Value,
+    };
 
     #[test]
     fn unified_types_widen_numeric_mixes_across_rows() {
@@ -626,6 +874,79 @@ mod tests {
         assert_eq!(url_password("postgres://u:a:b@h/db"), Some("a:b"));
         assert_eq!(url_password("postgres://u@h/db"), None); // user, no password
         assert_eq!(url_password("postgres://h/db"), None); // no userinfo
+    }
+
+    #[test]
+    fn plain_sslmodes_are_left_to_the_driver_and_verify_nothing() {
+        // libpq: `prefer`/`require` encrypt but authenticate nothing, so the URL
+        // reaches tokio-postgres untouched and no trust store is consulted.
+        for url in [
+            "postgres://h/db",
+            "postgres://h/db?sslmode=prefer",
+            "postgres://h/db?sslmode=require",
+            "postgres://h/db?sslmode=disable",
+        ] {
+            let (cleaned, ssl) = extract_ssl_params(url);
+            assert_eq!(cleaned, url);
+            assert_eq!(ssl, SslParams::default());
+            assert_eq!(ssl.check, CertCheck::None);
+        }
+    }
+
+    #[test]
+    fn verifying_sslmodes_become_require_for_the_driver() {
+        // tokio-postgres rejects libpq's verify-* spellings, and both of them
+        // mandate TLS, so the driver is handed `require` instead.
+        let (cleaned, ssl) = extract_ssl_params("postgres://h/db?sslmode=verify-ca");
+        assert_eq!(cleaned, "postgres://h/db?sslmode=require");
+        assert_eq!(ssl.check, CertCheck::Chain);
+
+        let (cleaned, ssl) = extract_ssl_params("postgres://h/db?sslmode=verify-full");
+        assert_eq!(cleaned, "postgres://h/db?sslmode=require");
+        assert_eq!(ssl.check, CertCheck::Full);
+    }
+
+    #[test]
+    fn sslrootcert_is_stripped_and_other_params_are_preserved() {
+        let (cleaned, ssl) = extract_ssl_params(
+            "postgres://h/db?application_name=x&sslmode=verify-full&sslrootcert=/etc/rds.pem",
+        );
+        // Only the keys the driver cannot parse are consumed; order is kept.
+        assert_eq!(
+            cleaned,
+            "postgres://h/db?application_name=x&sslmode=require"
+        );
+        assert_eq!(ssl.check, CertCheck::Full);
+        assert_eq!(ssl.root_cert.as_deref(), Some("/etc/rds.pem"));
+    }
+
+    #[test]
+    fn a_url_of_only_ssl_params_loses_its_query() {
+        let (cleaned, ssl) = extract_ssl_params("postgres://h/db?sslrootcert=/etc/rds.pem");
+        assert_eq!(cleaned, "postgres://h/db");
+        // As in libpq, a root certificate alone does not turn verification on.
+        assert_eq!(ssl.check, CertCheck::None);
+    }
+
+    #[test]
+    fn missing_sslrootcert_file_is_a_config_error() {
+        let err = root_store(Some("/nonexistent/rds.pem")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sslrootcert"), "{msg}");
+        assert!(msg.contains("rds.pem"), "{msg}");
+    }
+
+    #[test]
+    fn connectors_are_built_for_every_verification_level() {
+        for check in [CertCheck::None, CertCheck::Chain, CertCheck::Full] {
+            let params = SslParams {
+                check,
+                root_cert: None,
+            };
+            assert!(make_tls_connector(&params).is_ok(), "{check:?}");
+            // Second call comes off the process-wide cache.
+            assert!(make_tls_connector(&params).is_ok(), "{check:?}");
+        }
     }
 
     #[test]
