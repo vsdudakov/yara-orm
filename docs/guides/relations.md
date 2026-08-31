@@ -113,6 +113,19 @@ instance, so `book.author` never serves a stale object. Assigning an
 **unsaved** instance (its pk is still `None`) raises `ValueError` — save the
 related row first.
 
+When **both** forms arrive at construction — the relation object and its raw
+column — the explicit id wins:
+
+```python
+book = Book(author=other_author, author_id=ada.id)
+book.author_id                      # ada.id — the id you passed
+await book.author                   # Ada; the mismatched object is not cached
+```
+
+This is what a factory needs: a `SubFactory` declaration is evaluated even when
+the caller also passes `author_id=`, and the relation resolving last would
+silently replace the id that was asked for.
+
 ### Reverse manager
 
 The `related_name` installs a manager on the target model. It is awaitable (to a

@@ -73,6 +73,7 @@ Base class for models. See [Models & fields](guides/models-and-fields.md).
 | `update_from_dict` | `instance.update_from_dict(data)` | Set fields in place (no DB write). |
 | `fetch_related` | `await instance.fetch_related(*names)` | Populate relations on the instance. |
 | `pk` | `instance.pk` | Primary key value. |
+| `__iter__` | `dict(instance)` | Iterate the instance as `(name, value)` column pairs. |
 
 The inner `Meta` class supports `table`, `table_description` / `description`,
 `abstract` (mark as a base model with no table; not inherited by subclasses),
