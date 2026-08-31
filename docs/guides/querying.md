@@ -493,7 +493,15 @@ book.update_from_dict({"title": "New", "rating": 4})   # set fields, no DB write
 await book.save()
 
 await book.refresh_from_db()                            # reload column values from the row
+
+dict(book)                                              # {"id": 1, "title": "New", ...}
 ```
+
+Instances iterate as `(name, value)` pairs, so `dict(instance)` works and
+consumers that walk an object that way — pydantic's `from_attributes`,
+serializers, factories — take a model directly. Columns come in declaration
+order; a column the instance does not carry (`only()` / `defer()`) is skipped
+rather than fetched, and private attributes are omitted.
 
 ## Projections: `values()` and `values_list()`
 

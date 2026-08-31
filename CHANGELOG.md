@@ -4,6 +4,49 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-08-31
+
+### Added
+
+- **`Model.__iter__`** — instances iterate as `(name, value)` pairs, so
+  `dict(instance)` works and consumers that walk an object that way
+  (pydantic's `from_attributes`, serializers, factories) take a model
+  directly. Declared columns come first, in declaration order; a column the
+  instance does not carry (`only()` / `defer()`) is skipped rather than
+  fetched, private attributes are omitted, and any extras kept under
+  `Meta.extra_kwargs = "store"` follow. Code that relied on `iter(instance)`
+  raising `TypeError` changes behaviour.
+
+### Changed
+
+- **An explicit `<name>_id` wins over a relation object at construction.**
+  Relations used to be applied last and unconditionally, so
+  `Book(author=obj, author_id=x)` silently stored `obj.pk`. The explicit id
+  (by field name or db-column alias) is now kept, and an object whose pk
+  disagrees is not cached as the prefetched relation, so `await book.author`
+  cannot return a row the column does not point at. This is what factories
+  need: a `SubFactory` declaration is evaluated even when the caller also
+  passes `author_id=`. Passing only one of the two is unchanged.
+- **`auto_now_add` fills the column instead of imposing a value.** A row
+  created with an explicit stamp (backdated fixtures, imports, backfills)
+  keeps it instead of being restamped at `now()`. `auto_now` still always
+  stamps, and so does a field declaring both.
+
+### Fixed
+
+- **Foreign-key columns are coerced on assignment.** `create(parent_id=str(pk))`
+  bound correctly but left the raw `str` on the instance, so
+  `child.parent_id == parent.id` was `False` until re-fetch.
+  `ForeignKeyFieldInstance.to_python_value` now mirrors `to_db`, and the
+  `<name>_id` column joins `MetaInfo.coerced_fields` so `__init__`
+  normalises it like every other coerced column. Row hydration is untouched.
+- **`bulk_update` batches respect the dialect's bind-parameter ceiling.**
+  Each row costs one `(pk, value)` pair per updated field in the `CASE` arms
+  plus a pk slot in the `WHERE ... IN` list, so a large `batch_size` could
+  exceed PostgreSQL's 65535 / SQL Server's 2100 limit and fail. Batches are
+  now clamped from `max_bind_params`, and SQLite declares its default
+  `SQLITE_MAX_VARIABLE_NUMBER` (32766) instead of inheriting 65535.
+
 ## [1.15.0] - 2026-07-16
 
 ### Added

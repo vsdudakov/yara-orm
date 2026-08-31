@@ -35,7 +35,7 @@ from .relations import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Generator, Iterator, Sequence
 
     from typing_extensions import Self
 
@@ -877,6 +877,9 @@ class Model(metaclass=ModelMeta):
     def __init__(self, **kwargs: Any) -> None:
         """Initialise field values from keyword arguments.
 
+        A relation may be given as an object (``parent=<Node>``) or as its raw
+        column (``parent_id=...``); when both arrive, the explicit id wins.
+
         Args:
             **kwargs: Field values, relation objects/ids, or db-column aliases.
                 Unset fields fall back to their declared defaults.
@@ -896,7 +899,13 @@ class Model(metaclass=ModelMeta):
         rel_overrides = {}
         for rel_name, info in meta.relations.items():
             if rel_name in kwargs:
-                rel_overrides[rel_name] = (info, kwargs.pop(rel_name))
+                # An explicit ``<name>_id`` alongside the relation wins: a
+                # factory's ``SubFactory`` declaration is evaluated even when the
+                # caller passes the id, and the relation resolving last would
+                # silently replace the id that was asked for.
+                id_field = meta.fields[info.source_attr]
+                explicit_id = info.source_attr in kwargs or id_field.db_column in kwargs
+                rel_overrides[rel_name] = (info, kwargs.pop(rel_name), explicit_id)
         for rel_name in meta.m2m:
             if rel_name in kwargs:
                 raise TypeError(
@@ -919,18 +928,24 @@ class Model(metaclass=ModelMeta):
             # rest (the majority) assign directly at C speed.
             d[name] = field.to_python_value(value) if name in coerced else value
 
-        for rel_name, (info, value) in rel_overrides.items():
+        for rel_name, (info, value, explicit_id) in rel_overrides.items():
             if value is None:
-                self.__dict__[info.source_attr] = None
+                if not explicit_id:
+                    self.__dict__[info.source_attr] = None
             elif isinstance(value, Model):
                 if value.pk is None:
                     raise ValueError(
                         f'Cannot assign "{value!r}" to {type(self).__name__}.{rel_name}: '
                         f"the instance isn't saved in the database yet; save it first"
                     )
-                self.__dict__[info.source_attr] = value.pk
-                self.__dict__.setdefault("_prefetch", {})[rel_name] = value
-            else:
+                if not explicit_id:
+                    self.__dict__[info.source_attr] = value.pk
+                # Only cache the object as the prefetched relation when it is
+                # the row the id names; otherwise ``await obj.<rel>`` would hand
+                # back an instance that is not the one the column points at.
+                if self.__dict__[info.source_attr] == value.pk:
+                    self.__dict__.setdefault("_prefetch", {})[rel_name] = value
+            elif not explicit_id:
                 self.__dict__[info.source_attr] = value
 
         if kwargs:
@@ -954,6 +969,28 @@ class Model(metaclass=ModelMeta):
         """
         yield from ()
         return self
+
+    def __iter__(self) -> Iterator[tuple[str, Any]]:
+        """Yield ``(name, value)`` for the columns this instance carries.
+
+        Makes ``dict(instance)`` work and lets consumers that walk an object as
+        pairs — pydantic's ``from_attributes`` conversion, serializers, factories
+        — take a model directly. Declared columns come first, in declaration
+        order; a column absent from the instance (``only()``/``defer()``) is
+        skipped rather than fetched, and any extra attributes kept under
+        ``Meta.extra_kwargs = "store"`` follow. Private attributes are omitted.
+
+        Yields:
+            ``(field_name, value)`` pairs.
+        """
+        d = self.__dict__
+        declared = self._meta.fields
+        for name in declared:
+            if name in d:
+                yield name, d[name]
+        for name, value in list(d.items()):
+            if name not in declared and not name.startswith("_"):
+                yield name, value
 
     def __class_getitem__(cls, _item: Any) -> type:
         """Make model classes subscriptable for annotations (no-op).
@@ -1185,6 +1222,16 @@ class Model(metaclass=ModelMeta):
                 if field.auto_now_add and in_db:
                     continue
                 if only is not None and name not in only:
+                    continue
+                # ``auto_now_add`` fills the stamp, it does not impose one: a row
+                # created with an explicit value (backdated fixtures, imports,
+                # backfills) keeps it. ``auto_now`` always stamps — that is the
+                # column's contract — and so does a field declaring both.
+                if (
+                    field.auto_now_add
+                    and not field.auto_now
+                    and self.__dict__.get(name) is not None
+                ):
                     continue
                 setattr(self, name, now)
 
@@ -2084,10 +2131,10 @@ class Model(metaclass=ModelMeta):
         meta = cls._meta
         out = []
         for name in key_fields:
-            if isinstance(values, dict):
-                value = values[name]  # ty: ignore[invalid-argument-type]
-            else:
+            if isinstance(values, Model):
                 value = getattr(values, name)
+            else:
+                value = values[name]
             field = meta.fields.get(name)
             out.append(field.to_db(value) if field is not None else value)
         return tuple(out)

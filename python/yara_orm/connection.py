@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from . import _engine, registry
 from . import timezone as _tz
@@ -1681,7 +1681,7 @@ class in_transaction:
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         tb: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         """Commit/release on clean exit, roll back on error, and unpin.
 
         Args:

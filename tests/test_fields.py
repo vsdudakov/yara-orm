@@ -265,6 +265,40 @@ async def test_foreign_key_coerces_str_value_to_target_uuid(db):
 
 
 @pytest.mark.asyncio
+async def test_foreign_key_id_assignment_coerces_to_target_pk_type(db):
+    """
+    GIVEN a child constructed with the FK column set from a string id
+    WHEN the in-memory attribute is read back before any re-fetch
+    THEN it already holds the target pk's Python type
+
+    ``to_db`` coerced the value at bind time, but the instance kept the raw
+    ``str``, so ``child.parent_id == parent.id`` was False until reload.
+    """
+    p = await CompatParent.create(name="root")
+
+    c = CompatChild(parent_id=str(p.id), payload={"a": 1})
+
+    assert isinstance(c.parent_id, uuid.UUID)
+    assert c.parent_id == p.id
+
+
+def test_foreign_key_value_passes_through_before_the_target_is_registered():
+    """
+    GIVEN a foreign-key field whose target model is not registered
+    WHEN a value is assigned or bound
+    THEN it passes through unchanged instead of raising
+
+    Both directions consult the target's pk field, which cannot be resolved
+    until the model is registered (during schema/relation setup).
+    """
+    field = fields.ForeignKeyField("CompatNotRegistered")
+
+    assert field.to_python_value("abc") == "abc"
+    assert field.to_db("abc") == "abc"
+    assert field.to_python_value(None) is None
+
+
+@pytest.mark.asyncio
 async def test_jsonfield_encoder_and_decoder_hooks_apply(db):
     """
     GIVEN a JSONField with ``encoder``/``decoder`` value-transform hooks
