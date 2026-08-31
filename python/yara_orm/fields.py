@@ -1696,6 +1696,30 @@ class ForeignKeyFieldInstance(Field[Any]):
         #: Cached pk field of the target model, used to coerce bound values.
         self._target_pk_field: Field | None = None
 
+    def to_python_value(self, value: Any) -> Any:
+        """Coerce an assigned foreign-key value to the target pk's Python type.
+
+        Mirrors :meth:`to_db` on the assignment path. ``create(parent_id=str(pk))``
+        bound correctly (``to_db`` coerces) but left the raw ``str`` on the
+        instance, so ``obj.parent_id == parent.id`` was False until the row was
+        re-fetched. Declaring this override also enrols the ``<name>_id`` column
+        in ``MetaInfo.coerced_fields``, so ``__init__`` normalises it like every
+        other coerced column.
+
+        Args:
+            value: The Python value assigned to the ``<name>_id`` column.
+
+        Returns:
+            The value coerced by the target model's pk field, or unchanged when
+            that model is not registered yet.
+        """
+        if value is None:
+            return None
+        target_pk = self._resolve_target_pk_field()
+        if target_pk is None:
+            return value
+        return target_pk.to_python_value(value)
+
     def to_db(self, value: Any) -> Any:
         """Coerce a foreign-key value to the target primary key's type.
 

@@ -234,6 +234,10 @@ default automatically; see [Primary keys](#primary-keys) below.
     to refresh the value on every `save()`. In the canonical `Author` model,
     `created_at` uses `auto_now_add=True`.
 
+    `auto_now_add` **fills** the column, it does not impose a value: a row
+    created with an explicit stamp (a backdated fixture, an import, a backfill)
+    keeps it. `auto_now` always stamps — that is the column's contract.
+
 !!! note "ISO-8601 string input is coerced"
     `DateField`, `DatetimeField` and `TimeField` accept ISO-8601 **string** input
     (a trailing `Z` is accepted) and coerce it to a real `date` / `datetime` /

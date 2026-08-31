@@ -265,6 +265,24 @@ async def test_foreign_key_coerces_str_value_to_target_uuid(db):
 
 
 @pytest.mark.asyncio
+async def test_foreign_key_id_assignment_coerces_to_target_pk_type(db):
+    """
+    GIVEN a child constructed with the FK column set from a string id
+    WHEN the in-memory attribute is read back before any re-fetch
+    THEN it already holds the target pk's Python type
+
+    ``to_db`` coerced the value at bind time, but the instance kept the raw
+    ``str``, so ``child.parent_id == parent.id`` was False until reload.
+    """
+    p = await CompatParent.create(name="root")
+
+    c = CompatChild(parent_id=str(p.id), payload={"a": 1})
+
+    assert isinstance(c.parent_id, uuid.UUID)
+    assert c.parent_id == p.id
+
+
+@pytest.mark.asyncio
 async def test_jsonfield_encoder_and_decoder_hooks_apply(db):
     """
     GIVEN a JSONField with ``encoder``/``decoder`` value-transform hooks

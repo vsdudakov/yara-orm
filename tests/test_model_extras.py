@@ -1,6 +1,8 @@
 """Model-level query shortcuts, clone/describe, Meta.constraints, FK db_constraint,
 the Random function and the extra validators (reference parity)."""
 
+import datetime
+
 import pytest
 
 from yara_orm import (
@@ -11,6 +13,7 @@ from yara_orm import (
     UniqueConstraint,
     ValidationError,
     fields,
+    timezone,
 )
 from yara_orm.dialects import SqliteDialect
 from yara_orm.validators import CommaSeparatedIntegerListValidator, NumericValidator
@@ -47,7 +50,18 @@ class MxRef(Model):
         table = "mx_ref"
 
 
-MODELS = [MxTag, MxConstrained, MxRef]
+class MxStamped(Model):
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=50)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "mx_stamped"
+        extra_kwargs = "store"
+
+
+MODELS = [MxTag, MxConstrained, MxRef, MxStamped]
 
 
 # -- Model-level query shortcuts ----------------------------------------------
@@ -299,3 +313,141 @@ def test_comma_separated_integer_list_validator():
         CommaSeparatedIntegerListValidator()("1,x,3")
     with pytest.raises(ValidationError):
         CommaSeparatedIntegerListValidator()("1,,3")
+
+
+# -- Construction semantics ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_explicit_relation_id_wins_over_relation_object(db):
+    """
+    GIVEN a relation passed as an object alongside an explicit ``<name>_id``
+    WHEN the instance is constructed
+    THEN the explicit id is the one stored and persisted
+
+    A factory's ``SubFactory`` declaration is evaluated even when the caller
+    also passes the raw id; resolving the relation last would silently replace
+    the id that was asked for.
+    """
+    wanted = await MxTag.create(name="wanted")
+    other = await MxTag.create(name="other")
+
+    ref = MxRef(tag=other, tag_id=wanted.id)
+    assert ref.tag_id == wanted.id
+
+    await ref.save()
+    assert (await MxRef.get(id=ref.id)).tag_id == wanted.id
+
+
+@pytest.mark.asyncio
+async def test_explicit_relation_id_does_not_cache_a_mismatched_object(db):
+    """
+    GIVEN a relation object whose pk differs from the explicit ``<name>_id``
+    WHEN the relation is awaited
+    THEN the row the id names is fetched, not the object that was passed
+    """
+    wanted = await MxTag.create(name="wanted")
+    other = await MxTag.create(name="other")
+
+    ref = await MxRef.create(tag=other, tag_id=wanted.id)
+
+    assert (await ref.tag).id == wanted.id
+
+
+@pytest.mark.asyncio
+async def test_relation_object_still_sets_the_id_when_no_explicit_id(db):
+    """
+    GIVEN only a relation object (the ordinary case)
+    WHEN the instance is constructed
+    THEN its id is taken from the object and the object is cached as prefetched
+    """
+    tag = await MxTag.create(name="only")
+
+    ref = await MxRef.create(tag=tag)
+
+    assert ref.tag_id == tag.id
+    assert (await ref.tag) is tag
+
+
+@pytest.mark.asyncio
+async def test_auto_now_add_keeps_an_explicit_created_at(db):
+    """
+    GIVEN a row created with an explicit ``auto_now_add`` value
+    WHEN it is inserted
+    THEN the supplied stamp is kept, not replaced with the current time
+
+    ``auto_now_add`` fills the column when nothing was set; backdated fixtures,
+    imports and backfills supply their own.
+    """
+    # Derived from the ORM's clock so the value matches the session's ``use_tz``
+    # awareness on every backend.
+    backdated = timezone.now() - datetime.timedelta(days=365)
+
+    row = await MxStamped.create(name="imported", created_at=backdated)
+
+    assert row.created_at == backdated
+    again = await MxStamped.get(id=row.id)
+    # PostgreSQL hands back an aware UTC value even when ``use_tz`` is off, and
+    # both stamps are UTC, so the persisted one is compared in its naive form.
+    assert again.created_at.replace(tzinfo=None) == backdated.replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_auto_now_add_fills_an_unset_created_at(db):
+    """
+    GIVEN a row created without a ``created_at``
+    WHEN it is inserted
+    THEN the column is stamped with the current time
+    """
+    before = timezone.now()
+
+    row = await MxStamped.create(name="fresh")
+
+    assert row.created_at >= before - datetime.timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_auto_now_always_stamps_even_when_supplied(db):
+    """
+    GIVEN a row created with an explicit ``auto_now`` value
+    WHEN it is inserted
+    THEN the column is stamped anyway — ``auto_now`` owns its value
+    """
+    backdated = timezone.now() - datetime.timedelta(days=365)
+
+    row = await MxStamped.create(name="stamped", updated_at=backdated)
+
+    assert row.updated_at > backdated
+
+
+@pytest.mark.asyncio
+async def test_model_instance_iterates_as_name_value_pairs(db):
+    """
+    GIVEN a saved instance, including an attribute kept by ``extra_kwargs``
+    WHEN it is iterated (``dict(instance)``)
+    THEN every column comes back as a ``(name, value)`` pair, extras included,
+         and private attributes are omitted
+    """
+    row = await MxStamped.create(name="iterable", label="extra")
+
+    as_dict = dict(row)
+
+    assert as_dict["id"] == row.id
+    assert as_dict["name"] == "iterable"
+    assert as_dict["created_at"] == row.created_at
+    assert as_dict["label"] == "extra"
+    assert not [key for key in as_dict if key.startswith("_")]
+
+
+@pytest.mark.asyncio
+async def test_deferred_column_is_skipped_by_iteration(db):
+    """
+    GIVEN an instance fetched with ``only()``
+    WHEN it is iterated
+    THEN the columns it does not carry are skipped rather than fetched
+    """
+    await MxStamped.create(name="partial")
+
+    row = await MxStamped.all().only("id", "name").first()
+
+    assert dict(row).keys() == {"id", "name"}
