@@ -2131,10 +2131,10 @@ class Model(metaclass=ModelMeta):
         meta = cls._meta
         out = []
         for name in key_fields:
-            if isinstance(values, dict):
-                value = values[name]  # ty: ignore[invalid-argument-type]
-            else:
+            if isinstance(values, Model):
                 value = getattr(values, name)
+            else:
+                value = values[name]
             field = meta.fields.get(name)
             out.append(field.to_db(value) if field is not None else value)
         return tuple(out)
