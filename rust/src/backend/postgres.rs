@@ -21,7 +21,7 @@ use tokio_postgres::{NoTls, Socket, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::backend::pool::extract_pool_params;
-use crate::backend::{Backend, TxConn, TxState};
+use crate::backend::{Backend, PasswordProvider, TxConn, TxState};
 use crate::error::EngineError;
 use crate::value::{decode_pg_row, decode_pg_row_values, decode_pg_rows, Row, Value};
 
@@ -352,14 +352,52 @@ type Pool = managed::Pool<PgManager>;
 /// Opens Postgres connections, reading the password at connect time.
 ///
 /// The password sits in [`PgManager::password`] rather than being frozen into
-/// the pool. [`PgBackend::set_password`] replaces it; the next physical
-/// connection presents the new one, and connections already checked out are
-/// not touched. Recycling matches deadpool's `RecyclingMethod::Fast`: a closed
-/// connection is discarded, a live one is reused with no extra query.
+/// the pool. A fixed string is presented as stored. A provider is called when
+/// a physical connection opens, so an expiring credential is signed at that
+/// moment. Connections already checked out are not touched. Recycling matches
+/// deadpool's `RecyclingMethod::Fast`: a closed connection is discarded, a
+/// live one is reused with no extra query.
 struct PgManager {
     config: tokio_postgres::Config,
     tls: PgTls,
-    password: Arc<RwLock<Option<String>>>,
+    password: Arc<RwLock<PasswordSlot>>,
+}
+
+/// What `create` presents as the password.
+enum PasswordSlot {
+    /// Nothing has been set since connect. `create` leaves the parsed URL password.
+    Absent,
+    Fixed(String),
+    Provider(PasswordProvider),
+}
+
+/// A failure while opening a pooled connection.
+///
+/// The driver error stays reachable through [`std::error::Error::source`] so
+/// a server SQLSTATE can still be recovered. A password provider that fails
+/// has no driver error; its message is the failure.
+#[derive(Debug)]
+enum OpenError {
+    Driver(tokio_postgres::Error),
+    Password(String),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Driver(err) => write!(formatter, "{err}"),
+            OpenError::Password(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenError::Driver(err) => Some(err),
+            OpenError::Password(_) => None,
+        }
+    }
 }
 
 /// The two TLS connectors this backend builds. Held as an enum so the pool
@@ -386,26 +424,48 @@ where
     Ok(ClientWrapper::new(client, conn_task))
 }
 
+impl PgManager {
+    /// The password for this new connection.
+    ///
+    /// The lock is released before a provider runs. The provider may itself
+    /// call `set_password`, and holding the read lock across that call would
+    /// deadlock.
+    fn password_for_new_connection(&self) -> Result<Option<String>, OpenError> {
+        let taken = {
+            let slot = self.password.read().unwrap_or_else(|err| err.into_inner());
+            match &*slot {
+                PasswordSlot::Absent => PasswordSlot::Absent,
+                PasswordSlot::Fixed(password) => PasswordSlot::Fixed(password.clone()),
+                PasswordSlot::Provider(provider) => PasswordSlot::Provider(Arc::clone(provider)),
+            }
+        };
+        match taken {
+            PasswordSlot::Absent => Ok(None),
+            PasswordSlot::Fixed(password) => Ok(Some(password)),
+            PasswordSlot::Provider(provider) => provider().map(Some).map_err(OpenError::Password),
+        }
+    }
+}
+
 impl managed::Manager for PgManager {
     type Type = ClientWrapper;
-    type Error = tokio_postgres::Error;
+    type Error = OpenError;
 
-    async fn create(&self) -> Result<ClientWrapper, tokio_postgres::Error> {
+    async fn create(&self) -> Result<ClientWrapper, OpenError> {
         let mut config = self.config.clone();
-        if let Some(password) = self
-            .password
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-        {
+        if let Some(password) = self.password_for_new_connection()? {
             let _ = config.password(password);
         }
         // The socket type differs per TLS mode, so each arm owns the connect
         // and the background task. The driver reports a dropped socket on that
         // task; the pool notices on the next checkout via `is_closed`.
         match &self.tls {
-            PgTls::Off(tls) => open_connection(config, *tls).await,
-            PgTls::On(tls) => open_connection(config, tls.clone()).await,
+            PgTls::Off(tls) => open_connection(config, *tls)
+                .await
+                .map_err(OpenError::Driver),
+            PgTls::On(tls) => open_connection(config, tls.clone())
+                .await
+                .map_err(OpenError::Driver),
         }
     }
 
@@ -413,7 +473,7 @@ impl managed::Manager for PgManager {
         &self,
         client: &mut ClientWrapper,
         _: &managed::Metrics,
-    ) -> managed::RecycleResult<tokio_postgres::Error> {
+    ) -> managed::RecycleResult<OpenError> {
         if client.is_closed() {
             return Err(managed::RecycleError::message("Connection closed"));
         }
@@ -423,9 +483,9 @@ impl managed::Manager for PgManager {
 
 pub struct PgBackend {
     pool: Pool,
-    /// Shared with [`PgManager`]. `None` means no password has been set since
-    /// connect; `create` then uses the URL's password from the parsed config.
-    password: Arc<RwLock<Option<String>>>,
+    /// Shared with [`PgManager`]. `Absent` means no password has been set since
+    /// connect, so `create` uses the URL's password from the parsed config.
+    password: Arc<RwLock<PasswordSlot>>,
     /// When false (URL `statement_cache_size=0`), prepared statements are not
     /// cached per connection — required behind a transaction-pooling proxy
     /// such as PgBouncer, which would otherwise see stale prepared statements.
@@ -563,7 +623,7 @@ impl PgBackend {
         // The slot starts empty so `create` uses the URL's password exactly as
         // parsed (raw bytes, not necessarily UTF-8). `set_password` fills it
         // later; `create` reads the slot, so a rotation does not rebuild the pool.
-        let password = Arc::new(RwLock::new(None));
+        let password = Arc::new(RwLock::new(PasswordSlot::Absent));
         let mgr = PgManager {
             config: pg_config,
             tls,
@@ -585,6 +645,7 @@ impl PgBackend {
                     client
                         .batch_execute("SET TIME ZONE 'UTC'")
                         .await
+                        .map_err(OpenError::Driver)
                         .map_err(HookError::Backend)?;
                     Ok(())
                 })
@@ -735,7 +796,14 @@ impl Backend for PgBackend {
     }
 
     fn set_password(&self, password: String) -> Result<(), EngineError> {
-        *self.password.write().unwrap_or_else(|err| err.into_inner()) = Some(password);
+        *self.password.write().unwrap_or_else(|err| err.into_inner()) =
+            PasswordSlot::Fixed(password);
+        Ok(())
+    }
+
+    fn set_password_provider(&self, provider: PasswordProvider) -> Result<(), EngineError> {
+        *self.password.write().unwrap_or_else(|err| err.into_inner()) =
+            PasswordSlot::Provider(provider);
         Ok(())
     }
 
