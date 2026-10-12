@@ -12,7 +12,7 @@ import copy
 import json
 import uuid as _uuid
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Context, Decimal
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
@@ -764,23 +764,34 @@ class DecimalField(Field[VT]):
         """
         super().__init__(**kwargs)
         self.type_params = {"max_digits": max_digits, "decimal_places": decimal_places}
+        self._quantum = Decimal(1).scaleb(-decimal_places)
 
     def to_db(self, value: Any) -> Decimal | None:
         """Convert a value into a ``Decimal`` for binding.
 
         The engine binds ``Decimal`` straight to a NUMERIC parameter, so values
         are kept exact instead of being routed through ``float`` (which would
-        silently lose precision for large or high-scale decimals).
+        silently lose precision for large or high-scale decimals). Finite values
+        are rounded to ``decimal_places`` (half away from zero, as PostgreSQL
+        rounds on insert), so every backend stores the column's scale and a
+        derived value such as ``1 / Decimal(3)`` stays bindable.
 
         Args:
             value: The Python value to convert.
 
         Returns:
-            The value as a ``Decimal``, or ``None``.
+            The value as a ``Decimal`` at the field's scale, or ``None``.
         """
         if value is None:
             return None
-        return value if isinstance(value, Decimal) else Decimal(str(value))
+        dec = value if isinstance(value, Decimal) else Decimal(str(value))
+        if not dec.is_finite():
+            return dec
+        # Size the precision to the value (integer digits + scale + one for a
+        # rounding carry) so quantize never hits the default 28-digit context
+        # limit; a value too wide for ``max_digits`` is left to the database.
+        prec = max(dec.adjusted() + 1, 1) + self.type_params["decimal_places"] + 1
+        return dec.quantize(self._quantum, context=Context(prec=prec, rounding=ROUND_HALF_UP))
 
     def to_python(self, value: Any) -> Decimal | None:
         """Convert a database value into a ``Decimal``.

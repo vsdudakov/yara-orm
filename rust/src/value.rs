@@ -220,11 +220,25 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Value {
             // (e.g. ``1E-10``), which ``from_str_exact`` rejects — fall back to
             // ``from_scientific`` so either form parses exactly.
             let s = ob.str()?.to_string();
-            let parsed = rust_decimal::Decimal::from_str_exact(&s)
+            if let Ok(parsed) = rust_decimal::Decimal::from_str_exact(&s)
                 .or_else(|_| rust_decimal::Decimal::from_scientific(&s))
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!("invalid decimal {s:?}: {e}"))
-                })?;
+            {
+                return Ok(Value::Decimal(parsed));
+            }
+            // rust_decimal holds at most 28 decimal places in a 96-bit
+            // mantissa, while NUMERIC (and asyncpg) take any scale. A value
+            // such as ``1 / Decimal(3)`` is still a valid parameter, so round
+            // the excess fractional digits (half away from zero, as
+            // PostgreSQL does) instead of rejecting it. ``format(d, "f")``
+            // avoids the exponent form, which the lenient parser does not
+            // accept beyond 28 places. Only a too-large integer part, NaN or
+            // infinity still fails.
+            let fixed = ob.call_method1("__format__", ("f",))?.to_string();
+            let parsed = fixed.parse::<rust_decimal::Decimal>().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid decimal {s:?}: {e} (bound decimals must fit 28-29 significant digits)"
+                ))
+            })?;
             return Ok(Value::Decimal(parsed));
         }
         Err(pyo3::exceptions::PyTypeError::new_err(format!(

@@ -4,6 +4,22 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Decimals with more than 28 decimal places bind instead of failing.** A
+  derived value such as `1 / Decimal("162.35")` used to raise
+  `ValueError: invalid decimal "…": Failed to parse`, because the engine's
+  `rust_decimal` holds at most 28 places, even though NUMERIC accepts any
+  scale. The binder now rounds the extra fractional digits half away from
+  zero, as PostgreSQL does. A value whose integer part is too large, NaN or
+  infinity still raises, and the error now gives the limit.
+- **`DecimalField` rounds to `decimal_places` before binding**, as Tortoise
+  did, so model writes store the column's scale on every backend, including
+  SQLite, which has no column scale of its own. Rounding is half away from
+  zero.
+
 ## [1.19.0] - 2026-10-12
 
 ### Added
