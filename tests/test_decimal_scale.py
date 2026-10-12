@@ -32,6 +32,21 @@ class DsRate(Model):
 MODELS = [DsRate]
 
 
+async def _raw_insert_rate(rate: Decimal) -> None:
+    """Insert ``rate`` with raw SQL, bypassing ``DecimalField.to_db``.
+
+    Identifiers are quoted for the dialect (Oracle folds unquoted names to
+    upper case) and ``id`` is left to the database (SQL Server rejects an
+    explicit value for an identity column).
+    """
+    dialect = get_dialect(DsRate)
+    sql = (
+        f"INSERT INTO {dialect.quote('ds_rate')} ({dialect.quote('rate')}) "
+        f"VALUES ({dialect.placeholder(1)})"
+    )
+    await connections.get().execute_query(sql, [rate])
+
+
 def test_inverse_rate_exceeds_rust_decimal_scale():
     """
     GIVEN the fixture rate used below
@@ -91,12 +106,8 @@ async def test_raw_sql_binds_high_scale_decimal(db):
     WHEN a 30-place Decimal is bound as a parameter
     THEN the engine rounds the excess digits instead of rejecting the value
     """
-    ph = get_dialect(DsRate).placeholder
-    conn = connections.get()
-    await conn.execute_query(
-        f"INSERT INTO ds_rate (id, rate) VALUES ({ph(1)}, {ph(2)})", [1, INVERSE_RATE]
-    )
-    got = (await DsRate.get(id=1)).rate
+    await _raw_insert_rate(INVERSE_RATE)
+    got = (await DsRate.first()).rate
     if db == "sqlite":
         # TEXT storage has no column scale, so the binder's 28-place rounding
         # is what lands.
@@ -112,12 +123,8 @@ async def test_raw_sql_binds_tiny_exponent_decimal(db):
     WHEN it is bound as a raw parameter
     THEN it rounds to zero rather than failing to parse
     """
-    ph = get_dialect(DsRate).placeholder
-    conn = connections.get()
-    await conn.execute_query(
-        f"INSERT INTO ds_rate (id, rate) VALUES ({ph(1)}, {ph(2)})", [2, Decimal("1E-40")]
-    )
-    assert (await DsRate.get(id=2)).rate == 0
+    await _raw_insert_rate(Decimal("1E-40"))
+    assert (await DsRate.first()).rate == 0
 
 
 @pytest.mark.asyncio
@@ -127,10 +134,6 @@ async def test_raw_sql_rejects_out_of_range_decimal(db):
     WHEN they are bound as raw parameters
     THEN a ValueError names the value instead of silently changing it
     """
-    ph = get_dialect(DsRate).placeholder
-    conn = connections.get()
     for bad in (Decimal("123456789012345678901234567890"), Decimal("NaN")):
         with pytest.raises(ValueError, match="invalid decimal"):
-            await conn.execute_query(
-                f"INSERT INTO ds_rate (id, rate) VALUES ({ph(1)}, {ph(2)})", [3, bad]
-            )
+            await _raw_insert_rate(bad)
