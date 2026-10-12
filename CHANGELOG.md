@@ -4,6 +4,18 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.1] - 2026-10-12
+
+### Changed
+
+- **Lint toolchain is pinned.** `ruff` and `ty` are pinned in a new
+  `requirements-lint.txt` (`ruff==0.17.0`, `ty==0.0.86`), which CI and
+  `make dev` install from and Dependabot keeps current. Before this, CI
+  installed whatever was newest, so a new `ty` release could fail lint on
+  unrelated pull requests. The `dev` extra now requires the same minimums.
+- Build and docs minimums raised to `maturin>=1.15.0` and
+  `mkdocs-material>=9.7.7`.
+
 ## [1.18.0] - 2026-10-09
 
 ### Added
