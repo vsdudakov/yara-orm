@@ -11,11 +11,11 @@ code runs unchanged across backends — only the URL you pass to `YaraOrm.init()
 ```python
 from yara_orm import YaraOrm
 
-await YaraOrm.init("postgres://user:pass@localhost/db")   # PostgreSQL (tokio-postgres)
-await YaraOrm.init("mysql://user:pass@localhost/db")       # MySQL/MariaDB (mysql_async)
+await YaraOrm.init("postgres://user:pass@localhost/db")  # PostgreSQL (tokio-postgres)
+await YaraOrm.init("mysql://user:pass@localhost/db")  # MySQL/MariaDB (mysql_async)
 await YaraOrm.init("oracle://user:pass@localhost:1521/FREEPDB1")  # Oracle (oracle-rs)
-await YaraOrm.init("mssql://user:pass@localhost:1433/db")   # SQL Server (tiberius)
-await YaraOrm.init("sqlite:///path/to/app.db")             # SQLite (rusqlite)
+await YaraOrm.init("mssql://user:pass@localhost:1433/db")  # SQL Server (tiberius)
+await YaraOrm.init("sqlite:///path/to/app.db")  # SQLite (rusqlite)
 ```
 
 ## PostgreSQL
@@ -46,8 +46,7 @@ alongside ordinary driver parameters (e.g. `sslmode`):
 
 ```python
 await YaraOrm.init(
-    "postgres://user:pass@host/db"
-    "?max_size=32&min_size=4&statement_cache_size=0&sslmode=require"
+    "postgres://user:pass@host/db?max_size=32&min_size=4&statement_cache_size=0&sslmode=require"
 )
 ```
 
@@ -132,15 +131,19 @@ the *next* time it opens a connection. It does not close the pool, and it does
 not interrupt a query that already holds a connection:
 
 ```python
-YaraOrm.set_password(new_password)
-YaraOrm.set_password(reader_password, connection="reader")
+YaraOrm.set_password(lambda: fresh_token())
+YaraOrm.set_password(lambda: fresh_reader_token(), connection="reader")
 ```
 
-Use it for a credential that expires, such as an RDS IAM authentication token
-(15 minutes). Refresh the stored password on a timer shorter than that
-lifetime. Opening a second pool to pick up the new token closes the pool that
-is serving traffic, and any query still on a connection from that pool fails
-with `Pool has been closed`.
+A string still sets the password used by the next new connection, until
+another call replaces it.
+
+Use a callable for a credential that expires, such as an RDS IAM authentication
+token (15 minutes). The pool calls it when it opens a connection, so the token
+is signed then and no timer has to keep the stored password fresh. Opening a
+second pool to pick up a new token closes the pool that is serving traffic,
+and any query still on a connection from that pool fails with
+`Pool has been closed`.
 
 Other backends raise `ValueError`: the password is part of the URL they were
 opened with, and there is no separate slot to update.
@@ -345,7 +348,7 @@ hops to a blocking thread), and the async bridge itself can be removed entirely 
 opt-in [sync fast path](#opt-in-synchronous-fast-path-sync_fast_path1).
 
 ```python
-await YaraOrm.init("sqlite:///app.db")     # file-backed
+await YaraOrm.init("sqlite:///app.db")  # file-backed
 ```
 
 - Rich types (UUID, JSON, datetime, decimal) are mapped onto SQLite's storage classes and
@@ -427,7 +430,7 @@ Each named connection has its own backend, so a single app can talk to PostgreSQ
 MySQL and SQLite databases at once. See [Multiple databases](../guides/multiple-databases.md).
 
 ```python
-await YaraOrm.init("postgres://localhost/primary")     # default
+await YaraOrm.init("postgres://localhost/primary")  # default
 await YaraOrm.add_connection("cache", "sqlite:///cache.db")
 ```
 

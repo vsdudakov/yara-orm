@@ -4,9 +4,14 @@
 //! holds a `dyn Backend`, so adding MySQL or SQLite later is purely a matter of
 //! providing another implementation and wiring it into [`connect`].
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::error::EngineError;
+
+/// A password read when a PostgreSQL pool opens a physical connection.
+pub type PasswordProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 use crate::value::{Row, Value};
 
 pub mod mssql;
@@ -97,6 +102,16 @@ pub trait Backend: Send + Sync {
     /// password only when a connection is opened. The default rejects the call;
     /// PostgreSQL is the backend that honours it.
     fn set_password(&self, _password: String) -> Result<(), EngineError> {
+        Err(EngineError::Config(
+            "set_password is supported for PostgreSQL connections only".to_string(),
+        ))
+    }
+
+    /// Read the password from `provider` each time this pool opens a connection.
+    ///
+    /// Same rule as [`set_password`]: connections already in the pool are left
+    /// alone. PostgreSQL is the backend that honours it.
+    fn set_password_provider(&self, _provider: PasswordProvider) -> Result<(), EngineError> {
         Err(EngineError::Config(
             "set_password is supported for PostgreSQL connections only".to_string(),
         ))

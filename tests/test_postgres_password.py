@@ -69,6 +69,8 @@ async def test_set_password_is_rejected_for_sqlite() -> None:
             YaraOrm.set_password("secret", connection="reader")
         with pytest.raises(ValueError, match="PostgreSQL"):
             YaraOrm.set_password("secret")
+        with pytest.raises(ValueError, match="PostgreSQL"):
+            YaraOrm.set_password(lambda: "secret")
     finally:
         await YaraOrm.close()
 
@@ -112,6 +114,45 @@ async def test_set_password_applies_to_the_next_connection_only() -> None:
                 await engine.fetch_row("SELECT 1")
             engine.set_password(password)
             assert (await engine.fetch_row("SELECT 1"))[0] == 1
+        finally:
+            await held.rollback()
+        assert (await engine.fetch_row("SELECT 1"))[0] == 1
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_password_callable_runs_when_a_connection_opens() -> None:
+    """
+    GIVEN a pool with one live connection
+    WHEN the password is a callable
+    THEN the connection already held keeps working, and the callable supplies
+    the password of the next connection the pool opens
+    """
+    parsed = urllib.parse.urlsplit(_PG_URL)
+    password = urllib.parse.unquote(parsed.password) if parsed.password else None
+    if not _pg_reachable() or password is None:
+        pytest.skip("PostgreSQL with a password in ORM_TEST_DB is required")
+    engine = await engine_connect(_with_pool(_PG_URL, max_size=2, min_size=1))
+    calls = {"n": 0}
+
+    def provider() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "not-the-password"
+        return password
+
+    try:
+        assert (await engine.fetch_row("SELECT 1"))[0] == 1
+        held = await engine.begin()
+        try:
+            engine.set_password(provider)
+            assert calls["n"] == 0
+            with pytest.raises(DBConnectionError, match="SQLSTATE 28P01"):
+                await engine.fetch_row("SELECT 1")
+            assert calls["n"] == 1
+            assert (await engine.fetch_row("SELECT 1"))[0] == 1
+            assert calls["n"] == 2
         finally:
             await held.rollback()
         assert (await engine.fetch_row("SELECT 1"))[0] == 1

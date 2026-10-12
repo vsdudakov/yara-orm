@@ -350,9 +350,31 @@ impl Engine {
 
     /// Replace the password the pool will use the next time it opens a connection.
     ///
-    /// Connections already in the pool keep working. PostgreSQL only.
-    fn set_password(&self, password: String) -> PyResult<()> {
-        self.backend.set_password(password).map_err(to_pyerr)
+    /// A string is stored as-is. A callable is invoked when a physical
+    /// connection opens, and must return a string. Connections already in the
+    /// pool keep working. PostgreSQL only.
+    fn set_password(&self, _py: Python<'_>, password: Bound<'_, PyAny>) -> PyResult<()> {
+        if let Ok(text) = password.extract::<String>() {
+            return self.backend.set_password(text).map_err(to_pyerr);
+        }
+        if password.is_callable() {
+            let callback = password.unbind();
+            let provider = std::sync::Arc::new(move || {
+                Python::attach(|py| {
+                    callback
+                        .call0(py)
+                        .and_then(|value| value.extract::<String>(py))
+                        .map_err(|err| err.to_string())
+                })
+            });
+            return self
+                .backend
+                .set_password_provider(provider)
+                .map_err(to_pyerr);
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "password must be a string or a callable that returns a string",
+        ))
     }
 
     /// Close the underlying connection pool.
