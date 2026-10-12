@@ -67,6 +67,17 @@ docs = ["mkdocs-material[imaging]>=9.7.7"]
 # factory-boy: optional runtime dep of yara_orm.contrib.factory; ty must
 # resolve its import.
 lint = ["ruff==0.17.0", "ty==0.0.86", "factory-boy==3.3.3"]
+# Build + test tooling: CI's test job installs it with `pip install --group test`.
+test = [
+    "maturin>=1.15.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
+    "factory-boy>=3.3.3",
+]
+# Everything a local checkout needs; `make dev` installs it.
+dev = [{ include-group = "test" }, { include-group = "lint" }]
 
 [tool.maturin]
 python-source = "python"
