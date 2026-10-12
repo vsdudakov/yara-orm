@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.14.1,<2.0"]
+requires = ["maturin>=1.15.0,<2.0"]
 build-backend = "maturin"
 
 [project]
 # Distribution name on PyPI is "yara-orm"; the import package is `yara_orm`.
 name = "yara-orm"
-version = "1.18.0"
+version = "1.18.1"
 description = "Fast async Python ORM with a Rust engine — Tortoise-style models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB and SQLite"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -56,10 +56,10 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "ruff>=0.15.20",
-    "ty>=0.0.56",
+    "ruff>=0.17.0",
+    "ty>=0.0.86",
 ]
-docs = ["mkdocs-material[imaging]>=9.7.6"]
+docs = ["mkdocs-material[imaging]>=9.7.7"]
 
 [tool.maturin]
 python-source = "python"

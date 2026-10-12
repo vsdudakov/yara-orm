@@ -1,0 +1,6 @@
+# Lint toolchain, pinned so a new ruff/ty release cannot break CI on an
+# unrelated PR. Dependabot bumps these; CI and `make dev` install from here.
+ruff==0.17.0
+ty==0.0.86
+# Optional runtime dep of yara_orm.contrib.factory; ty must resolve its import.
+factory-boy==3.3.3

@@ -19,9 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install lint tools
-        # factory-boy: optional runtime dep of yara_orm.contrib.factory — ty
-        # must be able to resolve its import.
-        run: pip install ruff ty factory-boy
+        run: pip install -r requirements-lint.txt
       - name: ruff check
         run: ruff check python tests benchmarks examples
       - name: ruff format --check

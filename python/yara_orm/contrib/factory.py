@@ -239,7 +239,7 @@ class YaraModelFactory(factory_boy.Factory[TModel]):
     :meth:`_build`.
     """
 
-    class Meta:
+    class Meta:  # ty: ignore[invalid-attribute-override]
         """Marks the base factory abstract; subclasses set ``model``."""
 
         abstract = True
