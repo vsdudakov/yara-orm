@@ -8,9 +8,9 @@ All notable changes to **yara-orm** are documented here. The format is based on
 
 ### Changed
 
-- **Lint toolchain is pinned.** `ruff` and `ty` are pinned in a new
-  `requirements-lint.txt` (`ruff==0.17.0`, `ty==0.0.86`), which CI and
-  `make dev` install from and Dependabot keeps current. Before this, CI
+- **Lint toolchain is pinned.** `ruff` and `ty` are pinned in a new `lint`
+  dependency group in `pyproject.toml` (`ruff==0.17.0`, `ty==0.0.86`), which CI
+  and `make dev` install with `pip install --group lint`. Before this, CI
   installed whatever was newest, so a new `ty` release could fail lint on
   unrelated pull requests. The `dev` extra now requires the same minimums.
 - Build and docs minimums raised to `maturin>=1.15.0` and

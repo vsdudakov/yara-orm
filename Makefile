@@ -7,7 +7,8 @@ LINT_PATHS := python tests benchmarks examples
 
 dev:
 	python3 -m venv $(VENV)
-	$(VENV)/bin/pip install -U pip maturin pytest pytest-asyncio pytest-xdist -r requirements-lint.txt
+	$(VENV)/bin/pip install -U pip
+	$(VENV)/bin/pip install -U maturin pytest pytest-asyncio pytest-xdist --group lint
 
 build:
 	VIRTUAL_ENV=$(PWD)/$(VENV) $(VENV)/bin/maturin develop --release
