@@ -7,7 +7,8 @@ LINT_PATHS := python tests benchmarks examples
 
 dev:
 	python3 -m venv $(VENV)
-	$(VENV)/bin/pip install -U pip maturin pytest pytest-asyncio pytest-xdist ruff ty
+	$(VENV)/bin/pip install -U pip
+	$(VENV)/bin/pip install -U --group dev
 
 build:
 	VIRTUAL_ENV=$(PWD)/$(VENV) $(VENV)/bin/maturin develop --release
@@ -73,7 +74,7 @@ bench-features: build
 # --- Documentation (MkDocs Material) -----------------------------------------
 # Install the docs extra from pyproject.toml ([project.optional-dependencies]).
 docs-install:
-	$(VENV)/bin/pip install -U "mkdocs-material[imaging]>=9.5"
+	$(VENV)/bin/pip install -U "mkdocs-material[imaging]>=9.7.7"
 
 # Build the static site into ./site (social cards enabled, like CI).
 docs:

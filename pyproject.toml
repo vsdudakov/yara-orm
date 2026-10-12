@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.14.1,<2.0"]
+requires = ["maturin>=1.15.0,<2.0"]
 build-backend = "maturin"
 
 [project]
 # Distribution name on PyPI is "yara-orm"; the import package is `yara_orm`.
 name = "yara-orm"
-version = "1.18.0"
+version = "1.19.0"
 description = "Fast async Python ORM with a Rust engine — Tortoise-style models, querysets, relations and migrations for PostgreSQL, MySQL, MariaDB and SQLite"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -56,10 +56,28 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "ruff>=0.15.20",
-    "ty>=0.0.56",
+    "ruff>=0.17.0",
+    "ty>=0.0.86",
 ]
-docs = ["mkdocs-material[imaging]>=9.7.6"]
+docs = ["mkdocs-material[imaging]>=9.7.7"]
+
+[dependency-groups]
+# Lint toolchain, pinned so a new ruff/ty release cannot break CI on an
+# unrelated PR. CI and `make dev` install it with `pip install --group lint`.
+# factory-boy: optional runtime dep of yara_orm.contrib.factory; ty must
+# resolve its import.
+lint = ["ruff==0.17.0", "ty==0.0.86", "factory-boy==3.3.3"]
+# Build + test tooling: CI's test job installs it with `pip install --group test`.
+test = [
+    "maturin>=1.15.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
+    "factory-boy>=3.3.3",
+]
+# Everything a local checkout needs; `make dev` installs it.
+dev = [{ include-group = "test" }, { include-group = "lint" }]
 
 [tool.maturin]
 python-source = "python"

@@ -4,6 +4,28 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] - 2026-10-12
+
+### Added
+
+- **`YaraOrm.set_password` accepts a callable.** The PostgreSQL pool calls it
+  each time it opens a new connection and uses the string it returns, so an
+  expiring credential such as an RDS IAM token is created at connect time
+  instead of being refreshed on a timer. The callable runs on a worker thread,
+  so a slow token fetch does not stall queries on connections already open.
+  A plain string still works as before. Any other type raises `TypeError` (#29).
+
+### Changed
+
+- **Dev tooling moves into `pyproject.toml` dependency groups.** `ruff` and
+  `ty` are pinned in a `lint` group (`ruff==0.17.0`, `ty==0.0.86`); build and
+  test tools are in a `test` group; `dev` includes both. CI and `make dev`
+  install them with `pip install --group …`. Before this, CI installed whatever
+  `ruff`/`ty` was newest, so a new `ty` release could fail lint on unrelated
+  pull requests. The `dev` extra now requires the same minimums.
+- Build and docs minimums raised to `maturin>=1.15.0` and
+  `mkdocs-material>=9.7.7`.
+
 ## [1.18.0] - 2026-10-09
 
 ### Added
